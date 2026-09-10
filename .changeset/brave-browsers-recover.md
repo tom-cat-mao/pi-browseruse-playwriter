@@ -1,5 +1,5 @@
 ---
-'playwriter': minor
+'@tom-cat/pi-browser-runtime': minor
 '@tom-cat/pi-browser-use-extension': minor
 ---
 

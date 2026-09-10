@@ -1,5 +1,5 @@
 ---
-'playwriter': patch
+'@tom-cat/pi-browser-runtime': patch
 ---
 
 Fix the in-page toolbar **Record Skill** button staying on Record after a click.

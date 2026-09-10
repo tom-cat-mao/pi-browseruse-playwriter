@@ -44,6 +44,10 @@ function createTruncatingReplacer({ maxStringLength }: { maxStringLength: number
 }
 
 const DEFAULT_MAX_ENTRIES = 10_000
+const FLUSH_INTERVAL_MS = 500
+// Cap the in-memory buffer so a stalled disk cannot grow it without bound.
+// When exceeded we drop the oldest lines and record how many were dropped.
+const DEFAULT_MAX_BUFFERED_LINES = 20_000
 
 function resolvePositiveInt(value: number | undefined, fallback: number): number {
   if (value == null || !Number.isFinite(value) || value < 2) {
@@ -52,39 +56,69 @@ function resolvePositiveInt(value: number | undefined, fallback: number): number
   return Math.floor(value)
 }
 
+type CdpLoggerOptions = {
+  logFilePath?: string
+  maxStringLength?: number
+  maxEntries?: number
+  maxBufferedLines?: number
+}
+
+/**
+ * JSONL logger for raw CDP traffic. Like the relay file logger this is
+ * best-effort: append/rotation failures are swallowed so a broken or full disk
+ * cannot poison the write queue or crash the relay, and the in-memory buffer
+ * is bounded. Kept file grows to at most `maxEntries` lines before rotating to
+ * the most recent half.
+ */
 export function createCdpLogger({
   logFilePath,
   maxStringLength,
   maxEntries,
-}: { logFilePath?: string; maxStringLength?: number; maxEntries?: number } = {}): CdpLogger {
+  maxBufferedLines,
+}: CdpLoggerOptions = {}): CdpLogger {
   const resolvedLogFilePath = logFilePath || LOG_CDP_FILE_PATH
-  const logDir = path.dirname(resolvedLogFilePath)
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true })
-  }
-  fs.writeFileSync(resolvedLogFilePath, '')
-
-  let queue: Promise<void> = Promise.resolve()
-  let lineCount = 0
+  const resolvedMaxEntries = resolvePositiveInt(
+    maxEntries,
+    resolvePositiveInt(Number(process.env.PLAYWRITER_CDP_LOG_MAX_ENTRIES), DEFAULT_MAX_ENTRIES),
+  )
+  const resolvedMaxBufferedLines = resolvePositiveInt(
+    maxBufferedLines,
+    resolvePositiveInt(Number(process.env.PLAYWRITER_CDP_LOG_MAX_BUFFERED_LINES), DEFAULT_MAX_BUFFERED_LINES),
+  )
   const maxLength = maxStringLength ?? DEFAULT_MAX_STRING_LENGTH
-  const envMaxEntries = Number(process.env.PLAYWRITER_CDP_LOG_MAX_ENTRIES)
-  const resolvedMaxEntries = resolvePositiveInt(maxEntries, resolvePositiveInt(envMaxEntries, DEFAULT_MAX_ENTRIES))
   // Keep half the entries after rotation so we don't rotate on every write
   const keepAfterRotation = Math.floor(resolvedMaxEntries / 2)
 
-  // Batch buffer: accumulate lines and flush periodically to reduce disk I/O.
-  // Without batching, high-frequency CDP events cause thousands of appendFile
-  // calls per second. See: https://github.com/remorses/playwriter/issues/96
-  const FLUSH_INTERVAL_MS = 500
+  const enabled = (() => {
+    try {
+      const logDir = path.dirname(resolvedLogFilePath)
+      if (!fs.existsSync(logDir)) {
+        fs.mkdirSync(logDir, { recursive: true })
+      }
+      fs.writeFileSync(resolvedLogFilePath, '')
+      return true
+    } catch {
+      return false
+    }
+  })()
+
+  let queue: Promise<void> = Promise.resolve()
+  let lineCount = 0
+  let droppedLines = 0
   let buffer: string[] = []
   let flushTimer: ReturnType<typeof setInterval> | undefined
+
+  const enqueue = (operation: () => Promise<void>): Promise<void> => {
+    queue = queue.then(operation, operation)
+    return queue
+  }
 
   // Atomic rotation: write to temp file then rename to avoid corruption on crash
   const rotate = async (): Promise<void> => {
     try {
       const content = await fs.promises.readFile(resolvedLogFilePath, 'utf-8')
-      const lines = content.split('\n').filter((l) => {
-        return l.length > 0
+      const lines = content.split('\n').filter((line) => {
+        return line.length > 0
       })
       const kept = lines.slice(-keepAfterRotation)
       const tmpPath = `${resolvedLogFilePath}.tmp`
@@ -98,25 +132,48 @@ export function createCdpLogger({
   }
 
   const flushBuffer = async (): Promise<void> => {
-    if (buffer.length === 0) {
+    if (!enabled || buffer.length === 0) {
+      buffer = []
       return
     }
     const lines = buffer
     buffer = []
-    await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
-    lineCount += lines.length
-    if (lineCount > resolvedMaxEntries) {
-      await rotate()
+    if (droppedLines > 0) {
+      const marker: CdpLogEntry = {
+        timestamp: new Date().toISOString(),
+        direction: 'from-extension',
+        source: 'server',
+        message: { method: 'cdpLogOverflow', droppedLines },
+      }
+      lines.unshift(JSON.stringify(marker))
+      droppedLines = 0
+    }
+    try {
+      await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+      lineCount += lines.length
+      if (lineCount > resolvedMaxEntries) {
+        await rotate()
+      }
+    } catch {
+      // Never reject the queue: logging failures must not escape into the relay.
     }
   }
 
   const log = (entry: CdpLogEntry): void => {
+    if (!enabled) {
+      return
+    }
     const replacer = createTruncatingReplacer({ maxStringLength: maxLength })
     const line = JSON.stringify(entry, replacer)
     buffer.push(line)
+    if (buffer.length > resolvedMaxBufferedLines) {
+      const overflow = buffer.length - resolvedMaxBufferedLines
+      buffer = buffer.slice(overflow)
+      droppedLines += overflow
+    }
     if (!flushTimer) {
       flushTimer = setInterval(() => {
-        queue = queue.then(flushBuffer)
+        void enqueue(flushBuffer)
       }, FLUSH_INTERVAL_MS)
       flushTimer.unref()
     }
@@ -127,8 +184,7 @@ export function createCdpLogger({
       clearInterval(flushTimer)
       flushTimer = undefined
     }
-    queue = queue.then(flushBuffer)
-    await queue
+    await enqueue(flushBuffer)
   }
 
   return {

@@ -1,6 +1,6 @@
 ---
 '@xmorse/playwright-core': patch
-'playwriter': patch
+'@tom-cat/pi-browser-runtime': patch
 ---
 
 Fix recorder writing the same click 3 times.

@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+  pull_request:
 
 jobs:
   ci:
@@ -14,8 +15,11 @@ jobs:
           submodules: true
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org/
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: pnpm/action-setup@v4
         with:
           version: 10.18.1
@@ -27,8 +31,25 @@ jobs:
         with:
           path: ${{ env.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-store-
-      - run: pnpm install
-      # scripts
-      # - run: pnpm build
-      # - run: pnpm test
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+      - run: pnpm install --frozen-lockfile
+      # Generate playwright injected sources and build the local playwright-core
+      # fork before anything imports it (missing setup breaks builds).
+      - name: Bootstrap playwright fork
+        run: |
+          node playwright/utils/generate_injected.js
+          node playwright/packages/playwright-core/build.mjs
+      - name: Typecheck runtime
+        run: pnpm --filter @tom-cat/pi-browser-runtime typecheck
+      - name: Build runtime package
+        run: pnpm --filter @tom-cat/pi-browser-runtime build
+      - name: Distribution smoke check
+        run: pnpm --filter @tom-cat/pi-browser-runtime smoke
+      # Browser-free tests only. Chrome tests are a separate, user-authorized phase.
+      - name: Unit tests (no browser)
+        run: pnpm --filter @tom-cat/pi-browser-runtime test:unit
+      - name: Typecheck extension
+        run: pnpm --filter mcp-extension exec tsc --project .
+      - name: Typecheck pi package
+        run: pnpm --filter @tom-cat/pi-browser-use-extension typecheck
