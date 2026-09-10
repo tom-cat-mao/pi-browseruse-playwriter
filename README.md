@@ -112,8 +112,9 @@ it does not spawn a browser or call `npx playwriter@latest`.
 
 ## Status
 
-The first independent candidate review **failed**. Executor corrections are
-under revalidation; user-assisted Chrome acceptance has not started. Current, evidence-based state is tracked in
+Independent **browser-free acceptance has passed**, including review of the
+snapshot-ref handoff. User-assisted Chrome acceptance is the remaining gate;
+the fork is not yet fully browser-validated. Current evidence is tracked in
 [docs/exec/browser-rebuild-progress.md](./docs/exec/browser-rebuild-progress.md);
 this README intentionally does not freeze temporary test numbers. Chrome
 acceptance is a separate, user-authorized phase.

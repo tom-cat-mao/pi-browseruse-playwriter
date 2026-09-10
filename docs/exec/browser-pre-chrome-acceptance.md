@@ -81,3 +81,32 @@ pnpm --filter @tom-cat/pi-browser-use-extension exec vitest run test/index.test.
 - C 新增 changeset 引用旧包名 `playwriter` 的问题已在 integration 修正为
   `@tom-cat/pi-browser-runtime`，属元数据、非产品缺陷。
 - 原 FAIL 报告与 d607439 增量报告均未改动；本报告是新增的收尾记录。
+
+# 候选 134233d 差异复核（追加，2026-09-10）
+
+范围：仅复核 `33e6ab2`（生产 14 行）与 `62962da` 的 refs 步骤；上文 a4e1669 章节
+与证据计数保持不变。结论：**差异通过（no-regression），Chrome 仍 INCOMPLETE，
+仍只允许进入用户 Chrome gate，不允许 merge。**
+
+- 生产 diff：`playwriter/src/managed-executor-worker.ts` +10/−4。`snapshot()` 中
+  `snapshotRefs` 由 `result.refs` 单次生成
+  `{ref: entry.shortRef, role: entry.role, name: entry.name, selector}`
+  并为每个有 selector 的 entry 建 `refs` map（同一遍），返回新增
+  `value.refs = [{ref, role, name}]`；`text` 与 `snapshotId` 构造未变。
+  上游字段来源确认：`AriaRef`（aria-snapshot.ts:60-63）本身含
+  `role/name/shortRef`，`getSelectorForRef(ref)` 按完整 ref 取 selector、map 按
+  `shortRef` 存——与 harness 发送 `aria-ref=<shortRef>` 的解析（worker
+  `normalizeSnapshotRef` → `refs.get`）闭环一致。
+- 向后兼容：`BrowserResultData.value` 已是可选任意 JSON，未改协议类型/版本；
+  旧客户端忽略新字段；`snapshotRefs` 为空时 `value.refs: []`。
+- 不可从 CSS guess：harness `snapshot-refs.ts` 只读 `value.refs`，缺失即抛错；
+  选择按 role+name 唯一匹配，重复即拒绝；注释与自检均禁止从 text/CSS/位置推断。
+- unknown-ref 非假验：`unknown-ref` 步骤先 `page.evaluate`+计数器读取，再取
+  **fresh** snapshot，然后用 `aria-ref=e99999` 配该 fresh snapshotId，断言
+  `stale-snapshot` 且 message 必须含 “is not present in snapshot”（真 unknown-ref
+  路径，而非过期快照误判），并验证输入值与 fixture 计数均未变。
+- 其余差异：`snapshot-click` delta 恰为 1（轮询）；`page-navigate` 使用与
+  tabs.create 相同的 marker 并在导航后经 evaluate 校验；`page-screenshot`
+  校验 PNG mime/非空/尺寸/artifact 落盘。
+- 自检：`acceptance-harness --self-test` → **22/22 passed**
+  （tmp/review-a4e1669/selftest-134233d.log）。未跑 Chrome、未跑全套件。

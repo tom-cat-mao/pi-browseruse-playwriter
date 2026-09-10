@@ -123,7 +123,8 @@ page.execute 保留 JS 逃生舱，但 scope 的 page 固定为请求 tab；cont
 请求被取消/释放后不得继续发送 CDP 指令。执行器输出字符串/JSON须有上限，
 network listener 精确按页面绑定清理。无验证码检测，无业务重试。
 
-page.snapshot 返回 text + snapshotId；ref 索引按 tab/generation 存储。
+page.snapshot 返回 text + snapshotId + value.refs:[{ref,role,name}]；ref 是
+同次快照索引中的 shortRef，按 tab/generation 存储，不能从 CSS/位置猜测。
 click/fill 收到 aria-ref/@eN 必须带 snapshotId 并核验，无匹配不能 first()。
 普通明确 CSS/role locator 可以无 snapshotId，仍遵守严格匹配。
 

@@ -10,7 +10,8 @@ prompt: |
 
 # 当前阶段
 
-Step 2：五条工作流已集成，独立审查发现的问题正在修复与复验。
+Step 3：候选134233d已冻结，无浏览器验收与增量独立复核通过。
+停止扩展设计，等待用户打开隔离Chrome进行真机验收。
 尚未进行 Chrome 验收；非浏览器检查通过不代表最终验收通过。
 用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
 全部执行 agent 使用默认 model/effort；禁止 Reasonix。
@@ -25,12 +26,12 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | E 工具链/发行/日志 | CodeBuddy11/15 | feat/browser-runtime-foundation | eab8301已集成，产品README/legacy测试入口完成 |
 | A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 42eb198 已集成 |
 | B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
-| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 0e4867a已集成，独立复验中 |
-| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验中 |
+| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 33e6ab2已集成，独立复验通过 |
+| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验通过 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备 | CodeBuddy13/16 | feat/browser-acceptance-harness | 5f4c19f已集成；计数/ref/核心操作覆盖收尾 |
-| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS；Chrome INCOMPLETE |
+| 验收脚本准备 | CodeBuddy13/16 | feat/browser-acceptance-harness | 62962da已集成，strict+22selfchecks通过 |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS+134233d差异通过；Chrome INCOMPLETE |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -157,6 +158,15 @@ executor、pi-tools、integration。主目录 main 未修改。
   已明确最小兼容修订：page.snapshot沿现有value字段返回
   refs:[{ref,role,name}]，来源必须是同次snapshot的shortRef索引。
   C补返回值，harness16改读真实refs而不从CSS值猜；此改动另行短复核。
+- 33e6ab2与62962da已集成到134233d；refs返回值与正向验收闭环由
+  CodeBuddy14短复核通过，追加记录已入独立报告，原证据不改。
+- 协调者在134233d再次验证：build/smoke、unit228、integration34、Pi60、
+  extension34、12工具load-check、全部typecheck、harness strict+22selfchecks
+  与无连接dry-run均通过。日志tmp/validation-134233d/suites.log。
+- 测试扩展已重建，dist-acceptance版本0.0.126、ID eeklahpecooapnailfaebkjjembkjhhg、
+  端口19990；尚未启动测试runtime/Chrome。19988仍为原PID68650。
+- 用户明确要求避免钻牛角尖/过度设计，当前停止新增范围，只做用户配合的
+  Chrome真实测试和发现的阻塞修复；未测项目不冒充通过。
 - 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
@@ -164,9 +174,9 @@ executor、pi-tools、integration。主目录 main 未修改。
 - [x] 五个 owner 首轮提交及真实无浏览器验证结果。
 - [x] 集成跨层接口、类型和依赖配置。
 - [x] C/D审查修复提交及协调者无浏览器验证。
-- [ ] 验收harness误判修复与核心操作覆盖。
+- [x] 验收harness误判修复与核心操作覆盖准备。
 - [x] 独立全新 agent 代码审查及a4e1669无浏览器验收。
-- [ ] snapshot refs可见性补齐与正向验收脚本复核。
+- [x] snapshot refs可见性补齐与正向验收脚本复核。
 - [ ] 用户配合加载测试 Chrome 扩展。
 - [ ] 多 profile/多组/断线不散组/用户释放 Chrome 验收。
 - [ ] origin draft PR -> 验收完成后就绪 -> 最终合并。
