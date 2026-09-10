@@ -334,4 +334,69 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(parsed.tabs.length).toBeLessThan(3000);
     expect(parsed.tabsTruncated).toBeGreaterThan(0);
   });
+
+  it("does not split an emoji when byte-truncating primary text", async () => {
+    // A wall of 4-byte emoji whose UTF-8 size far exceeds the text budget: the
+    // truncated content must stay valid (no U+FFFD replacement char from a lone
+    // surrogate) while still landing under the byte ceiling.
+    runtimeHandler(() => ({ text: "😀".repeat(40_000), snapshotId: "snap-emoji" }));
+    const snap = toolByName("browser_snapshot");
+    const res = await snap.execute("call-13", { tabId: "t" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    expect(Buffer.byteLength(t, "utf8")).toBeLessThanOrEqual(90_000);
+    expect(t).not.toContain("\uFFFD");
+    expect(t).toContain("snap-emoji");
+  });
+
+  it("keeps a single tab's ids parseable even with a huge title/url (clamps display fields)", async () => {
+    // One tab whose title and url alone exceed the structured budget. The block
+    // must still be valid JSON with tabId + snapshotId intact and stay <=24k.
+    runtimeHandler(() => ({
+      snapshotId: "snap-solo",
+      tab: {
+        tabId: "the-real-tab-id",
+        groupId: "g",
+        sessionId: "s",
+        profileId: "profile-1",
+        url: `https://example.com/${"路径".repeat(30_000)}`,
+        title: "巨大标题".repeat(30_000),
+        state: "ready",
+        browserEpoch: "e",
+        revision: 1,
+        chromeTabId: 1,
+      },
+    }));
+    const tool = toolByName("browser_tabs");
+    const res = await tool.execute("call-14", { action: "create", groupId: "g", url: "https://x" }, undefined, undefined, makeCtx());
+    const jsonLine = textOf(res.content).split("\n").find((l) => l.startsWith("{"))!;
+    expect(Buffer.byteLength(jsonLine, "utf8")).toBeLessThanOrEqual(24_000);
+    const parsed = JSON.parse(jsonLine) as { snapshotId?: string; tab: { tabId: string } };
+    expect(parsed.tab.tabId).toBe("the-real-tab-id");
+    expect(parsed.snapshotId).toBe("snap-solo");
+  });
+
+  it("stays within budget and parseable when profiles+groups+tabs are all huge together", async () => {
+    const mk = (n: number, kind: string) =>
+      Array.from({ length: n }, (_v, i) => ({
+        sessionId: "s",
+        profileId: `p-${kind}-${i}`,
+        state: "ready",
+        browserEpoch: "e",
+        revision: 1,
+      }));
+    const profiles = mk(2000, "pf").map((b, i) => ({ ...b, profileId: `pf-${i}`, browser: "chrome", label: `标签${i}`, connected: true, capabilities: validCapabilities }));
+    const groups = mk(2000, "g").map((b, i) => ({ ...b, groupId: `g-${i}`, name: `组名称${i}` }));
+    const tabs = mk(2000, "t").map((b, i) => ({ ...b, tabId: `t-${i}`, groupId: "g", url: `https://e.com/${i}`, title: `标题${i}`, chromeTabId: i }));
+    runtimeHandler(() => ({ profiles, groups, tabs, snapshotId: "combo" }));
+    const tool = toolByName("browser_tabs");
+    const res = await tool.execute("call-15", { action: "list" }, undefined, undefined, makeCtx());
+    const jsonLine = textOf(res.content).split("\n").find((l) => l.startsWith("{"))!;
+    // Whole combined structured block honors the byte budget and stays parseable.
+    expect(Buffer.byteLength(jsonLine, "utf8")).toBeLessThanOrEqual(24_000);
+    const parsed = JSON.parse(jsonLine) as Record<string, unknown>;
+    expect(parsed.snapshotId).toBe("combo");
+    // At least one list got truncated (they can't all fit) and JSON is valid.
+    const truncatedKeys = Object.keys(parsed).filter((k) => k.endsWith("Truncated"));
+    expect(truncatedKeys.length).toBeGreaterThan(0);
+  });
 });

@@ -66,15 +66,20 @@ const MAX_TEXT_BYTES = 48_000; // primary page text
 const MAX_STRUCTURED_BYTES = 24_000; // budget for the structured-ids JSON block
 const MAX_LOG_LINES = 50; // most recent N log lines
 const MAX_LOG_BYTES = 20_000; // total bytes across surfaced log lines
+// Per-field clamp for free-form display strings (group name, tab url/title,
+// profile label) inside the structured block, so one huge value can't blow the
+// budget and force JSON slicing that would drop stable ids.
+const MAX_FIELD_BYTES = 2_000;
 // Hard ceiling on the total text we emit into `content` (excludes image bytes).
 // Structured ids are laid down first and are never dropped for text/logs.
 const MAX_TOTAL_TEXT_BYTES = 90_000;
 
 const utf8 = new TextEncoder();
 const byteLen = (s: string): number => utf8.encode(s).length;
-// Slice a string down to at most `maxBytes` UTF-8 bytes without splitting a
-// multibyte code point (TextEncoder counts bytes; we shrink by chars until it
-// fits, so the result is always valid UTF-8 and truly within budget).
+// Slice a string down to at most `maxBytes` UTF-8 bytes on a code-point
+// boundary. Binary-searches by UTF-16 code unit, then drops a trailing lone
+// high surrogate so an astral char (emoji) is never split into a replacement
+// character. The result is always valid UTF-8 and within budget.
 function sliceToBytes(s: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
   if (byteLen(s) <= maxBytes) return s;
@@ -84,6 +89,12 @@ function sliceToBytes(s: string, maxBytes: number): string {
     const mid = Math.ceil((lo + hi) / 2);
     if (byteLen(s.slice(0, mid)) <= maxBytes) lo = mid;
     else hi = mid - 1;
+  }
+  // If we cut right after a high surrogate, its low half is on the far side of
+  // the boundary — drop the orphan so we never emit U+FFFD.
+  if (lo > 0) {
+    const last = s.charCodeAt(lo - 1);
+    if (last >= 0xd800 && last <= 0xdbff) lo -= 1;
   }
   return s.slice(0, lo);
 }
@@ -226,8 +237,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const marker = "\n…[truncated]";
-      const head = sliceToBytes(t, Math.max(0, remaining - byteLen(marker)));
-      content.push(text(`${head}${marker}`));
+      const markerBytes = byteLen(marker);
+      // Never emit a marker that would itself push us past the budget: if the
+      // remaining room can't hold the marker, fill it with text only.
+      if (remaining <= markerBytes) {
+        content.push(text(sliceToBytes(t, remaining)));
+      } else {
+        content.push(text(`${sliceToBytes(t, remaining - markerBytes)}${marker}`));
+      }
       remaining = 0;
     };
 
@@ -330,14 +347,20 @@ export default function (pi: ExtensionAPI) {
     // Reserve up to a quarter of the budget for a value preview (emitted outside
     // the JSON) so ids/lists get the rest.
     const listBudget = valueStr !== undefined ? Math.floor(MAX_STRUCTURED_BYTES * 0.75) : MAX_STRUCTURED_BYTES;
+    // Reserve room UPFRONT for EVERY list's empty-array key and its worst-case
+    // `${key}Truncated:<count>` marker. Packing one list to the full budget and
+    // only then discovering the other lists' keys/markers still need bytes would
+    // overflow — a single-list test never catches this.
+    const overhead = lists.reduce(
+      (sum, l) => sum + byteLen(`,"${l.key}":[]`) + byteLen(`,"${l.key}Truncated":${l.items.length}`),
+      0,
+    );
+    const packBudget = Math.max(0, listBudget - overhead);
     for (const l of lists) {
-      // Reserve room for the `${key}Truncated: <count>` marker that may be added
-      // after the loop so the final JSON never slips past the byte budget.
-      const perListBudget = listBudget - byteLen(`,"${l.key}Truncated":${l.items.length}`);
       const kept: Json[] = [];
       for (const item of l.items) {
         kept.push(item);
-        if (byteLen(JSON.stringify({ ...out, [l.key]: kept })) > perListBudget) {
+        if (byteLen(JSON.stringify({ ...out, [l.key]: kept })) > packBudget) {
           kept.pop();
           break;
         }
@@ -351,9 +374,13 @@ export default function (pi: ExtensionAPI) {
     if (valueStr === undefined) return idsJson;
     // value present and the whole thing didn't fit: emit ids JSON, then the
     // value as an explicitly-truncated standalone string (never sliced JSON).
-    const valueBudget = Math.max(0, MAX_STRUCTURED_BYTES - byteLen(idsJson) - 96);
+    // Compute the value block's real header/footer byte cost (no magic number)
+    // so the whole structured block stays within MAX_STRUCTURED_BYTES.
+    const header = `\nvalue (truncated, ${valueStr.length} chars total):\n`;
+    const footer = "\n…[value truncated; read it in smaller pieces via browser_evaluate]";
+    const valueBudget = Math.max(0, MAX_STRUCTURED_BYTES - byteLen(idsJson) - byteLen(header) - byteLen(footer));
     const valuePreview = sliceToBytes(valueStr, valueBudget);
-    const valueBlock = `value (truncated, ${valueStr.length} chars total):\n${valuePreview}\n…[value truncated; read it in smaller pieces via browser_evaluate]`;
+    const valueBlock = `${header.slice(1)}${valuePreview}${footer}`;
     return Object.keys(out).length > 0 ? `${idsJson}\n${valueBlock}` : valueBlock;
   }
 
@@ -362,24 +389,32 @@ export default function (pi: ExtensionAPI) {
   const profileLine = (p: BrowserProfile): string =>
     `${p.label} [${p.profileId}] ${p.browser} ${p.connected ? "connected" : "disconnected"}`;
 
-  // Compact projections keep only the fields the LLM needs to act, so listings
-  // stay within the structured-text byte budget.
+  // Compact projections keep only the fields the LLM needs to act. Stable IDs
+  // are kept intact; free-form display fields (name/url/title/label) are clamped
+  // to MAX_FIELD_BYTES so a single resource with a huge title/url can never make
+  // the structured block exceed its byte budget and force JSON slicing that
+  // would drop the ids. Keeping an id != keeping an unbounded name.
+  const clampField = (s: string | undefined): string => {
+    if (s == null) return "";
+    if (byteLen(s) <= MAX_FIELD_BYTES) return s;
+    return `${sliceToBytes(s, MAX_FIELD_BYTES)}…`;
+  };
   const compactGroup = (g: BrowserGroup): Json => ({
     groupId: g.groupId,
-    name: g.name,
+    name: clampField(g.name),
     profileId: g.profileId,
     state: g.state,
   });
   const compactTab = (t: BrowserTab): Json => ({
     tabId: t.tabId,
     groupId: t.groupId,
-    url: t.url,
-    title: t.title,
+    url: clampField(t.url),
+    title: clampField(t.title),
     state: t.state,
   });
   const compactProfile = (p: BrowserProfile): Json => ({
     profileId: p.profileId,
-    label: p.label,
+    label: clampField(p.label),
     browser: p.browser,
     connected: p.connected,
   });
@@ -466,11 +501,12 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Tabs",
     description:
       "Manage tabs within this session's groups. Actions: list (this session's tabs, optionally filtered by groupId), " +
-      "create (needs groupId and url — the tab opens inside that group), close (a tab), release (mark a tab released so " +
-      "reconnects won't pull it back). All actions take explicit ids; there is no implicit current tab.",
+      "create (needs groupId and url — the tab opens inside that group), close (a tab), release (relinquish this session's " +
+      "control of a tab so a later reconnect won't pull it back into this session). All actions take explicit ids; there is " +
+      "no implicit current tab.",
     promptSnippet: "List/create/close/release tabs in this session's groups",
     promptGuidelines: [
-      "Use browser_tabs create with a groupId (from browser_groups) and a url to open a managed tab; use the returned tabId for all page tools. Use release only when the user is done with a tab so a browser restart won't reopen it.",
+      "Use browser_tabs create with a groupId (from browser_groups) and a url to open a managed tab; use the returned tabId for all page tools. Use release to give up control of a tab when you are done with it so a later reconnect won't pull it back into this session.",
     ],
     parameters: Type.Object({
       action: StringEnum(["list", "create", "close", "release"] as const),
@@ -777,11 +813,13 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Execute",
     description:
       "Escape hatch: run a Playwright snippet against a managed tab in the runtime's Node sandbox. Scope is fixed to the " +
-      "requested tab (its `page`); there is no newPage/close/context escape. Errors and output are returned verbatim. " +
-      "Optional timeout in ms (runtime caps it at 120s).",
+      "requested tab (its `page`); there is no newPage/close/context escape. Each call is independent: you may keep plain " +
+      "data or ids in variables you return, but page/locator/CDP handles cannot be reused across calls — re-acquire them " +
+      "each time. Await every action to completion and leave no background timers running. keyboard/mouse/touchscreen input " +
+      "is not supported right now. Errors and output are returned verbatim. Optional timeout in ms (runtime caps it at 120s).",
     promptSnippet: "Run a Playwright snippet against a managed tab (escape hatch)",
     promptGuidelines: [
-      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Never call browser.close()/context.close(); close tabs via browser_tabs.",
+      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Do not rely on page/locator/CDP objects surviving between calls (re-acquire them); await all actions and leave no background timers; keyboard/mouse/touchscreen input is unsupported for now. Never call browser.close()/context.close(); close tabs via browser_tabs.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
