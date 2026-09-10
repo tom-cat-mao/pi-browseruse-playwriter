@@ -268,9 +268,70 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     const snap = toolByName("browser_snapshot");
     const res = await snap.execute("call-9", { tabId: "t" }, undefined, undefined, makeCtx());
     const t = textOf(res.content);
-    // Total emitted text stays within the hard ceiling (plus small markers).
-    expect(t.length).toBeLessThan(95_000);
+    // Total emitted text stays within the hard byte ceiling (plus small markers).
+    expect(Buffer.byteLength(t, "utf8")).toBeLessThan(95_000);
     // The tiny structured id is never dropped.
     expect(t).toContain("snap-big");
+  });
+
+  it("measures the budget in UTF-8 bytes for multibyte (Chinese) content", async () => {
+    // 60k Chinese chars = ~180KB UTF-8; a char-based budget would wrongly let
+    // this through. Assert the true byte size stays under the ceiling.
+    runtimeHandler(() => ({ text: "中".repeat(60_000), snapshotId: "snap-cn" }));
+    const snap = toolByName("browser_snapshot");
+    const res = await snap.execute("call-10", { tabId: "t" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    expect(Buffer.byteLength(t, "utf8")).toBeLessThanOrEqual(90_000);
+    expect(t).toContain("snap-cn");
+  });
+
+  it("truncates a huge group listing item-by-item into valid JSON with a count", async () => {
+    // Thousands of groups with long Chinese names + long urls. The structured
+    // block must stay parseable JSON, keep only what fits, and record how many
+    // were dropped — never dump the full giant array or slice invalid JSON.
+    const groups = Array.from({ length: 4000 }, (_v, i) => ({
+      groupId: `g-${i}`,
+      sessionId: "s",
+      profileId: "profile-1",
+      name: `分组名称非常长的中文测试${i}`,
+      state: "ready",
+      browserEpoch: "e",
+      revision: 1,
+    }));
+    runtimeHandler(() => ({ groups }));
+    const tool = toolByName("browser_groups");
+    const res = await tool.execute("call-11", { action: "list" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    const jsonLine = t.split("\n").find((l) => l.startsWith("{"))!;
+    const parsed = JSON.parse(jsonLine) as { groups: unknown[]; groupsTruncated?: number };
+    expect(Array.isArray(parsed.groups)).toBe(true);
+    expect(parsed.groups.length).toBeLessThan(4000);
+    expect(parsed.groupsTruncated).toBe(4000 - parsed.groups.length);
+    expect(Buffer.byteLength(jsonLine, "utf8")).toBeLessThanOrEqual(24_000);
+    // details keeps the full listing for the UI.
+    expect((res.details.groups as unknown[]).length).toBe(4000);
+  });
+
+  it("keeps snapshotId intact even when a listing is truncated", async () => {
+    const tabs = Array.from({ length: 3000 }, (_v, i) => ({
+      tabId: `t-${i}`,
+      groupId: "g",
+      sessionId: "s",
+      profileId: "profile-1",
+      url: `https://example.com/very/long/path/segment/${i}/${"x".repeat(80)}`,
+      title: `标签页标题${i}`,
+      state: "ready",
+      browserEpoch: "e",
+      revision: 1,
+      chromeTabId: i,
+    }));
+    runtimeHandler(() => ({ tabs, snapshotId: "keep-me" }));
+    const tool = toolByName("browser_tabs");
+    const res = await tool.execute("call-12", { action: "list" }, undefined, undefined, makeCtx());
+    const jsonLine = textOf(res.content).split("\n").find((l) => l.startsWith("{"))!;
+    const parsed = JSON.parse(jsonLine) as { snapshotId?: string; tabs: unknown[]; tabsTruncated?: number };
+    expect(parsed.snapshotId).toBe("keep-me");
+    expect(parsed.tabs.length).toBeLessThan(3000);
+    expect(parsed.tabsTruncated).toBeGreaterThan(0);
   });
 });
