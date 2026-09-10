@@ -536,8 +536,8 @@ export class ManagedExecutorWorkerRuntime {
   /**
    * Real browser history back — never a goto() to the previous URL, so the site
    * keeps whatever it restores from its own history entry. Sites that rebuild
-   * scroll/form state from JS may still not restore it; we report the result and
-   * do not fake it.
+   * scroll/form state from JS may still not restore it; we report the resulting
+   * URL and never assert more than we know.
    */
   private async goBack({
     page,
@@ -552,15 +552,17 @@ export class ManagedExecutorWorkerRuntime {
       timeout: DEFAULT_NAVIGATION_TIMEOUT_MS,
     })
     this.invalidateSnapshot({ page })
-    if (!response) {
-      return {
-        text: `No earlier page in this tab's history; still on ${page.url()}`,
-        value: { url: page.url(), title: await page.title(), wentBack: false },
-      }
-    }
+    const url = page.url()
+    const title = await page.title()
+    // A null response only means "no main-resource response to report" — a
+    // same-document/SPA/hash history entry goes back without one. Never claim
+    // nothing happened; report the tab's real state instead.
     return {
-      text: `Went back to ${page.url()}`,
-      value: { url: page.url(), title: await page.title(), wentBack: true },
+      text:
+        response === null
+          ? `Went back; the tab is now on ${url} (no navigation response — normal for same-document or SPA history entries)`
+          : `Went back to ${url}`,
+      value: { url, title, hadNavigationResponse: response !== null },
     }
   }
 

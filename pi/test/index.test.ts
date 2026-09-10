@@ -443,12 +443,20 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(t).toContain("pcdt:profile-1:epoch-a:7");
     expect(t).toContain("pcdt:profile-1:epoch-a:9");
     const jsonLine = t.split("\n").find((l) => l.startsWith("{"))!;
-    const parsed = JSON.parse(jsonLine) as { candidates: Array<{ windowId: number; active: boolean; windowFocused: boolean }> };
+    const parsed = JSON.parse(jsonLine) as {
+      candidates: Array<{ windowId: number; active: boolean; windowFocused: boolean; browser: string; profileLabel: string }>;
+    };
     // Every window keeps its own active flag: nothing is collapsed into a
     // single "current tab".
     expect(parsed.candidates.map((c) => [c.windowId, c.active, c.windowFocused])).toEqual([
       [3, true, false],
       [4, true, true],
+    ]);
+    // Browser + profile label survive so two Chrome builds/profiles with the
+    // same tab title can be told apart.
+    expect(parsed.candidates.map((c) => [c.browser, c.profileLabel])).toEqual([
+      ["chrome", "work@example.com"],
+      ["chrome", "work@example.com"],
     ]);
     const post = server.requests.find((r) => r.url === "/browser/v1/request");
     expect(post?.body).toMatchObject({ operation: { kind: "tabs.discover", query: "invoice" } });

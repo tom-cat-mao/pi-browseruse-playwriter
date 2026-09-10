@@ -358,6 +358,17 @@ export class ManagedGroups {
     return findActiveTabByChromeTabId(this.registry, { chromeTabId, browserEpoch: this.browserEpoch })
   }
 
+  /**
+   * True when this tab was attached in place, so its window layout and Chrome
+   * groups must be left alone — including the child tabs it opens.
+   */
+  isInPlaceManagedChromeTab(chromeTabId: number): boolean {
+    const tab = this.findManagedTabByChromeTabId(chromeTabId)
+    if (!tab) return false
+    const group = findGroup(this.getRegistry(), tab.groupId)
+    return group?.origin === 'existing'
+  }
+
   /** Called after every WS (re)connect: restore bindings before any CDP routing. */
   handleWsConnected(): Promise<void> {
     this.connectQueue = this.connectQueue
@@ -2109,6 +2120,9 @@ export class ManagedGroups {
           // layout and Chrome groups stay exactly as they were. Task groups keep
           // their existing "popup joins the group" behaviour.
           const inPlace = group.origin === 'existing'
+          // The window the tab actually ends up in: chromeTab was read before the
+          // move, so its windowId is stale once we relocate the tab.
+          let finalWindowId = chromeTab.windowId
 
           if (!inPlace) {
             const targetWindowId = await this.resolveAdoptionWindow(group, sourceTab)
@@ -2125,6 +2139,14 @@ export class ManagedGroups {
                     error,
                   )
                 })
+              const afterMove = await chrome.tabs.get(options.chromeTabId).catch(() => {
+                return null
+              })
+              if (afterMove?.windowId !== undefined) {
+                finalWindowId = afterMove.windowId
+              } else if (targetWindowId !== undefined) {
+                finalWindowId = targetWindowId
+              }
             }
           }
 
@@ -2136,7 +2158,7 @@ export class ManagedGroups {
             : await this.ensureTabInManagedGroup({
                 chromeTabId: options.chromeTabId,
                 group,
-                windowId: chromeTab.windowId,
+                windowId: finalWindowId,
               })
 
           const tabId = createOpaqueId('ptab')
@@ -2158,7 +2180,7 @@ export class ManagedGroups {
               return setGroupChromeBindingMissing(registry, {
                 groupId: group.groupId,
                 chromeGroupId,
-                windowId: chromeTab.windowId,
+                windowId: finalWindowId,
               })
             })
           }

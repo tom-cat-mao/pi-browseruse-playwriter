@@ -2429,6 +2429,17 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
       return
     }
 
+    // A tab attached in place stays in place, and so do the tabs it opens: skip
+    // the relocation below and adopt the popup tab where Chrome put it. Task
+    // groups and legacy connected tabs keep the original "move the popup into the
+    // source window" behaviour.
+    if (managedGroups.isInPlaceManagedChromeTab(sourceTabId)) {
+      for (const tabId of tabIds) {
+        await managedGroups.adoptInheritedTab({ chromeTabId: tabId, sourceChromeTabId: sourceTabId })
+      }
+      return
+    }
+
     let destinationWindowId: number
     try {
       const sourceTab = await chrome.tabs.get(sourceTabId)

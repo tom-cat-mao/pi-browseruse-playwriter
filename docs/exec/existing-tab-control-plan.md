@@ -122,7 +122,7 @@ changeset）。共享契约见下文“共享契约（本轮新增，唯一写�
   绑定，不参与 Chrome 分组，也不因“不在任务组里”被释放。
 - `BrowserTab.origin?` / `BrowserTab.sourceTabId?`
   - `sourceTabId`：外链新标签的来源 managed tabId（点击结果或随后列表可查）。
-- `BrowserCapabilities.existingTabs?: boolean`（optional，旧 profile 不失效）。
+- `BrowserCapabilities.existingTabControl?: boolean`（optional，旧 profile 不失效）。
 - `BrowserResultData.candidates?: BrowserTabCandidate[]`（发现结果，元数据）。
 
 ## candidateId（发现目标的真实标识）
