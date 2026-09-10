@@ -13,6 +13,8 @@ import type { ExtensionState, ConnectionState, TabState, TabInfo } from './types
 import { initPlaywriterToolbar } from './toolbar/toolbar'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
+import type { BrowserRequest } from 'playwriter/src/browser-protocol'
+import { ManagedGroups } from './managed-groups'
 import { handleGhostBrowserCommand, type GhostBrowserCommandParams } from 'playwriter/src/ghost-browser'
 // Inlined at build time via vite ?raw. Source: playwriter/src/ghost-cursor-client.ts
 import ghostCursorBundleCode from '../../playwriter/dist/ghost-cursor-client.js?raw'
@@ -537,6 +539,15 @@ class ConnectionManager {
         return
       }
 
+      // Handle managed (Pi) group/tab control requests. The relay forwards the
+      // request envelope and expects the legacy response envelope back.
+      if (message.method === 'browserRequest') {
+        const params: BrowserRequest = message.params
+        const result = await managedGroups.handleBrowserRequest(params)
+        sendMessage({ id: message.id, result })
+        return
+      }
+
       const response: ExtensionResponseMessage = { id: message.id }
       try {
         response.result = await handleCommand(message as ExtensionCommandMessage)
@@ -558,6 +569,10 @@ class ConnectionManager {
 
     chrome.debugger.onEvent.addListener(onDebuggerEvent)
     chrome.debugger.onDetach.addListener(onDebuggerDetach)
+
+    // Restore managed ownership bindings and re-attach debuggers before any
+    // CDP routing starts; this never replays page actions, only connections.
+    void managedGroups.handleWsConnected()
 
     logger.debug('Connection established')
   }
@@ -687,9 +702,10 @@ class ConnectionManager {
         await this.ensureConnection()
         store.setState({ connectionState: 'connected' })
 
-        // Re-attach any tabs that were in 'connecting' state (from a previous disconnect)
+        // Re-attach any tabs that were in 'connecting' state (from a previous disconnect).
+        // Managed tabs are restored by managedGroups.handleWsConnected with registry checks.
         const tabsToReattach = Array.from(store.getState().tabs.entries())
-          .filter(([_, tab]) => tab.state === 'connecting')
+          .filter(([tabId, tab]) => tab.state === 'connecting' && !managedGroups.isManagedChromeTabId(tabId))
           .map(([tabId]) => tabId)
 
         for (const tabId of tabsToReattach) {
@@ -899,19 +915,30 @@ async function createTabInPreferredWindow(options: { url: string; active: boolea
 
 async function syncTabGroup(): Promise<void> {
   try {
+    // Wait for the managed registry so managed tabs are never mistaken for legacy ones.
+    await managedGroups.initialize()
     // Include 'connecting' tabs in the group only when the relay is alive, so that
     // tabs the user drags into the group stay visible while attaching. When the relay
     // is dead all tabs are 'connecting' (waiting for reconnect) and the group should
     // be cleaned up. The onUpdated handler (line ~1601) already guards against the
     // ungroup→disconnect loop for 'connecting' tabs, so excluding them here is safe.
+    // Managed (Pi) tabs and groups are owned by the resource registry and must never
+    // be dissolved by this legacy sync.
     const { connectionState } = store.getState()
     const isRelayConnected = connectionState === 'connected'
+    const managedChromeGroupIds = new Set(managedGroups.getManagedChromeGroupIds())
     const connectedTabIds = Array.from(store.getState().tabs.entries())
-      .filter(([_, info]) => info.state === 'connected' || (info.state === 'connecting' && isRelayConnected))
+      .filter(([tabId, info]) => {
+        if (managedGroups.isManagedChromeTabId(tabId)) return false
+        return info.state === 'connected' || (info.state === 'connecting' && isRelayConnected)
+      })
       .map(([tabId]) => tabId)
 
-    // Always query by title - no cached ID that can go stale
-    const existingGroups = await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })
+    // Always query by title - no cached ID that can go stale. Managed groups may
+    // legitimately be named "playwriter"; they are excluded by id, never by title.
+    const existingGroups = (await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })).filter((group) => {
+      return !managedChromeGroupIds.has(group.id)
+    })
 
     // If no connected tabs, clear any existing playwriter groups
     if (connectedTabIds.length === 0) {
@@ -1270,6 +1297,13 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
     logger.debug('Ignoring debugger detach during relay reconnect:', tabId, reason)
     return
   }
+
+  // Managed tabs keep their ownership on transient detaches; only the Chrome
+  // infobar cancel counts as a user release. Chrome cancels every debugger
+  // session at once, so the remaining ready tabs become disconnected.
+  void managedGroups.handleDebuggerDetached(tabId, reason, {
+    releaseAllReady: reason === chrome.debugger.DetachReason.CANCELED_BY_USER,
+  })
 
   logger.warn(`DISCONNECT: onDebuggerDetach tabId=${tabId} reason=${reason}`)
 
@@ -1785,6 +1819,9 @@ async function disconnectEverything(): Promise<void> {
     }
   })
   await tabGroupQueue
+  // Managed tabs keep their registry ownership on transport disconnects, but an
+  // explicit disconnect-everything is a user release.
+  await managedGroups.releaseAllChromeTabs('disconnect-everything')
   // WS connection is maintained - maintainConnection handles it
 }
 
@@ -1823,6 +1860,21 @@ function isRestrictedUrl(url: string | undefined): boolean {
   ]
   return restrictedPrefixes.some((prefix) => url.startsWith(prefix))
 }
+
+// Managed (Pi) ownership runtime. The registry in chrome.storage.local is the
+// authority for named groups and their tabs; this wiring only connects it to
+// the Chrome APIs and the legacy store.
+export const managedGroups = new ManagedGroups({
+  getProfileId: getInstallId,
+  attachTab,
+  detachManagedTab: (tabId: number) => {
+    detachTab(tabId, true)
+  },
+  sendMessage,
+  logger,
+  getPreferredWindowId,
+  isRestrictedUrl,
+})
 
 const icons = {
   connected: {
@@ -1938,6 +1990,7 @@ async function updateIcons(): Promise<void> {
 
 async function onTabRemoved(tabId: number): Promise<void> {
   popupSourceTabMap.delete(tabId)
+  void managedGroups.handleChromeTabRemoved(tabId)
   const { tabs } = store.getState()
   if (!tabs.has(tabId)) return
   logger.debug(`Connected tab ${tabId} was closed, disconnecting`)
@@ -1987,6 +2040,24 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 
   if (tab.windowId !== undefined) {
     store.setState({ currentTabId: tab.id, preferredWindowId: tab.windowId })
+  }
+
+  // Managed (Pi) tabs: an icon click is "cancel control" and releases the tab;
+  // clicking a disconnected managed tab restores its attachment instead.
+  await managedGroups.initialize()
+  const managedTab = managedGroups.findManagedTabByChromeTabId(tab.id)
+  if (managedTab) {
+    if (managedTab.state === 'ready') {
+      logger.debug('Icon click on managed tab, releasing control:', tab.id)
+      await managedGroups.releaseChromeTab(tab.id, 'icon-click-cancel-control')
+      return
+    }
+    if (managedTab.state === 'disconnected') {
+      logger.debug('Icon click on disconnected managed tab, restoring attachment:', tab.id)
+      await managedGroups.restoreChromeTab(tab.id)
+      return
+    }
+    return
   }
 
   if (isRestrictedUrl(tab.url)) {
@@ -2144,14 +2215,38 @@ checkMemory()
 chrome.tabs.onRemoved.addListener(onTabRemoved)
 chrome.tabs.onActivated.addListener(onTabActivated)
 chrome.action.onClicked.addListener(onActionClicked)
+// Chrome removes a tab group as soon as its last tab leaves. Managed logical
+// groups are session-owned, so this only drops the stale physical binding.
+chrome.tabGroups.onRemoved.addListener((group) => {
+  void managedGroups.handleChromeGroupRemoved(group.id)
+})
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void updateIcons()
+  if (changeInfo.groupId !== undefined) {
+    void managedGroups.handleChromeTabUpdatedGroup({
+      chromeTabId: tabId,
+      chromeGroupId: changeInfo.groupId,
+      url: tab.url ?? '',
+      title: tab.title ?? '',
+    })
+  }
+  if ((changeInfo.url !== undefined || changeInfo.title !== undefined) && managedGroups.isManagedChromeTabId(tabId)) {
+    managedGroups.noteChromeTabPageInfo(tabId, tab.url ?? '', tab.title ?? '')
+  }
   if (changeInfo.groupId !== undefined) {
     // Queue tab group operations to serialize with syncTabGroup and disconnectEverything
     tabGroupQueue = tabGroupQueue
       .then(async () => {
-        // Query for playwriter group by title - no stale cached ID
-        const existingGroups = await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })
+        // Managed tabs are owned by the resource registry, never by this legacy path
+        await managedGroups.initialize()
+        if (managedGroups.isManagedChromeTabId(tabId)) return
+
+        // Query for playwriter group by title - no stale cached ID. Managed groups
+        // are excluded by id so a managed group named "playwriter" is never touched.
+        const managedGroupIds = new Set(managedGroups.getManagedChromeGroupIds())
+        const existingGroups = (await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })).filter((group) => {
+          return !managedGroupIds.has(group.id)
+        })
         const groupId = existingGroups[0]?.id
         if (groupId === undefined) {
           return
@@ -2191,7 +2286,32 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
   setTimeout(() => {
     popupSourceTabMap.delete(details.tabId)
   }, 10000)
+  void adoptInheritedTabIfInNormalWindow({ chromeTabId: details.tabId, sourceChromeTabId: details.sourceTabId })
 })
+
+// target=_blank links and cmd+click open as regular tabs (no popup window), so the
+// popup-window relocation path below never sees them. Tabs that are still inside a
+// popup window are skipped here: windows.onCreated moves them into the source window
+// first and adopts them after the move, avoiding a double-adoption race.
+async function adoptInheritedTabIfInNormalWindow(options: {
+  chromeTabId: number
+  sourceChromeTabId: number
+}): Promise<void> {
+  try {
+    if (managedGroups.isManagedChromeTabId(options.chromeTabId)) return
+    const tab = await chrome.tabs.get(options.chromeTabId).catch(() => {
+      return null
+    })
+    if (!tab) return
+    const parentWindow = await chrome.windows.get(tab.windowId).catch(() => {
+      return null
+    })
+    if (parentWindow?.type !== 'normal') return
+    await managedGroups.adoptInheritedTab(options)
+  } catch (error) {
+    logger.debug('Inherited tab adoption check failed (ignored):', error)
+  }
+}
 
 // Relocate popup windows opened by a Playwriter-connected tab into the
 // source tab's window as a regular tab, since Playwriter cannot attach
@@ -2204,6 +2324,7 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
     return
   }
   try {
+    await managedGroups.initialize()
     // Retry tab discovery — windows.onCreated can fire before
     // chrome.tabs.query({ windowId }) sees the new popup tab.
     let popupTabs: chrome.tabs.Tab[] = []
@@ -2263,7 +2384,14 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
     } catch {
       // Chrome may have already closed the empty popup window.
     }
+    const managedSourceTab = managedGroups.findManagedTabByChromeTabId(sourceTabId)
     for (const tabId of tabIds) {
+      if (managedSourceTab) {
+        // Task popup inherits its source tab's managed group; unrelated popups are
+        // never moved because only managed source tabs lead here.
+        await managedGroups.adoptInheritedTab({ chromeTabId: tabId, sourceChromeTabId: sourceTabId })
+        continue
+      }
       if (connectedTabs.has(tabId)) continue
       try {
         await connectTab(tabId)
