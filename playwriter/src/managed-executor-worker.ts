@@ -984,13 +984,14 @@ export class ManagedExecutorWorkerRuntime {
       locator,
       interactiveOnly: interactiveOnly ?? false,
     })
-    const refs = new Map<string, string>()
-    result.refs.forEach((entry) => {
+    const snapshotRefs = result.refs.flatMap((entry) => {
       const selector = result.getSelectorForRef(entry.ref)
-      if (selector) {
-        refs.set(entry.shortRef, selector)
+      if (!selector) {
+        return [] as Array<{ ref: string; role: string; name: string; selector: string }>
       }
+      return [{ ref: entry.shortRef, role: entry.role, name: entry.name, selector }]
     })
+    const refs = new Map(snapshotRefs.map((entry) => [entry.ref, entry.selector]))
     pageState.snapshotGeneration += 1
     const snapshotId = [
       'managed',
@@ -1013,6 +1014,11 @@ export class ManagedExecutorWorkerRuntime {
     return {
       text,
       snapshotId,
+      value: {
+        refs: snapshotRefs.map((entry) => {
+          return { ref: entry.ref, role: entry.role, name: entry.name }
+        }),
+      },
     }
   }
 
