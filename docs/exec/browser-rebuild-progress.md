@@ -10,7 +10,8 @@ prompt: |
 
 # 当前阶段
 
-Step 1/2：五条工作流并行实施并滚动集成。尚未进行 Chrome 验收。
+Step 2：五条工作流已集成，独立审查发现的问题正在修复与复验。
+尚未进行 Chrome 验收；非浏览器检查通过不代表最终验收通过。
 用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
 全部执行 agent 使用默认 model/effort；禁止 Reasonix。
 codebuddy-6 原先显式 effort=high，已依用户要求停止，由默认配置的
@@ -21,15 +22,15 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
-| E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 2346d18 已集成，CI待重跑 |
+| E 工具链/发行/日志 | CodeBuddy11/15 | feat/browser-runtime-foundation | eab8301已集成，产品README/legacy测试入口完成 |
 | A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 42eb198 已集成 |
 | B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
-| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | f37b70b 已集成 |
-| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 6dcde8e 已集成 |
+| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | f10b201已集成，CDP订阅/终止顺序补验中 |
+| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 6595df2已集成，单资源/联合列表输出边界补验中 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 54c1f07已集成，说明/严格类型修订中 |
-| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | FAIL：C outcome/残留回调阻塞，Chrome未开始 |
+| 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 5f4c19f已集成，strict+selfcheck17通过 |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | 原23c3ebd FAIL保留；d607439原探针增量复验中 |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -105,12 +106,38 @@ executor、pi-tools、integration。主目录 main 未修改。
   P0副作用后not-started错误、P1成功脚本残留timer跨请求发指令；C修订中。
 - reviewer其余测试重跑通过不抵消P0/P1，Chrome阶段INCOMPLETE。
 - 最新静态worker接线后协调者build/smoke、unit218、integration34通过。
+- D4099b03已集成，body阶段abort归一化/自deadline取消已修，输出大列表
+  UTF8预算及bootstrap abort listener清理收尾中。
+- 验收5f4c19f已集成，协调者严格tsc与17/17纯selfchecks、dry-run通过，
+  不连接runtime/Chrome。此前“strict --noImplicitAny false”说法已纠正。
+- ca96c8b的三条Linux CI全部通过，不抵消独立review的C阻塞项。
+- 已构建extension/dist-acceptance，manifest0.0.126、forkID一致、端口19990。
+  只构建未加载Chrome；等C blocker修复和独立复审后通知用户打开测试Chrome。
+- 本地tag extension@0.0.126指向42eb198，未push tag/未发布。
+- E原会话回收后，新默认CodeBuddy15只收尾产品README与legacy test-utils
+  显式build:legacy；防止产品入口教用户装上游版本。
+- D6595df2已集成，协调者重跑Pi57测试、typecheck和12工具load-check通过。
+  read-back发现单tab巨标题/URL、多列表联合预算、emoji切分与marker计量
+  仍有边界缺口，已交D补齐；同时澄清state句柄不可跨请求复用。
+- E eab8301已集成；产品README不再引导安装上游，旧Chrome测试harness
+  显式build:legacy。协调者修正文档中自动attach及重载needs-rebind说明。
+- C f10b201已集成；永久per-facade lease与已派发动作unknown已实现。
+  read-back仍发现getExistingCDPSession原始对象、CDP订阅清理与异步timer
+  拒绝处理遗漏，以及worker结束前提前返回terminated；已交C针对性补齐。
+- review工作树fast-forward至d607439；原未跟踪报告已以相同SHA256保全到
+  tmp/review-23c3ebd/original-independent-acceptance.md，旧探针证据不覆盖。
+  CodeBuddy14只重跑原outcome/timer/facade探针；不提前给最终绿灯。
+- d607439代码基线协调者验证：runtime build/smoke、unit225、process
+  integration34、Pi57与12工具load-check、extension34、全部typechecks
+  均通过；acceptance strict tsc、17 self-checks与不联网dry-run也通过。
+  这些均未启动Chrome，后续C/D提交仍须重跑对应验证。
 - 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
 
-- [ ] 五个 owner 提交及真实无浏览器验证结果。
-- [ ] 集成跨层接口、类型和依赖配置。
+- [x] 五个 owner 首轮提交及真实无浏览器验证结果。
+- [x] 集成跨层接口、类型和依赖配置。
+- [ ] C/D审查修复收尾及修订后的验证结果。
 - [ ] 独立全新 agent 代码审查及无浏览器验收。
 - [ ] 用户配合加载测试 Chrome 扩展。
 - [ ] 多 profile/多组/断线不散组/用户释放 Chrome 验收。

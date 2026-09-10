@@ -63,7 +63,8 @@ Load the extension in Chrome:
 2. The default build always embeds the **fork** identity
    `eeklahpecooapnailfaebkjjembkjhhg` and targets runtime port `19989`
    (see `extension/vite.config.mts`).
-3. Click the extension icon on a tab to connect it.
+3. The extension connects when the runtime is available. Tabs created through
+   the managed tools attach automatically; no per-tab icon click is needed.
 
 Start the runtime (the Pi package starts its companion runtime itself, this is
 the manual path):
@@ -98,21 +99,21 @@ it does not spawn a browser or call `npx playwriter@latest`.
   title. Reusing a group means passing its `groupId`.
 - The extension registry in `chrome.storage` is the source of truth for
   ownership. The runtime checks session ownership and never re-derives it.
-- Relay/WS disconnects, extension reloads and Pi exits **keep** groups and
-  ownership. A tab the user dragged out or released is recorded as released
-  and is **not pulled back** on reconnect.
-- After a full Chrome restart ownership cannot always be verified; those
-  resources are marked `needs-rebind` instead of being reattached by URL or
-  title.
+- Relay/WS disconnects and Pi exits **keep** groups and ownership. A tab the
+  user dragged out or released is recorded as released and is **not pulled
+  back** on reconnect.
+- A service-worker restart within the same browser epoch restores control.
+  A full Chrome restart, or extension reload that loses session storage,
+  preserves the records but marks resources `needs-rebind`; it never
+  reattaches them by URL or title.
 - These are **tools only**: no agent loop, no captcha or business checks, no
   HITL confirmation buttons, no automatic replay of page actions. Pi is the
   agent and decides what to do.
 
 ## Status
 
-The final independent review is currently **FAIL**: the C executor's
-outcome/lease fixes are in progress and the user-assisted Chrome acceptance has
-not started. Current, evidence-based state is tracked in
+The first independent candidate review **failed**. Executor corrections are
+under revalidation; user-assisted Chrome acceptance has not started. Current, evidence-based state is tracked in
 [docs/exec/browser-rebuild-progress.md](./docs/exec/browser-rebuild-progress.md);
 this README intentionally does not freeze temporary test numbers. Chrome
 acceptance is a separate, user-authorized phase.
