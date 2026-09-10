@@ -7,6 +7,7 @@ import {
   buildInventory,
   classifyCreateRequestDedupe,
   classifyFailedCreateCleanup,
+  classifyPendingCreateRecovery,
   clearGroupChromeBinding,
   clearTabAttachment,
   createEmptyRegistry,
@@ -20,11 +21,13 @@ import {
   parseRegistry,
   reconcileRegistry,
   releaseTab,
+  removeRequestLedgerEntry,
   renameGroup,
   setGroupChromeBinding,
   setGroupWindowId,
   setTabAttachment,
   setTabPageInfo,
+  updateRequestLedgerPhase,
 } from '../src/resource-registry'
 import type { ObservedChromeTab } from '../src/resource-registry'
 
@@ -471,6 +474,7 @@ describe('managed resource registry ownership', () => {
       requestId: 'req-1',
       operation: 'tabs.create' as const,
       fingerprint: 'tabs.create|groupId=pg-1|url=https://example.com/',
+      phase: 'completed' as const,
       createdAt: 1000,
       tabId: 'pt-1',
     }
@@ -483,6 +487,11 @@ describe('managed resource registry ownership', () => {
       }),
       replay: classifyCreateRequestDedupe({
         ledgerEntry: entry,
+        operation: 'tabs.create',
+        fingerprint: entry.fingerprint,
+      }),
+      pending: classifyCreateRequestDedupe({
+        ledgerEntry: { ...entry, phase: 'pending' },
         operation: 'tabs.create',
         fingerprint: entry.fingerprint,
       }),
@@ -501,7 +510,164 @@ describe('managed resource registry ownership', () => {
         "differentOperation": "reject-payload-mismatch",
         "differentPayload": "reject-payload-mismatch",
         "noEntry": "proceed",
+        "pending": "recover-pending",
         "replay": "replay",
+      }
+    `)
+  })
+
+  test('pending create recovery only resumes verifiably owned tabs', () => {
+    const base = {
+      hasRecord: true,
+      recordState: 'disconnected' as const,
+      recordBrowserEpoch: epoch,
+      browserEpoch: epoch,
+      chromeTabExists: true,
+      observedChromeGroupId: 11,
+      expectedChromeGroupId: 11,
+    }
+    const cases: Array<{ name: string; options: Parameters<typeof classifyPendingCreateRecovery>[0] }> = [
+      { name: 'owned-tab', options: base },
+      { name: 'no-record', options: { ...base, hasRecord: false } },
+      { name: 'released', options: { ...base, recordState: 'released' as const } },
+      { name: 'old-epoch', options: { ...base, recordBrowserEpoch: 'epoch-a', browserEpoch: 'epoch-b' } },
+      { name: 'tab-gone', options: { ...base, chromeTabExists: false } },
+      { name: 'tab-moved', options: { ...base, observedChromeGroupId: 99 } },
+      { name: 'unbound-group', options: { ...base, expectedChromeGroupId: undefined } },
+    ]
+
+    expect(
+      cases.map((entry) => {
+        return { name: entry.name, decision: classifyPendingCreateRecovery(entry.options) }
+      }),
+    ).toMatchInlineSnapshot(`
+      [
+        {
+          "decision": "resume-attach",
+          "name": "owned-tab",
+        },
+        {
+          "decision": "resource-not-recorded",
+          "name": "no-record",
+        },
+        {
+          "decision": "released",
+          "name": "released",
+        },
+        {
+          "decision": "unknown",
+          "name": "old-epoch",
+        },
+        {
+          "decision": "unknown",
+          "name": "tab-gone",
+        },
+        {
+          "decision": "unknown",
+          "name": "tab-moved",
+        },
+        {
+          "decision": "resume-attach",
+          "name": "unbound-group",
+        },
+      ]
+    `)
+  })
+
+  test('ledger phase updates and removal are explicit transactions', () => {
+    let registry = createRegistryWithGroup()
+    registry = appendRequestLedgerEntry(registry, {
+      entry: {
+        sessionId: 'session-1',
+        requestId: 'req-1',
+        operation: 'tabs.create',
+        fingerprint: 'fp',
+        phase: 'pending',
+        createdAt: 1000,
+        tabId: 'pt-1',
+      },
+      now: 1000,
+      maxEntries: 10,
+      maxAgeMs: 10000,
+    })
+    const completed = updateRequestLedgerPhase(registry, {
+      sessionId: 'session-1',
+      requestId: 'req-1',
+      phase: 'completed',
+      chromeTabId: 101,
+    })
+    const removed = removeRequestLedgerEntry(completed, { sessionId: 'session-1', requestId: 'req-1' })
+
+    expect({
+      pending: findRequestLedgerEntry(registry, { sessionId: 'session-1', requestId: 'req-1' }),
+      completed: findRequestLedgerEntry(completed, { sessionId: 'session-1', requestId: 'req-1' }),
+      removed: findRequestLedgerEntry(removed, { sessionId: 'session-1', requestId: 'req-1' }),
+    }).toMatchInlineSnapshot(`
+      {
+        "completed": {
+          "chromeTabId": 101,
+          "createdAt": 1000,
+          "fingerprint": "fp",
+          "operation": "tabs.create",
+          "phase": "completed",
+          "requestId": "req-1",
+          "sessionId": "session-1",
+          "tabId": "pt-1",
+        },
+        "pending": {
+          "createdAt": 1000,
+          "fingerprint": "fp",
+          "operation": "tabs.create",
+          "phase": "pending",
+          "requestId": "req-1",
+          "sessionId": "session-1",
+          "tabId": "pt-1",
+        },
+        "removed": undefined,
+      }
+    `)
+  })
+
+  test('reconcile never releases records written after the observed snapshot', () => {
+    const registryBeforeObserve = createRegistryWithGroup()
+    const revisionBeforeObserve = registryBeforeObserve.revision
+    // A tab created while Chrome was being observed: it is not in the snapshot.
+    const registry = addTab(registryBeforeObserve, {
+      tabId: 'pt-2',
+      groupId: 'pg-1',
+      sessionId: 'session-1',
+      chromeTabId: 202,
+      url: 'about:blank',
+      title: '',
+      browserEpoch: epoch,
+    })
+    const observed = [observedTab({ chromeTabId: 101, chromeGroupId: 11 })]
+
+    const withoutFence = reconcileRegistry(registry, {
+      browserEpoch: epoch,
+      observedTabs: observed,
+      observedChromeGroupIds: [11],
+    })
+    const withFence = reconcileRegistry(registry, {
+      browserEpoch: epoch,
+      observedTabs: observed,
+      observedChromeGroupIds: [11],
+      ignoreRecordsNewerThan: revisionBeforeObserve,
+    })
+
+    expect({
+      withoutFence: findTab(withoutFence.registry, 'pt-2')?.state,
+      withFence: findTab(withFence.registry, 'pt-2')?.state,
+      withFenceReattach: withFence.reattachTabIds,
+      withoutFenceReattach: withoutFence.reattachTabIds,
+    }).toMatchInlineSnapshot(`
+      {
+        "withFence": "disconnected",
+        "withFenceReattach": [],
+        "withoutFence": "released",
+        "withoutFenceReattach": [
+          101,
+        ],
       }
     `)
   })

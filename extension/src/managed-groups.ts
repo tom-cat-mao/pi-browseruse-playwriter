@@ -16,6 +16,7 @@ import {
   buildInventory,
   classifyCreateRequestDedupe,
   classifyFailedCreateCleanup,
+  classifyPendingCreateRecovery,
   clearGroupChromeBinding,
   clearTabAttachment,
   createEmptyRegistry,
@@ -29,12 +30,14 @@ import {
   listSessionTabs,
   reconcileRegistry,
   releaseTab,
+  removeRequestLedgerEntry,
   renameGroup,
   setGroupChromeBinding,
   setGroupState,
   setGroupWindowId,
   setTabAttachment,
   setTabPageInfo,
+  updateRequestLedgerPhase,
 } from './resource-registry'
 import type { ManagedResourceRegistry, ObservedChromeTab, RequestLedgerEntry } from './resource-registry'
 import {
@@ -46,6 +49,8 @@ import {
 } from './resource-storage'
 import { KeyedSerialQueue } from './keyed-queue'
 import { InternalMoves } from './internal-moves'
+import { PersistQueue } from './persist-queue'
+import { RequestTracker } from './request-tracker'
 
 /**
  * Managed (Pi) ownership runtime.
@@ -171,6 +176,13 @@ interface CreateDedupeContext {
   ledgerEntry: RequestLedgerEntry | undefined
 }
 
+interface RequestContext {
+  sessionId: string
+  requestId: string
+  /** Connection generation captured when the request started. */
+  generation: number
+}
+
 export class ManagedGroups {
   private readonly deps: ManagedGroupsDeps
   private registry: ManagedResourceRegistry | null = null
@@ -178,11 +190,12 @@ export class ManagedGroups {
   private generation = 0
   private readyPromise: Promise<void> | null = null
   private unavailableReason: string | null = null
-  private persistQueue: Promise<void> = Promise.resolve()
+  private readonly writeQueue = new PersistQueue()
   private publishQueue: Promise<void> = Promise.resolve()
   private connectQueue: Promise<void> = Promise.resolve()
   private readonly groupQueue = new KeyedSerialQueue()
   private readonly internalMoves = new InternalMoves(INTERNAL_MOVE_TTL_MS)
+  private readonly requests = new RequestTracker()
   private readonly adoptingChromeTabIds = new Set<number>()
   private readonly pendingAdoptions = new Set<number>()
   private readonly inFlightRequests = new Map<string, { fingerprint?: string; promise: Promise<BrowserResponse> }>()
@@ -208,6 +221,9 @@ export class ManagedGroups {
     if (this.unavailableReason !== null) {
       this.readyPromise = null
       this.unavailableReason = null
+      // Invalidate any write snapshot queued before the failure; the reload below
+      // replaces in-memory state with the authoritative persisted copy.
+      this.writeQueue.invalidate()
     }
     return this.initialize()
   }
@@ -266,11 +282,10 @@ export class ManagedGroups {
 
   private async persist(): Promise<void> {
     const snapshot = this.getRegistry()
-    this.persistQueue = this.persistQueue.then(() => {
-      return saveRegistry(snapshot)
-    })
     try {
-      await this.persistQueue
+      await this.writeQueue.run(() => {
+        return saveRegistry(snapshot)
+      })
     } catch (error: unknown) {
       // Never advertise ownership that could not be persisted. A later successful
       // load re-reads storage (the authoritative copy) and discards in-memory drift.
@@ -353,11 +368,21 @@ export class ManagedGroups {
     this.generation += 1
     const generation = this.generation
 
+    // Fence: any record written after this revision (a create/release that lands
+    // while we are observing Chrome) is newer than the snapshot we are about to
+    // take and must win over it.
+    const revisionBeforeObserve = this.getRegistry().revision
     const observed = await this.observeChromeState()
+    if (generation !== this.generation) return
+
+    // Re-read after the await so releases/mutations that happened during
+    // observation are applied to the freshest registry, and reconcile with the
+    // revision fence so the stale snapshot cannot release newer records.
     const result = reconcileRegistry(this.getRegistry(), {
       browserEpoch: this.browserEpoch,
       observedTabs: observed.observedTabs,
       observedChromeGroupIds: observed.observedChromeGroupIds,
+      ignoreRecordsNewerThan: revisionBeforeObserve,
     })
     this.registry = result.registry
     await this.persist()
@@ -462,6 +487,9 @@ export class ManagedGroups {
         if (decision === 'replay' && dedupe.ledgerEntry) {
           return this.replayCompletedCreate(requestId, dedupe.ledgerEntry)
         }
+        if (decision === 'recover-pending' && dedupe.ledgerEntry) {
+          return await this.recoverPendingCreate(request, dedupe.ledgerEntry)
+        }
       }
 
       const inFlightKey = dedupe?.key ?? `${request.sessionId}\u0000${requestId}`
@@ -476,12 +504,19 @@ export class ManagedGroups {
         return existing.promise
       }
 
-      const promise = this.dispatchRequest(request)
+      this.requests.start({ sessionId: request.sessionId, requestId })
+      const context: RequestContext = {
+        sessionId: request.sessionId,
+        requestId,
+        generation: this.generation,
+      }
+      const promise = this.dispatchRequest(request, context)
       this.inFlightRequests.set(inFlightKey, { fingerprint: dedupe?.fingerprint, promise })
       try {
         return await promise
       } finally {
         this.inFlightRequests.delete(inFlightKey)
+        this.requests.finish({ sessionId: request.sessionId, requestId })
       }
     } catch (error: unknown) {
       return this.errorResponse(requestId, error)
@@ -542,7 +577,14 @@ export class ManagedGroups {
 
   private rememberCreate(
     request: BrowserRequest,
-    options: { fingerprint: string; groupId?: string; tabId?: string; now: number },
+    options: {
+      fingerprint: string
+      phase: RequestLedgerEntry['phase']
+      groupId?: string
+      tabId?: string
+      chromeTabId?: number
+      now: number
+    },
   ): void {
     const operation = request.operation.kind === 'groups.create' ? 'groups.create' : 'tabs.create'
     const entry: RequestLedgerEntry = {
@@ -550,9 +592,11 @@ export class ManagedGroups {
       requestId: request.requestId,
       operation,
       fingerprint: options.fingerprint,
+      phase: options.phase,
       createdAt: options.now,
       ...(options.groupId !== undefined ? { groupId: options.groupId } : {}),
       ...(options.tabId !== undefined ? { tabId: options.tabId } : {}),
+      ...(options.chromeTabId !== undefined ? { chromeTabId: options.chromeTabId } : {}),
     }
     this.mutate((registry) => {
       return appendRequestLedgerEntry(registry, {
@@ -564,13 +608,22 @@ export class ManagedGroups {
     })
   }
 
-  private async dispatchRequest(request: BrowserRequest): Promise<BrowserResponse> {
+  private forgetCreate(request: BrowserRequest): void {
+    this.mutate((registry) => {
+      return removeRequestLedgerEntry(registry, {
+        sessionId: request.sessionId,
+        requestId: request.requestId,
+      })
+    })
+  }
+
+  private async dispatchRequest(request: BrowserRequest, context: RequestContext): Promise<BrowserResponse> {
     const operation = request.operation
     switch (operation.kind) {
       case 'groups.list':
         return this.handleGroupsList(request)
       case 'groups.create':
-        return this.handleGroupsCreate(request, operation)
+        return this.handleGroupsCreate(request, operation, context)
       case 'groups.rename':
         return this.handleGroupsRename(request, operation)
       case 'groups.close':
@@ -579,7 +632,7 @@ export class ManagedGroups {
         return this.handleTabsList(request, operation)
       case 'tabs.create':
         return this.groupQueue.run(operation.groupId, () => {
-          return this.handleTabsCreate(request, operation)
+          return this.handleTabsCreate(request, operation, context)
         })
       case 'tabs.close':
         return this.handleTabsClose(request, operation)
@@ -587,6 +640,10 @@ export class ManagedGroups {
         return this.handleTabsRelease(request, operation)
       case 'tab.resolve':
         return this.handleTabResolve(request, operation)
+      case 'request.cancel':
+        // Never queued behind group mutations: a cancel must be able to stop a
+        // create that currently holds the per-group lock.
+        return this.handleRequestCancel(request)
       default:
         return fail(request.requestId, {
           code: 'unsupported-capability',
@@ -602,6 +659,75 @@ export class ManagedGroups {
     const message = error instanceof Error ? error.message : String(error)
     this.deps.logger.error('Managed request failed:', error)
     return fail(requestId, { code: 'internal-error', message, outcome: 'unknown' })
+  }
+
+  /**
+   * Fence checked before every Chrome write in a request flow: the connection
+   * generation must not have changed (a dropped socket invalidates its requests),
+   * the request must not have been cancelled, and - when a tab id is given - the
+   * tab must still be owned by this session and epoch, not released.
+   */
+  private assertCanContinue(context: RequestContext, options: { tabId?: string } = {}): void {
+    if (context.generation !== this.generation) {
+      throw new ManagedGroupsError({
+        code: 'internal-error',
+        message: 'connection generation changed while the request was running; remaining steps aborted',
+        outcome: 'unknown',
+      })
+    }
+    if (this.requests.isCancelled({ sessionId: context.sessionId, requestId: context.requestId })) {
+      throw new ManagedGroupsError({
+        code: 'cancelled',
+        message: 'request was cancelled; remaining steps aborted',
+        outcome: this.requests.outcomeForCancelled({ sessionId: context.sessionId, requestId: context.requestId }),
+      })
+    }
+    if (options.tabId !== undefined) {
+      const tab = findTab(this.getRegistry(), options.tabId)
+      if (!tab || tab.state === 'released') {
+        throw new ManagedGroupsError({
+          code: 'resource-released',
+          message: 'tab was released while the request was running; not touching Chrome further',
+          outcome: 'unknown',
+        })
+      }
+      if (tab.browserEpoch !== this.browserEpoch) {
+        throw new ManagedGroupsError({
+          code: 'needs-rebind',
+          message: 'tab belongs to a previous browser run; its Chrome mapping is not reused',
+          outcome: 'unknown',
+        })
+      }
+    }
+  }
+
+  /** request.cancel: stops future steps of a same-session request, never queued. */
+  private handleRequestCancel(request: BrowserRequest): BrowserResponse {
+    const operation = request.operation
+    if (operation.kind !== 'request.cancel') {
+      throw new ManagedGroupsError({ code: 'invalid-request', message: 'expected request.cancel' })
+    }
+    const targetRequestId = operation.targetRequestId
+    if (typeof targetRequestId !== 'string' || targetRequestId.length === 0) {
+      throw new ManagedGroupsError({ code: 'invalid-request', message: 'targetRequestId must not be empty' })
+    }
+    const lookup = this.requests.cancel({ sessionId: request.sessionId, targetRequestId })
+    const text =
+      lookup === 'cancelled'
+        ? `cancel requested for ${targetRequestId}`
+        : `no active request ${targetRequestId} in this session`
+    return ok(request.requestId, { text })
+  }
+
+  /**
+   * The websocket connection dropped: invalidate its generation and cancel every
+   * control request that belongs to it. Ownership records are untouched, so a
+   * later reconnect restores bindings without replaying operations.
+   */
+  handleWsDisconnected(): void {
+    this.generation += 1
+    this.requests.cancelAll()
+    this.deps.logger.debug('Managed transport disconnected: in-flight control requests invalidated')
   }
 
   private requireGroup(options: { groupId: string; sessionId: string }): BrowserGroup {
@@ -647,9 +773,13 @@ export class ManagedGroups {
   private async handleGroupsCreate(
     request: BrowserRequest,
     operation: Extract<BrowserOperation, { kind: 'groups.create' }>,
+    context: RequestContext,
   ): Promise<BrowserResponse> {
     const name = validateGroupName(operation.name)
+    this.assertCanContinue(context)
     const groupId = createOpaqueId('pgrp')
+    // Group record and completed ledger entry are written in one transaction, so
+    // an interrupted group create can never leave a half-created resource.
     this.mutate((registry) => {
       return addGroup(registry, {
         groupId,
@@ -658,8 +788,10 @@ export class ManagedGroups {
         browserEpoch: this.browserEpoch,
       })
     })
+    this.requests.markSideEffects({ sessionId: context.sessionId, requestId: context.requestId })
     this.rememberCreate(request, {
       fingerprint: buildCreateRequestFingerprint({ kind: 'groups.create', name }),
+      phase: 'completed',
       groupId,
       now: Date.now(),
     })
@@ -687,7 +819,7 @@ export class ManagedGroups {
       if (group.state === 'needs-rebind' || group.browserEpoch !== this.browserEpoch) {
         throw new ManagedGroupsError({
           code: 'needs-rebind',
-          message: `group ${group.groupId} needs to be rebound after a browser restart`,
+          message: `group ${group.groupId} belongs to a previous browser run: the record is kept, its old Chrome mapping is not reused, and it is not recovered automatically`,
         })
       }
 
@@ -763,6 +895,7 @@ export class ManagedGroups {
   private async handleTabsCreate(
     request: BrowserRequest,
     operation: Extract<BrowserOperation, { kind: 'tabs.create' }>,
+    context: RequestContext,
   ): Promise<BrowserResponse> {
     // Re-read the group inside the per-group critical section: concurrent first
     // creates for one group must reuse the Chrome group the first one bound.
@@ -773,42 +906,54 @@ export class ManagedGroups {
     if (group.state === 'needs-rebind' || group.browserEpoch !== this.browserEpoch) {
       throw new ManagedGroupsError({
         code: 'needs-rebind',
-        message: `group ${group.groupId} needs to be rebound after a browser restart`,
+        message: `group ${group.groupId} was created in a previous browser run: its Chrome mapping is not reused and it is kept as a needs-rebind record. It is not recovered automatically; close it explicitly or create a new group.`,
       })
     }
     const url = validateNavigationUrl(operation.url)
+    this.assertCanContinue(context)
 
-    const windowId = await this.resolveGroupWindow(group)
-    const created = await chrome.tabs.create({
-      url: 'about:blank',
-      active: false,
-      ...(windowId !== undefined ? { windowId } : {}),
-    })
-    const chromeTabId = created.id
-    if (chromeTabId === undefined) {
-      throw new ManagedGroupsError({ code: 'internal-error', message: 'Chrome did not return a tab id' })
-    }
+    // Preallocated logical id + pending ledger entry are persisted before any
+    // Chrome side effect, so an interrupted attempt can never create a duplicate.
+    const tabId = createOpaqueId('ptab')
+    const fingerprint = buildCreateRequestFingerprint({ kind: 'tabs.create', groupId: operation.groupId, url })
+    this.rememberCreate(request, { fingerprint, phase: 'pending', tabId, now: Date.now() })
+    await this.persist()
 
-    let tabId: string | undefined
+    let chromeTabId: number | undefined
     let approvedChromeGroupId: number | undefined
+    let recordPersisted = false
     try {
+      this.assertCanContinue(context)
+      const windowId = await this.resolveGroupWindow(group)
+      this.assertCanContinue(context)
+      const created = await chrome.tabs.create({
+        url: 'about:blank',
+        active: false,
+        ...(windowId !== undefined ? { windowId } : {}),
+      })
+      const createdChromeTabId = created.id
+      if (createdChromeTabId === undefined) {
+        throw new ManagedGroupsError({ code: 'internal-error', message: 'Chrome did not return a tab id' })
+      }
+      chromeTabId = createdChromeTabId
+      this.requests.markSideEffects({ sessionId: context.sessionId, requestId: context.requestId })
+
+      this.assertCanContinue(context)
       const chromeGroupId = await this.ensureTabInManagedGroup({
-        chromeTabId,
+        chromeTabId: createdChromeTabId,
         group,
         windowId: created.windowId,
       })
       approvedChromeGroupId = chromeGroupId
 
-      // Record persisted before attach: even if attach/navigate fail the tab is
-      // tracked (and tombstoned on cleanup) instead of leaking as a fake ready tab.
-      tabId = createOpaqueId('ptab')
-      const newTabId = tabId
+      // Record + pending ledger update in one transaction; the record is
+      // persisted before attach so a crash resumes instead of duplicating.
       this.mutate((registry) => {
         return addTab(registry, {
-          tabId: newTabId,
+          tabId,
           groupId: group.groupId,
           sessionId: request.sessionId,
-          chromeTabId,
+          chromeTabId: createdChromeTabId,
           url: 'about:blank',
           title: '',
           browserEpoch: this.browserEpoch,
@@ -821,9 +966,34 @@ export class ManagedGroups {
           windowId: created.windowId,
         })
       })
+      this.mutate((registry) => {
+        return updateRequestLedgerPhase(registry, {
+          sessionId: request.sessionId,
+          requestId: request.requestId,
+          phase: 'pending',
+          chromeTabId: createdChromeTabId,
+        })
+      })
       await this.persist()
+      recordPersisted = true
 
+      // Owner fence before touching the tab again: a release during grouping must
+      // win, otherwise we would attach/navigate a tab the user just took back.
+      this.assertCanContinue(context, { tabId })
       const attached = await this.deps.attachTab(chromeTabId)
+
+      // Same fence after attach: the user may have released the tab while the
+      // debugger was attaching - never navigate it in that case.
+      this.assertCanContinue(context, { tabId })
+      const stillInGroup = await this.isTabInChromeGroup({ chromeTabId, chromeGroupId })
+      if (!stillInGroup) {
+        throw new ManagedGroupsError({
+          code: 'internal-error',
+          message: 'new tab left its managed group before the request completed',
+          outcome: 'unknown',
+        })
+      }
+
       await chrome.tabs.update(chromeTabId, { url })
 
       // Verify the tab is still owned by this group before declaring it ready.
@@ -840,33 +1010,52 @@ export class ManagedGroups {
 
       this.mutate((registry) => {
         return setTabAttachment(registry, {
-          tabId: newTabId,
+          tabId,
           targetId: attached.targetInfo.targetId,
           cdpSessionId: attached.sessionId,
         })
       })
       this.mutate((registry) => {
         return setTabPageInfo(registry, {
-          tabId: newTabId,
+          tabId,
           url: verified.url && verified.url !== 'about:blank' ? verified.url : url,
           title: verified.title ?? '',
         })
       })
-      this.rememberCreate(request, {
-        fingerprint: buildCreateRequestFingerprint({ kind: 'tabs.create', groupId: operation.groupId, url }),
-        tabId: newTabId,
-        now: Date.now(),
+      this.mutate((registry) => {
+        return updateRequestLedgerPhase(registry, {
+          sessionId: request.sessionId,
+          requestId: request.requestId,
+          phase: 'completed',
+          chromeTabId: createdChromeTabId,
+        })
       })
       await this.persist()
       await this.publishInventory()
 
-      const tab = findTab(this.getRegistry(), newTabId)
+      const tab = findTab(this.getRegistry(), tabId)
       if (!tab) {
         throw new ManagedGroupsError({ code: 'internal-error', message: 'created tab vanished from the registry' })
       }
       return ok(request.requestId, { tab })
     } catch (error: unknown) {
-      await this.cleanupFailedCreate({ chromeTabId, tabId, approvedChromeGroupId })
+      if (
+        recordPersisted &&
+        this.requests.isCancelled({ sessionId: context.sessionId, requestId: context.requestId })
+      ) {
+        // Cancellation stops future steps but keeps the resource: the tab exists
+        // and is registered, so it is re-attached on the next connection. It is
+        // never deleted just because the request was cancelled.
+        await this.persist()
+        await this.publishInventory()
+        throw error
+      }
+      await this.cleanupFailedCreate({
+        request,
+        chromeTabId,
+        tabId: recordPersisted ? tabId : undefined,
+        approvedChromeGroupId,
+      })
       throw error
     }
   }
@@ -875,25 +1064,33 @@ export class ManagedGroups {
    * Cleans up a failed `tabs.create`. The Chrome tab is only removed while it is
    * still provably ours: same epoch, record not released, and still inside the
    * group this operation created. If the user released or moved it meanwhile we
-   * stop touching Chrome and just drop control.
+   * stop touching Chrome and just drop control. A pending ledger entry with no
+   * persisted record is dropped so a later retry can proceed cleanly.
    */
   private async cleanupFailedCreate(options: {
-    chromeTabId: number
+    request: BrowserRequest
+    chromeTabId?: number
     tabId?: string
     approvedChromeGroupId?: number
   }): Promise<void> {
     const registry = this.getRegistry()
     const record = options.tabId ? findTab(registry, options.tabId) : undefined
-    const observed = await chrome.tabs.get(options.chromeTabId).catch(() => {
-      return null
-    })
-    const decision = classifyFailedCreateCleanup({
-      recordState: record ? record.state : 'missing',
-      recordBrowserEpoch: record?.browserEpoch,
-      browserEpoch: this.browserEpoch,
-      approvedChromeGroupId: options.approvedChromeGroupId ?? TAB_ID_NONE,
-      observedChromeGroupId: observed ? (observed.groupId ?? TAB_ID_NONE) : null,
-    })
+    const observed =
+      options.chromeTabId === undefined
+        ? null
+        : await chrome.tabs.get(options.chromeTabId).catch(() => {
+            return null
+          })
+    const decision =
+      options.chromeTabId === undefined
+        ? 'leave-user-tab'
+        : classifyFailedCreateCleanup({
+            recordState: record ? record.state : 'missing',
+            recordBrowserEpoch: record?.browserEpoch,
+            browserEpoch: this.browserEpoch,
+            approvedChromeGroupId: options.approvedChromeGroupId ?? TAB_ID_NONE,
+            observedChromeGroupId: observed ? (observed.groupId ?? TAB_ID_NONE) : null,
+          })
 
     const recordIsCurrent =
       record !== undefined && record.browserEpoch === this.browserEpoch && record.state !== 'released'
@@ -904,21 +1101,120 @@ export class ManagedGroups {
       })
     }
 
-    this.deps.detachManagedTab(options.chromeTabId)
-    if (decision === 'remove-chrome-tab') {
-      await chrome.tabs.remove(options.chromeTabId).catch((error: unknown) => {
-        this.deps.logger.debug(`Failed create cleanup: tab ${options.chromeTabId} already gone:`, error)
-      })
-      this.deps.logger.warn(`Cleaned up failed tabs.create (chromeTabId=${options.chromeTabId})`)
-    } else {
-      this.deps.logger.warn(
-        `tabs.create failed after tab ${options.chromeTabId} was taken over by the user; leaving it open`,
-      )
+    if (!options.tabId) {
+      // No record was ever persisted: the intent ledger entry is void.
+      this.forgetCreate(options.request)
     }
 
-    if (options.tabId && recordIsCurrent) {
+    if (options.chromeTabId !== undefined) {
+      this.deps.detachManagedTab(options.chromeTabId)
+      if (decision === 'remove-chrome-tab') {
+        await chrome.tabs.remove(options.chromeTabId).catch((error: unknown) => {
+          this.deps.logger.debug(`Failed create cleanup: tab ${options.chromeTabId} already gone:`, error)
+        })
+        this.deps.logger.warn(`Cleaned up failed tabs.create (chromeTabId=${options.chromeTabId})`)
+      } else {
+        this.deps.logger.warn(
+          `tabs.create failed after tab ${options.chromeTabId} was taken over by the user; leaving it open`,
+        )
+      }
+    }
+
+    await this.persist()
+    await this.publishInventory()
+  }
+
+  /**
+   * Retry of an interrupted (pending) create. Only a verifiably owned tab is
+   * resumed by re-attaching the debugger; navigation is never replayed because we
+   * cannot know whether it was already sent.
+   */
+  private async recoverPendingCreate(request: BrowserRequest, entry: RequestLedgerEntry): Promise<BrowserResponse> {
+    if (entry.operation !== 'tabs.create') {
+      throw new ManagedGroupsError({
+        code: 'outcome-unknown',
+        outcome: 'unknown',
+        message:
+          'a previous groups.create was interrupted; the group is either fully written or absent, so it is not resumed automatically',
+      })
+    }
+    const registry = this.getRegistry()
+    const tab = entry.tabId ? findTab(registry, entry.tabId) : undefined
+    const group = tab ? findGroup(registry, tab.groupId) : undefined
+    const chromeTab = tab
+      ? await chrome.tabs.get(tab.chromeTabId).catch(() => {
+          return null
+        })
+      : null
+    const decision = classifyPendingCreateRecovery({
+      hasRecord: tab !== undefined,
+      recordState: tab ? tab.state : 'missing',
+      recordBrowserEpoch: tab?.browserEpoch,
+      browserEpoch: this.browserEpoch,
+      chromeTabExists: chromeTab !== null,
+      observedChromeGroupId: chromeTab ? (chromeTab.groupId ?? TAB_ID_NONE) : null,
+      expectedChromeGroupId: group?.chromeGroupId,
+    })
+
+    if (decision === 'released') {
+      throw new ManagedGroupsError({
+        code: 'resource-released',
+        message: 'the tab from the interrupted create was released and is not resumed',
+      })
+    }
+    if (decision !== 'resume-attach' || !tab) {
+      throw new ManagedGroupsError({
+        code: 'outcome-unknown',
+        outcome: 'unknown',
+        message:
+          'the interrupted create cannot be verified against Chrome; its previous navigation is not replayed and the request outcome is unknown',
+      })
+    }
+
+    try {
+      const attached = await this.deps.attachTab(tab.chromeTabId)
+      this.mutate((current) => {
+        return setTabAttachment(current, {
+          tabId: tab.tabId,
+          targetId: attached.targetInfo.targetId,
+          cdpSessionId: attached.sessionId,
+        })
+      })
+      this.mutate((current) => {
+        return setTabPageInfo(current, {
+          tabId: tab.tabId,
+          url: chromeTab?.url ?? tab.url,
+          title: chromeTab?.title ?? tab.title,
+        })
+      })
+      this.mutate((current) => {
+        return updateRequestLedgerPhase(current, {
+          sessionId: entry.sessionId,
+          requestId: entry.requestId,
+          phase: 'completed',
+          chromeTabId: tab.chromeTabId,
+        })
+      })
+      const resumed = findTab(this.getRegistry(), tab.tabId)
+      if (!resumed || resumed.state === 'released') {
+        throw new ManagedGroupsError({
+          code: 'resource-released',
+          message: 'the tab was released while the interrupted create was being resumed',
+        })
+      }
       await this.persist()
       await this.publishInventory()
+      this.deps.logger.warn(
+        `Resumed interrupted tabs.create (${entry.requestId}): debugger re-attached, navigation not replayed`,
+      )
+      return ok(request.requestId, { tab: resumed })
+    } catch (error: unknown) {
+      if (error instanceof ManagedGroupsError) throw error
+      throw new ManagedGroupsError({
+        code: 'outcome-unknown',
+        outcome: 'unknown',
+        message: `failed to resume the interrupted create: ${error instanceof Error ? error.message : String(error)}`,
+      })
     }
   }
 

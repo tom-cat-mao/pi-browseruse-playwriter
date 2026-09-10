@@ -36,6 +36,8 @@ export interface ManagedResourceRegistry {
 /**
  * Completed-create dedup ledger. Persisted so a retried create request cannot
  * create a second group/tab after a relay reconnect or service-worker restart.
+ * Entries start as `pending` (written before Chrome side effects) and flip to
+ * `completed` in the same transaction as the final record update.
  */
 export interface RequestLedgerEntry {
   sessionId: string
@@ -43,9 +45,11 @@ export interface RequestLedgerEntry {
   operation: 'groups.create' | 'tabs.create'
   /** Payload fingerprint; a retry with the same requestId must match it. */
   fingerprint: string
+  phase: 'pending' | 'completed'
   createdAt: number
   groupId?: string
   tabId?: string
+  chromeTabId?: number
 }
 
 export function createEmptyRegistry(options: { profileId: string; browserEpoch: string }): ManagedResourceRegistry {
@@ -159,16 +163,21 @@ function readLedgerEntry(value: unknown): RequestLedgerEntry | null {
   const fingerprint = readString(value.fingerprint)
   const createdAt = readNumber(value.createdAt)
   if (!sessionId || !requestId || !operation || !fingerprint || createdAt === undefined) return null
+  // Entries persisted before the pending phase existed are completed creates.
+  const phase = value.phase === 'pending' ? 'pending' : 'completed'
   const groupId = readString(value.groupId)
   const tabId = readString(value.tabId)
+  const chromeTabId = readNumber(value.chromeTabId)
   return {
     sessionId,
     requestId,
     operation,
     fingerprint,
+    phase,
     createdAt,
     ...(groupId !== undefined ? { groupId } : {}),
     ...(tabId !== undefined ? { tabId } : {}),
+    ...(chromeTabId !== undefined ? { chromeTabId } : {}),
   }
 }
 
@@ -451,12 +460,14 @@ export function setTabPageInfo(
   })
 }
 
-export type CreateDedupeDecision = 'proceed' | 'replay' | 'reject-payload-mismatch'
+export type CreateDedupeDecision = 'proceed' | 'replay' | 'recover-pending' | 'reject-payload-mismatch'
 
 /**
  * Pure decision for a create request that may have completed before (ledger
  * entry) or be retried with the same requestId. Reusing a requestId with a
- * different operation or payload is always rejected.
+ * different operation or payload is always rejected. A `pending` entry means a
+ * previous attempt was interrupted before completion, so the caller must verify
+ * and resume instead of replaying side effects.
  */
 export function classifyCreateRequestDedupe(options: {
   ledgerEntry: RequestLedgerEntry | undefined
@@ -468,7 +479,56 @@ export function classifyCreateRequestDedupe(options: {
   if (entry.operation !== options.operation || entry.fingerprint !== options.fingerprint) {
     return 'reject-payload-mismatch'
   }
-  return 'replay'
+  return entry.phase === 'pending' ? 'recover-pending' : 'replay'
+}
+
+export type PendingCreateRecovery = 'resume-attach' | 'released' | 'resource-not-recorded' | 'unknown'
+
+/**
+ * Decides what a retry may do for an interrupted (pending) create. The only
+ * non-destructive outcome is resuming the debugger attachment for a tab that is
+ * verifiably still ours; navigation is never replayed because we cannot know
+ * whether it was already sent.
+ */
+export function classifyPendingCreateRecovery(options: {
+  hasRecord: boolean
+  recordState: BrowserResourceState | 'missing'
+  recordBrowserEpoch: string | undefined
+  browserEpoch: string
+  chromeTabExists: boolean
+  observedChromeGroupId: number | null
+  expectedChromeGroupId: number | undefined
+}): PendingCreateRecovery {
+  if (!options.hasRecord) return 'resource-not-recorded'
+  if (options.recordState === 'released') return 'released'
+  if (options.recordBrowserEpoch !== options.browserEpoch) return 'unknown'
+  if (!options.chromeTabExists) return 'unknown'
+  if (options.expectedChromeGroupId !== undefined && options.observedChromeGroupId !== options.expectedChromeGroupId) {
+    return 'unknown'
+  }
+  return 'resume-attach'
+}
+
+/** Flips a pending ledger entry to completed (same transaction as the record). */
+export function updateRequestLedgerPhase(
+  registry: ManagedResourceRegistry,
+  options: {
+    sessionId: string
+    requestId: string
+    phase: RequestLedgerEntry['phase']
+    chromeTabId?: number
+  },
+): ManagedResourceRegistry {
+  const requestLedger = registry.requestLedger.map((entry) => {
+    if (entry.sessionId !== options.sessionId || entry.requestId !== options.requestId) return entry
+    return {
+      ...entry,
+      phase: options.phase,
+      ...(options.chromeTabId !== undefined ? { chromeTabId: options.chromeTabId } : {}),
+    }
+  })
+  if (requestLedger.every((entry, index) => entry === registry.requestLedger[index])) return registry
+  return cloneWithRevision(registry, { requestLedger })
 }
 
 /** Stable payload fingerprint for create dedup: retries must match it exactly. */
@@ -488,6 +548,17 @@ export function findRequestLedgerEntry(
   return registry.requestLedger.find((entry) => {
     return entry.sessionId === options.sessionId && entry.requestId === options.requestId
   })
+}
+
+export function removeRequestLedgerEntry(
+  registry: ManagedResourceRegistry,
+  options: { sessionId: string; requestId: string },
+): ManagedResourceRegistry {
+  const requestLedger = registry.requestLedger.filter((entry) => {
+    return !(entry.sessionId === options.sessionId && entry.requestId === options.requestId)
+  })
+  if (requestLedger.length === registry.requestLedger.length) return registry
+  return cloneWithRevision(registry, { requestLedger })
 }
 
 export function appendRequestLedgerEntry(
@@ -556,6 +627,12 @@ export interface ReconcileOptions {
   browserEpoch: string
   observedTabs: ObservedChromeTab[]
   observedChromeGroupIds: number[]
+  /**
+   * Registry revision captured before the Chrome snapshot was taken. Records
+   * written after that revision (a create or release that landed while we were
+   * observing) are newer than the snapshot and must not be overwritten by it.
+   */
+  ignoreRecordsNewerThan?: number
 }
 
 export interface ReconcileResult {
@@ -593,6 +670,11 @@ export function reconcileRegistry(registry: ManagedResourceRegistry, options: Re
     // needs-rebind records have no verifiable Chrome identity; they stay put
     // until the owning session closes/releases them explicitly.
     if (tab.state === 'needs-rebind') return tab
+    // Newer than the Chrome snapshot: a create/release happened while observing,
+    // so the stale snapshot must not release this live record.
+    if (options.ignoreRecordsNewerThan !== undefined && tab.revision > options.ignoreRecordsNewerThan) {
+      return tab
+    }
 
     const group = findGroup(registry, tab.groupId)
     if (!group || group.state === 'released') {
@@ -626,6 +708,11 @@ export function reconcileRegistry(registry: ManagedResourceRegistry, options: Re
     if (group.state === 'released' || group.state === 'needs-rebind') return group
     if (group.chromeGroupId === undefined) return group
     if (observedGroupIds.has(group.chromeGroupId)) return group
+    // Same fence as tabs: a group updated while we were observing is newer than
+    // the snapshot and keeps its live binding.
+    if (options.ignoreRecordsNewerThan !== undefined && group.revision > options.ignoreRecordsNewerThan) {
+      return group
+    }
     // Chrome emptied/closed the visual group while we were offline. Logical
     // groups are session-owned (only groups.close releases them), so we only
     // drop the stale physical binding here.
@@ -641,7 +728,15 @@ export function reconcileRegistry(registry: ManagedResourceRegistry, options: Re
     revision: changed ? registry.revision + 1 : registry.revision,
   }
 
-  const reattachTabIds = tabs.filter((tab) => tab.state === 'disconnected').map((tab) => tab.chromeTabId)
+  // Records newer than the snapshot are mid-flight (a create is still running);
+  // they are neither released nor re-attached by this reconcile pass.
+  const reattachTabIds = tabs
+    .filter((tab) => {
+      if (tab.state !== 'disconnected') return false
+      if (options.ignoreRecordsNewerThan === undefined) return true
+      return tab.revision <= options.ignoreRecordsNewerThan
+    })
+    .map((tab) => tab.chromeTabId)
 
   return {
     registry: nextRegistry,
