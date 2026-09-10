@@ -794,6 +794,7 @@ export class ManagedExecutorWorkerRuntime {
     const pageFacade = facade.wrapPage(page)
     const contextFacade = facade.wrapContext(context)
     const operationLogs: string[] = []
+    const leasedCdpSessions: LeasedCDPSession[] = []
     const customConsole: RawConsole = {
       log: (...args) => {
         operationLogs.push(formatConsoleLine({ method: 'log', args }))
@@ -849,7 +850,9 @@ export class ManagedExecutorWorkerRuntime {
       const rawPage = facade.unwrapPage(targetPage)
       this.assertAllowedPage({ page: rawPage })
       const session = await getCDPSessionForPage({ page: rawPage })
-      return new LeasedCDPSession({ session, lease })
+      const leasedSession = new LeasedCDPSession({ session, lease })
+      leasedCdpSessions.push(leasedSession)
+      return leasedSession
     }
     const screenshotHelper = async ({ page: targetPage }: { page?: Page } = {}): Promise<void> => {
       lease.assertActive()
@@ -908,6 +911,9 @@ export class ManagedExecutorWorkerRuntime {
     } finally {
       lease.release()
       timerScope.dispose()
+      leasedCdpSessions.forEach((session) => {
+        session.dispose()
+      })
       facade.dispose()
     }
   }

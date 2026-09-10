@@ -225,9 +225,7 @@ export class ManagedPlaywrightFacade {
           }
         }
         if (property === 'getExistingCDPSession') {
-          return (...args: unknown[]) => {
-            return this.invoke({ target, property, args: this.unwrapArguments(args) })
-          }
+          return this.forbidden('context.getExistingCDPSession; use getCDPSession({ page })')
         }
 
         const value = Reflect.get(target, property, target)

@@ -459,17 +459,6 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     }
     const active = worker.active
     worker.active = null
-    if (active) {
-      this.settleTask({
-        task: active,
-        response: errorResponse({
-          requestId: active.execution.request.requestId,
-          code: 'outcome-unknown',
-          message: `Managed executor worker disconnected: ${error.message}`,
-          outcome: 'unknown',
-        }),
-      })
-    }
     const queued = worker.queue.splice(0, worker.queue.length)
     queued.forEach((task) => {
       this.settleTask({
@@ -484,7 +473,7 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     })
     if (!worker.invalidated) {
       worker.invalidated = true
-      const shutdown = this.finishFailedWorker({ worker })
+      const shutdown = this.finishFailedWorker({ worker, active })
       this.trackInvalidation({ key: worker.key, promise: shutdown })
       void shutdown.catch((terminationError) => {
         console.error('[managed-executor] failed to terminate a failed worker:', errorMessage(terminationError))
@@ -633,17 +622,6 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     }
     const active = worker.active
     worker.active = null
-    if (active) {
-      this.settleTask({
-        task: active,
-        response: errorResponse({
-          requestId: active.execution.request.requestId,
-          code: activeCode,
-          message: activeMessage,
-          outcome: active.started ? 'unknown' : 'not-started',
-        }),
-      })
-    }
     const queued = worker.queue.splice(0, worker.queue.length)
     queued.forEach((task) => {
       this.settleTask({
@@ -656,20 +634,44 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
         }),
       })
     })
+    const termination = terminateWorkerProcess({ process: worker.process })
     try {
       if (notify) {
         await this.notifyInvalidated({ worker })
       }
     } finally {
-      await terminateWorkerProcess({ process: worker.process })
+      await termination
+    }
+    if (active) {
+      this.settleTask({
+        task: active,
+        response: errorResponse({
+          requestId: active.execution.request.requestId,
+          code: activeCode,
+          message: activeMessage,
+          outcome: active.started ? 'unknown' : 'not-started',
+        }),
+      })
     }
   }
 
-  private async finishFailedWorker({ worker }: { worker: ManagedWorker }): Promise<void> {
+  private async finishFailedWorker({ worker, active }: { worker: ManagedWorker; active: ManagedWorkerTask | null }): Promise<void> {
+    const termination = terminateWorkerProcess({ process: worker.process })
     try {
       await this.notifyInvalidated({ worker })
     } finally {
-      await terminateWorkerProcess({ process: worker.process })
+      await termination
+    }
+    if (active) {
+      this.settleTask({
+        task: active,
+        response: errorResponse({
+          requestId: active.execution.request.requestId,
+          code: 'outcome-unknown',
+          message: 'Managed executor worker disconnected after the request was dispatched',
+          outcome: 'unknown',
+        }),
+      })
     }
   }
 
