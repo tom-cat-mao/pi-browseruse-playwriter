@@ -30,12 +30,22 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
-import { VERSION, EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
+import { VERSION, ALLOWED_EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
 import { createCdpLogger, type CdpLogEntry, type CdpLogger } from './cdp-log.js'
 import { RecordingRelay } from './recording-relay.js'
 import { StreamRelay } from './stream-relay.js'
 import { appendSessionToWsUrl } from './chrome-discovery.js'
 import * as relayState from './relay-state.js'
+import {
+  MANAGED_REQUEST_BODY_LIMIT_BYTES,
+  ManagedRelay,
+  ManagedTransportError,
+  parseBrowserInventoryMessage,
+  parseBrowserRequest,
+  type ManagedConnectionScope,
+  type ManagedScopeView,
+} from './managed-relay.js'
+import type { ManagedExecutorPoolContract } from './browser-protocol.js'
 
 /**
  * Checks if a target should be filtered out (not exposed to Playwright).
@@ -55,10 +65,10 @@ function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
     return false
   }
 
-  // Allow our own extension pages
+  // Allow our own extension pages (legacy and fork extension identities)
   if (url.startsWith('chrome-extension://')) {
     const extensionId = url.replace('chrome-extension://', '').split('/')[0]
-    if (EXTENSION_IDS.includes(extensionId)) {
+    if (ALLOWED_EXTENSION_IDS.includes(extensionId)) {
       return false
     }
     return true
@@ -105,12 +115,15 @@ export async function startPlayWriterCDPRelayServer({
   token,
   logger,
   cdpLogger,
+  managedExecutorPoolFactory,
 }: {
   port?: number
   host?: string
   token?: string
   logger?: { log(...args: any[]): void; error(...args: any[]): void }
   cdpLogger?: CdpLogger
+  /** Test seam / custom wiring for the managed isolated executor pool (owner C). */
+  managedExecutorPoolFactory?: () => Promise<ManagedExecutorPoolContract>
 } = {}): Promise<RelayServer> {
   const emitter = new EventEmitter()
   const store = relayState.createRelayStore()
@@ -339,10 +352,26 @@ export async function startPlayWriterCDPRelayServer({
       }
     }
 
+    // Managed clients only receive CDP events for targets owned by their session;
+    // legacy clients keep receiving every event bound to their extension.
+    const deliver = (client: relayState.PlaywrightClient) => {
+      const managedScope = managedCdpClients.get(client.id)
+      if (!managedScope || !('method' in message)) {
+        safeSend(client)
+        return
+      }
+      const scope = resolveManagedScopeView(managedScope)
+      const event = message as CDPEventBase
+      if (!managedRelay.isEventInScope({ scope, method: event.method, sessionId: event.sessionId, params: event.params })) {
+        return
+      }
+      safeSend(client)
+    }
+
     if (clientId) {
       const client = store.getState().playwrightClients.get(clientId)
       if (client) {
-        safeSend(client)
+        deliver(client)
       }
     } else {
       const { playwrightClients } = store.getState()
@@ -350,7 +379,7 @@ export async function startPlayWriterCDPRelayServer({
         if (extensionId && client.extensionId !== extensionId) {
           continue
         }
-        safeSend(client)
+        deliver(client)
       }
     }
   }
@@ -478,6 +507,114 @@ export async function startPlayWriterCDPRelayServer({
         reject(new Error(`Extension send failed: ${method}`, { cause: sendError }))
       }
     })
+  }
+
+  // ==========================================================================
+  // Managed browser relay (owner B): /browser/v1 plus scoped managed /cdp
+  // clients. The extension inventory is the resource source of truth; this
+  // instance caches it, enforces session/ownership rules and dispatches work.
+  // ==========================================================================
+  const managedRelayLogger = {
+    log: (...args: unknown[]) => {
+      logger?.log(...args)
+    },
+    error: (...args: unknown[]) => {
+      logger?.error(...args)
+    },
+  }
+
+  const managedRelay = new ManagedRelay({
+    host,
+    port,
+    token,
+    logger: managedRelayLogger,
+    transport: {
+      sendBrowserRequest: async ({ profileId, stableKey, request, timeoutMs }) => {
+        const conn = getExtensionConnection(stableKey)
+        if (!conn) {
+          throw new ManagedTransportError({
+            code: 'profile-disconnected',
+            message: `extension for profile ${profileId} is not connected`,
+            outcome: 'not-started',
+          })
+        }
+        try {
+          return await sendToExtension({ extensionId: conn.id, method: 'browserRequest', params: request, timeout: timeoutMs })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          // 'not connected' / 'send failed' happen before the message reached the
+          // extension, so the operation never started. Everything else (timeout,
+          // connection closed mid-flight) leaves the outcome unknown and must not
+          // be replayed automatically.
+          const neverSent = message.includes('not connected') || message.includes('send failed')
+          const code = message.includes('timeout') ? 'timeout' : 'profile-disconnected'
+          throw new ManagedTransportError(
+            { code, message: `browserRequest failed: ${message}`, outcome: neverSent ? 'not-started' : 'unknown' },
+            { cause: error },
+          )
+        }
+      },
+    },
+    hasConnectedExtensions: () => {
+      return store.getState().extensions.size > 0
+    },
+    closeManagedClient: ({ clientId, code, reason }) => {
+      const client = store.getState().playwrightClients.get(clientId)
+      if (!client) {
+        return
+      }
+      try {
+        client.ws.close(code, reason)
+      } catch (error) {
+        logger?.log(pc.gray(`[managed-relay] failed to close managed client ${clientId}: ${(error as Error).message}`))
+      }
+    },
+    poolFactory: managedExecutorPoolFactory,
+  })
+
+  /** Active managed /cdp clients by clientId (session/profile scoped). */
+  const managedCdpClients = new Map<string, ManagedConnectionScope>()
+
+  /**
+   * Resolve live ownership sets for one managed scope: page targetIds from the
+   * cached inventory plus extension CDP session/frame ids from the attached
+   * target map. Called per command/event so revocations take effect immediately.
+   */
+  const resolveManagedScopeView = (scope: { sessionId: string; profileId: string }): ManagedScopeView => {
+    const view = managedRelay.getScope({ sessionId: scope.sessionId, profileId: scope.profileId })
+    const profile = managedRelay.getState().profiles.get(scope.profileId)
+    const extensionState = profile?.connectionId ? store.getState().extensions.get(profile.connectionId) : undefined
+    if (!extensionState) {
+      return view
+    }
+    const owned = Array.from(extensionState.connectedTargets.values()).filter((target) => {
+      return view.targetIds.has(target.targetId)
+    })
+    managedRelay.noteOwnedTargetState({
+      scope: view,
+      cdpSessionIds: owned.map((target) => {
+        return target.sessionId
+      }),
+      frameIds: owned.flatMap((target) => {
+        return Array.from(target.frameIds)
+      }),
+    })
+    return view
+  }
+
+  const isManagedTargetOwned = ({
+    scope,
+    targetId,
+    parentFrameId,
+  }: {
+    scope: ManagedScopeView
+    targetId: string
+    parentFrameId?: string
+  }): boolean => {
+    if (managedRelay.isTargetInScope({ scope, targetId })) {
+      return true
+    }
+    return Boolean(parentFrameId && scope.ownedFrameIds.has(parentFrameId))
   }
 
   const recordingRelays = new Map<string, RecordingRelay>()
@@ -684,16 +821,40 @@ export async function startPlayWriterCDPRelayServer({
     params,
     sessionId,
     source,
+    managedScope,
   }: {
     extensionId: string | null
     method: CDPCommand['method'] | (string & {})
     params: CDPCommand['params']
     sessionId?: CDPCommand['sessionId']
     source?: CDPCommand['source']
+    managedScope?: ManagedConnectionScope | null
   }) {
     const conn = getExtensionConnection(extensionId)
     const connectedTargets = conn?.connectedTargets || new Map<string, relayState.ConnectedTarget>()
     const resolvedExtensionId = conn?.id || extensionId
+    const managedView = managedScope ? resolveManagedScopeView(managedScope) : null
+    if (managedView) {
+      const rejection = managedRelay.validateCdpCommand({ scope: managedView, method, params, sessionId })
+      if (rejection) {
+        throw new Error(rejection)
+      }
+    }
+    // Targets visible to this client. Managed clients never see other sessions'
+    // targets, not even in list responses.
+    const visibleTargets = Array.from(connectedTargets.values()).filter((target) => {
+      if (isRestrictedTarget(target.targetInfo)) {
+        return false
+      }
+      if (!managedView) {
+        return true
+      }
+      return isManagedTargetOwned({
+        scope: managedView,
+        targetId: target.targetId,
+        parentFrameId: target.targetInfo.parentFrameId,
+      })
+    })
     switch (method) {
       case 'Browser.getVersion': {
         return {
@@ -711,11 +872,16 @@ export async function startPlayWriterCDPRelayServer({
           throw new Error('behavior is required for Browser.setDownloadBehavior')
         }
         if (resolvedExtensionId) {
-          extensionDownloadBehavior.set(resolvedExtensionId, downloadBehaviorParams)
+          // Managed clients must not change the profile-wide cached behavior.
+          if (!managedView) {
+            extensionDownloadBehavior.set(resolvedExtensionId, downloadBehaviorParams)
+          }
           await applyDownloadBehaviorToTargets({
             extensionId: resolvedExtensionId,
             behavior: downloadBehaviorParams,
             source,
+            // Managed clients may only affect their own tabs, never the whole profile.
+            ...(managedView ? { targetSessionIds: Array.from(managedView.ownedCdpSessionIds) } : {}),
           })
         }
         return {}
@@ -765,7 +931,7 @@ export async function startPlayWriterCDPRelayServer({
         const targetId = infoReqParams?.targetId
 
         if (targetId) {
-          for (const target of connectedTargets.values()) {
+          for (const target of visibleTargets) {
             if (target.targetId === targetId) {
               return { targetInfo: target.targetInfo }
             }
@@ -773,24 +939,24 @@ export async function startPlayWriterCDPRelayServer({
         }
 
         if (sessionId) {
-          const target = connectedTargets.get(sessionId)
+          const target = visibleTargets.find((candidate) => {
+            return candidate.sessionId === sessionId
+          })
           if (target) {
             return { targetInfo: target.targetInfo }
           }
         }
 
-        const firstTarget = Array.from(connectedTargets.values())[0]
+        const firstTarget = visibleTargets[0]
         return { targetInfo: firstTarget?.targetInfo }
       }
 
       case 'Target.getTargets': {
         return {
-          targetInfos: Array.from(connectedTargets.values())
-            .filter((t) => !isRestrictedTarget(t.targetInfo))
-            .map((t) => ({
-              ...t.targetInfo,
-              attached: true,
-            })),
+          targetInfos: visibleTargets.map((t) => ({
+            ...t.targetInfo,
+            attached: true,
+          })),
         }
       }
 
@@ -927,7 +1093,7 @@ export async function startPlayWriterCDPRelayServer({
           return null
         }
         const extensionId = origin.replace('chrome-extension://', '')
-        if (!EXTENSION_IDS.includes(extensionId)) {
+        if (!ALLOWED_EXTENSION_IDS.includes(extensionId)) {
           return null
         }
         return origin
@@ -1076,6 +1242,62 @@ export async function startPlayWriterCDPRelayServer({
     return c.json({ extensions })
   })
 
+  // ============================================================================
+  // Managed browser API (/browser/v1)
+  //
+  // Pi talks to these routes with requestId/sessionId on every request.
+  // - malformed JSON/fields -> 400, missing token -> 401
+  // - normal protocol failures (including business failures) -> 200 with ok:false
+  // - never falls back to the legacy /cli relay paths
+  // ============================================================================
+  app.use('/browser/v1/*', async (c, next) => {
+    const secFetchSite = c.req.header('sec-fetch-site')
+    if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+      logger?.log(pc.red(`Rejecting ${c.req.path}: cross-origin browser request (Sec-Fetch-Site: ${secFetchSite})`))
+      return c.text('Forbidden - Cross-origin requests not allowed', 403)
+    }
+    if (token && !hasValidToken(c)) {
+      logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
+      return c.text('Unauthorized', 401)
+    }
+    return next()
+  })
+
+  app.get('/browser/v1/capabilities', (c) => {
+    return c.json(managedRelay.getCapabilities())
+  })
+
+  app.get('/browser/v1/profiles', (c) => {
+    return c.json({ profiles: managedRelay.listProfiles() })
+  })
+
+  app.post('/browser/v1/request', async (c) => {
+    const contentType = c.req.header('content-type') || ''
+    if (!contentType.includes('application/json')) {
+      return c.json({ error: 'Content-Type must be application/json' }, 400)
+    }
+    const declaredLength = Number(c.req.header('content-length') || '0')
+    if (Number.isFinite(declaredLength) && declaredLength > MANAGED_REQUEST_BODY_LIMIT_BYTES) {
+      return c.json({ error: `request body exceeds ${MANAGED_REQUEST_BODY_LIMIT_BYTES} bytes` }, 400)
+    }
+    const raw = await c.req.text()
+    if (Buffer.byteLength(raw, 'utf8') > MANAGED_REQUEST_BODY_LIMIT_BYTES) {
+      return c.json({ error: `request body exceeds ${MANAGED_REQUEST_BODY_LIMIT_BYTES} bytes` }, 400)
+    }
+    let bodyValue: unknown
+    try {
+      bodyValue = JSON.parse(raw)
+    } catch {
+      return c.json({ error: 'malformed JSON request body' }, 400)
+    }
+    const parsed = parseBrowserRequest(bodyValue)
+    if (!parsed.ok) {
+      return c.json({ error: parsed.message }, 400)
+    }
+    const response = await managedRelay.handleRequest(parsed.value)
+    return c.json(response)
+  })
+
   // CDP Discovery Endpoints - Standard Chrome DevTools Protocol HTTP API
   // Allows tools like Playwright to discover the WebSocket URL via http://host:port
   // Spec: https://chromium.googlesource.com/chromium/src/+/main/content/browser/devtools/devtools_http_handler.cc
@@ -1169,7 +1391,7 @@ export async function startPlayWriterCDPRelayServer({
       if (origin) {
         if (origin.startsWith('chrome-extension://')) {
           const extensionId = origin.replace('chrome-extension://', '')
-          if (!EXTENSION_IDS.includes(extensionId)) {
+          if (!ALLOWED_EXTENSION_IDS.includes(extensionId)) {
             logger?.log(pc.red(`Rejecting /cdp WebSocket from unknown extension: ${extensionId}`))
             return c.text('Forbidden', 403)
           }
@@ -1192,12 +1414,27 @@ export async function startPlayWriterCDPRelayServer({
       const clientId = c.req.param('clientId') || 'default'
       const url = new URL(c.req.url, 'http://localhost')
       const requestedExtensionId = url.searchParams.get('extensionId')
+      const requestedBrowserSessionId = url.searchParams.get('browserSessionId')
+      // Managed clients (Pi executors) identify their scope with browserSessionId,
+      // browserEpoch and connectionEpoch; legacy clients keep the old resolution.
+      const managedConnection = requestedBrowserSessionId
+        ? managedRelay.validateManagedConnection({
+            sessionId: requestedBrowserSessionId,
+            profileId: url.searchParams.get('profileId'),
+            stableKey: requestedExtensionId,
+            browserEpoch: url.searchParams.get('browserEpoch'),
+            connectionEpoch: url.searchParams.get('connectionEpoch'),
+          })
+        : null
       // When extensionId is explicit, resolve directly. Otherwise use fallback which
       // handles single-extension and uniquely-active-extension cases (#52).
-      const resolvedExtension = requestedExtensionId
-        ? getExtensionConnection(requestedExtensionId)
-        : getExtensionConnection(null, { allowFallback: true })
+      const resolvedExtension = managedConnection?.ok
+        ? getExtensionConnection(managedConnection.scope.stableKey)
+        : requestedExtensionId
+          ? getExtensionConnection(requestedExtensionId)
+          : getExtensionConnection(null, { allowFallback: true })
       const clientExtensionId = resolvedExtension?.id || null
+      const managedClientScope = managedConnection?.ok ? managedConnection.scope : null
 
       const getBoundExtensionIdForClient = (): string | null => {
         const client = store.getState().playwrightClients.get(clientId)
@@ -1212,10 +1449,18 @@ export async function startPlayWriterCDPRelayServer({
             return
           }
 
+          if (managedConnection && !managedConnection.ok) {
+            logger?.log(pc.yellow(`Rejecting managed CDP client ${clientId}: ${managedConnection.reason}`))
+            ws.close(4002, managedConnection.reason.slice(0, 120))
+            return
+          }
+
           if (!clientExtensionId) {
-            const reason = requestedExtensionId
-              ? `Unknown extensionId: ${requestedExtensionId}`
-              : 'Multiple extensions connected. Specify extensionId.'
+            const reason = managedClientScope
+              ? `Managed profile ${managedClientScope.profileId} is not connected`
+              : requestedExtensionId
+                ? `Unknown extensionId: ${requestedExtensionId}`
+                : 'Multiple extensions connected. Specify extensionId.'
             logger?.log(pc.yellow(`Rejecting Playwright client ${clientId}: ${reason}`))
             ws.close(4003, reason)
             return
@@ -1225,6 +1470,15 @@ export async function startPlayWriterCDPRelayServer({
           store.setState((s) => {
             return relayState.addPlaywrightClient(s, { id: clientId, extensionId: clientExtensionId, ws })
           })
+          if (managedClientScope) {
+            managedCdpClients.set(clientId, managedClientScope)
+            managedRelay.noteManagedClientOpen({ clientId, scope: managedClientScope })
+            logger?.log(
+              pc.green(
+                `Managed CDP client connected: ${clientId} (session ${managedClientScope.sessionId}, profile ${managedClientScope.profileId}, browserEpoch ${managedClientScope.browserEpoch})`,
+              ),
+            )
+          }
           const extensionConnection = getExtensionConnection(clientExtensionId)
           const targetCount = extensionConnection?.connectedTargets.size || 0
           logger?.log(
@@ -1277,13 +1531,17 @@ export async function startPlayWriterCDPRelayServer({
           }
 
           try {
+            // Resolve the managed scope per message so revoked scopes fail closed.
+            const clientManagedScope = managedCdpClients.get(clientId) ?? null
             const result = await routeCdpCommand({
               extensionId: extensionConn.id,
               method,
               params,
               sessionId,
               source,
+              managedScope: clientManagedScope,
             })
+            const managedView = clientManagedScope ? resolveManagedScopeView(clientManagedScope) : null
 
             if (method === 'Target.setAutoAttach' && !sessionId) {
               // Re-read state after async routeCdpCommand — targets may have changed
@@ -1292,6 +1550,16 @@ export async function startPlayWriterCDPRelayServer({
               for (const target of freshTargets.values()) {
                 // Skip restricted targets (extensions, chrome:// URLs, non-page types)
                 if (isRestrictedTarget(target.targetInfo)) {
+                  continue
+                }
+                if (
+                  managedView &&
+                  !isManagedTargetOwned({
+                    scope: managedView,
+                    targetId: target.targetId,
+                    parentFrameId: target.targetInfo.parentFrameId,
+                  })
+                ) {
                   continue
                 }
                 const attachedPayload = {
@@ -1329,6 +1597,16 @@ export async function startPlayWriterCDPRelayServer({
               for (const target of freshTargets2.values()) {
                 // Skip restricted targets (extensions, chrome:// URLs, non-page types)
                 if (isRestrictedTarget(target.targetInfo)) {
+                  continue
+                }
+                if (
+                  managedView &&
+                  !isManagedTargetOwned({
+                    scope: managedView,
+                    targetId: target.targetId,
+                    parentFrameId: target.targetInfo.parentFrameId,
+                  })
+                ) {
                   continue
                 }
                 const targetCreatedPayload = {
@@ -1414,6 +1692,10 @@ export async function startPlayWriterCDPRelayServer({
         },
 
         onClose() {
+          if (managedCdpClients.has(clientId)) {
+            managedCdpClients.delete(clientId)
+            managedRelay.noteManagedClientClosed({ clientId })
+          }
           store.setState((s) => relayState.removePlaywrightClient(s, { clientId }))
           logger?.log(pc.yellow(`Playwright client disconnected: ${clientId} (${store.getState().playwrightClients.size} remaining)`))
         },
@@ -1469,7 +1751,7 @@ export async function startPlayWriterCDPRelayServer({
       }
 
       const extensionId = origin.replace('chrome-extension://', '')
-      if (!EXTENSION_IDS.includes(extensionId)) {
+      if (!ALLOWED_EXTENSION_IDS.includes(extensionId)) {
         logger?.log(pc.red(`Rejecting /extension WebSocket from unknown extension: ${extensionId}`))
         return c.text('Forbidden', 403)
       }
@@ -1497,6 +1779,9 @@ export async function startPlayWriterCDPRelayServer({
           store.setState((s) => {
             return relayState.addExtension(s, { id: connectionId, info: incomingExtensionInfo, stableKey, ws })
           })
+          // Track connect order so stale browserInventory snapshots from older
+          // connections are rejected after a reconnect.
+          managedRelay.noteConnectionOpened({ connectionId })
 
           startExtensionPing(connectionId)
           logger?.log(`Extension connected (${connectionId})`)
@@ -1594,6 +1879,34 @@ export async function startPlayWriterCDPRelayServer({
               }
             }
           } else {
+            // Managed profiles publish their authoritative ownership registry as a
+            // full browserInventory snapshot on connect and after every change.
+            const inventoryMessage = parseBrowserInventoryMessage(message)
+            if (inventoryMessage.found) {
+              if (!inventoryMessage.ok) {
+                logger?.log(pc.yellow(`[managed-relay] ignoring invalid browserInventory: ${inventoryMessage.message}`))
+                return
+              }
+              const result = managedRelay.handleInventory({
+                connectionId,
+                info: {
+                  browser: ext.info.browser,
+                  email: ext.info.email,
+                  installId: ext.info.installId,
+                  stableKey: ext.stableKey,
+                },
+                inventory: inventoryMessage.inventory,
+              })
+              if (result.accepted) {
+                logger?.log(
+                  pc.magenta(
+                    `[managed-relay] inventory profile=${result.profile.profileId} epoch=${result.profile.browserEpoch} revision=${result.profile.revision} groups=${result.profile.groups.size} tabs=${result.profile.tabs.size}`,
+                  ),
+                )
+              }
+              return
+            }
+
             const extensionEvent = message
 
             if (extensionEvent.method !== 'forwardCDPEvent') {
@@ -1884,6 +2197,11 @@ export async function startPlayWriterCDPRelayServer({
               pending.reject(new Error('Extension connection closed'))
             }
           }
+
+          // Managed: keep cached ownership but mark the profile offline and revoke
+          // its executors/control connections. A reconnecting extension re-sends a
+          // newer full inventory snapshot instead of the relay guessing ownership.
+          managedRelay.handleConnectionClosed({ connectionId })
 
           const currentRelayState = store.getState()
           const closingExtension = currentRelayState.extensions.get(connectionId)
@@ -2799,6 +3117,10 @@ export async function startPlayWriterCDPRelayServer({
       store.setState({
         extensions: new Map(),
         playwrightClients: new Map(),
+      })
+      managedCdpClients.clear()
+      void managedRelay.dispose().catch((error) => {
+        logger?.error('[managed-relay] dispose failed:', error)
       })
       clearInterval(cloudIdleInterval)
       cloudSessionTracking.clear()
