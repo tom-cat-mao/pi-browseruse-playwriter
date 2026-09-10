@@ -14,8 +14,10 @@ import type { BrowserGroup, BrowserInventory, BrowserResourceState, BrowserTab }
  * - records stay in the registry while the relay is offline; disconnects must
  *   never dissolve a group or drop ownership. Only explicit close/release (or a
  *   verified Chrome-side removal) writes a tombstone.
- * - released records are tombstones: they are excluded from inventories but kept
- *   so reconnect/reconcile can never pull a user-released tab back into a group.
+ * - released records are tombstones: they are published in inventories so the
+ *   relay reports them as released and rejects operations on them, but they
+ *   never authorize work, and reconnect/reconcile can never pull a
+ *   user-released tab back into a group.
  * - a browser restart (new browserEpoch) makes old physical mappings
  *   unverifiable. Those records become needs-rebind instead of being silently
  *   adopted by chromeTabId/title/url guessing.
@@ -603,14 +605,24 @@ export function classifyFailedCreateCleanup(options: {
   return 'remove-chrome-tab'
 }
 
+/**
+ * Full authoritative snapshot for the relay. Released tombstones are included,
+ * otherwise the relay would wholesale-replace its cache and forget released
+ * resources: tabs.list would lose them and later actions would return
+ * resource-not-found instead of resource-released. A released group and its
+ * tabs must both be present (the relay refuses tabs that reference unknown
+ * groups). Publishing a tombstone only records state - authorization still
+ * comes from the active-only lookups, and releaseTab keeps targetId/cdpSessionId
+ * stripped.
+ */
 export function buildInventory(registry: ManagedResourceRegistry): BrowserInventory {
   return {
     protocolVersion: BROWSER_PROTOCOL_VERSION,
     profileId: registry.profileId,
     browserEpoch: registry.browserEpoch,
     revision: registry.revision,
-    groups: registry.groups.filter((group) => group.state !== 'released'),
-    tabs: registry.tabs.filter((tab) => tab.state !== 'released'),
+    groups: registry.groups,
+    tabs: registry.tabs,
   }
 }
 
