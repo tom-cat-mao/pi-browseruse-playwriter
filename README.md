@@ -112,12 +112,13 @@ it does not spawn a browser or call `npx playwriter@latest`.
 
 ## Status
 
-Independent **browser-free acceptance has passed**, including review of the
-snapshot-ref handoff. User-assisted Chrome acceptance is the remaining gate;
-the fork is not yet fully browser-validated. Current evidence is tracked in
-[docs/exec/browser-rebuild-progress.md](./docs/exec/browser-rebuild-progress.md);
-this README intentionally does not freeze temporary test numbers. Chrome
-acceptance is a separate, user-authorized phase.
+Independent **browser-free acceptance and the single-profile Chrome core
+workflow have passed**. The live retest covers grouping, explicit-tab actions,
+popups, session isolation, release and cancellation. Multi-profile operation,
+manual restart/drag-out fault scenarios and an interactive Pi end-to-end demo
+remain untested; they are not implied by this result. Evidence is in
+[the live retest report](./docs/exec/browser-live-retest.md) and
+[the progress record](./docs/exec/browser-rebuild-progress.md).
 
 ## Docs
 

@@ -10,10 +10,9 @@ prompt: |
 
 # 当前阶段
 
-Step 3：用户已连接隔离Chrome并授权CodeBuddy完成第一轮主体真机验收。
-run e93b0af2：18 PASS / 3 FAIL / 4 SKIP；实际状态回报与验收脚本修复
-已集成，测试扩展0.0.127已构建，等待用户重载后由CodeBuddy复测。
-只做实际问题的小修与复测，不扩展设计。
+Step 3主体已完成：候选6aeb91c、扩展0.0.127在用户隔离Chrome复验
+22 PASS / 0 FAIL / 4 SKIP，run 0546d44d。第一轮实际问题全部闭环。
+停止新增测试和设计，转入交付收尾；明确保留未测项，不抬高无意义门槛。
 用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
 全部执行 agent 使用默认 model/effort；禁止 Reasonix。
 codebuddy-6 原先显式 effort=high，已依用户要求停止，由默认配置的
@@ -25,13 +24,13 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
 | E 工具链/发行/日志 | CodeBuddy11/15 | feat/browser-runtime-foundation | eab8301已集成，产品README/legacy测试入口完成 |
-| A 扩展归属/分组 | CodeBuddy7/18 | feat/browser-owned-groups | 3e638d1已集成，0.0.127待用户重载 |
+| A 扩展归属/分组 | CodeBuddy7/18 | feat/browser-owned-groups | 3e638d1已集成，0.0.127真机复验通过 |
 | B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 33e6ab2已集成，独立复验通过 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验通过 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 983bd1c已集成，23selfchecks通过，等待复测 |
+| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 0546d44d真机22/0/4，已结束 |
 | 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS+134233d差异通过；Chrome INCOMPLETE |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
@@ -195,7 +194,20 @@ executor、pi-tools、integration。主目录 main 未修改。
   版本0.0.127、端口19990。未重载Chrome或重启用户runtime。
 - 下一步请用户重载测试扩展并确认版本，再让CodeBuddy用新run复测；旧run
   及证据保留，重载后旧资源可能needs-rebind，不将其混入新run。
-- 以上不等于完整Chrome验收通过，不提前merge main。
+- 用户重载0.0.127并手动清空旧测试组后，指定profile12h9psg4abxxa继续
+  connected，新epoch为epoch-mtvjt0pc-6zkqn519ak41o；再次明确授权复测。
+- CodeBuddy17用全新session/run 0546d44d在候选6aeb91c真机完成：22 PASS、
+  0 FAIL、4 SKIP（exit0）。H1实读DOM/echo/logs、H2两popup不同ID、R1释放
+  状态可见且拒绝resource-released、普通execute值均通过。协调者读原JSON
+  核验通过，不再增加测试/派agent。
+- 报告docs/exec/browser-live-retest.md；原始证据在acceptance工作树
+  tmp/live-retest-6aeb91c/，旧first-report与ledger均保留，不改历史结论。
+- 4SKIP为第二profile、可选CDP交叉核验、人工popup目视、主动保留资源未cleanup。
+  手动重启/拖出故障和真实Pi交互端另属未测范围，不冒充通过，也不自动补跑。
+- 6aeb91c的两条Linux CI均成功；所有external agent已结束，无新任务。
+  fixture/harness已退出，runtime2030与测试Chrome和本run资源保留。
+- 本轮结论仅为单profile核心真机流程可用，停止扩展范围；PR与worktree
+  收尾待用户确认，不提前merge main或关闭测试浏览器。
 
 # 待完成门槛
 
@@ -207,8 +219,8 @@ executor、pi-tools、integration。主目录 main 未修改。
 - [x] snapshot refs可见性补齐与正向验收脚本复核。
 - [x] 用户配合加载测试 Chrome 扩展并授权主体真机验收。
 - [x] 第一轮主体真机测试及根因分类。
-- [ ] R1扩展状态回报、H1/H2验收脚本修复后真机复测。
-- [ ] 多 profile/断线不散组/用户拖出等未测项按用户实际需要补验。
+- [x] R1扩展状态回报、H1/H2验收脚本修复后真机复测：22/0/4。
+- [ ] 多profile/重启/拖出/真实Pi交互端列为已知未测，不自动扩大验收。
 - [ ] origin draft PR -> 验收完成后就绪 -> 最终合并。
 - [ ] 归档独有产物，清理所有 swarm worktree。
 
