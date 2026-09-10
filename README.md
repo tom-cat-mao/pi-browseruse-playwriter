@@ -112,12 +112,14 @@ it does not spawn a browser or call `npx playwriter@latest`.
 
 ## Status
 
-Independent **browser-free acceptance and the single-profile Chrome core
-workflow have passed**. The live retest covers grouping, explicit-tab actions,
-popups, session isolation, release and cancellation. Multi-profile operation,
-manual restart/drag-out fault scenarios and an interactive Pi end-to-end demo
-remain untested; they are not implied by this result. Evidence is in
-[the live retest report](./docs/exec/browser-live-retest.md) and
+Independent **browser-free acceptance, the single-profile Chrome core
+workflow and the two-profile isolation checks have passed**. Live checks cover
+grouping, explicit-tab actions, popups, session isolation, release and
+cancellation; the two-profile checks also verify profile-bound groups,
+independent page actions and isolation of a test cookie on the same origin.
+Manual restart/drag-out fault scenarios and an interactive Pi end-to-end demo
+remain untested. Evidence is in [the live retest report](./docs/exec/browser-live-retest.md),
+[the two-profile report](./docs/exec/browser-multi-profile-acceptance.md) and
 [the progress record](./docs/exec/browser-rebuild-progress.md).
 
 ## Docs

@@ -12,6 +12,7 @@ prompt: |
 
 Step 3主体已完成：候选6aeb91c、扩展0.0.127在用户隔离Chrome复验
 22 PASS / 0 FAIL / 4 SKIP，run 0546d44d。第一轮实际问题全部闭环。
+用户追加授权的双profile专项也已完成：run 7a2051ce，3/3 PASS。
 停止新增测试和设计，转入交付收尾；明确保留未测项，不抬高无意义门槛。
 用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
 全部执行 agent 使用默认 model/effort；禁止 Reasonix。
@@ -30,7 +31,7 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验通过 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 0546d44d真机22/0/4，已结束 |
+| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 主体22/0/4+双profile3/3通过，已结束 |
 | 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS+134233d差异通过；Chrome INCOMPLETE |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
@@ -206,8 +207,19 @@ executor、pi-tools、integration。主目录 main 未修改。
   手动重启/拖出故障和真实Pi交互端另属未测范围，不冒充通过，也不自动补跑。
 - 6aeb91c的两条Linux CI均成功；所有external agent已结束，无新任务。
   fixture/harness已退出，runtime2030与测试Chrome和本run资源保留。
-- 本轮结论仅为单profile核心真机流程可用，停止扩展范围；PR与worktree
-  收尾待用户确认，不提前merge main或关闭测试浏览器。
+- 主体复验结论为单profile核心真机流程可用；后续用户追加授权第二profile
+  专项，不提前merge main或关闭测试浏览器。
+- 用户加载第二测试profile 1sr6lelstfua1，协调者确认其与12h9psg4abxxa
+  同时connected后，CodeBuddy17只补双profile三项。run 7a2051ce最终3/3 PASS：
+  同session两个profile各有独立组/tab、交替fill/click不串页且计数各1、
+  同origin自造cookie隔离并只清除此cookie。产品代码未改。
+- 专项前两次尝试为脚本错误（snapshotId取错层级、resume requestId撞去重），
+  runtime拒绝符合契约；修正脚本后复用本run2组2tab通过，原失败日志保留。
+  报告docs/exec/browser-multi-profile-acceptance.md；证据在acceptance工作树
+  tmp/multi-profile-99eb7ae/，未覆盖既有single-profile报告。
+- 协调者已核对最终JSON、stdout与关键断言；无新实际产品问题，不新增测试。
+  fixture已结束，用户runtime/两个profile和本run资源保留；PR/worktree收尾
+  待用户确认。手动重启/拖出和真实Pi交互端仍未测，不隐去限制。
 
 # 待完成门槛
 
@@ -220,7 +232,8 @@ executor、pi-tools、integration。主目录 main 未修改。
 - [x] 用户配合加载测试 Chrome 扩展并授权主体真机验收。
 - [x] 第一轮主体真机测试及根因分类。
 - [x] R1扩展状态回报、H1/H2验收脚本修复后真机复测：22/0/4。
-- [ ] 多profile/重启/拖出/真实Pi交互端列为已知未测，不自动扩大验收。
+- [x] 双profile专项：分组绑定、操作不串页、同origin测试cookie隔离3/3通过。
+- [ ] 重启/拖出/真实Pi交互端列为已知未测，不自动扩大验收。
 - [ ] origin draft PR -> 验收完成后就绪 -> 最终合并。
 - [ ] 归档独有产物，清理所有 swarm worktree。
 
