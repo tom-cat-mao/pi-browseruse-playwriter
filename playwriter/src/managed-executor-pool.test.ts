@@ -192,6 +192,35 @@ describe('ManagedExecutorPool child-process lifecycle', () => {
     }
   }, 10_000)
 
+  test('waits for old worker exit before resolving while invalidation callback is delayed', async () => {
+    const cwd = createTestDirectory('managed-executor-invalidate-delay-')
+    const pool = new ManagedExecutorPool({
+      workerPath: workerPath('managed-executor-test-worker.ts'),
+      onInvalidate: async () => {
+        await waitForMilliseconds(80)
+      },
+    })
+    try {
+      const warmup = await pool.execute(createExecution({ requestId: 'warmup', code: 'immediate', cwd, timeoutMs: 1_000 }))
+      const oldPid = responsePid(warmup)
+      const startedAt = Date.now()
+      const response = await pool.execute(
+        createExecution({ requestId: 'timeout', code: 'delayed-80', cwd, timeoutMs: 10 }),
+      )
+
+      expect(response).toMatchObject({
+        requestId: 'timeout',
+        ok: false,
+        error: { code: 'timeout', outcome: 'unknown' },
+      })
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(60)
+      expect(fs.existsSync(path.join(cwd, `worker-exit-${oldPid}.txt`))).toBe(true)
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 10_000)
+
   test('contains malformed stdout and stderr without taking down the parent', async () => {
     const cwd = createTestDirectory('managed-executor-budget-')
     const pool = new ManagedExecutorPool({ workerPath: workerPath('managed-executor-test-worker.ts') })

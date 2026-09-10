@@ -1,7 +1,9 @@
 import type { Browser, BrowserContext, ElementHandle, Frame, Locator, Page } from '@xmorse/playwright-core'
+import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js'
 import { describe, expect, test } from 'vitest'
+import type { ICDPSession } from './cdp-session.js'
 import { ManagedPlaywrightFacade } from './managed-executor-facade.js'
-import { ManagedExecutionLease, ManagedTimerScope } from './managed-executor-lease.js'
+import { LeasedCDPSession, ManagedExecutionLease, ManagedTimerScope } from './managed-executor-lease.js'
 import { resolveManagedOperationOutcome } from './managed-executor-worker.js'
 
 interface StubState {
@@ -90,6 +92,54 @@ function createFacade({
   })
 }
 
+function createStubCDPSession(): {
+  session: ICDPSession
+  getSendCount: () => number
+  getOnCount: () => number
+  getOffCount: () => number
+  getRuntimeCallback: () => ((params: ProtocolMapping.Events['Runtime.consoleAPICalled'][0]) => void) | null
+} {
+  let sendCount = 0
+  let onCount = 0
+  let offCount = 0
+  let runtimeCallback: ((params: ProtocolMapping.Events['Runtime.consoleAPICalled'][0]) => void) | null = null
+  const session: ICDPSession = {
+    send: async <K extends keyof ProtocolMapping.Commands>(
+      _method: K,
+      _params?: ProtocolMapping.Commands[K]['paramsType'][0],
+      _sessionId?: string | null,
+    ): Promise<ProtocolMapping.Commands[K]['returnType']> => {
+      sendCount += 1
+      return {} as ProtocolMapping.Commands[K]['returnType']
+    },
+    on: <K extends keyof ProtocolMapping.Events>(
+      event: K,
+      callback: (params: ProtocolMapping.Events[K][0]) => void,
+    ): unknown => {
+      onCount += 1
+      if (event === 'Runtime.consoleAPICalled') {
+        runtimeCallback = callback as ((params: ProtocolMapping.Events['Runtime.consoleAPICalled'][0]) => void)
+      }
+      return undefined
+    },
+    off: <K extends keyof ProtocolMapping.Events>(
+      _event: K,
+      _callback: (params: ProtocolMapping.Events[K][0]) => void,
+    ): unknown => {
+      offCount += 1
+      return undefined
+    },
+    detach: async () => {},
+  }
+  return {
+    session,
+    getSendCount: () => sendCount,
+    getOnCount: () => onCount,
+    getOffCount: () => offCount,
+    getRuntimeCallback: () => runtimeCallback,
+  }
+}
+
 describe('managed executor outcome and raw execution lease', () => {
   test('reports unknown after an operation has started a side effect', () => {
     expect(resolveManagedOperationOutcome({ sideEffectsStarted: false, outcome: 'not-started' })).toBe('not-started')
@@ -128,6 +178,7 @@ describe('managed executor outcome and raw execution lease', () => {
     expect(wrappedFrame.page()).toBe(wrappedPage)
     expect(() => wrappedFrame.page().close()).toThrow('page.close')
     expect(() => wrappedFrame.page().context().newPage()).toThrow('context.newPage')
+    expect(() => wrappedFrame.page().context().getExistingCDPSession(wrappedPage)).toThrow('getCDPSession')
     expect(() => wrappedFrame.page().context().browser()?.close()).toThrow('browser.close')
 
     const wrappedElement = await wrappedPage.locator('#button').elementHandle()
@@ -153,5 +204,42 @@ describe('managed executor outcome and raw execution lease', () => {
     })
     expect(state.clicks).toBe(0)
     expect(() => oldPage.locator('#button')).toThrow('lease has expired')
+  })
+
+  test('leased CDP sessions reject old sends and remove listeners after release', async () => {
+    const cdp = createStubCDPSession()
+    const leaseA = new ManagedExecutionLease()
+    const sessionA = new LeasedCDPSession({ session: cdp.session, lease: leaseA })
+    let callbackCalls = 0
+    const callback = () => {
+      callbackCalls += 1
+    }
+    sessionA.on('Runtime.consoleAPICalled', callback)
+    leaseA.release()
+    cdp.getRuntimeCallback()?.(undefined as unknown as ProtocolMapping.Events['Runtime.consoleAPICalled'][0])
+    expect(callbackCalls).toBe(0)
+    await expect(sessionA.send('Runtime.enable')).rejects.toThrow('lease has expired')
+    sessionA.dispose()
+    expect(cdp.getOnCount()).toBe(1)
+    expect(cdp.getOffCount()).toBe(1)
+
+    const leaseB = new ManagedExecutionLease()
+    const sessionB = new LeasedCDPSession({ session: cdp.session, lease: leaseB })
+    await sessionB.send('Runtime.enable')
+    expect(cdp.getSendCount()).toBe(1)
+    sessionB.dispose()
+  })
+
+  test('async timer callback rejection is captured instead of becoming unhandled', async () => {
+    const lease = new ManagedExecutionLease()
+    const timers = new ManagedTimerScope(lease)
+    timers.setTimeout(async () => {
+      throw new Error('async timer failure')
+    }, 5)
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 30)
+    })
+    expect(lease.isActive()).toBe(true)
+    timers.dispose()
   })
 })

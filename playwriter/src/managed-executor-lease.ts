@@ -77,6 +77,11 @@ export class ManagedTimerScope {
 export class LeasedCDPSession implements ICDPSession {
   private readonly session: ICDPSession
   private readonly lease: ManagedExecutionLease
+  private readonly subscriptions: Array<{
+    event: string
+    original: unknown
+    remove: () => void
+  }> = []
 
   constructor({ session, lease }: { session: ICDPSession; lease: ManagedExecutionLease }) {
     this.session = session
@@ -94,18 +99,48 @@ export class LeasedCDPSession implements ICDPSession {
 
   on<K extends keyof ProtocolMapping.Events>(event: K, callback: (params: ProtocolMapping.Events[K][0]) => void): this {
     this.lease.assertActive()
-    this.session.on(event, callback)
+    const leasedCallback = (params: ProtocolMapping.Events[K][0]): void => {
+      if (!this.lease.isActive()) {
+        return
+      }
+      callback(params)
+    }
+    this.session.on(event, leasedCallback)
+    this.subscriptions.push({
+      event: String(event),
+      original: callback,
+      remove: () => {
+        this.session.off(event, leasedCallback)
+      },
+    })
     return this
   }
 
   off<K extends keyof ProtocolMapping.Events>(event: K, callback: (params: ProtocolMapping.Events[K][0]) => void): this {
-    this.session.off(event, callback)
+    const index = this.subscriptions.findIndex((subscription) => {
+      return subscription.event === String(event) && subscription.original === callback
+    })
+    if (index >= 0) {
+      const [subscription] = this.subscriptions.splice(index, 1)
+      subscription.remove()
+    }
     return this
   }
 
   async detach(): Promise<void> {
     this.lease.assertActive()
     await this.session.detach()
+  }
+
+  dispose(): void {
+    const subscriptions = this.subscriptions.splice(0, this.subscriptions.length)
+    subscriptions.forEach((subscription) => {
+      try {
+        subscription.remove()
+      } catch (error) {
+        console.error('[managed-executor] failed to remove CDP listener:', error)
+      }
+    })
   }
 }
 
@@ -115,7 +150,10 @@ function timerCallback(handler: unknown): () => void {
   }
   return () => {
     try {
-      handler()
+      const result = handler()
+      void Promise.resolve(result).catch((error) => {
+        console.error('[managed-executor] request-scoped timer callback failed:', error)
+      })
     } catch (error) {
       console.error('[managed-executor] request-scoped timer callback failed:', error)
     }
