@@ -30,7 +30,7 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
 | 验收脚本准备 | CodeBuddy13/16 | feat/browser-acceptance-harness | 5f4c19f已集成；计数/ref/核心操作覆盖收尾 |
-| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669冻结候选复验中；Chrome未开始 |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS；Chrome INCOMPLETE |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -149,6 +149,14 @@ executor、pi-tools、integration。主目录 main 未修改。
   CodeBuddy16新修订待集成后另跑strict/selfchecks/dry-run。
 - C新增changeset仍用旧包名playwriter，协调者仅修正为
   @tom-cat/pi-browser-runtime；没有改公共版本号或发布。
+- CodeBuddy14对a4e1669收尾复验：无浏览器PASS，Chrome INCOMPLETE。
+  报告docs/exec/browser-pre-chrome-acceptance.md；worker/CDP/pool/D预算独立
+  探针已核实，原FAIL报告继续保留。46e7bf2的两条Linux CI均通过。
+- 准备正向ref验收时，协调者确认新的可用性缺口：worker索引用shortRef，
+  上游snapshot文本只输出CSS locator，LLM无法获得相应eN。
+  已明确最小兼容修订：page.snapshot沿现有value字段返回
+  refs:[{ref,role,name}]，来源必须是同次snapshot的shortRef索引。
+  C补返回值，harness16改读真实refs而不从CSS值猜；此改动另行短复核。
 - 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
@@ -157,7 +165,8 @@ executor、pi-tools、integration。主目录 main 未修改。
 - [x] 集成跨层接口、类型和依赖配置。
 - [x] C/D审查修复提交及协调者无浏览器验证。
 - [ ] 验收harness误判修复与核心操作覆盖。
-- [ ] 独立全新 agent 代码审查及无浏览器验收。
+- [x] 独立全新 agent 代码审查及a4e1669无浏览器验收。
+- [ ] snapshot refs可见性补齐与正向验收脚本复核。
 - [ ] 用户配合加载测试 Chrome 扩展。
 - [ ] 多 profile/多组/断线不散组/用户释放 Chrome 验收。
 - [ ] origin draft PR -> 验收完成后就绪 -> 最终合并。
