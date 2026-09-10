@@ -12,7 +12,7 @@ export function getInstalledPlaywriterPackageDir(): string {
     return localPackageDir
   }
 
-  const packageJsonPath = require.resolve('playwriter/package.json')
+  const packageJsonPath = require.resolve('@tom-cat/pi-browser-runtime/package.json')
   return path.dirname(packageJsonPath)
 }
 

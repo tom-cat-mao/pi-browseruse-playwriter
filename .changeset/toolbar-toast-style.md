@@ -1,5 +1,5 @@
 ---
-'playwriter': patch
+'@tom-cat/pi-browser-runtime': patch
 ---
 
 Match in-page toasts to the toolbar and put them where you look.

@@ -229,6 +229,32 @@ Color-coded: yellow=links, orange=buttons, coral=inputs, pink=checkboxes, peach=
 +---------------------+     (no extension click)      +-----------------+
 ```
 
+## Pi Browser Runtime (fork)
+
+This fork keeps the playwriter CLI and WebSocket protocol compatible, and adds a managed runtime for the Pi browser-use tools. The relay source still lives in `playwriter/`, but the package is published as `@tom-cat/pi-browser-runtime` and ships a second executable:
+
+```bash
+pi-browser-runtime
+# listening on 127.0.0.1:19989, logs in ~/.pi-browser-use
+```
+
+| Environment variable  | Default             | Purpose                                            |
+| --------------------- | ------------------- | -------------------------------------------------- |
+| `PI_BROWSER_HOST`     | `127.0.0.1`         | bind/connect host                                  |
+| `PI_BROWSER_PORT`     | `19989`             | managed runtime port, separate from legacy `19988` |
+| `PI_BROWSER_TOKEN`    | none                | shared token, required for non-loopback binds      |
+| `PI_BROWSER_DATA_DIR` | `~/.pi-browser-use` | runtime data and log directory                     |
+
+The runtime runs side by side with the legacy `playwriter serve` process: it never stops a relay it does not own, HTTP 401 is reported as an authentication error instead of "server down", and managed capability negotiation replaces version comparison.
+
+The Pi package (`pi/`) depends on this runtime and type-imports the shared contract from `@tom-cat/pi-browser-runtime/browser-protocol`.
+
+To build the extension with the fork dev identity (stable fork ID, installable next to the upstream dev extension):
+
+```bash
+cd extension && PLAYWRITER_FORK_DEV_KEY=1 pnpm build
+```
+
 ## Remote Access
 
 Control Chrome on a remote machine over the internet using [traforo](https://traforo.dev) tunnels:
@@ -263,7 +289,7 @@ Connect programmatically (without CLI):
 
 ```typescript
 import { chromium } from 'playwright-core'
-import { startPlayWriterCDPRelayServer, getCdpUrl } from 'playwriter'
+import { startPlayWriterCDPRelayServer, getCdpUrl } from '@tom-cat/pi-browser-runtime'
 
 const server = await startPlayWriterCDPRelayServer()
 const browser = await chromium.connectOverCDP(getCdpUrl())
