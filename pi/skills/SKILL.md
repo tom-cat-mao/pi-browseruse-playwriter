@@ -70,6 +70,10 @@ Never chain actions blindly. For every step:
 `browser_execute` (`tabId`, `code`, optional `timeout` ms, capped at 120s) runs a
 Playwright snippet against that tab's `page` in the runtime's isolated sandbox.
 Use it for iframes, custom waits, multi-step flows the typed tools don't cover.
+Each call is independent: return plain data or ids to carry forward, but
+`page`/locator/CDP handles cannot be reused across calls — re-acquire them each
+time. Await every action to completion and leave no background timers running.
+`keyboard`/`mouse`/`touchscreen` input is not supported right now.
 Never call `browser.close()`/`context.close()` — close tabs with `browser_tabs`.
 Code is sent as JSON: no shell quoting layer, so quotes/`$`/backticks are safe.
 
@@ -85,8 +89,9 @@ auto-replayed.
 - Identity is automatic: every call carries this Pi session's UUID. You never
   pass a session id.
 - Close tabs you no longer need with `browser_tabs` (`action:"close"`), or
-  `action:"release"` when the user is done with a tab so a browser restart won't
-  reopen it.
+  `action:"release"` to relinquish this session's control of a tab when you are
+  done with it so a later reconnect won't pull it back into this session (the
+  runtime never re-opens tabs on its own).
 - On Pi session shutdown the runtime frees this session's workers automatically;
   it does **not** delete your groups/tabs (persistent ownership) and never stops
   the shared runtime.
