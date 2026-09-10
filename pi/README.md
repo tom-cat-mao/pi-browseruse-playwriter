@@ -1,74 +1,105 @@
 # @tom-cat/pi-browser-use-extension
 
-pi extension package that drives the **user's real Chrome** (their login
-sessions) through the [Playwriter](https://playwriter.dev) browser extension +
-relay server. No new browser, no cloud — the tools automate the tab you
-already have logged in.
+Pi extension that drives the **user's real Chrome** (their real login sessions)
+through a paired **managed browser runtime** (`@tom-cat/pi-browser-runtime`).
+No new browser is launched by the extension, no cloud — the tools speak a frozen
+HTTP v1 contract to a local runtime that owns the Chrome connection.
+
+The extension only executes and reports facts; the Pi LLM owns every decision.
+There is no agent loop, HITL, captcha, or danger-confirmation logic here.
 
 ## Requirements
 
-- **pi** (`@earendil-works/pi-coding-agent`)
-- **Chrome** with the **Playwriter extension** installed and connected
-  (relay on `127.0.0.1:19988`; check with `/browser-status`).
-- Remote access: set `PLAYWRITER_HOST` and `PLAYWRITER_TOKEN` env vars
-  (matches the playwriter CLI conventions).
+- **Pi** (`@earendil-works/pi-coding-agent`)
+- The **managed browser runtime** on `127.0.0.1:19989` (default). It is started
+  automatically on first tool use (see *How it works*); inspect it any time with
+  `/browser-status`.
+- **Chrome** connected to the runtime as a profile (`browser_profiles` must show
+  a `connected` profile before you can open groups/tabs).
 
-## Install
+## Configuration
 
-```bash
-pi install git:github.com/tom-cat-mao/pi-browseruse-playwriter
-# or locally during development
-pi install ./pi
-# try without installing (current run only)
-pi -e ./pi/extensions/index.ts
-```
+| Env | Meaning | Default |
+|---|---|---|
+| `PI_BROWSER_HOST` | runtime host (bare host or full `http(s)://…`) | `127.0.0.1` |
+| `PI_BROWSER_PORT` | runtime port | `19989` |
+| `PI_BROWSER_TOKEN` | bearer token, if the runtime requires auth | none |
+| `PI_BROWSER_RUNTIME_PATH` | absolute path to a runtime-cli entry to launch (`.ts` via `tsx`, else `node`) | packaged `pi-browser-runtime` bin |
+
+A non-loopback `PI_BROWSER_HOST` is treated as a remote runtime: the extension
+will **not** try to spawn a local daemon for it. `npx playwriter@latest` is never
+used.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `browser_navigate` | open a URL (reuse tab or `newTab`, optional `group_title`) |
-| `browser_snapshot` | accessibility tree with `aria-ref=eN` refs |
-| `browser_click` | click by ref (`aria-ref=eN` / `@eN`) or CSS |
+| `browser_profiles` | list Chrome profiles + connection state (needed for `profileId`) |
+| `browser_groups` | list/create/rename/close this session's tab groups (create needs `name`+`profileId`) |
+| `browser_tabs` | list/create/close/release tabs (create needs `groupId`+`url`) |
+| `browser_navigate` | navigate a `tabId` to a URL |
+| `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` |
+| `browser_click` | click by ref (`aria-ref=eN`/`@eN` + `snapshotId`) or strict CSS |
 | `browser_fill` | set input/textarea/contenteditable text (clear-and-insert) |
-| `browser_evaluate` | run JS in the page (IIFE-wrapped, `RESULT:` JSON line) |
-| `browser_screenshot` | labeled screenshot, inline when the model sees images |
-| `browser_tabs` | list / find / close_tab / close_session |
-| `browser_network` | capture & filter page responses (start/list/stop) |
-| `browser_save_as_pdf` | `page.pdf` (headless/direct-CDP only) |
-| `browser_execute` | escape hatch: raw Playwright snippet in the session sandbox |
+| `browser_evaluate` | run JS in a tab's page (`document`/`window`, async) |
+| `browser_screenshot` | screenshot a tab (inline image, optional `path`/`fullPage`/`labels`) |
+| `browser_network` | capture/list/stop a tab's network responses |
+| `browser_logs` | buffered console/log output for a tab |
+| `browser_execute` | escape hatch: Playwright snippet bound to a tab's `page` |
 
-Also registers the `/browser-status` command (relay version, extension
-connection, bound session, capabilities).
+Also registers the inspect-only `/browser-status` command (reachability,
+capabilities, connected profiles). There is no `browser_save_as_pdf` — it always
+errored on headed extension sessions.
+
+## Resource & identity model
+
+- **Identity is automatic.** Every request carries the full Pi session UUID from
+  `ctx.sessionManager.getSessionId()`. It is never an LLM parameter and never a
+  cached module-global, so `/new`, `/resume`, `/fork`, `/reload` each get their
+  own id with no stale carry-over.
+- **requestId is the Pi toolCallId.** A retried create with the same id returns
+  the original resource (idempotency is enforced by the runtime).
+- One Pi session : N named groups; each group is bound to one fixed profile.
+  All page tools take an explicit `tabId` — there is no implicit "current page"
+  and no URL/title heuristics to reach another session's resources.
+- `browser_groups list` / `browser_tabs list` are filtered by the runtime
+  strictly to this session.
 
 ## How it works
 
-- First tool call probes the relay; if it is down, the extension auto-starts
-  it via `playwriter session new` (falls back to
-  `npx -y playwriter@latest session new`) and binds a relay session named
-  `pi-<8-char-pi-session-id>`. Everything after is plain HTTP.
-- Sessions are 1:1 with pi sessions; the relay session is deleted on
-  `session_shutdown`. Stale sessions are recreated automatically once.
-- All tool calls are serialized (browser state is global), images from
-  `browser_screenshot` are inlined as base64, and capabilities are probed
-  with silent degradation (stock relay lacks `/cli/capabilities` — the
-  package keeps working with session-group/consent/audit features off).
+- The first tool call probes `GET /browser/v1/capabilities`. If a managed v1
+  runtime answers, it is used as-is. If the loopback port is genuinely free, the
+  extension launches the paired runtime once (detached) and waits for it to come
+  up. A slow/timing-out, token-protected (401), or non-managed listener is a hard
+  error — the extension never launches over, nor replaces, a process it does not
+  own.
+- Requests are `POST /browser/v1/request` (`BrowserRequest` → `BrowserResponse`).
+  Responses are validated at runtime (not just typed): protocol version must be
+  `1`, managed capabilities must be advertised, and result payloads are
+  size-bounded. Business failures (`ok:false`) preserve the runtime's error
+  `code` and `outcome` so the LLM can reason about partial effects.
+- Structured resources (group/tab ids, `snapshotId`, evaluate values, listings)
+  are serialized into the tool **content** the LLM sees — not just `details`
+  (which Pi keeps for UI only). Text and inline images are capped.
+- On cancellation the extension fires a separate best-effort `request.cancel`
+  with a fresh signal; page actions are never retried or replayed. An aborted
+  mutating request reports `outcome: "unknown"`.
+- `session_shutdown` calls `session.release` only — it frees this session's
+  workers/CDP clients but never deletes groups/tabs and never stops the shared
+  runtime.
 
 ## Development
 
 ```bash
-pnpm --filter @tom-cat/pi-browser-use-extension test   # vitest (58 tests)
-pnpm --filter @tom-cat/pi-browser-use-extension typecheck
+pnpm --filter @tom-cat/pi-browser-use-extension test        # vitest (real local HTTP server)
+pnpm --filter @tom-cat/pi-browser-use-extension typecheck    # tsc --noEmit
+pnpm --filter @tom-cat/pi-browser-use-extension load-check   # jiti load + registration assert
 ```
 
-Zero runtime dependencies — only global `fetch` + node built-ins; pi packages
-(`@earendil-works/*`, `typebox`) are peer dependencies.
+Tests use a real `node:http` server (no mocked `fetch`) to exercise the wire
+contract, response validation, output bounds, lifecycle, and result shaping.
+None of them start Chrome or a real runtime.
 
-## Known limitations
-
-- `browser_save_as_pdf` requires headless Chromium; headed extension sessions
-  error (Playwright limitation).
-- `browser_tabs find active:true` switches to the most recently attached tab;
-  the relay does not expose the user's focused tab.
-- Tab-group naming (`group_title`) takes effect when the relay supports
-  session groups (capability `sessionGroups`); stock relays ignore it.
+Runtime dependencies: the type-only `@tom-cat/pi-browser-runtime/browser-protocol`
+export plus Pi packages (`@earendil-works/*`, `typebox`); at runtime only global
+`fetch` + node built-ins are used.

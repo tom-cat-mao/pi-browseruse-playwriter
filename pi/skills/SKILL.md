@@ -1,106 +1,94 @@
-# Browser Use (Playwriter relay) — usage discipline
+# Browser Use (managed runtime) — usage discipline
 
-You can drive the user's real Chrome (their login sessions) through the
-`browser_*` tools. These talk to the user's own browser via the Playwriter
-extension + local relay — no new browser is launched, cookies/logins are the
-user's real ones.
+You can drive the user's real Chrome (their real login sessions, cookies) through
+the `browser_*` tools. These talk to a paired **managed browser runtime** over a
+local HTTP contract — no new browser is launched by you, and cookies/logins are
+the user's real ones. You only execute and report facts; you own every decision.
 
-## When to use
+## Resource model: profiles → groups → tabs
 
-- Use `browser_*` when the task needs a real browser: JS-heavy sites,
-  logged-in pages, forms, cookie walls, screenshots of actual layout.
-- Prefer `browser_snapshot` (text) over `browser_screenshot` (visual) to read
-  page state — it is fast, cheap and gives you refs for the other tools.
-- Only touch the user's browser when the task calls for it. Do not open
-  unrelated tabs. Every tab you open should be cleaned up with
-  `browser_tabs close_session` (or close_tab) at the end.
+The runtime is explicit — there is **no implicit "current page"** and no matching
+by URL or title. Everything is addressed by id:
+
+- **Profile** — an installed Chrome identity. List them with `browser_profiles`.
+  A `profileId` is required to create a group; a profile must be `connected`.
+- **Group** — a named tab group owned by *this* Pi session and bound to one fixed
+  profile for its lifetime. Create with `browser_groups` (`action:"create"`,
+  `name`, `profileId`). Same-name groups are allowed — each has its own `groupId`.
+- **Tab** — created inside a group with `browser_tabs`
+  (`action:"create"`, `groupId`, `url`). Use the returned `tabId` for every page
+  tool. `browser_groups list` / `browser_tabs list` only ever show *this*
+  session's resources.
+
+Typical start of a task:
+
+1. `browser_profiles` → pick a connected `profileId`.
+2. `browser_groups` create with a `name` + that `profileId` → get `groupId`.
+3. `browser_tabs` create with that `groupId` + a `url` → get `tabId`.
+4. Drive the page with `tabId`.
 
 ## Core loop: observe → act → observe
 
 Never chain actions blindly. For every step:
 
-1. `browser_navigate` (pass `newTab: true` on the first navigate of a task so
-   the task gets its own tab; `group_title` labels the tab group when the
-   relay supports session groups).
-2. `browser_snapshot` to read the page. Pages redirect unexpectedly — always
-   check the URL in the result.
+1. `browser_navigate` (`tabId`, `url`) to load. Pages redirect — check the URL.
+2. `browser_snapshot` (`tabId`) to read the page as an accessibility tree.
 3. Act with one tool (`browser_click`, `browser_fill`, ...).
-4. `browser_snapshot` / `browser_evaluate` again to verify the effect. If the
-   page did not change, you clicked the wrong thing or it is still loading —
-   wait and re-observe instead of clicking again.
+4. `browser_snapshot` / `browser_evaluate` again to verify. If nothing changed,
+   you hit the wrong element or it is still loading — re-observe, don't re-click.
 
 ## Selectors: refs over CSS
 
-- The snapshot returns `aria-ref=eN` refs. Pass them straight to
-  `browser_click`/`browser_fill` (the `@eN` shorthand also works).
-- Refs are only valid against the **latest** snapshot. If the page changed,
-  take a fresh `browser_snapshot` before clicking — stale refs throw.
-- Avoid hand-written CSS selectors; use refs from the snapshot.
-- If a selector matches multiple elements the click hits `.first()`; when you
-  need a specific one, re-snapshot and use its ref.
+- `browser_snapshot` returns a `snapshotId` and `aria-ref=eN` refs. To click/fill
+  a ref, pass the ref as `selector` **and** its `snapshotId` (the `@eN`
+  shorthand also works).
+- Refs are only valid against the snapshot that produced them. If the page
+  changed, take a fresh `browser_snapshot` first — stale refs throw
+  (`stale-snapshot`).
+- Plain CSS/role selectors are matched **strictly**: an ambiguous selector is an
+  error, never a silent `.first()`. When you need a specific element, use a ref.
 
-## After every action: check console logs
+## Reading vs seeing
 
-The executor buffers page console output. After goto/click/submit, look at
-the `Page logs:` lines in the result — they surface hydration errors, failed
-requests and runtime exceptions without you attaching any listeners.
+- Prefer `browser_snapshot` (text, cheap, gives refs) to read state.
+- `browser_evaluate` (`tabId`, `code`) runs JS in the page (`document`/`window`,
+  async ok). End with `return <value>` — a bare expression returns undefined.
+- `browser_screenshot` (`tabId`) returns an inline image when your model can see
+  images; pass `path` to save, `fullPage` for the whole page, `labels` to overlay
+  interactive markers. (There is no PDF tool.)
 
-## Filling forms
+## Console logs and network
 
-- `browser_fill` is clear-and-insert: existing content is replaced.
-- To append, read the current value with `browser_evaluate`, concatenate, then
-  `browser_fill` the result.
-- Prefer filling the focused input; click the field first if the page needs a
-  click to open an editor (contenteditable/ProseMirror-style).
-
-## Waiting and timeouts
-
-- Prefer proper waits over sleeps: `browser_execute` with
-  `await state.page.waitForSelector(...)` or
-  `await state.page.waitForLoadState('domcontentloaded')`.
-- For SPA navigations use
-  `await state.page.waitForResponse(url => url.includes('api/'), { timeout: 10000 })`.
-- Short sleeps (1-2s) are acceptable for non-deterministic UI (animations,
-  async updates) where no selector exists. `browser_execute` accepts `timeout`
-  (ms) for long-running snippets.
+- `browser_logs` (`tabId`, optional `limit`) returns buffered console output —
+  check it after navigate/click/submit for hydration errors and failed requests.
+- `browser_network` (`tabId`, `action:"start"|"list"|"stop"`, optional url
+  substring `filter`): start before the triggering action, list to inspect,
+  stop to clear.
 
 ## browser_execute (escape hatch)
 
-The sandbox scope has `page`, `context`, `state` (persistent across calls),
-`snapshot`, `getLatestLogs`, `refToLocator`. Use it for things the typed tools
-don't cover (iframes, multi-step flows, custom waits).
+`browser_execute` (`tabId`, `code`, optional `timeout` ms, capped at 120s) runs a
+Playwright snippet against that tab's `page` in the runtime's isolated sandbox.
+Use it for iframes, custom waits, multi-step flows the typed tools don't cover.
+Never call `browser.close()`/`context.close()` — close tabs with `browser_tabs`.
+Code is sent as JSON: no shell quoting layer, so quotes/`$`/backticks are safe.
 
-- `state` persists per relay session — store your page as `state.page`, reuse
-  it across calls.
-- Never call `browser.close()` / `context.close()`. Close tabs with
-  `browser_tabs`.
-- Wrap multi-statement code in an IIFE: `const`/`let` redeclared across calls
-  throws. Results print on a `RESULT:` line as compact JSON.
+## Cancellation and outcomes
 
-## Quoting and escaping
-
-The pi tools send code as JSON — there is **no shell quoting layer**, so
-single quotes, `$`, backticks inside snippets are safe. Just keep JS strings
-consistent (`'...'` or `"..."` as you like).
-
-## Network capture
-
-`browser_network start` before the action that triggers requests, then
-`browser_network list` with a url substring `filter` to inspect API calls.
-Capture persists in session state across calls; `stop` clears it.
-
-## Screenshots and PDFs
-
-- `browser_screenshot` returns an inline labeled image when your model can
-  see images, plus the saved file path.
-- `browser_save_as_pdf` only works on headless/direct-CDP sessions; in
-  extension mode (headed Chrome) it errors — use `browser_screenshot`.
+If a call is cancelled or times out, the result reports the runtime's `outcome`
+(`not-started` vs `unknown`). `unknown` means the action may have partially
+happened — re-observe with a snapshot before assuming anything; nothing is
+auto-replayed.
 
 ## Session hygiene
 
-- The session binds once per pi session as `pi-<id8>` on the relay.
-- **Always** close the session's tabs when done:
-  `browser_tabs close_session` (or `close_tab` per tab). The relay session is
-  deleted automatically on pi session shutdown.
-- If a tool reports the session is gone, it is recreated automatically on the
-  next call — just retry.
+- Identity is automatic: every call carries this Pi session's UUID. You never
+  pass a session id.
+- Close tabs you no longer need with `browser_tabs` (`action:"close"`), or
+  `action:"release"` when the user is done with a tab so a browser restart won't
+  reopen it.
+- On Pi session shutdown the runtime frees this session's workers automatically;
+  it does **not** delete your groups/tabs (persistent ownership) and never stops
+  the shared runtime.
+- `/browser-status` inspects the runtime (reachability, capabilities, connected
+  profiles) without creating anything.
