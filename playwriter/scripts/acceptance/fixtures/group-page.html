@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Acceptance Group Page</title>
+  </head>
+  <body>
+    <h1 id="marker" data-testid="marker">acceptance-group-page</h1>
+    <p>
+      This static fixture runs only real browser events: clicks, input, fetch, console logs, a
+      <code>target=_blank</code> link and a <code>window.open</code> popup. It contains no business
+      logic and no automation hooks.
+    </p>
+    <form id="fill-form" onsubmit="return false">
+      <label for="name-input">Name</label>
+      <input id="name-input" data-testid="name-input" name="name" type="text" autocomplete="off" />
+      <button id="submit-fill" data-testid="submit-fill" type="button">Submit</button>
+    </form>
+    <p id="echo" data-testid="echo"></p>
+    <p>
+      <button id="fetch-echo" data-testid="fetch-echo" type="button">Fetch echo</button>
+      <button id="slow-action" data-testid="slow-action" type="button">Slow action</button>
+    </p>
+    <p>
+      <a id="blank-link" data-testid="blank-link" href="/popup-page.html" target="_blank">Open blank target</a>
+      <button id="open-popup" data-testid="open-popup" type="button">Open window popup</button>
+    </p>
+    <script>
+      window.__acceptance = { submitClicks: 0, fetchClicks: 0, slowClicks: 0 }
+      const marker = new URLSearchParams(location.search).get('marker') || 'default'
+      document.getElementById('marker').textContent = 'acceptance:' + marker
+      const echo = document.getElementById('echo')
+      const popupUrl = '/popup-page.html?marker=' + marker
+      document.getElementById('blank-link').href = popupUrl
+      document.getElementById('open-popup').addEventListener('click', () => {
+        window.open(popupUrl, 'acceptance-popup', 'width=420,height=320')
+      })
+
+      document.getElementById('submit-fill').addEventListener('click', async () => {
+        window.__acceptance.submitClicks += 1
+        const value = document.getElementById('name-input').value
+        echo.textContent = value
+        console.log('[fixture] fill-submitted ' + value)
+        await fetch('/api/echo?tag=submit-fill-' + marker)
+      })
+
+      document.getElementById('fetch-echo').addEventListener('click', async () => {
+        window.__acceptance.fetchClicks += 1
+        console.log('[fixture] fetch-echo-click')
+        await fetch('/api/echo?tag=fetch-echo-' + marker)
+      })
+
+      document.getElementById('slow-action').addEventListener('click', async () => {
+        window.__acceptance.slowClicks += 1
+        console.log('[fixture] slow-action-click')
+        await fetch('/api/slow?ms=4000&tag=slow-action-' + marker)
+      })
+
+      console.log('[fixture] group-page-ready marker=' + marker)
+    </script>
+  </body>
+</html>

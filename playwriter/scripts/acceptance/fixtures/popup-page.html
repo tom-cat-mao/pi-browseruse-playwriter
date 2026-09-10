@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Acceptance Popup Page</title>
+  </head>
+  <body>
+    <h1 id="popup-marker" data-testid="popup-marker">acceptance-popup-page</h1>
+    <p>Popup fixture opened from the group page. The group inheritance check reads this marker.</p>
+    <script>
+      const marker = new URLSearchParams(location.search).get('marker') || 'default'
+      document.getElementById('popup-marker').textContent = 'acceptance-popup:' + marker
+      console.log('[fixture] popup-page-ready marker=' + marker)
+    </script>
+  </body>
+</html>
