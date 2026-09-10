@@ -245,15 +245,22 @@ pi-browser-runtime
 | `PI_BROWSER_TOKEN`    | none                | shared token, required for non-loopback binds      |
 | `PI_BROWSER_DATA_DIR` | `~/.pi-browser-use` | runtime data and log directory                     |
 
-The runtime runs side by side with the legacy `playwriter serve` process: it never stops a relay it does not own, HTTP 401 is reported as an authentication error instead of "server down", and managed capability negotiation replaces version comparison.
+The runtime runs side by side with the legacy `playwriter serve` process. It never stops a relay it does not own: a port is only treated as a usable runtime when it answers a valid capabilities payload, and HTTP 401 is reported as an authentication error instead of "server down". Only loopback hosts are auto-started; remote runtimes are probed, never spawned.
 
 The Pi package (`pi/`) depends on this runtime and type-imports the shared contract from `@tom-cat/pi-browser-runtime/browser-protocol`.
 
-To build the extension with the fork dev identity (stable fork ID, installable next to the upstream dev extension):
+### Extension builds
+
+`pnpm build` builds the **fork** extension: fork dev ID `eeklahpecooapnailfaebkjjembkjhhg` and managed runtime port `19989`. The upstream identity and legacy relay port stay available as opt-in:
 
 ```bash
-cd extension && PLAYWRITER_FORK_DEV_KEY=1 pnpm build
+pnpm --filter mcp-extension build        # fork identity + 19989 (default)
+pnpm --filter mcp-extension build:legacy # upstream dev ID + 19988
+pnpm --filter mcp-extension reload:fork  # build fork and open it in Chrome
+pnpm --filter mcp-extension reload:legacy
 ```
+
+At the repo root, `pnpm reload` and `pnpm release` refuse to run because the old flows restarted port 19988 and targeted the upstream Chrome Web Store listing. Use `pnpm reload:fork`, or the explicit `pnpm reload:legacy` / `pnpm release:legacy` commands. `pnpm release:legacy` still needs `PRODUCTION=true` for a store build, which ignores the fork identity.
 
 ## Remote Access
 
@@ -320,7 +327,7 @@ playwriter logfile  # prints the log file path
 # typically: ~/.playwriter/relay-server.log
 ```
 
-The relay log contains extension, MCP and WebSocket server logs. A separate CDP JSONL log is also created alongside it (see `playwriter logfile`). Both are recreated on each server start.
+The relay log contains extension, MCP and WebSocket server logs. A separate CDP JSONL log is also created alongside it (see `playwriter logfile`). Both are appended across restarts and rotated in place when they grow too large, so starting a second process never wipes a running relay's logs.
 
 Example: summarize CDP traffic counts by direction + method:
 

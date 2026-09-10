@@ -26,7 +26,11 @@ const FORK_DEV_EXTENSION_KEY =
 const useForkDevKey = process.env.PLAYWRITER_FORK_DEV_KEY === '1' || process.env.PLAYWRITER_FORK_DEV_KEY === 'true'
 
 const defineEnv: Record<string, string> = {
-  'process.env.PLAYWRITER_PORT': JSON.stringify(process.env.PLAYWRITER_PORT || '19988'),
+  // Fork dev builds target the managed runtime port; legacy and production
+  // builds keep the old relay port.
+  'process.env.PLAYWRITER_PORT': JSON.stringify(
+    process.env.PLAYWRITER_PORT || (!process.env.PRODUCTION && useForkDevKey ? '19989' : '19988'),
+  ),
   __PLAYWRITER_VERSION__: JSON.stringify(playwriterPkg.version),
   __PLAYWRITER_OPEN_WELCOME_PAGE__: JSON.stringify(process.env.PLAYWRITER_OPEN_WELCOME_PAGE !== '0'),
 }

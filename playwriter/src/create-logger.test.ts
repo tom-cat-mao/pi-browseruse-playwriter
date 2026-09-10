@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { createFileLogger } from './create-logger.js'
+import { makeTestTmpDir, removeTestTmpDir } from './test-tmp.js'
 
 function makeTmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'file-logger-test-'))
+  return makeTestTmpDir('file-logger')
 }
 
 function readLines(logFile: string): string[] {
@@ -29,7 +29,21 @@ describe('file logger', () => {
 
     expect(readLines(logFile)).toEqual(['first line', 'second { nested: true }'])
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
+  })
+
+  it('appends to an existing log file without truncating it', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'relay.log')
+    fs.writeFileSync(logFile, 'line from previous run\n')
+    const logger = createFileLogger({ logFilePath: logFile })
+
+    await logger.log('line from this run')
+    await logger.flush()
+
+    expect(readLines(logFile)).toEqual(['line from previous run', 'line from this run'])
+
+    removeTestTmpDir(tmpDir)
   })
 
   it('rotates by byte budget and keeps the newest lines', async () => {
@@ -59,7 +73,7 @@ describe('file logger', () => {
       ]
     `)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('drops oldest buffered lines when the buffer cap is exceeded', async () => {
@@ -83,7 +97,7 @@ describe('file logger', () => {
       ]
     `)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('disables itself without throwing when the log path cannot be written', async () => {
@@ -97,7 +111,7 @@ describe('file logger', () => {
 
     expect(fs.readdirSync(logFile)).toEqual([])
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('keeps logging after an append failure without rejecting the queue', async () => {
@@ -118,6 +132,6 @@ describe('file logger', () => {
     await logger.log('still alive')
     await expect(logger.flush()).resolves.toBeUndefined()
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 })

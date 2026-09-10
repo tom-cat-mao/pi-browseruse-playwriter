@@ -49,13 +49,15 @@ export function createFileLogger({ logFilePath, maxBufferedLines, maxFileBytes }
     resolvePositiveInt(Number(process.env.PLAYWRITER_LOG_MAX_BYTES), DEFAULT_MAX_FILE_BYTES),
   )
 
+  // Append mode creates the file without truncating: a second process racing
+  // for the same data dir must not wipe the running relay's logs.
   const enabled = (() => {
     try {
       const logDir = path.dirname(resolvedLogFilePath)
       if (!fs.existsSync(logDir)) {
         fs.mkdirSync(logDir, { recursive: true })
       }
-      fs.writeFileSync(resolvedLogFilePath, '')
+      fs.appendFileSync(resolvedLogFilePath, '')
       return true
     } catch {
       return false

@@ -1,31 +1,32 @@
 /**
  * Entry point for the `pi-browser-runtime` executable.
  *
- * This is the managed runtime Pi tools talk to: its own port (default 19989),
- * its own data directory (default ~/.pi-browser-use) and its own logs, so it
- * can run next to the legacy playwriter relay on 19988 without either process
- * restarting or hijacking the other. All options come from PI_BROWSER_* env:
- *
- *   PI_BROWSER_HOST      bind/connect host, default 127.0.0.1
- *   PI_BROWSER_PORT      port, default 19989
- *   PI_BROWSER_TOKEN     optional shared token, required for non-loopback binds
- *   PI_BROWSER_DATA_DIR  data directory, default ~/.pi-browser-use
- *   PI_BROWSER_LOG_FILE_PATH / PI_BROWSER_CDP_LOG_FILE_PATH  log overrides
+ * Config comes from PI_BROWSER_HOST / PI_BROWSER_PORT / PI_BROWSER_TOKEN /
+ * PI_BROWSER_DATA_DIR. Defaults to 127.0.0.1:19989 and ~/.pi-browser-use so it
+ * can run next to the legacy relay on 19988 without cross-talk.
  */
 
-import path from 'node:path'
+import * as path from 'node:path'
 import { createCdpLogger } from './cdp-log.js'
 import { createFileLogger } from './create-logger.js'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
-import { resolveBrowserRuntimeConfig } from './utils.js'
-import { probeRelayServer } from './relay-client.js'
+import { probeManagedRuntime } from './relay-client.js'
+import { isLoopbackHost, resolveBrowserRuntimeConfig, type BrowserRuntimeConfig } from './utils.js'
 
 process.title = 'pi-browser-runtime'
 
-const config = resolveBrowserRuntimeConfig()
+function loadConfig(): BrowserRuntimeConfig {
+  try {
+    return resolveBrowserRuntimeConfig()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  }
+}
 
-// Export the resolved config so managed request handlers and any child
-// processes observe the same values the server was started with.
+const config = loadConfig()
+
+// Managed handlers and child processes read the same resolved values.
 process.env.PI_BROWSER_HOST = config.host
 process.env.PI_BROWSER_PORT = String(config.port)
 process.env.PI_BROWSER_DATA_DIR = config.dataDir
@@ -48,10 +49,6 @@ process.on('unhandledRejection', async (reason) => {
   process.exit(1)
 })
 
-function isLoopbackHost(host: string): boolean {
-  return host === '127.0.0.1' || host === 'localhost' || host === '::1'
-}
-
 export async function startRuntimeServer() {
   if (!isLoopbackHost(config.host) && !config.token) {
     console.error(`Refusing to bind ${config.host} without PI_BROWSER_TOKEN.`)
@@ -72,22 +69,20 @@ export async function startRuntimeServer() {
     if (errWithCode?.code !== 'EADDRINUSE') {
       throw error
     }
-    const probe = await probeRelayServer({ port: config.port })
-    if (probe.state === 'running') {
-      await logger.log(
-        `Another relay (v${probe.version ?? 'unknown'}) already owns port ${config.port}, not replacing it`,
-      )
+    // Only another fully capable managed runtime counts as "already running".
+    const probe = await probeManagedRuntime({ host: config.host, port: config.port, token: config.token })
+    if (probe.state === 'ready') {
+      await logger.log(`Another managed runtime already owns ${config.host}:${config.port}, not replacing it`)
       await logger.flush()
       process.exit(0)
     }
-    if (probe.state === 'unauthorized') {
-      await logger.error(
-        `Port ${config.port} is owned by a token-protected relay this process cannot authenticate against; not replacing it`,
-      )
-      await logger.flush()
-      process.exit(1)
-    }
-    await logger.error(`Port ${config.port} is in use by a non-relay process; not replacing it`)
+    const reason =
+      probe.state === 'unauthorized'
+        ? 'a token-protected listener'
+        : probe.state === 'unsupported'
+          ? 'a listener without the managed browser API'
+          : 'an unreachable listener'
+    await logger.error(`Port ${config.port} is owned by ${reason}; not replacing it`)
     await logger.flush()
     process.exit(1)
   }
@@ -100,7 +95,7 @@ export async function startRuntimeServer() {
   const shutdown = async () => {
     server.close()
     await logger.flush()
-    cdpLogger.flush()
+    await cdpLogger.flush()
     process.exit(0)
   }
 

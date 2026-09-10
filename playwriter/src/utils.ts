@@ -33,12 +33,19 @@ export type BrowserRuntimeConfig = {
   cdpLogFilePath: string
 }
 
-function resolvePositiveInt(value: string | undefined, fallback: number): number {
+function resolvePort(value: string | undefined): number {
+  if (value == null || value === '') {
+    return DEFAULT_BROWSER_RUNTIME_PORT
+  }
   const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed <= 0 || Math.floor(parsed) !== parsed) {
-    return fallback
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 65535) {
+    throw new Error(`Invalid PI_BROWSER_PORT "${value}": expected an integer between 1 and 65535`)
   }
   return parsed
+}
+
+export function isLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '::1' || host === '[::1]' || /^127\./.test(host)
 }
 
 /**
@@ -53,7 +60,7 @@ export function resolveBrowserRuntimeConfig({
   const token = env.PI_BROWSER_TOKEN || undefined
   return {
     host: env.PI_BROWSER_HOST || '127.0.0.1',
-    port: resolvePositiveInt(env.PI_BROWSER_PORT, DEFAULT_BROWSER_RUNTIME_PORT),
+    port: resolvePort(env.PI_BROWSER_PORT),
     token,
     dataDir,
     logFilePath: env.PI_BROWSER_LOG_FILE_PATH || path.join(dataDir, 'relay-server.log'),
