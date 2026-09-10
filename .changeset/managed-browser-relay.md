@@ -1,5 +1,5 @@
 ---
-'playwriter': minor
+'@tom-cat/pi-browser-runtime': minor
 ---
 
 Add the managed browser runtime API: `GET /browser/v1/capabilities`, `GET /browser/v1/profiles` and `POST /browser/v1/request`.

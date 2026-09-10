@@ -1,5 +1,5 @@
 ---
-'playwriter': minor
+'@tom-cat/pi-browser-runtime': minor
 ---
 
 add managed browser ownership to the extension for Pi sessions

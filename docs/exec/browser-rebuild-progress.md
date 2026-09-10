@@ -21,9 +21,9 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
-| E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 1107228 已集成，复核修订中 |
+| E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 7d0f92b 已集成，发行默认值修订中 |
 | A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | bf29f36 已集成，P0 修订中 |
-| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 运行中 |
+| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 543b636 已集成，CDP作用域补强中 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 运行中 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 运行中 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
@@ -51,7 +51,14 @@ executor、pi-tools、integration。主目录 main 未修改。
 - A 复核要求：持久化失败不假ready、scoped持久去重、per-group并发、
   用户释放时失败cleanup不删用户tab、旧epoch数字不访问Chrome、
   popup先归属/入组再attach、用户改名事件、全局取消不自动重控。
-- B 已提示 managed CDP URL必须传token，request指纹去重和tab.resolve。
+- B 543b636已合入：CDP URL token、request指纹去重、tab.resolve已实现。
+- 协调者再次在集成树跑 typecheck，runtime 123/123测试、extension
+  11/11纯状态测试通过（无Chrome）。
+- E追加7d0f92b已合入：非破坏日志、端点分类、真实token/并发启动测试。
+- B二审要求：root/nested CDP绕过防护、parent释放即撤销iframe权限、
+  流式body限额、队列执行前再校验owner/epoch/释放。
+- E二审要求：ownbin不覆盖全局playwriter、production fork不退19988、
+  CI加入各新模块/Pi/extension测试、logger序列化与既有文件计量。
 - 以上是协调者初审，不能代替最后的全新agent独立验收。
 
 # 待完成门槛
