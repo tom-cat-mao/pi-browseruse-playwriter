@@ -30,7 +30,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
-import { VERSION, EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
+import { VERSION, ALLOWED_EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
 import { createCdpLogger, type CdpLogEntry, type CdpLogger } from './cdp-log.js'
 import { RecordingRelay } from './recording-relay.js'
 import { StreamRelay } from './stream-relay.js'
@@ -65,10 +65,10 @@ function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
     return false
   }
 
-  // Allow our own extension pages
+  // Allow our own extension pages (legacy and fork extension identities)
   if (url.startsWith('chrome-extension://')) {
     const extensionId = url.replace('chrome-extension://', '').split('/')[0]
-    if (EXTENSION_IDS.includes(extensionId)) {
+    if (ALLOWED_EXTENSION_IDS.includes(extensionId)) {
       return false
     }
     return true
@@ -1092,7 +1092,7 @@ export async function startPlayWriterCDPRelayServer({
           return null
         }
         const extensionId = origin.replace('chrome-extension://', '')
-        if (!EXTENSION_IDS.includes(extensionId)) {
+        if (!ALLOWED_EXTENSION_IDS.includes(extensionId)) {
           return null
         }
         return origin
@@ -1390,7 +1390,7 @@ export async function startPlayWriterCDPRelayServer({
       if (origin) {
         if (origin.startsWith('chrome-extension://')) {
           const extensionId = origin.replace('chrome-extension://', '')
-          if (!EXTENSION_IDS.includes(extensionId)) {
+          if (!ALLOWED_EXTENSION_IDS.includes(extensionId)) {
             logger?.log(pc.red(`Rejecting /cdp WebSocket from unknown extension: ${extensionId}`))
             return c.text('Forbidden', 403)
           }
@@ -1750,7 +1750,7 @@ export async function startPlayWriterCDPRelayServer({
       }
 
       const extensionId = origin.replace('chrome-extension://', '')
-      if (!EXTENSION_IDS.includes(extensionId)) {
+      if (!ALLOWED_EXTENSION_IDS.includes(extensionId)) {
         logger?.log(pc.red(`Rejecting /extension WebSocket from unknown extension: ${extensionId}`))
         return c.text('Forbidden', 403)
       }

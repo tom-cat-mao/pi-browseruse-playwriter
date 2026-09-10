@@ -276,6 +276,7 @@ type FakeExtensionOptions = {
   installId: string
   browser?: string
   email?: string
+  origin?: string
 }
 
 class FakeExtension {
@@ -305,7 +306,7 @@ class FakeExtension {
       v: 'test',
     })
     const ws = new WebSocket(`ws://127.0.0.1:${options.port}/extension?${query.toString()}`, {
-      origin: EXTENSION_ORIGIN,
+      origin: options.origin ?? EXTENSION_ORIGIN,
     })
     const extension = new FakeExtension(ws)
     ws.on('message', (data) => {
@@ -829,6 +830,40 @@ describe('managed /browser/v1 HTTP surface', () => {
       ok: false,
       error: { code: 'profile-disconnected', outcome: 'not-started' },
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Extension origin allowlist
+// ---------------------------------------------------------------------------
+
+describe('extension origin allowlist', () => {
+  test('accepts the fork extension identity and rejects unknown origins', async () => {
+    const relay = await startTrackedRelay()
+    const forkExtension = await FakeExtension.connect({
+      port: relay.port,
+      installId: 'install-fork',
+      origin: 'chrome-extension://eeklahpecooapnailfaebkjjembkjhhg',
+    })
+    extensions.push(forkExtension)
+    await waitForExtensionRegistered({ port: relay.port })
+    forkExtension.sendInventory(makeInventory({ groups: [], tabs: [] }))
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'fork extension inventory accepted' },
+    )
+
+    await expect(
+      FakeExtension.connect({
+        port: relay.port,
+        installId: 'install-unknown',
+        origin: 'chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      }),
+    ).rejects.toThrow()
   })
 })
 
