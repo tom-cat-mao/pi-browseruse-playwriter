@@ -57,16 +57,36 @@ type ContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
-// Output caps so a huge page never overflows the LLM context.
+// Output caps so a huge page never overflows the LLM context. Budgets are in
+// UTF-8 BYTES (not chars) so multibyte content — e.g. thousands of Chinese
+// group names — is measured at its true size, and include truncation markers.
 const MAX_INLINE_IMAGES = 2;
 const MAX_INLINE_IMAGE_BASE64 = 16 * 1024 * 1024; // ~12MB raw per image
-const MAX_TEXT_CHARS = 48_000; // ~12k tokens
-const MAX_STRUCTURED_CHARS = 24_000; // budget for the structured-ids JSON block
+const MAX_TEXT_BYTES = 48_000; // primary page text
+const MAX_STRUCTURED_BYTES = 24_000; // budget for the structured-ids JSON block
 const MAX_LOG_LINES = 50; // most recent N log lines
-const MAX_LOG_CHARS = 20_000; // total chars across surfaced log lines
+const MAX_LOG_BYTES = 20_000; // total bytes across surfaced log lines
 // Hard ceiling on the total text we emit into `content` (excludes image bytes).
 // Structured ids are laid down first and are never dropped for text/logs.
-const MAX_TOTAL_TEXT_CHARS = 90_000;
+const MAX_TOTAL_TEXT_BYTES = 90_000;
+
+const utf8 = new TextEncoder();
+const byteLen = (s: string): number => utf8.encode(s).length;
+// Slice a string down to at most `maxBytes` UTF-8 bytes without splitting a
+// multibyte code point (TextEncoder counts bytes; we shrink by chars until it
+// fits, so the result is always valid UTF-8 and truly within budget).
+function sliceToBytes(s: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (byteLen(s) <= maxBytes) return s;
+  let lo = 0;
+  let hi = s.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (byteLen(s.slice(0, mid)) <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return s.slice(0, lo);
+}
 
 // --- rendering helpers -------------------------------------------------------
 
@@ -191,19 +211,23 @@ export default function (pi: ExtensionAPI) {
    */
   function shapeResult(ctx: ExtensionContext, data: BrowserResultData): { content: ContentBlock[]; details: Json } {
     const content: ContentBlock[] = [];
-    // Track the running text budget so the total content never blows past
-    // MAX_TOTAL_TEXT_CHARS. Structured ids are laid down FIRST and always fit
-    // (bounded by MAX_STRUCTURED_CHARS) so groupId/tabId/snapshotId can never be
-    // pushed out by a large snapshot body or a wall of logs.
-    let remaining = MAX_TOTAL_TEXT_CHARS;
+    // Track the running text budget in UTF-8 BYTES so the total content never
+    // blows past MAX_TOTAL_TEXT_BYTES regardless of multibyte content. Structured
+    // ids are laid down FIRST and always fit (bounded by MAX_STRUCTURED_BYTES) so
+    // groupId/tabId/snapshotId can never be pushed out by a large snapshot body
+    // or a wall of logs.
+    let remaining = MAX_TOTAL_TEXT_BYTES;
     const pushText = (t: string): void => {
       if (!t || remaining <= 0) return;
-      if (t.length <= remaining) {
+      const bytes = byteLen(t);
+      if (bytes <= remaining) {
         content.push(text(t));
-        remaining -= t.length;
+        remaining -= bytes;
         return;
       }
-      content.push(text(`${t.slice(0, remaining)}\n…[truncated]`));
+      const marker = "\n…[truncated]";
+      const head = sliceToBytes(t, Math.max(0, remaining - byteLen(marker)));
+      content.push(text(`${head}${marker}`));
       remaining = 0;
     };
 
@@ -212,17 +236,17 @@ export default function (pi: ExtensionAPI) {
     if (structured) pushText(structured);
 
     // 2) Primary text (snapshot/navigate/etc.), truncated to its own cap first.
-    const textTruncated = data.text != null && data.text.length > MAX_TEXT_CHARS;
-    if (data.text) pushText(textTruncated ? `${data.text.slice(0, MAX_TEXT_CHARS)}\n…[truncated]` : data.text);
+    const textTruncated = data.text != null && byteLen(data.text) > MAX_TEXT_BYTES;
+    if (data.text) pushText(textTruncated ? `${sliceToBytes(data.text, MAX_TEXT_BYTES)}\n…[truncated]` : data.text);
 
-    // 3) Page logs — last N lines, capped in total chars.
+    // 3) Page logs — last N lines, capped in total bytes.
     let logTruncated = false;
     if (data.logs && data.logs.length > 0) {
       const tail = data.logs.slice(-MAX_LOG_LINES);
       let joined = tail.join("\n");
       if (tail.length < data.logs.length) logTruncated = true;
-      if (joined.length > MAX_LOG_CHARS) {
-        joined = joined.slice(0, MAX_LOG_CHARS);
+      if (byteLen(joined) > MAX_LOG_BYTES) {
+        joined = sliceToBytes(joined, MAX_LOG_BYTES);
         logTruncated = true;
       }
       pushText(`\nPage logs:\n${joined}`);
@@ -266,51 +290,71 @@ export default function (pi: ExtensionAPI) {
 
   /**
    * Serialize the structured fields the LLM must see (ids, snapshotId, evaluate
-   * value) as compact JSON, bounded by MAX_STRUCTURED_CHARS. Only present fields
-   * are emitted; list fields collapse to their essential columns so a large
-   * listing stays within budget. Returns "" when there is nothing structured.
-   */
-  /**
-   * Serialize the structured fields the LLM must see (ids, snapshotId, evaluate
-   * value) as compact JSON, bounded by MAX_STRUCTURED_CHARS.
+   * value) as JSON, bounded by MAX_STRUCTURED_BYTES (UTF-8 bytes, not chars).
    *
-   * Resource ids (snapshotId, group/tab/list ids) are ALWAYS emitted intact —
-   * they are small and must never be dropped. Only the free-form evaluate
-   * `value` can be large; if including it would blow the budget we omit it from
-   * the JSON and surface it separately as an explicitly-truncated string, so the
-   * ids block stays valid parseable JSON and the value is never sliced into
-   * invalid JSON. Returns "" when there is nothing structured.
+   * Guarantees:
+   *   - the emitted ids block is always VALID parseable JSON, never sliced;
+   *   - snapshotId and single group/tab are always kept intact;
+   *   - a large list (groups/tabs/profiles) is truncated item-by-item with a
+   *     `truncated` count so the JSON stays within budget instead of dumping the
+   *     full giant array;
+   *   - only the free-form evaluate `value` may be large: if it won't fit it is
+   *     emitted separately as an explicitly-truncated string (never sliced JSON).
+   * Returns "" when there is nothing structured.
    */
   function buildStructuredText(data: BrowserResultData): string {
-    const ids: Json = {};
-    if (data.snapshotId) ids.snapshotId = data.snapshotId;
-    if (data.group) ids.group = compactGroup(data.group);
-    if (data.tab) ids.tab = compactTab(data.tab);
-    if (data.profiles) ids.profiles = data.profiles.map(compactProfile);
-    if (data.groups) ids.groups = data.groups.map(compactGroup);
-    if (data.tabs) ids.tabs = data.tabs.map(compactTab);
+    // Small ids that must always survive intact.
+    const base: Json = {};
+    if (data.snapshotId) base.snapshotId = data.snapshotId;
+    if (data.group) base.group = compactGroup(data.group);
+    if (data.tab) base.tab = compactTab(data.tab);
 
-    // Try the full object (ids + value) first — the common, small case.
-    if (data.value !== undefined) {
-      const full = JSON.stringify({ ...ids, value: data.value });
-      if (full.length <= MAX_STRUCTURED_CHARS) return full;
-    } else {
-      if (Object.keys(ids).length === 0) return "";
-      const idsJson = JSON.stringify(ids);
-      if (idsJson.length <= MAX_STRUCTURED_CHARS) return idsJson;
-      // ids alone somehow exceed budget (huge listing): keep valid JSON by
-      // dropping array bodies rather than slicing into invalid JSON.
-      return JSON.stringify({ ...ids, note: "listing too large; narrow with a filter" });
+    // Lists are budgeted: keep as many items as fit, record how many dropped.
+    const lists: Array<{ key: "profiles" | "groups" | "tabs"; items: Json[] }> = [];
+    if (data.profiles) lists.push({ key: "profiles", items: data.profiles.map(compactProfile) });
+    if (data.groups) lists.push({ key: "groups", items: data.groups.map(compactGroup) });
+    if (data.tabs) lists.push({ key: "tabs", items: data.tabs.map(compactTab) });
+
+    // Fast path: everything (base + full lists + value) fits.
+    const full: Json = { ...base };
+    for (const l of lists) full[l.key] = l.items;
+    if (data.value !== undefined) full.value = data.value;
+    if (Object.keys(full).length === 0) return "";
+    const fullJson = JSON.stringify(full);
+    if (byteLen(fullJson) <= MAX_STRUCTURED_BYTES) return fullJson;
+
+    // Over budget. Rebuild with bounded lists, reserving room for the value.
+    const out: Json = { ...base };
+    const valueStr =
+      data.value === undefined ? undefined : typeof data.value === "string" ? data.value : JSON.stringify(data.value);
+    // Reserve up to a quarter of the budget for a value preview (emitted outside
+    // the JSON) so ids/lists get the rest.
+    const listBudget = valueStr !== undefined ? Math.floor(MAX_STRUCTURED_BYTES * 0.75) : MAX_STRUCTURED_BYTES;
+    for (const l of lists) {
+      // Reserve room for the `${key}Truncated: <count>` marker that may be added
+      // after the loop so the final JSON never slips past the byte budget.
+      const perListBudget = listBudget - byteLen(`,"${l.key}Truncated":${l.items.length}`);
+      const kept: Json[] = [];
+      for (const item of l.items) {
+        kept.push(item);
+        if (byteLen(JSON.stringify({ ...out, [l.key]: kept })) > perListBudget) {
+          kept.pop();
+          break;
+        }
+      }
+      out[l.key] = kept;
+      const dropped = l.items.length - kept.length;
+      if (dropped > 0) out[`${l.key}Truncated`] = dropped;
     }
+    const idsJson = JSON.stringify(out);
 
-    // value is present and oversize: emit ids as valid JSON, then value as an
-    // explicitly-truncated standalone string (never sliced JSON).
-    const idsJson = Object.keys(ids).length > 0 ? JSON.stringify(ids) : "";
-    const budgetForValue = Math.max(0, MAX_STRUCTURED_CHARS - idsJson.length - 64);
-    const valueStr = typeof data.value === "string" ? data.value : JSON.stringify(data.value);
-    const valuePreview = (valueStr ?? "").slice(0, budgetForValue);
-    const valueBlock = `value (truncated, ${(valueStr ?? "").length} chars total):\n${valuePreview}\n…[value truncated; read it in smaller pieces via browser_evaluate]`;
-    return idsJson ? `${idsJson}\n${valueBlock}` : valueBlock;
+    if (valueStr === undefined) return idsJson;
+    // value present and the whole thing didn't fit: emit ids JSON, then the
+    // value as an explicitly-truncated standalone string (never sliced JSON).
+    const valueBudget = Math.max(0, MAX_STRUCTURED_BYTES - byteLen(idsJson) - 96);
+    const valuePreview = sliceToBytes(valueStr, valueBudget);
+    const valueBlock = `value (truncated, ${valueStr.length} chars total):\n${valuePreview}\n…[value truncated; read it in smaller pieces via browser_evaluate]`;
+    return Object.keys(out).length > 0 ? `${idsJson}\n${valueBlock}` : valueBlock;
   }
 
   const groupLine = (g: BrowserGroup): string => `${g.name} [${g.groupId}] profile=${g.profileId} ${g.state}`;
