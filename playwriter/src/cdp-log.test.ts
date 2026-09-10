@@ -106,6 +106,46 @@ describe('CDP log rotation', () => {
     removeTestTmpDir(tmpDir)
   })
 
+  it('does not throw when an entry cannot be serialized', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'cdp.jsonl')
+    const logger = createCdpLogger({ logFilePath: logFile })
+
+    expect(() => {
+      logger.log({
+        timestamp: new Date().toISOString(),
+        direction: 'from-extension',
+        message: { big: 10n },
+      })
+    }).not.toThrow()
+    await expect(logger.flush()).resolves.toBeUndefined()
+
+    const content = fs.readFileSync(logFile, 'utf-8')
+    expect(content).toContain('cdpLogSerializeError')
+
+    removeTestTmpDir(tmpDir)
+  })
+
+  it('rotates based on the existing file size after a restart', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'cdp.jsonl')
+    const existing = Array.from({ length: 30 }, (_, i) => {
+      return JSON.stringify(makeEntry(i))
+    }).join('\n')
+    fs.writeFileSync(logFile, `${existing}\n`)
+
+    const logger = createCdpLogger({ logFilePath: logFile, maxEntries: 10 })
+    logger.log(makeEntry(99))
+    await logger.flush()
+
+    const ids = readIds(logFile)
+    expect(ids[ids.length - 1]).toBe(99)
+    expect(ids.length).toBeLessThanOrEqual(10)
+    expect(ids).not.toContain(0)
+
+    removeTestTmpDir(tmpDir)
+  })
+
   it('appends to an existing log file without truncating it', async () => {
     const tmpDir = makeTmpDir()
     const logFile = path.join(tmpDir, 'cdp.jsonl')

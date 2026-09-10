@@ -16,6 +16,8 @@ Configuration comes from the environment:
 - `PI_BROWSER_TOKEN` (optional, required for non-loopback binds)
 - `PI_BROWSER_DATA_DIR` (default `~/.pi-browser-use`)
 
+The package installs only the `pi-browser-runtime` executable; the legacy CLI is available as the explicit `pnpm cli:legacy` script so it cannot shadow an upstream `playwriter` global install.
+
 Invalid values for `PI_BROWSER_PORT` (zero, negative, above 65535, or not an integer) now fail the start with a clear error instead of silently falling back to the default; an unset port still means `19989`. `SIGINT`/`SIGTERM` shutdown flushes both log files.
 
 The runtime runs next to the legacy playwriter relay on `19988`: it has its own logs and never stops a process it does not own. The legacy `playwriter` executable, WebSocket protocol and extension imports stay unchanged, and the Pi package now depends on this runtime.

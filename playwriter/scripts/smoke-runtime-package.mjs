@@ -1,19 +1,33 @@
 /**
  * Distribution smoke check for @tom-cat/pi-browser-runtime.
- * Verifies the built package exposes both executables and the protocol types
- * entry without starting any browser or server. Run after `pnpm build`.
+ * Verifies the built package owns the pi-browser-runtime bin, exports the
+ * protocol types, and ships an extension bundle with the fork identity on
+ * port 19989. Runs after `pnpm build`; starts no browser or server.
  */
 
-import fs from 'node:fs'
-import path from 'node:path'
+import * as crypto from 'node:crypto'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(fs.readFileSync(path.join(packageDir, 'package.json'), 'utf-8'))
 
+const FORK_EXTENSION_ID = 'eeklahpecooapnailfaebkjjembkjhhg'
+
 function fail(message) {
   console.error(`smoke check failed: ${message}`)
   process.exit(1)
+}
+
+function extensionIdFromKey(key) {
+  const hash = crypto.createHash('sha256').update(Buffer.from(key, 'base64')).digest()
+  return [...hash.subarray(0, 16)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+    .split('')
+    .map((char) => 'abcdefghijklmnop'[parseInt(char, 16)])
+    .join('')
 }
 
 const requiredFiles = [
@@ -33,8 +47,11 @@ for (const file of requiredFiles) {
 if (pkg.name !== '@tom-cat/pi-browser-runtime') {
   fail(`unexpected package name ${pkg.name}`)
 }
-if (!pkg.bin?.['pi-browser-runtime'] || !pkg.bin?.playwriter) {
-  fail('package must expose both the playwriter and pi-browser-runtime bins')
+if (!pkg.bin?.['pi-browser-runtime']) {
+  fail('package must expose the pi-browser-runtime bin')
+}
+if (pkg.bin?.playwriter) {
+  fail('package must not install a playwriter binary (it would shadow the upstream CLI)')
 }
 if (!pkg.exports?.['./browser-protocol']) {
   fail('package must export ./browser-protocol for Pi type imports')
@@ -53,4 +70,21 @@ if (typeof index.ensureManagedRuntime !== 'function') {
   fail('index must export ensureManagedRuntime')
 }
 
-console.log(`smoke check ok: ${pkg.name}@${pkg.version}`)
+const bundledManifestPath = path.join(packageDir, 'dist', 'extension', 'manifest.json')
+if (!fs.existsSync(bundledManifestPath)) {
+  fail('missing dist/extension/manifest.json (packaged extension bundle)')
+}
+const bundledManifest = JSON.parse(fs.readFileSync(bundledManifestPath, 'utf-8'))
+if (!bundledManifest.key) {
+  fail('packaged extension must embed the fork dev key')
+}
+const bundledExtensionId = extensionIdFromKey(bundledManifest.key)
+if (bundledExtensionId !== FORK_EXTENSION_ID) {
+  fail(`packaged extension ID ${bundledExtensionId} is not the fork ID`)
+}
+const bundledBackground = fs.readFileSync(path.join(packageDir, 'dist', 'extension', 'background.js'), 'utf-8')
+if (!bundledBackground.includes('19989')) {
+  fail('packaged extension must target the managed runtime port 19989')
+}
+
+console.log(`smoke check ok: ${pkg.name}@${pkg.version}, bundled extension ${bundledExtensionId} on 19989`)

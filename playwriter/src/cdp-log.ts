@@ -105,7 +105,19 @@ export function createCdpLogger({
   })()
 
   let queue: Promise<void> = Promise.resolve()
+  // Count existing lines so a restart with a large file still rotates at the
+  // configured budget instead of growing past it.
   let lineCount = 0
+  if (enabled) {
+    try {
+      const existing = fs.readFileSync(resolvedLogFilePath, 'utf-8')
+      lineCount = existing.split('\n').filter((line) => {
+        return line.length > 0
+      }).length
+    } catch {
+      lineCount = 0
+    }
+  }
   let droppedLines = 0
   let buffer: string[] = []
   let flushTimer: ReturnType<typeof setInterval> | undefined
@@ -165,8 +177,23 @@ export function createCdpLogger({
     if (!enabled) {
       return
     }
-    const replacer = createTruncatingReplacer({ maxStringLength: maxLength })
-    const line = JSON.stringify(entry, replacer)
+    let line: string
+    try {
+      const replacer = createTruncatingReplacer({ maxStringLength: maxLength })
+      line = JSON.stringify(entry, replacer)
+    } catch (error) {
+      // Serializing arbitrary CDP payloads can fail (BigInt, cycles after
+      // truncation). Logging is best-effort and must not throw into the relay.
+      line = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        direction: entry.direction,
+        source: 'server',
+        message: {
+          method: 'cdpLogSerializeError',
+          error: error instanceof Error ? error.message : String(error),
+        },
+      })
+    }
     buffer.push(line)
     if (buffer.length > resolvedMaxBufferedLines) {
       const overflow = buffer.length - resolvedMaxBufferedLines

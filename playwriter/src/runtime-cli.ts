@@ -79,9 +79,11 @@ export async function startRuntimeServer() {
     const reason =
       probe.state === 'unauthorized'
         ? 'a token-protected listener'
-        : probe.state === 'unsupported'
-          ? 'a listener without the managed browser API'
-          : 'an unreachable listener'
+        : probe.state === 'incompatible'
+          ? `a runtime missing required capabilities (${probe.missing.join(', ')})`
+          : probe.state === 'unsupported'
+            ? 'a listener without the managed browser API'
+            : 'an unreachable listener'
     await logger.error(`Port ${config.port} is owned by ${reason}; not replacing it`)
     await logger.flush()
     process.exit(1)

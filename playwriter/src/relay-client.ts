@@ -58,15 +58,16 @@ export type RelayProbeResult =
   | { state: 'unauthorized' }
   | { state: 'unreachable' }
 
-function formatProbeBaseUrl({ host, port }: { host: string; port: number }): string {
+/**
+ * Build the HTTP base URL for a runtime host. Full URLs are used as-is (no
+ * default port is injected into https tunnels); bare IPv6 hosts get brackets.
+ */
+export function formatManagedRuntimeBaseUrl({ host, port }: { host: string; port: number }): string {
   if (host.startsWith('http://') || host.startsWith('https://')) {
-    const url = new URL(host)
-    if (!url.port) {
-      url.port = String(port)
-    }
-    return url.origin
+    return new URL(host).origin
   }
-  return `http://${host}:${port}`
+  const normalizedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+  return `http://${normalizedHost}:${port}`
 }
 
 /**
@@ -81,7 +82,7 @@ export async function probeRelayServer({
   timeoutMs = 2000,
 }: { host?: string; port?: number; timeoutMs?: number } = {}): Promise<RelayProbeResult> {
   try {
-    const response = await fetch(`${formatProbeBaseUrl({ host, port })}/version`, {
+    const response = await fetch(`${formatManagedRuntimeBaseUrl({ host, port })}/version`, {
       signal: AbortSignal.timeout(timeoutMs),
     })
     if (response.status === 401 || response.status === 403) {
@@ -107,9 +108,12 @@ export async function probeRelayServer({
 
 export type ManagedRuntimeProbeResult =
   | { state: 'ready'; version: string | null; capabilities: BrowserCapabilities }
+  | { state: 'incompatible'; version: string | null; capabilities: BrowserCapabilities; missing: string[] }
   | { state: 'unsupported'; version: string | null }
   | { state: 'unauthorized' }
   | { state: 'unreachable' }
+
+const REQUIRED_MANAGED_CAPABILITIES = ['managedGroups', 'persistentOwnership', 'explicitTabs', 'isolatedExecution'] as const
 
 function parseBrowserCapabilities(value: unknown): BrowserCapabilities | null {
   if (typeof value !== 'object' || value === null) {
@@ -134,10 +138,17 @@ function parseBrowserCapabilities(value: unknown): BrowserCapabilities | null {
   }
 }
 
+function missingCapabilities(capabilities: BrowserCapabilities): string[] {
+  return REQUIRED_MANAGED_CAPABILITIES.filter((name) => {
+    return !capabilities[name]
+  })
+}
+
 /**
- * Probe the managed runtime API on a port. Capability negotiation replaces
- * version comparison: a relay that answers /version but has no managed
- * endpoints is reported as `unsupported` instead of being replaced.
+ * Probe the managed runtime API on a port. A reachable protocol is not enough:
+ * `ready` requires every required capability to be true. A listener that
+ * speaks the protocol but lacks capabilities is `incompatible`, and one
+ * without valid managed capabilities is `unsupported`.
  */
 export async function probeManagedRuntime({
   host = '127.0.0.1',
@@ -146,7 +157,7 @@ export async function probeManagedRuntime({
   timeoutMs = 2000,
 }: { host?: string; port?: number; token?: string; timeoutMs?: number } = {}): Promise<ManagedRuntimeProbeResult> {
   try {
-    const response = await fetch(`${formatProbeBaseUrl({ host, port })}/browser/v1/capabilities`, {
+    const response = await fetch(`${formatManagedRuntimeBaseUrl({ host, port })}/browser/v1/capabilities`, {
       signal: AbortSignal.timeout(timeoutMs),
       headers: token ? { authorization: `Bearer ${token}` } : undefined,
     })
@@ -157,11 +168,12 @@ export async function probeManagedRuntime({
       const capabilities = parseBrowserCapabilities(await response.json().catch(() => null))
       if (capabilities) {
         const relay = await probeRelayServer({ host, port, timeoutMs })
-        return {
-          state: 'ready',
-          version: relay.state === 'ready' ? relay.version : null,
-          capabilities,
+        const version = relay.state === 'ready' ? relay.version : null
+        const missing = missingCapabilities(capabilities)
+        if (missing.length > 0) {
+          return { state: 'incompatible', version, capabilities, missing }
         }
+        return { state: 'ready', version, capabilities }
       }
     }
     const relay = await probeRelayServer({ host, port, timeoutMs })
@@ -582,6 +594,12 @@ async function ensureManagedRuntimeImpl(
     )
   }
 
+  if (probe.state === 'incompatible') {
+    throw new Error(
+      `${host}:${port} speaks the managed protocol but is missing required capabilities: ${probe.missing.join(', ')}. Refusing to use or replace it.`,
+    )
+  }
+
   if (probe.state === 'unsupported') {
     throw new Error(
       `${host}:${port} is serving a listener without the managed browser API (${probe.version ? `v${probe.version}` : 'unknown version'}). Refusing to replace it; run \`pi-browser-runtime\` on another port or stop it yourself.`,
@@ -623,6 +641,11 @@ async function ensureManagedRuntimeImpl(
     if (newProbe.state === 'unauthorized') {
       throw new Error(
         `Managed runtime on ${host}:${port} requires PI_BROWSER_TOKEN that does not match this client. Check the token and the runtime logs at ${runtimeLogPath}.`,
+      )
+    }
+    if (newProbe.state === 'incompatible') {
+      throw new Error(
+        `Managed runtime on ${host}:${port} is missing required capabilities: ${newProbe.missing.join(', ')}.`,
       )
     }
   }

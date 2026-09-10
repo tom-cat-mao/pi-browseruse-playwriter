@@ -26,11 +26,9 @@ const FORK_DEV_EXTENSION_KEY =
 const useForkDevKey = process.env.PLAYWRITER_FORK_DEV_KEY === '1' || process.env.PLAYWRITER_FORK_DEV_KEY === 'true'
 
 const defineEnv: Record<string, string> = {
-  // Fork dev builds target the managed runtime port; legacy and production
-  // builds keep the old relay port.
-  'process.env.PLAYWRITER_PORT': JSON.stringify(
-    process.env.PLAYWRITER_PORT || (!process.env.PRODUCTION && useForkDevKey ? '19989' : '19988'),
-  ),
+  // Fork builds always target the managed runtime port, including packaged and
+  // production builds; legacy builds keep the old relay port.
+  'process.env.PLAYWRITER_PORT': JSON.stringify(process.env.PLAYWRITER_PORT || (useForkDevKey ? '19989' : '19988')),
   __PLAYWRITER_VERSION__: JSON.stringify(playwriterPkg.version),
   __PLAYWRITER_OPEN_WELCOME_PAGE__: JSON.stringify(process.env.PLAYWRITER_OPEN_WELCOME_PAGE !== '0'),
 }
@@ -63,12 +61,14 @@ export default defineConfig({
               }
             }
 
-            // Inject key for stable extension ID in dev/test builds (not production).
-            // Default build keeps the legacy dev ID (pebbngnfojnignonigcnkdilknapkgid)
-            // so existing tests keep working. The fork key gives the runtime its own
-            // dev identity (eeklahpecooapnailfaebkjjembkjhhg).
-            if (!process.env.PRODUCTION) {
-              manifest.key = useForkDevKey ? FORK_DEV_EXTENSION_KEY : LEGACY_DEV_EXTENSION_KEY
+            // Fork builds always embed the fork key (eeklahpecooapnailfaebkjjembkjhhg),
+            // including production/packaged builds, so the unpacked identity is
+            // stable. A listed store build would use a real store key here instead.
+            // Legacy builds keep the upstream dev key only outside production.
+            if (useForkDevKey) {
+              manifest.key = FORK_DEV_EXTENSION_KEY
+            } else if (!process.env.PRODUCTION) {
+              manifest.key = LEGACY_DEV_EXTENSION_KEY
             }
 
             return JSON.stringify(manifest, null, 2)

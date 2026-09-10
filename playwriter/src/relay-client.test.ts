@@ -2,7 +2,12 @@ import { describe, it, expect } from 'vitest'
 import * as http from 'node:http'
 import * as net from 'node:net'
 import { BROWSER_PROTOCOL_VERSION, type BrowserCapabilities } from './browser-protocol.js'
-import { ensureManagedRuntime, probeManagedRuntime, probeRelayServer } from './relay-client.js'
+import {
+  ensureManagedRuntime,
+  formatManagedRuntimeBaseUrl,
+  probeManagedRuntime,
+  probeRelayServer,
+} from './relay-client.js'
 
 const validCapabilities: BrowserCapabilities = {
   protocolVersion: BROWSER_PROTOCOL_VERSION,
@@ -73,6 +78,24 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.setHeader('content-type', 'application/json')
   res.end(JSON.stringify(body))
 }
+
+describe('formatManagedRuntimeBaseUrl', () => {
+  it('does not inject the managed port into full URLs', () => {
+    expect(formatManagedRuntimeBaseUrl({ host: 'https://machine.traforo.dev', port: 19989 })).toBe(
+      'https://machine.traforo.dev',
+    )
+    expect(formatManagedRuntimeBaseUrl({ host: 'https://machine.traforo.dev:8443', port: 19989 })).toBe(
+      'https://machine.traforo.dev:8443',
+    )
+    expect(formatManagedRuntimeBaseUrl({ host: 'http://127.0.0.1', port: 19989 })).toBe('http://127.0.0.1')
+  })
+
+  it('brackets bare ipv6 hosts', () => {
+    expect(formatManagedRuntimeBaseUrl({ host: '::1', port: 19989 })).toBe('http://[::1]:19989')
+    expect(formatManagedRuntimeBaseUrl({ host: '[::1]', port: 19989 })).toBe('http://[::1]:19989')
+    expect(formatManagedRuntimeBaseUrl({ host: '127.0.0.1', port: 19989 })).toBe('http://127.0.0.1:19989')
+  })
+})
 
 describe('probeRelayServer', () => {
   it('reports a valid /version response as ready', async () => {
@@ -197,6 +220,25 @@ describe('probeManagedRuntime', () => {
     await relay.close()
   })
 
+  it('reports a protocol without required capabilities as incompatible', async () => {
+    const relay = await listenHttp((req, res) => {
+      if (req.url === '/browser/v1/capabilities') {
+        sendJson(res, 200, { ...validCapabilities, managedGroups: false, persistentOwnership: false })
+        return
+      }
+      sendJson(res, 200, { version: '1.0.0' })
+    })
+
+    expect(await probeManagedRuntime({ port: relay.port })).toEqual({
+      state: 'incompatible',
+      version: '1.0.0',
+      capabilities: { ...validCapabilities, managedGroups: false, persistentOwnership: false },
+      missing: ['managedGroups', 'persistentOwnership'],
+    })
+
+    await relay.close()
+  })
+
   it('reports invalid capabilities as unsupported', async () => {
     const relay = await listenHttp((req, res) => {
       sendJson(res, 200, { protocolVersion: BROWSER_PROTOCOL_VERSION })
@@ -271,6 +313,20 @@ describe('ensureManagedRuntime', () => {
     ])
 
     expect(relay.requests.filter((url) => url === '/browser/v1/capabilities')).toHaveLength(2)
+
+    await relay.close()
+  })
+
+  it('refuses a runtime that is missing required capabilities', async () => {
+    const relay = await listenHttp((req, res) => {
+      if (req.url === '/browser/v1/capabilities') {
+        sendJson(res, 200, { ...validCapabilities, isolatedExecution: false })
+        return
+      }
+      sendJson(res, 200, { version: '1.0.0' })
+    })
+
+    await expect(ensureManagedRuntime({ host: '127.0.0.1', port: relay.port })).rejects.toThrow(/isolatedExecution/)
 
     await relay.close()
   })

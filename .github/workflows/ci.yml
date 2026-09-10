@@ -47,8 +47,14 @@ jobs:
       - name: Distribution smoke check
         run: pnpm --filter @tom-cat/pi-browser-runtime smoke
       # Browser-free tests only. Chrome tests are a separate, user-authorized phase.
-      - name: Unit tests (no browser)
+      - name: Runtime unit tests (no browser)
         run: pnpm --filter @tom-cat/pi-browser-runtime test:unit
+      - name: Extension tests (no browser)
+        run: pnpm --filter mcp-extension test
+      - name: Pi package tests
+        run: pnpm --filter @tom-cat/pi-browser-use-extension test
+      - name: Pi load check
+        run: pnpm --filter @tom-cat/pi-browser-use-extension load-check
       - name: Typecheck extension
         run: pnpm --filter mcp-extension exec tsc --project .
       - name: Typecheck pi package
