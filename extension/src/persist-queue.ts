@@ -2,9 +2,10 @@
  * Serial write queue that survives failures: a rejected write never poisons the
  * chain, so the next write still runs.
  *
- * `invalidate()` drops queued and in-flight writers. Callers use it after
- * re-reading authoritative state (e.g. recovering from a storage failure) so a
- * stale in-memory snapshot can never overwrite fresher persisted records.
+ * `invalidate()` marks queued-but-not-started writers as stale and resolves only
+ * after the currently running write settles. Callers await it before re-reading
+ * authoritative state, so a slower in-flight write can never land after the
+ * reload/new state (an already-issued chrome.storage write cannot be cancelled).
  */
 export class PersistQueue {
   private tail: Promise<void> = Promise.resolve()
@@ -28,8 +29,18 @@ export class PersistQueue {
     return next
   }
 
-  invalidate(): void {
+  /**
+   * Skips queued stale writers and waits for the in-flight one to finish. New
+   * writers submitted during the drain stay ordered behind it.
+   */
+  async invalidate(): Promise<void> {
     this.generation += 1
-    this.tail = Promise.resolve()
+    const pending = this.tail
+    await pending.catch(() => {
+      return undefined
+    })
+    if (this.tail === pending) {
+      this.tail = Promise.resolve()
+    }
   }
 }

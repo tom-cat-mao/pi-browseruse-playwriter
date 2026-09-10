@@ -50,7 +50,7 @@ describe('PersistQueue', () => {
     expect(events).toEqual(['first:start', 'first:end', 'second'])
   })
 
-  test('invalidate drops queued stale writers but lets the running one finish', async () => {
+  test('invalidate drops queued stale writers and waits for the running one', async () => {
     const queue = new PersistQueue()
     const events: string[] = []
     const gate = deferred()
@@ -70,9 +70,33 @@ describe('PersistQueue', () => {
     await Promise.resolve()
     expect(events).toEqual(['running:start'])
 
-    queue.invalidate()
+    const drained = queue.invalidate()
     gate.resolve()
-    await Promise.all([running, queued])
+    await Promise.all([running, queued, drained])
     expect(events).toEqual(['running:start', 'running:end'])
+  })
+
+  test('an old slower write settles before a new write starts', async () => {
+    const queue = new PersistQueue()
+    const events: string[] = []
+    const gate = deferred()
+
+    const oldWrite = queue.run(async () => {
+      events.push('old:start')
+      await gate.promise
+      events.push('old:end')
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(events).toEqual(['old:start'])
+
+    const drained = queue.invalidate()
+    // Submitted during the drain: must start only after the old write settles.
+    const newWrite = queue.run(async () => {
+      events.push('new')
+    })
+    gate.resolve()
+    await Promise.all([oldWrite, newWrite, drained])
+    expect(events).toEqual(['old:start', 'old:end', 'new'])
   })
 })

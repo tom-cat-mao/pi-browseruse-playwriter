@@ -217,15 +217,15 @@ export class ManagedGroups {
   }
 
   /** Retries a failed load once (used by WS connect and requests) so transient errors recover. */
-  private retryInitialize(): Promise<void> {
+  private async retryInitialize(): Promise<void> {
     if (this.unavailableReason !== null) {
       this.readyPromise = null
       this.unavailableReason = null
-      // Invalidate any write snapshot queued before the failure; the reload below
-      // replaces in-memory state with the authoritative persisted copy.
-      this.writeQueue.invalidate()
+      // Wait for any in-flight write to settle before re-reading authoritative
+      // state; queued stale snapshots are skipped.
+      await this.writeQueue.invalidate()
     }
-    return this.initialize()
+    await this.initialize()
   }
 
   private isAvailable(): boolean {
@@ -457,10 +457,6 @@ export class ManagedGroups {
   async handleBrowserRequest(request: BrowserRequest): Promise<BrowserResponse> {
     const requestId = typeof request?.requestId === 'string' ? request.requestId : ''
     try {
-      await this.retryInitialize()
-      // Wait for an in-flight restore so requests never observe a half-reconciled registry.
-      await this.connectQueue
-      this.ensureAvailable()
       if (!requestId) {
         throw new ManagedGroupsError({ code: 'invalid-request', message: 'requestId must not be empty' })
       }
@@ -471,7 +467,19 @@ export class ManagedGroups {
         throw new ManagedGroupsError({ code: 'invalid-request', message: 'operation.kind is required' })
       }
 
+      // Cancel is handled before init/restore waits: it must be able to interrupt
+      // a request that is still queued behind the restore or a per-group lock.
+      if (request.operation.kind === 'request.cancel') {
+        return this.handleRequestCancel(request)
+      }
+
+      await this.retryInitialize()
+      // Wait for an in-flight restore so requests never observe a half-reconciled registry.
+      await this.connectQueue
+      this.ensureAvailable()
+
       const dedupe = this.buildCreateDedupeContext(request)
+      let recoveryEntry: RequestLedgerEntry | undefined
       if (dedupe) {
         const decision = classifyCreateRequestDedupe({
           ledgerEntry: dedupe.ledgerEntry,
@@ -487,8 +495,8 @@ export class ManagedGroups {
         if (decision === 'replay' && dedupe.ledgerEntry) {
           return this.replayCompletedCreate(requestId, dedupe.ledgerEntry)
         }
-        if (decision === 'recover-pending' && dedupe.ledgerEntry) {
-          return await this.recoverPendingCreate(request, dedupe.ledgerEntry)
+        if (decision === 'recover-pending') {
+          recoveryEntry = dedupe.ledgerEntry
         }
       }
 
@@ -510,7 +518,9 @@ export class ManagedGroups {
         requestId,
         generation: this.generation,
       }
-      const promise = this.dispatchRequest(request, context)
+      const promise = recoveryEntry
+        ? this.dispatchPendingRecovery(request, recoveryEntry, context)
+        : this.dispatchRequest(request, context)
       this.inFlightRequests.set(inFlightKey, { fingerprint: dedupe?.fingerprint, promise })
       try {
         return await promise
@@ -521,6 +531,22 @@ export class ManagedGroups {
     } catch (error: unknown) {
       return this.errorResponse(requestId, error)
     }
+  }
+
+  /**
+   * Recovery of an interrupted create runs through the per-group queue and the
+   * request tracker like a normal create, with the same cancellation and owner
+   * fences, so a cancel can stop it before it touches Chrome.
+   */
+  private dispatchPendingRecovery(
+    request: BrowserRequest,
+    entry: RequestLedgerEntry,
+    context: RequestContext,
+  ): Promise<BrowserResponse> {
+    const queueKey = entry.groupId ?? `pending:${entry.requestId}`
+    return this.groupQueue.run(queueKey, () => {
+      return this.recoverPendingCreate(request, entry, context)
+    })
   }
 
   /**
@@ -916,7 +942,13 @@ export class ManagedGroups {
     // Chrome side effect, so an interrupted attempt can never create a duplicate.
     const tabId = createOpaqueId('ptab')
     const fingerprint = buildCreateRequestFingerprint({ kind: 'tabs.create', groupId: operation.groupId, url })
-    this.rememberCreate(request, { fingerprint, phase: 'pending', tabId, now: Date.now() })
+    this.rememberCreate(request, {
+      fingerprint,
+      phase: 'pending',
+      tabId,
+      groupId: operation.groupId,
+      now: Date.now(),
+    })
     await this.persist()
 
     let chromeTabId: number | undefined
@@ -1129,7 +1161,11 @@ export class ManagedGroups {
    * resumed by re-attaching the debugger; navigation is never replayed because we
    * cannot know whether it was already sent.
    */
-  private async recoverPendingCreate(request: BrowserRequest, entry: RequestLedgerEntry): Promise<BrowserResponse> {
+  private async recoverPendingCreate(
+    request: BrowserRequest,
+    entry: RequestLedgerEntry,
+    context: RequestContext,
+  ): Promise<BrowserResponse> {
     if (entry.operation !== 'tabs.create') {
       throw new ManagedGroupsError({
         code: 'outcome-unknown',
@@ -1138,6 +1174,11 @@ export class ManagedGroups {
           'a previous groups.create was interrupted; the group is either fully written or absent, so it is not resumed automatically',
       })
     }
+    // The earlier attempt already had Chrome side effects; a cancel now must
+    // report unknown rather than claiming nothing happened.
+    this.requests.markSideEffects({ sessionId: context.sessionId, requestId: context.requestId })
+    this.assertCanContinue(context)
+
     const registry = this.getRegistry()
     const tab = entry.tabId ? findTab(registry, entry.tabId) : undefined
     const group = tab ? findGroup(registry, tab.groupId) : undefined
@@ -1156,6 +1197,10 @@ export class ManagedGroups {
       expectedChromeGroupId: group?.chromeGroupId,
     })
 
+    // Cancellation/generation/ownership fence after the Chrome read and before
+    // the resume attaches anything.
+    this.assertCanContinue(context, tab ? { tabId: tab.tabId } : {})
+
     if (decision === 'released') {
       throw new ManagedGroupsError({
         code: 'resource-released',
@@ -1173,6 +1218,8 @@ export class ManagedGroups {
 
     try {
       const attached = await this.deps.attachTab(tab.chromeTabId)
+      // The user may have released the tab while the debugger was attaching.
+      this.assertCanContinue(context, { tabId: tab.tabId })
       this.mutate((current) => {
         return setTabAttachment(current, {
           tabId: tab.tabId,
@@ -1252,23 +1299,54 @@ export class ManagedGroups {
     const chromeTab = await chrome.tabs.get(tab.chromeTabId).catch(() => {
       return null
     })
-    if (!chromeTab) {
-      await this.releaseManagedTab({ tabId: tab.tabId, reason: 'resolved-tab-missing', ungroup: false })
+
+    // Re-read after the await: the user may have released or moved the tab while
+    // we were resolving it. This response is authoritative for the relay, so a
+    // stale "ready" must never be returned.
+    const current = findTab(this.getRegistry(), tab.tabId)
+    if (!current || current.state === 'released') {
       throw new ManagedGroupsError({
         code: 'resource-released',
-        message: `tab ${tab.tabId} no longer exists in Chrome`,
+        message: `tab ${tab.tabId} was released while it was being resolved`,
       })
     }
+    if (!chromeTab) {
+      await this.releaseManagedTab({ tabId: current.tabId, reason: 'resolved-tab-missing', ungroup: false })
+      throw new ManagedGroupsError({
+        code: 'resource-released',
+        message: `tab ${current.tabId} no longer exists in Chrome`,
+      })
+    }
+    if (current.browserEpoch !== this.browserEpoch || current.state === 'needs-rebind') {
+      throw new ManagedGroupsError({
+        code: 'needs-rebind',
+        message: `tab ${current.tabId} belongs to a previous browser run; its Chrome mapping is not reused`,
+      })
+    }
+    const group = findGroup(this.getRegistry(), current.groupId)
+    if (group?.chromeGroupId !== undefined && chromeTab.groupId !== group.chromeGroupId) {
+      // The user moved the tab out of its managed group mid-resolve: tombstone it
+      // immediately instead of reporting it as ready.
+      await this.releaseManagedTab({ tabId: current.tabId, reason: 'resolved-tab-moved-out', ungroup: false })
+      throw new ManagedGroupsError({
+        code: 'resource-released',
+        message: `tab ${current.tabId} is no longer inside its managed group`,
+      })
+    }
+
     this.mutate((registry) => {
       return setTabPageInfo(registry, {
-        tabId: tab.tabId,
+        tabId: current.tabId,
         url: chromeTab.url ?? '',
         title: chromeTab.title ?? '',
       })
     })
-    const resolved = findTab(this.getRegistry(), tab.tabId)
-    if (!resolved) {
-      throw new ManagedGroupsError({ code: 'internal-error', message: 'tab disappeared during resolve' })
+    const resolved = findTab(this.getRegistry(), current.tabId)
+    if (!resolved || resolved.state === 'released') {
+      throw new ManagedGroupsError({
+        code: 'resource-released',
+        message: `tab ${current.tabId} was released while it was being resolved`,
+      })
     }
     return ok(request.requestId, { tab: resolved })
   }
