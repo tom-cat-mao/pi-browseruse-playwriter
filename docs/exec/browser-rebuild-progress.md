@@ -29,7 +29,7 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
 | 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 54c1f07已集成，说明/严格类型修订中 |
-| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | 无Chrome验收中，候选23c3ebd |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | FAIL：C outcome/残留回调阻塞，Chrome未开始 |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -100,6 +100,11 @@ executor、pi-tools、integration。主目录 main 未修改。
   权限600，内容校验一致，不公开不提交，避免清理worktree丢失。
 - 全新最终reviewer CodeBuddy14在review/browser-rebuild独立树，
   候选23c3ebd；Chrome仍未授权，结果最多是非浏览器验收。
+- 全新CodeBuddy14最终独立验收FAIL（候选23c3ebd），报告在
+  docs/exec/browser-independent-acceptance.md。真实worker+桩page探针确认
+  P0副作用后not-started错误、P1成功脚本残留timer跨请求发指令；C修订中。
+- reviewer其余测试重跑通过不抵消P0/P1，Chrome阶段INCOMPLETE。
+- 最新静态worker接线后协调者build/smoke、unit218、integration34通过。
 - 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
