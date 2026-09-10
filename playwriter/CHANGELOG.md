@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.5.0
+
+1. **Skill Recorder** — record a workflow once in your real Chrome and let an agent turn it into a reusable skill. Click **Record Skill** on the in-page toolbar, or run:
+
+   ```bash
+   playwriter recorder start            # reuse the only session, or create one
+   playwriter recorder start -s 1       # attach to an existing session
+   # ... perform the workflow in the browser ...
+   playwriter recorder stop             # stop the only active recording
+   playwriter recorder events           # thin timeline of the latest recording
+   playwriter recorder events 4 7       # full details of events 4 and 7
+   playwriter recorder events -r 3      # events of recording 3
+   playwriter recorder status           # active recordings + current page urls
+   ```
+
+   Every click, fill, press, select, and file pick is recorded with Playwright locator code plus structured fields (`text`, `key`, `options`, `files`, `button`, `modifiers`). Mutating xhr/fetch (POST/PUT/PATCH/DELETE) is captured with request and response bodies so the agent can reverse-engineer a site API into an in-page SDK. Analytics collector hosts are dropped. WebSockets are not recorded.
+
+   Events live at `~/.playwriter/recordings/<id>.json`. A jpeg is saved for each visual change in `~/.playwriter/recordings/<id>/frames/<ms>.jpg`. Every event has an `ms` timestamp so you can pick the frame just before a click. Recording runs in the relay daemon, survives CLI exit, and auto-stops after 20 minutes. At most 10 recordings can be active; a new start stops the oldest one.
+
+   `recorder start` prints instructions for writing a `SKILL.md` plus a named helper (`submit.js`, `sdk.js`). The agent skill now installs from https://playwriter.dev:
+
+   ```bash
+   npx -y skills add https://playwriter.dev
+   ```
+
+   The toolbar Record button creates a session when none exists and no longer fails when many sessions are open. Websites cannot start or stop recordings: CORS on those routes allows only the Playwriter extension origin.
+
+2. **Live RTMP streaming** — stream a browser tab to X Live, Twitch, YouTube, or any RTMP endpoint via ffmpeg. Uses the same `chrome.tabCapture` pipeline as video recording, so the stream survives page navigation. ffmpeg runs inside the relay, so the stream keeps running after the CLI exits.
+
+   ```bash
+   playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>
+   playwriter stream status -s 1
+   playwriter stream stop -s 1
+   ```
+
+   Repeat `--rtmp` to fan out to several destinations with one encode. Defaults match X Live (1080p, 9000 kbps, 30 fps, 3s keyframes). For Twitch use `--video-bitrate 6000 --keyframe-interval 2`. Same API inside execute:
+
+   ```js
+   await stream.start({ rtmpUrls: ['rtmp://va.pscp.tv:80/x/KEY'] })
+   await stream.status()
+   await stream.stop()
+   ```
+
+   Stream keys are never logged. Status output only shows redacted destinations like `rtmp://host/…`.
+
+3. **Native ESM imports in execute** — `import()` now works inside `-e` / MCP execute. Relative modules resolve from the session working directory and run with normal Node.js permissions:
+
+   ```js
+   const { inspectPage } = await import('./scripts/inspect-page.mjs')
+   console.log(await inspectPage({ page }))
+   ```
+
+   Sandboxed `require()` and `importModule()` remain available for restricted access to allowlisted built-ins.
+
+4. **Daemon tutorial on idle icon click** — clicking the extension icon while the local daemon is down now opens a short tutorial tab instead of sitting on a gray or orange badge. A second click focuses the existing tutorial tab.
+
+5. **`PLAYWRITER_EXEC_TIMEOUT` env var** — set the default execution timeout (ms) for CLI `-e`/`-f` and the MCP `execute` tool. Explicit `--timeout` or the MCP `timeout` argument still wins:
+
+   ```bash
+   export PLAYWRITER_EXEC_TIMEOUT=30000
+   playwriter -s 1 -e 'await page.goto("https://slow.example")'
+   ```
+
+6. **Hide Playwriter UI during screenshots** — toolbar, overlay, ghost cursor, scrollbars, and the blinking caret are hidden for `Page.captureScreenshot`, so captured frames stay clean.
+
+7. **Show tracked page errors in execution output** — uncaught exceptions from pages assigned to the current session now appear automatically:
+
+   ```text
+   [PAGE ERROR] Uncaught TypeError: Cannot read properties of undefined
+   ```
+
+8. **Drop noisy CDP events** — high-frequency events such as `Network.dataReceived`, `*ExtraInfo`, and `webSocketFrame*` are no longer forwarded to Playwright clients. Relay and CDP logs also flush in 500ms batches, so heavy pages no longer flood the relay.
+
+9. **Ghost cursor works on strict CSP pages** — the cursor is now an inline `<svg>` instead of a `data:` background image, so sites like Hacker News no longer block it.
+
+10. **Fix long-running CLI executions** — `-e` / `-f` now follow the configured `--timeout` instead of failing at Node's fixed 300-second response-header timeout.
+
+11. **Fix cross-OS session cwd** — a Windows CLI talking to a WSL relay no longer mangles `C:\Users\...` into a POSIX path. Windows paths are translated to `/mnt/c/...`.
+
+12. **Fix remote relay auth** — MCP startup against token-protected remote relays, including Docker and devcontainer hosts, now sends the bearer token on the health check.
+
+    ```bash
+    playwriter --host host.docker.internal --token MY_SECRET_TOKEN
+    ```
+
+13. **Harden the execute sandbox** — `process.getBuiltinModule()` and `import()` no longer bypass the built-in allowlist.
+
+14. **Fix stale snapshots after navigation** — `snapshot()` waits for the accessibility cache to update after a full-page or client-side navigation.
+
+15. **Fix `Cannot find module 'ajv'` on `npx playwriter`** — `ajv` is now a direct dependency so npx can resolve it.
+
+16. **Document extension-mode keyboard focus** — skill docs now say agents should click a field before filling it, because Chrome routes OS key events to the focused Chrome window.
+
+Thanks @Ylandolsi for #103 and @tylergibbs1 for #101.
+
 ## 0.4.0
 
 1. **Cloud browser sessions via Browser Use** — spin up stealth Chromium VMs in the cloud with `playwriter session new --browser cloud`. Cloud browsers support residential proxies (`--proxy us`, `--proxy de`), custom proxies (`--custom-proxy host:port`), and configurable timeouts (`--timeout 120`). Idle sessions auto-disconnect after 10 minutes.

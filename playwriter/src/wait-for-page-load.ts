@@ -103,7 +103,7 @@ export async function waitForPageLoad(options: WaitForPageLoadOptions): Promise<
               return false
             }
 
-            if (filteredDomains.some((domain: string) => url.includes(domain))) {
+            if (filteredDomains.some((domain) => url.includes(domain))) {
               return false
             }
 
@@ -111,7 +111,7 @@ export async function waitForPageLoad(options: WaitForPageLoadOptions): Promise<
               return false
             }
 
-            if (elapsed > slowResourceThreshold && filteredExtensions.some((ext: string) => url.includes(ext))) {
+            if (elapsed > slowResourceThreshold && filteredExtensions.some((ext) => url.includes(ext))) {
               return false
             }
 

@@ -28,7 +28,7 @@ Other browser MCPs spawn a fresh Chrome — no logins, no extensions, instantly 
 
 4. Install the skill so your agent knows how to use Playwriter:
    ```bash
-   npx -y skills add remorses/playwriter
+   npx -y skills add https://playwriter.dev
    ```
 
 ## Quick Start
@@ -80,7 +80,7 @@ console.log({ title, url: page.url() });
 
 ## Examples
 
-Variables in scope: `page`, `context`, `state` (persists between calls), `require`, and Node.js globals.
+Variables in scope: `page`, `context`, `state` (persists between calls), `require`, `importModule`, native `import()`, and Node.js globals. Relative imports resolve from the session working directory.
 
 **Persist data in state:**
 
@@ -253,7 +253,7 @@ Also works on a LAN without traforo (`PLAYWRITER_HOST=192.168.1.10`). Full guide
 
 - **Local only**: WebSocket server on `localhost:19988`
 - **Origin validation**: Only our extension IDs allowed (browsers can't spoof Origin)
-- **Explicit consent**: Only tabs where you clicked the extension icon
+- **Controlled tab scope**: Tabs are controlled after an extension click. By default, Playwriter also creates a controlled `about:blank` tab when a client connects with no controlled tabs. Set `PLAYWRITER_AUTO_ENABLE=false` to require a manual click.
 - **Visible automation**: Chrome shows automation banner on controlled tabs
 - **No remote access**: Malicious websites cannot connect
 

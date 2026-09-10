@@ -211,4 +211,7 @@ to `get-stream@9+` unless the vendored unzip code is rewritten or replaced.
 `cli-help.test.ts > unknown command` fails on main: goke no longer prints
 `playwriter --help` to stderr. `extension-connection.test.ts > reconnect after
 disconnecting everything` also fails on clean HEAD (verified via worktree).
+`relay-core.test.ts > shadcn-ui snapshot` flakes when ui.shadcn.com loads
+slower than the 10s exec timeout. `relay-session.test.ts > list scripts with
+Debugger class` flakes intermittently (passes on retry).
 Neither is a regression signal for unrelated changes.

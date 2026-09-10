@@ -44,7 +44,7 @@ The `scripting` permission was originally added for iframe cleanup before debugg
 2. **Re-inject the toolbar** after page navigations via `chrome.webNavigation.onDOMContentLoaded`.
 3. **Destroy the toolbar** when the user disconnects Playwriter from a tab, so no extension UI is left behind on pages the user is actively browsing.
 
-All injections target only tabs that the user has explicitly connected (clicked the extension icon), and only the top-level frame (`allFrames: false`). No code is injected into tabs the user has not opted in to.
+Injections target manually connected tabs and the blank tab Playwriter auto-creates when a client connects with no controlled tabs. They target only the top-level frame (`allFrames: false`). Playwriter does not inject into other existing tabs.
 
 ### host_permissions (<all_urls>)
 

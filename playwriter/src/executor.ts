@@ -46,6 +46,77 @@ const __dirname = path.dirname(__filename)
 
 const require = createRequire(import.meta.url)
 
+/**
+ * Check if a path looks like a Windows absolute path (e.g. C:\Users or D:/foo).
+ * Works on any platform — uses a regex instead of path.isAbsolute() which is
+ * platform-dependent.
+ */
+export function isWindowsAbsolutePath(p: string): boolean {
+  return /^[A-Za-z]:[/\\]/.test(p)
+}
+
+/**
+ * On POSIX, attempt to translate a Windows absolute path to its WSL mount equivalent.
+ * E.g. C:\Users\me\project → /mnt/c/Users/me/project.
+ * Returns null if the current platform is Windows (no translation needed),
+ * if the path isn't a Windows path, or if the WSL mount point doesn't exist.
+ */
+export function tryTranslateWindowsPathToWSL(windowsPath: string): string | null {
+  if (process.platform === 'win32') {
+    return null
+  }
+  if (!isWindowsAbsolutePath(windowsPath)) {
+    return null
+  }
+  const driveLetter = windowsPath[0].toLowerCase()
+  const mountPoint = `/mnt/${driveLetter}`
+  if (!fs.existsSync(mountPoint)) {
+    return null
+  }
+  // Strip drive letter + colon, normalize backslashes to forward slashes
+  const relativePart = windowsPath.slice(2).replace(/\\/g, '/')
+  return path.posix.join(mountPoint, relativePart)
+}
+
+/**
+ * Resolve a session cwd that may have come from a different OS.
+ * Returns { cwd, warning } where cwd is the resolved absolute path (or null
+ * if unusable) and warning is a user-facing message if translation was needed
+ * or the path was rejected.
+ */
+export function resolveSessionCwd(rawCwd: string | undefined): { cwd: string | null; warning: string | null } {
+  if (!rawCwd) {
+    return { cwd: null, warning: null }
+  }
+
+  // If the path is already absolute on this platform, use it directly
+  if (path.isAbsolute(rawCwd)) {
+    return { cwd: path.resolve(rawCwd), warning: null }
+  }
+
+  // On POSIX receiving a Windows path: try WSL translation
+  if (isWindowsAbsolutePath(rawCwd)) {
+    const translated = tryTranslateWindowsPathToWSL(rawCwd)
+    if (translated) {
+      return {
+        cwd: translated,
+        warning: `CLI cwd '${rawCwd}' is a Windows path. Translated to WSL mount: ${translated}`,
+      }
+    }
+    return {
+      cwd: null,
+      warning: `CLI cwd '${rawCwd}' is a Windows path but no WSL mount found at /mnt/${rawCwd[0].toLowerCase()}. Session fs will be scoped to /tmp only.`,
+    }
+  }
+
+  // Path is relative on this platform and not a Windows path — shouldn't happen
+  // in normal usage but guard against mangled paths
+  return {
+    cwd: null,
+    warning: `CLI cwd '${rawCwd}' is not an absolute path on this platform. Session fs will be scoped to /tmp only.`,
+  }
+}
+
 export class CodeExecutionTimeoutError extends Error {
   constructor(timeout: number) {
     super(`Code execution timed out after ${timeout}ms`)
@@ -245,12 +316,13 @@ export interface ExecuteResult {
   isError: boolean
 }
 
-interface WarningEvent {
+interface OutputEvent {
   id: number
+  type: 'warning' | 'page-error'
   message: string
 }
 
-interface WarningScope {
+interface OutputScope {
   cursor: number
 }
 
@@ -346,16 +418,16 @@ export class PlaywrightExecutor {
   private pageLogCursor: Map<Page, number> = new Map()
   private lastSnapshots: WeakMap<Page, Map<string, string>> = new WeakMap()
   private lastRefToLocator: WeakMap<Page, Map<string, string>> = new WeakMap()
-  private warningEvents: WarningEvent[] = []
-  private nextWarningEventId = 0
-  private lastDeliveredWarningEventId = 0
+  private outputEvents: OutputEvent[] = []
+  private nextOutputEventId = 0
+  private lastDeliveredOutputEventId = 0
 
   // Recording timestamp tracking: when recording is active, each execute()
   // call pushes {start, end} (seconds relative to recordingStartedAt).
   // Returned by stopRecording() so the model can speed up idle sections.
   private recordingStartedAt: number | null = null
   private executionTimestamps: Array<{ start: number; end: number }> = []
-  private activeWarningScopes = new Set<WarningScope>()
+  private activeOutputScopes = new Set<OutputScope>()
   private pagesWithListeners = new WeakSet<Page>()
   private suppressPageCloseWarnings = false
 
@@ -378,7 +450,15 @@ export class PlaywrightExecutor {
     this.cdpConfig = options.cdpConfig
     this.logger = options.logger || { log: console.log, error: console.error }
     this.sessionMetadata = options.sessionMetadata || { extensionId: null, browser: null, profile: null }
-    this.sessionCwd = options.cwd ? path.resolve(options.cwd) : null
+    // Resolve cwd with cross-OS awareness (Windows CLI + Linux relay via WSL).
+    // resolveSessionCwd handles WSL /mnt/ translation and rejects paths that
+    // can't be resolved on the relay's platform to prevent mangled paths like
+    // /home/user/C:\Users\... (see issue #107).
+    const { cwd: resolvedCwd, warning: cwdWarning } = resolveSessionCwd(options.cwd)
+    this.sessionCwd = resolvedCwd
+    if (cwdWarning) {
+      this.logger.log(`[session cwd] ${cwdWarning}`)
+    }
     this.cloudSession = options.cloudSession || null
     // ScopedFS expects an array of allowed directories. If cwd is provided, use it; otherwise use defaults.
     this.scopedFs = new ScopedFS(
@@ -462,7 +542,7 @@ export class PlaywrightExecutor {
 
     // Apply to future pages
     context.on('page', (page) => {
-      applyToPage(page)
+      void applyToPage(page)
     })
 
     this.logger.log('Proxy bandwidth acceleration enabled: blocking raster images')
@@ -480,8 +560,12 @@ export class PlaywrightExecutor {
   }
 
   enqueueWarning(message: string) {
-    this.nextWarningEventId += 1
-    this.warningEvents.push({ id: this.nextWarningEventId, message })
+    this.enqueueOutputEvent({ type: 'warning', message })
+  }
+
+  private enqueueOutputEvent(event: Omit<OutputEvent, 'id'>) {
+    this.nextOutputEventId += 1
+    this.outputEvents.push({ id: this.nextOutputEventId, ...event })
   }
 
   /** Update the cloud session timeout from external tracking (relay timer). */
@@ -491,45 +575,55 @@ export class PlaywrightExecutor {
     }
   }
 
-  private beginWarningScope(): WarningScope {
-    // Use lastDeliveredWarningEventId as cursor (not nextWarningEventId) so
-    // warnings enqueued by the relay interval between execute() calls are
-    // picked up by the next scope. Using nextWarningEventId would skip them.
-    const scope: WarningScope = {
-      cursor: this.lastDeliveredWarningEventId,
+  private beginOutputScope(): OutputScope {
+    // Use lastDeliveredOutputEventId as cursor (not nextOutputEventId) so
+    // events enqueued between execute() calls are picked up by the next scope.
+    // Using nextOutputEventId would skip them.
+    const scope: OutputScope = {
+      cursor: this.lastDeliveredOutputEventId,
     }
-    this.activeWarningScopes.add(scope)
+    this.activeOutputScopes.add(scope)
     return scope
   }
 
-  private flushWarningsForScope(scope: WarningScope): string {
-    const relevantWarnings = this.warningEvents.filter((warning) => {
-      return warning.id > scope.cursor
+  private flushOutputForScope(scope: OutputScope): string {
+    const relevantEvents = this.outputEvents.filter((event) => {
+      return event.id > scope.cursor
     })
-    const latestWarningId = relevantWarnings.at(-1)?.id
-    if (latestWarningId && latestWarningId > this.lastDeliveredWarningEventId) {
-      this.lastDeliveredWarningEventId = latestWarningId
+    const latestEventId = relevantEvents.at(-1)?.id
+    if (latestEventId && latestEventId > this.lastDeliveredOutputEventId) {
+      this.lastDeliveredOutputEventId = latestEventId
     }
 
-    this.activeWarningScopes.delete(scope)
-    this.pruneDeliveredWarnings()
+    this.activeOutputScopes.delete(scope)
+    this.pruneDeliveredOutputEvents()
 
-    if (relevantWarnings.length === 0) {
+    if (relevantEvents.length === 0) {
       return ''
     }
 
-    return `${relevantWarnings.map((warning) => `[WARNING] ${warning.message}`).join('\n')}\n`
+    return `${relevantEvents
+      .map((event) => `[${event.type === 'warning' ? 'WARNING' : 'PAGE ERROR'}] ${event.message}`)
+      .join('\n')}\n`
   }
 
-  private pruneDeliveredWarnings() {
-    const activeCursors = [...this.activeWarningScopes].map((scope) => {
+  private pruneDeliveredOutputEvents() {
+    const activeCursors = [...this.activeOutputScopes].map((scope) => {
       return scope.cursor
     })
-    const minActiveCursor = activeCursors.length > 0 ? Math.min(...activeCursors) : this.lastDeliveredWarningEventId
-    const pruneBeforeOrAt = Math.min(this.lastDeliveredWarningEventId, minActiveCursor)
-    this.warningEvents = this.warningEvents.filter((warning) => {
-      return warning.id > pruneBeforeOrAt
+    const minActiveCursor = activeCursors.length > 0 ? Math.min(...activeCursors) : this.lastDeliveredOutputEventId
+    const pruneBeforeOrAt = Math.min(this.lastDeliveredOutputEventId, minActiveCursor)
+    this.outputEvents = this.outputEvents.filter((event) => {
+      return event.id > pruneBeforeOrAt
     })
+  }
+
+  private stateKeysForPage(page: Page): string[] {
+    return Object.entries(this.userState)
+      .filter(([, value]) => {
+        return value === page
+      })
+      .map(([key]) => key)
   }
 
   private warnIfExtensionOutdated(playwriterVersion: string | null) {
@@ -562,11 +656,7 @@ export class PlaywrightExecutor {
 
   private setupPageCloseDetection(page: Page) {
     page.on('close', () => {
-      const stateKeysForClosedPage = Object.entries(this.userState)
-        .filter(([, value]) => {
-          return value === page
-        })
-        .map(([key]) => key)
+      const stateKeysForClosedPage = this.stateKeysForPage(page)
 
       const wasCurrentPage = this.page === page
       let replacementPageInfo: { index: string; url: string } | null = null
@@ -663,6 +753,9 @@ export class PlaywrightExecutor {
 
     page.on('pageerror', (error) => {
       this.addBrowserLog({ page, logEntry: `[pageerror] ${error.message}` })
+      if (this.stateKeysForPage(page).length > 0) {
+        this.enqueueOutputEvent({ type: 'page-error', message: error.message })
+      }
     })
   }
 
@@ -1027,6 +1120,13 @@ export class PlaywrightExecutor {
     }
   }
 
+  /** Used by the action recorder (`playwriter recorder`) to attach
+   *  context-level instrumentation. Connects to the browser if needed. */
+  async getBrowserContext(): Promise<BrowserContext> {
+    const { page } = await this.ensureConnection()
+    return this.context || page.context()
+  }
+
   private async getCurrentPage(timeout = 10000): Promise<Page> {
     if (this.page && !this.page.isClosed()) {
       return this.page
@@ -1088,7 +1188,7 @@ export class PlaywrightExecutor {
 
   async execute(code: string, timeout = 10000): Promise<ExecuteResult> {
     const consoleLogs: Array<{ method: string; args: any[] }> = []
-    const warningScope = this.beginWarningScope()
+    const outputScope = this.beginOutputScope()
 
     const formatConsoleLogs = (logs: Array<{ method: string; args: any[] }>, prefix = 'Console output') => {
       if (logs.length === 0) {
@@ -1537,6 +1637,22 @@ export class PlaywrightExecutor {
       })
 
 
+      const sandboxedGetBuiltinModule = (id: string) => {
+        if (!ALLOWED_MODULES.has(id)) {
+          throw Object.assign(
+            new Error(
+              `Module "${id}" is not allowed in the sandbox. ` +
+                `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
+            ),
+            { name: 'ModuleNotAllowedError' },
+          )
+        }
+        if (id === 'fs' || id === 'node:fs') {
+          return self.scopedFs
+        }
+        return process.getBuiltinModule(id)
+      }
+
       let vmContextObj: any = {
         page,
         context,
@@ -1593,7 +1709,22 @@ export class PlaywrightExecutor {
           return { page: newPage, context: newContext }
         },
         require: this.sandboxedRequire,
-        import: (specifier: string) => import(specifier),
+        // Restricted alternative to native import() for allowlisted built-ins.
+        importModule: (specifier: string) => {
+          if (!ALLOWED_MODULES.has(specifier)) {
+            throw Object.assign(
+              new Error(
+                `Module "${specifier}" is not allowed in the sandbox. ` +
+                  `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
+              ),
+              { name: 'ModuleNotAllowedError' },
+            )
+          }
+          if (specifier === 'fs' || specifier === 'node:fs') {
+            return Promise.resolve(this.scopedFs)
+          }
+          return import(specifier)
+        },
         // Ghost Browser API - only works in Ghost Browser, mirrors chrome.ghostPublicAPI etc
         chrome: chromeGhostBrowser,
         ...usefulGlobals,
@@ -1601,22 +1732,42 @@ export class PlaywrightExecutor {
         // - cwd() returns the session's cwd instead of the relay server's cwd
         // - exit() is blocked to prevent killing the relay server
         // - chdir() is blocked to prevent affecting other sessions
+        // - getBuiltinModule() is blocked because it bypasses ALLOWED_MODULES (issue #105)
+        //   Uses getOwnPropertyDescriptor trap too, otherwise
+        //   Object.getOwnPropertyDescriptor(process, 'getBuiltinModule').value() bypasses get trap
         process: new Proxy(process, {
           get(target, prop, receiver) {
             if (prop === 'cwd') return () => self.sessionCwd || target.cwd()
             if (prop === 'exit') return () => { throw new Error('process.exit() is not allowed in the sandbox') }
             if (prop === 'chdir') return () => { throw new Error('process.chdir() is not allowed in the sandbox, use a new session with a different cwd instead') }
+            if (prop === 'getBuiltinModule') return sandboxedGetBuiltinModule
             return Reflect.get(target, prop, receiver)
+          },
+          // Prevent Object.getOwnPropertyDescriptor(process, 'getBuiltinModule').value()
+          // from bypassing the Proxy get trap
+          getOwnPropertyDescriptor(target, prop) {
+            const desc = Object.getOwnPropertyDescriptor(target, prop)
+            if (!desc) return desc
+            if (prop === 'getBuiltinModule') {
+              return { ...desc, value: sandboxedGetBuiltinModule }
+            }
+            return desc
           },
         }),
       }
 
       const vmContext = vm.createContext(vmContextObj)
+      const sandboxEntryPath = path.join(this.sessionCwd || process.cwd(), '.playwriter-eval.js')
       const autoReturnExpr = getAutoReturnExpression(code)
       const wrappedCode = autoReturnExpr !== null
         ? `(async () => { return await (${autoReturnExpr}) })()`
         : `(async () => { ${code} })()`
       const hasExplicitReturn = autoReturnExpr !== null || /\breturn\b/.test(code)
+      // Native imports use normal Node permissions and resolve from the session cwd.
+      const script = new vm.Script(wrappedCode, {
+        filename: sandboxEntryPath,
+        importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+      })
 
       // Track execution timestamps relative to recording start (seconds).
       // Used to identify idle gaps that can be sped up in demo videos.
@@ -1629,7 +1780,7 @@ export class PlaywrightExecutor {
       const result = await (async () => {
         try {
           return await Promise.race([
-            vm.runInContext(wrappedCode, vmContext, { timeout, displayErrors: true }),
+            script.runInContext(vmContext, { timeout, displayErrors: true }),
             new Promise((_, reject) => setTimeout(() => reject(new CodeExecutionTimeoutError(timeout)), timeout)),
           ])
         } finally {
@@ -1671,7 +1822,7 @@ export class PlaywrightExecutor {
         }
       }
 
-      responseText += this.flushWarningsForScope(warningScope)
+      responseText = this.flushOutputForScope(outputScope) + responseText
 
       if (!responseText.trim()) {
         responseText = 'Code executed successfully (no output)'
@@ -1706,7 +1857,7 @@ export class PlaywrightExecutor {
       this.logger.error('Error in execute:', errorStack)
 
       const logsText = formatConsoleLogs(consoleLogs, 'Console output (before error)')
-      const warningText = this.flushWarningsForScope(warningScope)
+      const outputText = this.flushOutputForScope(outputScope)
 
       // Cloud sessions: disconnection errors mean the VM expired or was destroyed.
       // Give a clear actionable message instead of a generic "call reset" hint.
@@ -1722,7 +1873,7 @@ export class PlaywrightExecutor {
       // timeout stacks are internal noise (Promise.race / setTimeout); only show the message
       const errorText = isTimeoutError ? error.message : errorStack
       return {
-        text: `${logsText}${warningText}\nError executing code: ${errorText}${resetHint}`,
+        text: `${outputText}${logsText}\nError executing code: ${errorText}${resetHint}`,
         images: [],
         screenshots: [],
         isError: true,

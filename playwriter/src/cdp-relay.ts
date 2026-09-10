@@ -819,6 +819,47 @@ export async function startPlayWriterCDPRelayServer({
         })
       }
 
+      case 'Page.captureScreenshot': {
+        // Hide playwriter UI, scrollbars, caret during screenshots (2 blocking + 1 fire-and-forget round trips)
+        const screenshotSessionId = sessionId
+        const addClassExpr = `(() => {
+          const id = '__playwriter_screenshot_style__';
+          if (!document.getElementById(id)) {
+            const s = document.createElement('style');
+            s.id = id;
+            s.textContent = [
+              'html.playwriter-screenshot [data-playwriter-toolbar],',
+              'html.playwriter-screenshot [data-playwriter-overlay],',
+              'html.playwriter-screenshot #__playwriter_ghost_cursor__ { display: none !important; }',
+              'html.playwriter-screenshot { scrollbar-width: none !important; }',
+              'html.playwriter-screenshot::-webkit-scrollbar { display: none !important; }',
+              'html.playwriter-screenshot *::-webkit-scrollbar { display: none !important; }',
+              'html.playwriter-screenshot * { scrollbar-width: none !important; caret-color: transparent !important; }',
+            ].join('\\n');
+            (document.head || document.documentElement).appendChild(s);
+          }
+          document.documentElement.classList.add('playwriter-screenshot');
+        })()`
+
+        const evalCmd = (expression: string) => ({
+          extensionId: resolvedExtensionId,
+          method: 'forwardCDPCommand' as const,
+          params: { sessionId: screenshotSessionId, method: 'Runtime.evaluate', params: { expression }, source },
+        })
+
+        // 1. add class (must complete before capture)
+        await sendToExtension(evalCmd(addClassExpr))
+        // 2. capture screenshot
+        const result = await sendToExtension({
+          extensionId: resolvedExtensionId,
+          method: 'forwardCDPCommand',
+          params: { sessionId: screenshotSessionId, method, params, source },
+        })
+        // 3. remove class
+        await sendToExtension(evalCmd(`document.documentElement.classList.remove('playwriter-screenshot')`)).catch(() => {})
+        return result
+      }
+
       case 'Runtime.enable': {
         if (!sessionId) {
           break
@@ -874,8 +915,9 @@ export async function startPlayWriterCDPRelayServer({
     return c.json({ error: err.message }, 500)
   })
 
-  // CORS middleware for HTTP endpoints - only allows our specific extension IDs.
-  // This prevents other extensions from reading responses via fetch/XHR.
+  // CORS middleware for HTTP endpoints.
+  // Only our extension IDs may read responses via fetch/XHR. The toolbar
+  // Record button does not fetch from the page; the service worker does.
   // WebSocket connections have their own separate origin validation.
   app.use(
     '*',
@@ -956,6 +998,17 @@ export async function startPlayWriterCDPRelayServer({
     return bearerToken === token || queryToken === token
   }
 
+  const requireTokenWhenConfigured = async (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+    next: () => Promise<void>,
+  ) => {
+    if (!token || hasValidToken(c)) {
+      return next()
+    }
+    logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
+    return c.text('Unauthorized', 401)
+  }
+
   app.use('*', async (c, next) => {
     const hostname = parseHostname(c.req.header('host'))
     if (hostname && ALLOWED_HOSTS.has(hostname)) {
@@ -988,6 +1041,11 @@ export async function startPlayWriterCDPRelayServer({
   app.get('/version', (c) => {
     return c.json({ version: VERSION })
   })
+
+  app.use('/extension/status', requireTokenWhenConfigured)
+  app.use('/extensions/status', requireTokenWhenConfigured)
+  app.use('/json', requireTokenWhenConfigured)
+  app.use('/json/*', requireTokenWhenConfigured)
 
   app.get('/extension/status', (c) => {
     const defaultExtension = getExtensionConnection(null, { allowFallback: true })
@@ -1097,18 +1155,6 @@ export async function startPlayWriterCDPRelayServer({
         })),
       )
     })
-
-  app.post('/mcp-log', async (c) => {
-    try {
-      const { level, args } = await c.req.json()
-      const logFn = (logger as any)?.[level] || logger?.log
-      const prefix = pc.red(`[MCP] [${level.toUpperCase()}]`)
-      logFn?.(prefix, ...args)
-      return c.json({ ok: true })
-    } catch {
-      return c.json({ ok: false }, 400)
-    }
-  })
 
   // Validate Origin header for WebSocket connections to prevent cross-origin attacks.
   // Browsers always send Origin header for WebSocket connections, but Node.js clients don't.
@@ -1277,7 +1323,7 @@ export async function startPlayWriterCDPRelayServer({
               }
             }
 
-            if (method === 'Target.setDiscoverTargets' && (params as Protocol.Target.SetDiscoverTargetsRequest)?.discover) {
+            if (method === 'Target.setDiscoverTargets' && params?.discover) {
               const freshExt2 = store.getState().extensions.get(extensionConn.id)
               const freshTargets2 = freshExt2?.connectedTargets || new Map()
               for (const target of freshTargets2.values()) {
@@ -1314,7 +1360,7 @@ export async function startPlayWriterCDPRelayServer({
 
             if (method === 'Target.attachToTarget') {
               const attachResponse = result as Protocol.Target.AttachToTargetResponse | undefined
-              const attachRequestParams = params as Protocol.Target.AttachToTargetRequest | undefined
+              const attachRequestParams = params
               if (attachResponse?.sessionId) {
                 const freshExt3 = store.getState().extensions.get(extensionConn.id)
                 const freshTargets3 = freshExt3?.connectedTargets || new Map()
@@ -1533,22 +1579,22 @@ export async function startPlayWriterCDPRelayServer({
             logFunc?.(prefix, ...args)
           } else if (message.method === 'recordingData') {
             const streamRelay = streamRelays.get(connectionId)
-            if (!streamRelay?.handleRecordingData(message as RecordingDataMessage)) {
+            if (!streamRelay?.handleRecordingData(message)) {
               const relay = getRecordingRelay(connectionId)
               if (relay) {
-                relay.handleRecordingData(message as RecordingDataMessage)
+                relay.handleRecordingData(message)
               }
             }
           } else if (message.method === 'recordingCancelled') {
             const streamRelay = streamRelays.get(connectionId)
-            if (!streamRelay?.handleRecordingCancelled(message as RecordingCancelledMessage)) {
+            if (!streamRelay?.handleRecordingCancelled(message)) {
               const relay = getRecordingRelay(connectionId)
               if (relay) {
-                relay.handleRecordingCancelled(message as RecordingCancelledMessage)
+                relay.handleRecordingCancelled(message)
               }
             }
           } else {
-            const extensionEvent = message as ExtensionEventMessage
+            const extensionEvent = message
 
             if (extensionEvent.method !== 'forwardCDPEvent') {
               return
@@ -1583,7 +1629,7 @@ export async function startPlayWriterCDPRelayServer({
             maybeEmitBrowserDownloadCompatEvent({ method, params, extensionId: connectionId })
 
             if (method === 'Target.attachedToTarget') {
-              const targetParams = params as Protocol.Target.AttachedToTargetEvent
+              const targetParams = params!
               const incomingSessionId = sessionId
               const iframeParentFrameId = targetParams.targetInfo.parentFrameId
               // Read current extension state for iframe parent lookup
@@ -1670,13 +1716,14 @@ export async function startPlayWriterCDPRelayServer({
                 })
               }
             } else if (method === 'Target.detachedFromTarget') {
-              const detachParams = params as Protocol.Target.DetachedFromTargetEvent
+              const detachParams = params!
               store.setState((s) =>
                 relayState.removeTarget(s, { extensionId: connectionId, sessionId: detachParams.sessionId }),
               )
 
               sendToPlaywright({
                 message: {
+                  sessionId,
                   method: 'Target.detachedFromTarget',
                   params: detachParams,
                 } as CDPEventBase,
@@ -1684,7 +1731,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Target.targetCrashed') {
-              const crashParams = params as Protocol.Target.TargetCrashedEvent
+              const crashParams = params!
               store.setState((s) =>
                 relayState.removeTargetByCrash(s, { extensionId: connectionId, targetId: crashParams.targetId }),
               )
@@ -1699,7 +1746,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Target.targetInfoChanged') {
-              const infoParams = params as Protocol.Target.TargetInfoChangedEvent
+              const infoParams = params!
               store.setState((s) =>
                 relayState.updateTargetInfo(s, { extensionId: connectionId, targetInfo: infoParams.targetInfo }),
               )
@@ -1713,7 +1760,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.frameAttached') {
-              const frameParams = params as Protocol.Page.FrameAttachedEvent
+              const frameParams = params!
               if (sessionId) {
                 store.setState((s) =>
                   relayState.addFrameId(s, { extensionId: connectionId, sessionId, frameId: frameParams.frameId }),
@@ -1730,7 +1777,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.frameDetached') {
-              const frameParams = params as Protocol.Page.FrameDetachedEvent
+              const frameParams = params!
               store.setState((s) =>
                 relayState.removeFrameId(s, { extensionId: connectionId, frameId: frameParams.frameId }),
               )
@@ -1745,7 +1792,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.frameNavigated') {
-              const frameParams = params as Protocol.Page.FrameNavigatedEvent
+              const frameParams = params!
               if (sessionId) {
                 store.setState((s) =>
                   relayState.addFrameId(s, { extensionId: connectionId, sessionId, frameId: frameParams.frame.id }),
@@ -1776,7 +1823,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.navigatedWithinDocument') {
-              const navParams = params as Protocol.Page.NavigatedWithinDocumentEvent
+              const navParams = params!
               if (sessionId) {
                 store.setState((s) =>
                   relayState.updateTargetUrl(s, { extensionId: connectionId, sessionId, url: navParams.url }),
@@ -1935,8 +1982,13 @@ export async function startPlayWriterCDPRelayServer({
     // Block cross-origin browser requests via Sec-Fetch-Site header.
     // Browsers always set this forbidden header; it cannot be spoofed.
     // Non-browser clients (Node.js, curl, MCP) don't send it.
+    // Exception: /recorder/start and /recorder/stop. The toolbar service worker
+    // fetch is chrome-extension:// → 127.0.0.1, so Sec-Fetch-Site is cross-site.
+    // Websites still cannot call these: CORS only allows our extension origin,
+    // so a page preflight fails and the POST is never sent.
     const secFetchSite = c.req.header('sec-fetch-site')
-    if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+    const isRecorderToggle = c.req.path === '/recorder/start' || c.req.path === '/recorder/stop'
+    if (!isRecorderToggle && secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
       logger?.log(pc.red(`Rejecting ${c.req.path}: cross-origin browser request (Sec-Fetch-Site: ${secFetchSite})`))
       return c.text('Forbidden - Cross-origin requests not allowed', 403)
     }
@@ -1959,15 +2011,9 @@ export async function startPlayWriterCDPRelayServer({
     // from 127.0.0.1 and would skip auth. In-process callers must instead
     // attach the token themselves — they read PLAYWRITER_TOKEN from env, which
     // the `serve` command sets at startup.
-    if (token) {
-      const authHeader = c.req.header('authorization') || ''
-      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
-      const url = new URL(c.req.url, 'http://localhost')
-      const queryToken = url.searchParams.get('token')
-      if (bearerToken !== token && queryToken !== token) {
-        logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
-        return c.text('Unauthorized', 401)
-      }
+    if (token && !hasValidToken(c)) {
+      logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
+      return c.text('Unauthorized', 401)
     }
 
     return next()
@@ -1975,14 +2021,29 @@ export async function startPlayWriterCDPRelayServer({
 
   app.use('/cli/*', privilegedRouteMiddleware)
   app.use('/recording/*', privilegedRouteMiddleware)
+  app.use('/recorder/*', privilegedRouteMiddleware)
   app.use('/stream/*', privilegedRouteMiddleware)
   app.use('/mcp-log', privilegedRouteMiddleware)
+
+  app.post('/mcp-log', async (c) => {
+    try {
+      const body = await c.req.json()
+      const level = typeof body?.level === 'string' ? body.level : 'log'
+      const args = Array.isArray(body?.args) ? body.args : []
+      const logFn = level === 'error' ? logger?.error : logger?.log
+      const prefix = pc.red(`[MCP] [${level.toUpperCase()}]`)
+      logFn?.(prefix, ...args)
+      return c.json({ ok: true })
+    } catch {
+      return c.json({ ok: false }, 400)
+    }
+  })
 
   const DEFAULT_EXEC_TIMEOUT = Number(process.env.PLAYWRITER_EXEC_TIMEOUT) || 10000
 
   app.post('/cli/execute', async (c) => {
     try {
-      const body = (await c.req.json()) as { sessionId: string | number; code: string; timeout?: number }
+      const body: { sessionId: string | number; code: string; timeout?: number } = await c.req.json()
       const sessionId = normalizeSessionId(body.sessionId)
       const { code, timeout = DEFAULT_EXEC_TIMEOUT } = body
 
@@ -2027,7 +2088,7 @@ export async function startPlayWriterCDPRelayServer({
 
   app.post('/cli/reset', async (c) => {
     try {
-      const body = (await c.req.json()) as { sessionId: string | number }
+      const body: { sessionId: string | number } = await c.req.json()
       const sessionId = normalizeSessionId(body.sessionId)
 
       if (!sessionId) {
@@ -2085,7 +2146,14 @@ export async function startPlayWriterCDPRelayServer({
       }
     }
     const sessionId = String(nextSessionNumber++)
-    const cwd = body.cwd
+    // Resolve cwd with cross-OS awareness: if CLI runs on Windows and relay on
+    // Linux (WSL), translate the Windows path to /mnt/<drive>/... so the sandbox
+    // can actually reach it. See issue #107.
+    const { resolveSessionCwd } = await import('./executor.js')
+    const { cwd, warning: cwdWarning } = resolveSessionCwd(body.cwd)
+    if (cwdWarning) {
+      logger?.log(`[session ${sessionId}] ${cwdWarning}`)
+    }
 
     // Headless mode: launch Chrome via chromium.launch(), no extension needed.
     // Force connection immediately so missing Chrome errors surface at creation time,
@@ -2094,7 +2162,7 @@ export async function startPlayWriterCDPRelayServer({
       const manager = await getExecutorManager()
       const executor = manager.getExecutor({
         sessionId,
-        cwd,
+        cwd: cwd || undefined,
         cdpConfig: { headless: true },
         sessionMetadata: {
           extensionId: null,
@@ -2115,6 +2183,7 @@ export async function startPlayWriterCDPRelayServer({
         extensionId: metadata.extensionId,
         browser: metadata.browser,
         profile: metadata.profile,
+        warning: cwdWarning,
       })
     }
 
@@ -2131,7 +2200,7 @@ export async function startPlayWriterCDPRelayServer({
       const manager = await getExecutorManager()
       const executor = manager.getExecutor({
         sessionId,
-        cwd,
+        cwd: cwd || undefined,
         cdpConfig: { directCdpUrl: appendSessionToWsUrl(body.cdpEndpoint, sessionId) },
         sessionMetadata: {
           extensionId: null,
@@ -2161,6 +2230,7 @@ export async function startPlayWriterCDPRelayServer({
         extensionId: metadata.extensionId,
         browser: metadata.browser,
         profile: metadata.profile,
+        warning: cwdWarning,
       })
     }
 
@@ -2177,7 +2247,7 @@ export async function startPlayWriterCDPRelayServer({
     const manager = await getExecutorManager()
     const executor = manager.getExecutor({
       sessionId,
-      cwd,
+      cwd: cwd || undefined,
       sessionMetadata: {
         extensionId: conn.stableKey,
         browser: conn.info.browser || null,
@@ -2191,6 +2261,7 @@ export async function startPlayWriterCDPRelayServer({
       extensionId: metadata.extensionId,
       browser: metadata.browser,
       profile: metadata.profile,
+      warning: cwdWarning,
     })
   })
 
@@ -2206,7 +2277,7 @@ export async function startPlayWriterCDPRelayServer({
 
   app.post('/cli/session/delete', async (c) => {
     try {
-      const body = (await c.req.json()) as { sessionId: string | number }
+      const body: { sessionId: string | number } = await c.req.json()
       const sessionId = normalizeSessionId(body.sessionId)
 
       if (!sessionId) {
@@ -2252,14 +2323,7 @@ export async function startPlayWriterCDPRelayServer({
   // ============================================================================
 
   app.post('/recording/start', async (c) => {
-    const body = (await c.req.json()) as {
-      outputPath?: string
-      sessionId?: string | number
-      frameRate?: number
-      audio?: boolean
-      videoBitsPerSecond?: number
-      audioBitsPerSecond?: number
-    }
+    const body: StartRecordingBody & { sessionId?: string | number } = await c.req.json()
     const sessionId = normalizeSessionId(body.sessionId)
     const { sessionId: _sessionId, ...recordingOptions } = body
     const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
@@ -2276,7 +2340,7 @@ export async function startPlayWriterCDPRelayServer({
   })
 
   app.post('/recording/stop', async (c) => {
-    const body = (await c.req.json()) as { sessionId?: string | number }
+    const body: { sessionId?: string | number } = await c.req.json()
     const sessionId = normalizeSessionId(body.sessionId)
     const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
     const relay = getRecordingRelay(extensionId)
@@ -2302,7 +2366,7 @@ export async function startPlayWriterCDPRelayServer({
   })
 
   app.post('/recording/cancel', async (c) => {
-    const body = (await c.req.json()) as { sessionId?: string | number }
+    const body: { sessionId?: string | number } = await c.req.json()
     const sessionId = normalizeSessionId(body.sessionId)
     const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
     const relay = getRecordingRelay(extensionId)
@@ -2314,12 +2378,154 @@ export async function startPlayWriterCDPRelayServer({
     return c.json(result)
   })
 
+  // Push a fire-and-forget notification to all connected extensions.
+  // No `id` field = no response expected; the extension handles it as a one-way event.
+  function notifyExtensionRecorderState(recording: boolean): void {
+    const message = JSON.stringify({ method: 'setRecorderState', params: { recording } })
+    for (const ext of store.getState().extensions.values()) {
+      ext.ws?.send(message)
+    }
+  }
+
+  // ============================================================================
+  // Action Record Endpoints - Record user interactions as a JSON array for skill
+  // generation (playwriter recorder start/stop). Runs inside the relay daemon so
+  // recording survives CLI exits. Events persist in ~/.playwriter/recordings/.
+  // ============================================================================
+
+  // Memoized as a promise so concurrent first calls share one manager instance
+  let actionRecordingManagerPromise: Promise<import('./action-recorder.js').ActionRecordingManager> | null = null
+  const getActionRecordingManager = () => {
+    if (!actionRecordingManagerPromise) {
+      actionRecordingManagerPromise = import('./action-recorder.js').then(({ ActionRecordingManager }) => {
+        return new ActionRecordingManager({
+          logger: logger || { log: console.error, error: console.error },
+          onActiveChanged: (active) => {
+            notifyExtensionRecorderState(active)
+          },
+        })
+      })
+      // Don't cache a rejected import forever; allow the next call to retry
+      actionRecordingManagerPromise.catch(() => {
+        actionRecordingManagerPromise = null
+      })
+    }
+    return actionRecordingManagerPromise
+  }
+
+  // RecordingError carries an HTTP status code hint (409 duplicate, 404 missing, 400 ambiguous)
+  const recordingErrorStatus = (error: unknown): 400 | 404 | 409 | 500 => {
+    const statusCode = (error as { statusCode?: number }).statusCode
+    if (statusCode === 400 || statusCode === 404 || statusCode === 409) {
+      return statusCode
+    }
+    return 500
+  }
+
+  app.post('/recorder/start', async (c) => {
+    let body: { sessionId?: string | number }
+    try {
+      body = await c.req.json()
+    } catch {
+      body = {}
+    }
+    try {
+      const manager = await getExecutorManager()
+      const recordingManager = await getActionRecordingManager()
+      const { pickRecorderStartSession } = await import('./action-recorder.js')
+      // Toolbar sends no sessionId. Never fail on many sessions: reuse a free
+      // extension session, or create one. Session pick does not matter for
+      // playback; the agent chooses the recording at stop time by page URL.
+      const pick = pickRecorderStartSession({
+        explicitSessionId: normalizeSessionId(body.sessionId) || undefined,
+        sessions: manager.listSessions(),
+        busySessionIds: recordingManager.list().map((recording) => {
+          return recording.sessionId
+        }),
+      })
+      const sessionId: string = (() => {
+        if (pick.kind === 'use') {
+          return pick.sessionId
+        }
+        const conn = getExtensionConnection(null, {
+          allowFallback: store.getState().extensions.size === 1,
+        })
+        if (!conn) {
+          throw new Error('Extension is not connected. Enable Playwriter on a tab first.')
+        }
+        const createdId = String(nextSessionNumber++)
+        manager.getExecutor({
+          sessionId: createdId,
+          sessionMetadata: {
+            extensionId: conn.stableKey,
+            browser: conn.info.browser || null,
+            profile: conn.info ? { email: conn.info.email || '', id: conn.info.id || '' } : null,
+          },
+        })
+        return createdId
+      })()
+      const executor = manager.getSession(sessionId)
+      if (!executor) {
+        return c.json({ error: `Session ${sessionId} not found. Run 'playwriter session new' first.` }, 404)
+      }
+      const context = await executor.getBrowserContext()
+      const recorder = await recordingManager.start({ context, sessionId })
+      return c.json({ recordingId: recorder.recordingId, sessionId, file: recorder.filePath })
+    } catch (error: any) {
+      logger?.error('Record start endpoint error:', error)
+      return c.json({ error: error.message }, recordingErrorStatus(error))
+    }
+  })
+
+  app.post('/recorder/stop', async (c) => {
+    try {
+      const body: { recordingId?: string | number } = await c.req.json().catch(() => ({}))
+      const recordingId = normalizeSessionId(body.recordingId)
+      const recordingManager = await getActionRecordingManager()
+      const result = await recordingManager.stop({ recordingId: recordingId || undefined })
+      return c.json(result)
+    } catch (error: any) {
+      const recordings = (error as { recordings?: unknown }).recordings
+      return c.json(
+        recordings ? { error: error.message, recordings } : { error: error.message },
+        recordingErrorStatus(error),
+      )
+    }
+  })
+
+  app.get('/recorder/status', async (c) => {
+    const recordingManager = await getActionRecordingManager()
+    return c.json({ recordings: recordingManager.list() })
+  })
+
+  // Serve recorded events so `recorder events` works against a remote relay
+  // (the events file lives on the relay's machine, not the CLI's)
+  app.get('/recorder/events/:id', async (c) => {
+    const { recordingFilePath, latestRecordingId } = await import('./action-recorder.js')
+    // 'latest' resolves to the most recent recording so the CLI can omit the id
+    const param = c.req.param('id')
+    if (param !== 'latest' && !/^\d+$/.test(param)) {
+      return c.json({ error: 'Invalid recording id' }, 400)
+    }
+    const recordingId = param === 'latest' ? latestRecordingId() : param
+    if (!recordingId) {
+      return c.json({ error: 'No recordings found' }, 404)
+    }
+    const filePath = recordingFilePath(recordingId)
+    try {
+      const content = await fs.promises.readFile(filePath, 'utf-8')
+      return c.text(content)
+    } catch {
+      return c.json({ error: `Recording ${recordingId} not found` }, 404)
+    }
+  })
+
   // ============================================================================
   // Streaming Endpoints - Live RTMP streaming of a tab via ffmpeg
   // ============================================================================
 
   app.post('/stream/start', async (c) => {
-    const body = (await c.req.json()) as StartStreamParams & { sessionId?: string | number }
+    const body: StartStreamParams & { sessionId?: string | number } = await c.req.json()
     const sessionId = normalizeSessionId(body.sessionId)
     const { sessionId: _sessionId, ...streamOptions } = body
     const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
@@ -2336,7 +2542,7 @@ export async function startPlayWriterCDPRelayServer({
   })
 
   app.post('/stream/stop', async (c) => {
-    const body = (await c.req.json()) as { sessionId?: string | number }
+    const body: { sessionId?: string | number } = await c.req.json()
     const sessionId = normalizeSessionId(body.sessionId)
     const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
     const relay = getStreamRelay(extensionId)

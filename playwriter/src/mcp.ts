@@ -78,7 +78,7 @@ async function sendLogToRelayServer(level: string, ...args: any[]) {
  */
 function mcpLog(...args: any[]) {
   console.error(...args)
-  sendLogToRelayServer('log', ...args)
+  void sendLogToRelayServer('log', ...args)
 }
 
 /** MCP-specific logger for executor */
@@ -86,7 +86,7 @@ const mcpLogger = {
   log: (...args: any[]) => mcpLog(...args),
   error: (...args: any[]) => {
     console.error(...args)
-    sendLogToRelayServer('error', ...args)
+    void sendLogToRelayServer('error', ...args)
   },
 }
 
@@ -161,11 +161,12 @@ async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
   return executor
 }
 
-async function checkRemoteServer({ host, port }: { host: string; port: number }): Promise<void> {
+async function checkRemoteServer({ host, port, token }: RemoteConfig): Promise<void> {
   const { httpBaseUrl } = parseRelayHost(host, port)
   const versionUrl = `${httpBaseUrl}/version`
   try {
-    const response = await fetch(versionUrl, { signal: AbortSignal.timeout(3000) })
+    const headers = token ? { Authorization: `Bearer ${token}` } : undefined
+    const response = await fetch(versionUrl, { headers, signal: AbortSignal.timeout(3000) })
     if (!response.ok) {
       throw new Error(`Server responded with status ${response.status}`)
     }
@@ -295,7 +296,7 @@ server.tool(
 
       console.error('Error in execute tool:', errorStack)
       if (!isTimeoutError) {
-        sendLogToRelayServer('error', 'Error in execute tool:', errorStack)
+        void sendLogToRelayServer('error', 'Error in execute tool:', errorStack)
       }
 
       const resetHint = isTimeoutError

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { goke, openInBrowser, isAgent } from 'goke'
 import { z } from 'zod'
 import pc from 'picocolors'
+import { Agent, fetch as undiciFetch } from 'undici'
 
 // Prevent Buffers from dumping hex bytes in util.inspect output.
 Buffer.prototype[util.inspect.custom] = function () {
@@ -28,6 +29,7 @@ import { discoverChromeInstances, resolveDirectInput, type DiscoveredInstance } 
 import { getCloudClient, loadCloudAuth, saveCloudAuth, CloudClient, buildLiveUrl } from './cloud-client.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const executeDispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 })
 
 const cli = goke('playwriter')
 
@@ -280,10 +282,12 @@ async function executeCode(options: {
   const executeUrl = `${serverUrl}/cli/execute`
 
   try {
-    const response = await fetch(executeUrl, {
+    const response = await undiciFetch(executeUrl, {
       method: 'POST',
       headers: buildAuthHeaders({ token, json: true }),
       body: JSON.stringify({ sessionId, code, timeout, cwd }),
+      dispatcher: executeDispatcher,
+      signal: AbortSignal.timeout(timeout + 30_000),
     })
 
     if (!response.ok) {
@@ -418,7 +422,8 @@ cli
           console.error(`Error: ${response.status} ${text}`)
           process.exit(1)
         }
-        const result = (await response.json()) as { id: string }
+        const result = (await response.json()) as { id: string; warning?: string | null }
+        printSessionWarning(result)
         console.log(`Session ${result.id} created (headless). Use with: playwriter -s ${result.id} -e "..."`)
         console.log(pc.dim('NOTE: Recording unavailable in headless mode.'))
       } catch (error: any) {
@@ -453,6 +458,7 @@ cli
       await ensureRelayForSessionCreation(isLocal)
       const serverUrl = await getServerUrl(options.host)
       const result = await createDirectSession({ serverUrl, cdpEndpoint, token: options.token })
+      printSessionWarning(result)
       console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
       console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
       return
@@ -483,6 +489,7 @@ cli
         const instance = instances[0]
         const serverUrl = await getServerUrl(options.host)
         const result = await createDirectSession({ serverUrl, cdpEndpoint: instance.wsUrl, browser: instance.browser, profiles: instance.profiles, token: options.token })
+        printSessionWarning(result)
         const profileLabel = formatInstanceProfiles(instance)
         console.log(
           `Session ${result.id} created (direct CDP, ${instance.browser}${profileLabel}). Use with: playwriter -s ${result.id} -e "..."`,
@@ -508,6 +515,7 @@ cli
         }
         const serverUrl = await getServerUrl(options.host)
         const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
+        printSessionWarning(result)
         console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
         console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
         return
@@ -625,7 +633,8 @@ cli
           console.error(`Error: ${response.status} ${text}`)
           process.exit(1)
         }
-        const result = (await response.json()) as { id: string; extensionId: string | null }
+        const result = (await response.json()) as { id: string; extensionId: string | null; warning?: string | null }
+        printSessionWarning(result)
         console.log(`Session ${result.id} created. Use with: playwriter -s ${result.id} -e "..."`)
         printCloudTip()
       } catch (error: any) {
@@ -697,6 +706,7 @@ cli
           }
         } else if (selected.type === 'direct') {
           const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
+          printSessionWarning(result)
           console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
           console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
         } else {
@@ -711,7 +721,8 @@ cli
             console.error(`Error: ${response.status} ${text}`)
             process.exit(1)
           }
-          const result = (await response.json()) as { id: string }
+          const result = (await response.json()) as { id: string; warning?: string | null }
+          printSessionWarning(result)
           console.log(`Session ${result.id} created. Use with: playwriter -s ${result.id} -e "..."`)
           printCloudTip()
         }
@@ -747,7 +758,7 @@ async function createDirectSession({
   browser?: string
   profiles?: Array<{ name: string; email: string }>
   token?: string
-}): Promise<{ id: string }> {
+}): Promise<{ id: string; warning?: string | null }> {
   const cwd = process.cwd()
   const response = await fetch(`${serverUrl}/cli/session/new`, {
     method: 'POST',
@@ -758,7 +769,7 @@ async function createDirectSession({
     const text = await response.text()
     throw new Error(`${response.status} ${text}`)
   }
-  return (await response.json()) as { id: string }
+  return (await response.json()) as { id: string; warning?: string | null }
 }
 
 function instanceToBrowserOption(instance: DiscoveredInstance): BrowserOption {
@@ -868,6 +879,13 @@ async function handleCloudBrowserNotFound(browserKey: string, { hasCloudOptions 
     }
   }
   process.exit(1)
+}
+
+/** Print a warning from the relay's session new response if present. */
+function printSessionWarning(result: { warning?: string | null }): void {
+  if (result.warning) {
+    console.error(pc.yellow(`Warning: ${result.warning}`))
+  }
 }
 
 function printCloudTip(): void {
@@ -1359,12 +1377,259 @@ cli
     })
   })
 
+// ============================================================================
+// Action recording commands. Recording runs inside the relay daemon (survives
+// CLI exit) and writes user interactions as a JSON array to ~/.playwriter/recordings/.
+// The printed prompt (src/recorder-prompt.md) instructs the agent how to turn a
+// recording into a SKILL.md plus a utils script that automates the same flow.
+// ============================================================================
+
+cli
+  .command('recorder start', 'Record user actions in the browser as events for skill generation')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID (defaults to the single active session, or creates a new one)')
+  .example('playwriter recorder start')
+  .example('playwriter recorder start -s 1')
+  .action(async (options) => {
+    if (!options.host && !process.env.PLAYWRITER_HOST) {
+      await ensureRelayServer({ logger: console })
+    }
+    const serverUrl = await getServerUrl(options.host)
+    const headers = buildAuthHeaders({ token: options.token, json: true })
+
+    try {
+      const sessionId: string = await (async () => {
+        const explicit = options.session ? String(options.session) : process.env.PLAYWRITER_SESSION
+        if (explicit) {
+          return explicit
+        }
+        const listResponse = await fetch(`${serverUrl}/cli/sessions`, {
+          headers: buildAuthHeaders({ token: options.token }),
+          signal: AbortSignal.timeout(5000),
+        })
+        const { sessions } = (await listResponse.json()) as { sessions: Array<{ id: string }> }
+        if (sessions.length === 1) {
+          return sessions[0].id
+        }
+        if (sessions.length > 1) {
+          console.error(`Multiple sessions active (${sessions.map((s) => s.id).join(', ')}). Pass -s <id>.`)
+          process.exit(1)
+        }
+        // No sessions: create a default extension-mode session
+        const newResponse = await fetch(`${serverUrl}/cli/session/new`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ cwd: process.cwd() }),
+        })
+        const newResult = (await newResponse.json()) as { id?: string; error?: string }
+        if (!newResponse.ok || !newResult.id) {
+          console.error(`Error creating session: ${newResult.error || newResponse.status}`)
+          console.error(`Run 'playwriter session new' first, then retry with -s <id>.`)
+          process.exit(1)
+        }
+        return newResult.id
+      })()
+
+      const response = await fetch(`${serverUrl}/recorder/start`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId }),
+        signal: AbortSignal.timeout(30_000),
+      })
+      const result = (await response.json()) as { recordingId?: string; file?: string; error?: string }
+      if (!response.ok || !result.recordingId) {
+        console.error(`Error: ${result.error || response.status}`)
+        process.exit(1)
+      }
+
+      console.log(`Recording ${result.recordingId} started on session ${sessionId}.`)
+      console.log(`Events file: ${result.file}`)
+      console.log('')
+      const promptPath = path.join(__dirname, '..', 'src', 'recorder-prompt.md')
+      console.log(fs.readFileSync(promptPath, 'utf-8'))
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
+cli
+  .command('recorder stop [recordingId]', 'Stop an active recording and print where the events are')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .example('playwriter recorder stop')
+  .action(async (recordingId, options) => {
+    const serverUrl = await getServerUrl(options.host)
+    try {
+      const response = await fetch(`${serverUrl}/recorder/stop`, {
+        method: 'POST',
+        headers: buildAuthHeaders({ token: options.token, json: true }),
+        body: JSON.stringify(recordingId ? { recordingId } : {}),
+      })
+      const result = (await response.json()) as {
+        recordingId?: string
+        eventCount?: number
+        filePath?: string
+        error?: string
+      }
+      if (!response.ok || !result.recordingId) {
+        console.error(`Error: ${result.error || response.status}`)
+        process.exit(1)
+      }
+      console.log(`Recording ${result.recordingId} stopped. ${result.eventCount} events captured.`)
+      console.log(`Events file: ${result.filePath}`)
+      console.log('')
+      console.log('Next steps (full instructions were printed by `recorder start`):')
+      console.log('  1. playwriter skill')
+      console.log('     or https://playwriter.dev/SKILL.md')
+      console.log(`  2. playwriter recorder events -r ${result.recordingId}`)
+      console.log('  3. Write SKILL.md + a named helper (submit.js, sdk.js) with playwriter -e examples from the events')
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
+cli
+  .command(
+    'recorder events [...eventIds]',
+    'Print recorded events as jsonl. Uses the latest recording unless `--recording` is passed. Default output is a thin timeline view (heavy payloads shown as sizes). Pass event ids to print their full details (network request/response bodies).',
+  )
+  .option('-r, --recording <id>', 'Recording ID (defaults to the latest recording)')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('--type <type>', 'Only print events of this type (e.g. action, network, page-error)')
+  .option('--full', 'Print full events for the whole timeline instead of the thin view')
+  .example('playwriter recorder events        # latest recording, thin timeline')
+  .example(`playwriter recorder events | jq -r '[.id, .t, .type, (.code // .url // empty)] | @tsv'`)
+  .example('playwriter recorder events 4 7    # full details of events 4 and 7')
+  .example('playwriter recorder events -r 2 --type action   # actions of recording 2')
+  .action(async (eventIds, options) => {
+    const recordingId = options.recording
+    // When defaulting to the latest recording while several recordings are
+    // active concurrently, "latest" is ambiguous: warn on stderr (stdout must
+    // stay clean jsonl). Best-effort: relay may not be reachable.
+    if (!recordingId) {
+      const active = await (async () => {
+        try {
+          const serverUrl = await getServerUrl(options.host)
+          const response = await fetch(`${serverUrl}/recorder/status`, {
+            headers: buildAuthHeaders({ token: options.token }),
+            signal: AbortSignal.timeout(2000),
+          })
+          const { recordings } = (await response.json()) as { recordings: Array<{ recordingId: string }> }
+          return recordings
+        } catch {
+          return []
+        }
+      })()
+      if (active.length > 1) {
+        console.error(
+          `Warning: ${active.length} recordings are active (ids ${active.map((r) => r.recordingId).join(', ')}). Showing the latest one; pass a recording id to choose.`,
+        )
+      }
+    }
+    const content: string = await (async () => {
+      // Local relay: read the jsonl straight from disk. Remote relay: the file
+      // lives on the relay's machine, fetch it over HTTP.
+      if (!options.host && !process.env.PLAYWRITER_HOST) {
+        const { recordingFilePath, latestRecordingId } = await import('./action-recorder.js')
+        // No id → latest recording, mirroring `recorder stop` defaulting
+        const resolvedId = recordingId ? String(recordingId) : latestRecordingId()
+        if (!resolvedId) {
+          console.error(`No recordings found. Start one with 'playwriter recorder start'.`)
+          process.exit(1)
+        }
+        const filePath = recordingFilePath(resolvedId)
+        if (!fs.existsSync(filePath)) {
+          console.error(`Recording ${resolvedId} not found at ${filePath}`)
+          process.exit(1)
+        }
+        return fs.readFileSync(filePath, 'utf-8')
+      }
+      const serverUrl = await getServerUrl(options.host)
+      const response = await fetch(`${serverUrl}/recorder/events/${recordingId ?? 'latest'}`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!response.ok) {
+        console.error(`Error: ${response.status} ${await response.text()}`)
+        process.exit(1)
+      }
+      return await response.text()
+    })()
+    const { projectThinEvent, parseRecording } = await import('./action-recorder.js')
+    const invalidIds = (eventIds || []).filter((id) => !/^\d+$/.test(String(id)))
+    if (invalidIds.length > 0) {
+      console.error(`Invalid event ids: ${invalidIds.join(', ')}. Event ids are the numeric 'id' field from the timeline.`)
+      process.exit(1)
+    }
+    const requestedIds = new Set((eventIds || []).map((id) => Number(id)))
+    const events = parseRecording(content)
+    for (const event of events) {
+      if (requestedIds.size > 0) {
+        if (event.id !== undefined && requestedIds.has(Number(event.id))) {
+          console.log(JSON.stringify(event))
+        }
+        continue
+      }
+      if (options.type && event.type !== options.type) {
+        continue
+      }
+      if (options.full) {
+        console.log(JSON.stringify(event))
+        continue
+      }
+      console.log(JSON.stringify(projectThinEvent(event)))
+    }
+  })
+
+cli
+  .command('recorder status', 'List active recordings')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .action(async (options) => {
+    const serverUrl = await getServerUrl(options.host)
+    try {
+      const response = await fetch(`${serverUrl}/recorder/status`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(5000),
+      })
+      const { recordings } = (await response.json()) as {
+        recordings: Array<{
+          recordingId: string
+          sessionId: string
+          startedAt: number
+          eventCount: number
+          filePath: string
+          pageUrls?: string[]
+          lastUrl?: string
+        }>
+      }
+      if (recordings.length === 0) {
+        console.log('No active recordings')
+        return
+      }
+      for (const recording of recordings) {
+        const uptime = Math.round((Date.now() - recording.startedAt) / 1000)
+        const urls = recording.pageUrls?.length ? recording.pageUrls.join(', ') : recording.lastUrl || '(no pages)'
+        console.log(`Recording ${recording.recordingId} (session ${recording.sessionId}): ${recording.eventCount} events, running ${uptime}s`)
+        console.log(`  ${urls}`)
+        console.log(`  ${recording.filePath}`)
+      }
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
 cli
   .command(
     'serve',
-    `Start the relay server on this machine (must be the same host where Chrome is running). Remote clients (Docker, other machines) connect via PLAYWRITER_HOST. Use --host localhost for Docker (no token needed) — containers reach it via host.docker.internal. Use --host 0.0.0.0 for LAN/internet access (requires --token).`,
+    `Start the relay server on this machine (must be the same host where Chrome is running). Remote clients (Docker, other machines) connect via PLAYWRITER_HOST and PLAYWRITER_TOKEN. Use --host 0.0.0.0 for Docker, LAN, or internet access (requires --token).`,
   )
-  .option('--host [host]', z.string().default('0.0.0.0').describe('Host to bind to (use "localhost" for Docker, "0.0.0.0" for remote access)'))
+  .option('--host [host]', z.string().default('0.0.0.0').describe('Host to bind to (use "0.0.0.0" for Docker or remote access)'))
   .option('--token <token>', 'Authentication token, required when --host is 0.0.0.0 (or use PLAYWRITER_TOKEN env var)')
   .option('--replace', 'Kill existing server if running')
   .action(async (options) => {
@@ -1779,6 +2044,13 @@ cli
       console.error(`Error: ${msg}`)
       process.exit(1)
     }
+  })
+
+cli
+  .command('serve restart', 'Kill and restart the local relay daemon')
+  .hidden()
+  .action(async () => {
+    await ensureRelayServer({ logger: console, forceRestart: true })
   })
 
 cli.command('logfile', 'Print the path to the relay server log file').action(() => {

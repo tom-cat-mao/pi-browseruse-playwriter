@@ -292,8 +292,11 @@
         <div class="step">
           <span class="step-number">2</span>
           <div class="step-content">
-            <strong>Enable a tab</strong>
-            <p>Click the extension icon on a tab. It turns green when connected.</p>
+            <strong>Enable a tab after the daemon starts</strong>
+            <p>
+              Click the extension icon on a tab. It turns green when connected. The icon stays gray until an agent runs
+              a playwriter command, which starts the local daemon.
+            </p>
           </div>
         </div>
 
@@ -314,7 +317,7 @@ playwriter -s 1 -e "await page.goto('https://example.com')"</code></pre>
             <strong>Add the skill to your agent</strong>
             <p>Install the Playwriter skill so your agent can call the CLI:</p>
             <pre><code class="language-bash"># add playwriter skill to your coding agent
-npx -y skills add remorses/playwriter</code></pre>
+npx -y skills add https://playwriter.dev</code></pre>
           </div>
         </div>
 

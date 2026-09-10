@@ -179,7 +179,7 @@ describe('Relay Navigation Tests', () => {
     }
   }, 60000)
 
-  it('should resolve locators for cross-origin iframe that starts with empty src', async () => {
+  it('should resolve and detach cross-origin iframe that starts with empty src', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
@@ -189,8 +189,9 @@ describe('Relay Navigation Tests', () => {
         '/canvas.html': '<!doctype html><html><body><button id="canvas-btn">Canvas</button></body></html>',
       },
     })
-    const loginUrl = `${childServer.baseUrl}/login.html`
-    const canvasUrl = `${childServer.baseUrl}/canvas.html`
+    const childOrigin = childServer.baseUrl.replace('127.0.0.1', 'localhost')
+    const loginUrl = `${childOrigin}/login.html`
+    const canvasUrl = `${childOrigin}/canvas.html`
 
     const parentServer = await createSimpleServer({
       routes: {
@@ -277,6 +278,12 @@ describe('Relay Navigation Tests', () => {
 
         const buttonCount = await pluginFrame.locator('button').count()
         expect(buttonCount).toBe(1)
+
+        await page.locator('#plugin-frame').evaluate((frame) => {
+          frame.remove()
+        })
+        await expect.poll(() => cdpPage!.frames().length, { timeout: 5000 }).toBe(1)
+        await context.exposeBinding('afterOopifDetach', () => {})
       } finally {
         await withTimeout({
           promise: browser.close(),

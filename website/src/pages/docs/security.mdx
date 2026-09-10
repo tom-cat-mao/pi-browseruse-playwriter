@@ -1,7 +1,7 @@
 ---
 title: Security Model and Sandboxed Execution
 sidebarTitle: Security
-description: How Playwriter keeps your browser safe with localhost-only architecture, origin validation, explicit tab consent, and a sandboxed filesystem for code execution.
+description: How Playwriter keeps your browser safe with localhost-only architecture, origin validation, controlled tab scope, and a sandboxed filesystem for code execution.
 icon: lucide:shield
 ---
 
@@ -14,8 +14,8 @@ Everything runs **on your machine**. The relay binds to `localhost:19988` and on
 │                                YOUR MACHINE                                              │
 │                                                                                          │
 │  ┌─────────────┐          ┌──────────────────┐          ┌──────────────┐                 │
-│  │  Extension   │◄────────►  Relay Server     │◄────────►  CLI / MCP   │                 │
-│  │  (Chrome)    │   WS     │  localhost:19988  │   WS     │  (Agent)    │                 │
+│  │  Extension  │ <────────>  Relay Server     │<────────>  CLI / MCP   │                 │
+│  │  (Chrome)   │    WS     │  localhost:19988  │   WS     │  (Agent)    │                │
 │  └─────────────┘          └──────────────────┘          └──────────────┘                 │
 │                                                                                          │
 │  Nothing leaves localhost unless you explicitly set up remote access                     │
@@ -28,7 +28,7 @@ Everything runs **on your machine**. The relay binds to `localhost:19988` and on
 
 **Origin validation.** The extension WebSocket endpoint only accepts the Playwriter extension origin. Browsers cannot spoof the `Origin` header, so malicious websites cannot connect and control your browser. CLI and MCP connect as local Node.js clients on localhost; for remote access, always use [token authentication](./remote-access.mdx).
 
-**Explicit consent.** Only tabs where you clicked the extension icon are controlled. No background access to other tabs. Chrome shows an automation banner on controlled tabs so you always know which tabs are being automated.
+**Controlled tab scope.** Existing tabs are controlled after you click the extension icon. By default, Playwriter also creates a controlled `about:blank` tab when a client connects with no controlled tabs. Set `PLAYWRITER_AUTO_ENABLE=false` to require a manual click. Playwriter does not attach to other existing tabs in the background.
 
 **Visible automation.** The Chrome debugger banner is always visible on controlled tabs. You can see everything the agent does in real time.
 
@@ -36,10 +36,10 @@ Everything runs **on your machine**. The relay binds to `localhost:19988` and on
 
 The `require('node:fs')` module in the execution sandbox is **scoped**. Write operations only succeed in:
 
-| Allowed path | Description |
-|---|---|
-| Session cwd | The directory where `playwriter` CLI was invoked |
-| `/tmp` | System temp directory |
+| Allowed path  | Description                                            |
+| ------------- | ------------------------------------------------------ |
+| Session cwd   | The directory where `playwriter` CLI was invoked       |
+| `/tmp`        | System temp directory                                  |
 | `os.tmpdir()` | OS-specific temp (e.g. `/var/folders/.../T/` on macOS) |
 
 Writing to any other path throws `EPERM: operation not permitted, access outside allowed directories`. To save files elsewhere, write to a temp path first, then move the file using a shell command outside the sandbox.
@@ -71,6 +71,14 @@ export PLAYWRITER_HOST=https://my-tunnel.traforo.dev
 export PLAYWRITER_TOKEN=MY_SECRET
 playwriter session new
 ```
+
+## Recorder start and stop
+
+The toolbar **Record Skill** button does not fetch the relay from the page. The page posts a message to the content script. The **service worker** then calls `POST /recorder/start`.
+
+CORS on those routes allows only the Playwriter **extension origin**. A website cannot pass the preflight, so it cannot start or stop a recording.
+
+The worker fetch looks cross-site (`chrome-extension://` to `127.0.0.1`). `/recorder/start` and `/recorder/stop` skip the `Sec-Fetch-Site` block for that reason. `/recorder/events` and `/recorder/status` do not.
 
 ## Cookie safety
 

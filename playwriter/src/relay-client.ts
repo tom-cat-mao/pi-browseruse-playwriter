@@ -217,6 +217,8 @@ export interface EnsureRelayServerOptions {
   logger?: { log: (...args: any[]) => void }
   /** If true, will kill and restart server on version mismatch. Default: true */
   restartOnVersionMismatch?: boolean
+  /** Kill any running relay and start a new one, even if versions match. */
+  forceRestart?: boolean
   /** Pass additional environment variables to the relay server process */
   env?: Record<string, string>
 }
@@ -241,10 +243,16 @@ export async function ensureRelayServer(options: EnsureRelayServerOptions = {}):
 }
 
 async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Promise<true | undefined> {
-  const { logger, restartOnVersionMismatch = true, env: additionalEnv } = options
+  const { logger, restartOnVersionMismatch = true, env: additionalEnv, forceRestart = false } = options
+
+  if (forceRestart) {
+    logger?.log(pc.yellow('Restarting CDP relay server...'))
+    await killRelayServer({ port: RELAY_PORT })
+  }
+
   const serverVersion = await getRelayServerVersion(RELAY_PORT)
 
-  if (serverVersion === VERSION) {
+  if (!forceRestart && serverVersion === VERSION) {
     return
   }
 
