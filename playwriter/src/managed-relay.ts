@@ -138,18 +138,21 @@ export type ManagedInventoryResult =
   | { accepted: true; profile: ManagedProfileSnapshot; epochChanged: boolean }
   | { accepted: false; reason: string }
 
-/** Per (sessionId, profileId) CDP scope. Derived sets are refreshed on access; the
- *  iframe sets persist until the profile snapshot is invalidated so child frame
- *  sessions stay attributed across events. */
+/** Per (sessionId, profileId) CDP scope. Derived sets are refreshed on access;
+ *  child-frame grants are always bound to their owning page target and are
+ *  dropped as soon as that page leaves the current ready set. */
 export type ManagedScopeView = {
   sessionId: string
   profileId: string
   targetIds: Set<string>
   tabIds: Set<string>
   ownedCdpSessionIds: Set<string>
-  ownedFrameIds: Set<string>
-  iframeSessionIds: Set<string>
-  iframeTargetIds: Set<string>
+  /** frameId -> owning page targetId (filled from the extension target map). */
+  frameOwners: Map<string, string>
+  /** iframe CDP session -> owning page targetId. */
+  iframeSessionParents: Map<string, string>
+  /** iframe targetId -> owning page targetId. */
+  iframeTargetParents: Map<string, string>
 }
 
 export type ManagedConnectionScope = {
@@ -215,7 +218,9 @@ type PendingManagedRequest = {
   started: boolean
   cancelRequested: boolean
   sessionReleased: boolean
+  clientDisconnected: boolean
   timedOut: boolean
+  detachClientSignal: (() => void) | null
 }
 
 type ManagedClientEntry = {
@@ -1025,13 +1030,13 @@ export function parseBrowserResponse(value: unknown): ParseResult<BrowserRespons
 // Capabilities
 // ---------------------------------------------------------------------------
 
-export function buildBrowserCapabilities(): BrowserCapabilities {
+export function buildBrowserCapabilities({ isolatedExecution }: { isolatedExecution: boolean }): BrowserCapabilities {
   return {
     protocolVersion: BROWSER_PROTOCOL_VERSION,
     managedGroups: true,
     persistentOwnership: true,
     explicitTabs: true,
-    isolatedExecution: true,
+    isolatedExecution,
   }
 }
 
@@ -1157,8 +1162,11 @@ export function effectiveResourceState({
   return state
 }
 
-export function listManagedProfiles(state: ManagedRelayState): BrowserProfile[] {
-  const capabilities = buildBrowserCapabilities()
+export function listManagedProfiles(
+  state: ManagedRelayState,
+  { isolatedExecution }: { isolatedExecution: boolean },
+): BrowserProfile[] {
+  const capabilities = buildBrowserCapabilities({ isolatedExecution })
   return Array.from(state.profiles.values())
     .sort((a, b) => {
       return a.profileId.localeCompare(b.profileId)
@@ -1298,7 +1306,9 @@ export class ManagedRelay {
   private readonly scopes = new Map<string, ManagedScopeView>()
   private readonly slots = new Map<string, ManagedExecutionSlot>()
   private readonly managedClients = new Map<string, ManagedClientEntry>()
-  private poolPromise: Promise<ManagedExecutorPoolContract | null> | null = null
+  private pool: ManagedExecutorPoolContract | null = null
+  private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
+  private poolUnavailable = false
   private disposed = false
 
   constructor(options: ManagedRelayOptions) {
@@ -1310,11 +1320,13 @@ export class ManagedRelay {
   }
 
   getCapabilities(): BrowserCapabilities {
-    return buildBrowserCapabilities()
+    this.maybeProbePool()
+    return buildBrowserCapabilities({ isolatedExecution: this.isPoolAvailable() })
   }
 
   listProfiles(): BrowserProfile[] {
-    return listManagedProfiles(this.state)
+    this.maybeProbePool()
+    return listManagedProfiles(this.state, { isolatedExecution: this.isPoolAvailable() })
   }
 
   noteConnectionOpened({ connectionId }: { connectionId: string }): void {
@@ -1341,7 +1353,7 @@ export class ManagedRelay {
     if (result.epochChanged) {
       this.invalidateProfileExecutions({
         profileId: result.profile.profileId,
-        reason: `browserEpoch changed to ${inventory.browserEpoch}`,
+        reason: 'browser epoch changed',
       })
       this.clearProfileScopes(result.profile.profileId)
     }
@@ -1358,7 +1370,7 @@ export class ManagedRelay {
       this.abortPendingForProfile(profile.profileId)
       this.invalidateProfileExecutions({ profileId: profile.profileId, reason: 'extension disconnected' })
       this.clearProfileScopes(profile.profileId)
-      void this.getPool()
+      void this.getExistingPool()
         .then(async (pool) => {
           await pool?.disconnectProfile({ profileId: profile.profileId })
         })
@@ -1372,7 +1384,7 @@ export class ManagedRelay {
   // HTTP request handling
   // -------------------------------------------------------------------------
 
-  async handleRequest(request: BrowserRequest): Promise<BrowserResponse> {
+  async handleRequest(request: BrowserRequest, options: { clientSignal?: AbortSignal } = {}): Promise<BrowserResponse> {
     if (this.disposed) {
       return failureResponse(request.requestId, {
         code: 'internal-error',
@@ -1435,7 +1447,7 @@ export class ManagedRelay {
       return existing.promise
     }
 
-    const promise = this.dispatch({ request, timeoutMs }).then((response) => {
+    const promise = this.dispatch({ request, timeoutMs, clientSignal: options.clientSignal }).then((response) => {
       return this.enforceResponseLimit(response, request.requestId)
     })
     this.dedup.set(dedupKey, { kind: operation.kind, fingerprint, timestamp: Date.now(), promise })
@@ -1446,9 +1458,11 @@ export class ManagedRelay {
   private async dispatch({
     request,
     timeoutMs,
+    clientSignal,
   }: {
     request: BrowserRequest
     timeoutMs: number
+    clientSignal?: AbortSignal
   }): Promise<BrowserResponse> {
     const operation = request.operation
     try {
@@ -1458,7 +1472,7 @@ export class ManagedRelay {
           if (!profile.ok) {
             return profile.response
           }
-          return await this.sendControl({ request, profile: profile.profile, timeoutMs })
+          return await this.sendControl({ request, profile: profile.profile, timeoutMs, clientSignal })
         }
         case 'groups.rename': {
           const group = this.resolveGroup({ requestId: request.requestId, sessionId: request.sessionId, groupId: operation.groupId })
@@ -1469,7 +1483,7 @@ export class ManagedRelay {
           if (!routable.ok) {
             return routable.response
           }
-          return await this.sendControl({ request, profile: routable.profile, timeoutMs })
+          return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
         }
         case 'groups.close': {
           const group = this.resolveGroup({ requestId: request.requestId, sessionId: request.sessionId, groupId: operation.groupId })
@@ -1480,7 +1494,7 @@ export class ManagedRelay {
           if (!routable.ok) {
             return routable.response
           }
-          return await this.sendControl({ request, profile: routable.profile, timeoutMs })
+          return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
         }
         case 'tabs.create': {
           const group = this.resolveGroup({ requestId: request.requestId, sessionId: request.sessionId, groupId: operation.groupId })
@@ -1491,7 +1505,7 @@ export class ManagedRelay {
           if (!routable.ok) {
             return routable.response
           }
-          return await this.sendControl({ request, profile: routable.profile, timeoutMs })
+          return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
         }
         case 'tabs.close':
         case 'tabs.release':
@@ -1504,7 +1518,7 @@ export class ManagedRelay {
           if (!routable.ok) {
             return routable.response
           }
-          return await this.sendControl({ request, profile: routable.profile, timeoutMs })
+          return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
         }
         case 'page.navigate':
         case 'page.snapshot':
@@ -1515,7 +1529,7 @@ export class ManagedRelay {
         case 'page.network':
         case 'page.logs':
         case 'page.execute': {
-          return await this.executePageOperation({ request, operation, timeoutMs })
+          return await this.executePageOperation({ request, operation, timeoutMs, clientSignal })
         }
         default: {
           return failureResponse(request.requestId, {
@@ -1545,16 +1559,19 @@ export class ManagedRelay {
     request,
     profile,
     timeoutMs,
+    clientSignal,
   }: {
     request: BrowserRequest
     profile: ManagedProfileSnapshot
     timeoutMs: number
+    clientSignal?: AbortSignal
   }): Promise<BrowserResponse> {
     const pending = this.createPending({
       sessionId: request.sessionId,
       requestId: request.requestId,
       profileId: profile.profileId,
       kind: request.operation.kind,
+      clientSignal,
     })
     try {
       const transportPromise = this.options.transport.sendBrowserRequest({
@@ -1590,6 +1607,7 @@ export class ManagedRelay {
     } catch (error) {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
     } finally {
+      pending.detachClientSignal?.()
       this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
     }
   }
@@ -1634,10 +1652,12 @@ export class ManagedRelay {
     request,
     operation,
     timeoutMs,
+    clientSignal,
   }: {
     request: BrowserRequest
     operation: BrowserPageOperation
     timeoutMs: number
+    clientSignal?: AbortSignal
   }): Promise<BrowserResponse> {
     const tabResult = this.resolveTab({ requestId: request.requestId, sessionId: request.sessionId, tabId: operation.tabId })
     if (!tabResult.ok) {
@@ -1647,16 +1667,13 @@ export class ManagedRelay {
     if (!routable.ok) {
       return routable.response
     }
-    const slot = this.beginExecution({
-      sessionId: request.sessionId,
-      profileId: tabResult.profile.profileId,
-      requestId: request.requestId,
-    })
+    const profileId = tabResult.profile.profileId
     const pending = this.createPending({
       sessionId: request.sessionId,
       requestId: request.requestId,
-      profileId: tabResult.profile.profileId,
+      profileId,
       kind: operation.kind,
+      clientSignal,
     })
     const timer = setTimeout(() => {
       pending.timedOut = true
@@ -1664,22 +1681,46 @@ export class ManagedRelay {
     }, timeoutMs)
     try {
       const response = await this.queue.run({
-        key: tabResult.profile.profileId,
+        key: profileId,
         controller: pending.controller,
         task: async (signal) => {
+          // The queue can wait a long time, so re-validate profile, tab, epoch and
+          // release state right before running instead of trusting the checks that
+          // happened when the request was enqueued.
+          const freshProfile = this.assertProfile({ profileId, allowOffline: false, requestId: request.requestId })
+          if (!freshProfile.ok) {
+            throw new ManagedTransportError(failureFromErrorResponse(freshProfile.response))
+          }
+          if (!freshProfile.profile) {
+            throw new ManagedTransportError({
+              code: 'profile-required',
+              message: 'profileId is required for this operation',
+              outcome: 'not-started',
+            })
+          }
+          const freshTab = this.resolveTab({ requestId: request.requestId, sessionId: request.sessionId, tabId: operation.tabId })
+          if (!freshTab.ok) {
+            throw new ManagedTransportError(failureFromErrorResponse(freshTab.response))
+          }
           // Authoritative release/ownership re-check with the extension right
-          // before executing: the cached inventory may be a moment behind a
-          // release that happened while this request was queued.
+          // before executing (the cached inventory may be a moment behind).
           const authoritative = await this.resolveTabWithExtension({
             request,
             operation,
-            profile: tabResult.profile,
+            profile: freshProfile.profile,
             timeoutMs,
             signal,
           })
           if (!authoritative.ok) {
             throw new ManagedTransportError(authoritative.failure)
           }
+          // Capture the connection epoch only now, so a browserEpoch change while
+          // the request was queued can never reuse a stale managed CDP connection.
+          const slot = this.beginExecution({
+            sessionId: request.sessionId,
+            profileId,
+            requestId: request.requestId,
+          })
           const pool = await this.getPool()
           if (!pool) {
             throw new ManagedTransportError({
@@ -1718,6 +1759,7 @@ export class ManagedRelay {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
     } finally {
       clearTimeout(timer)
+      pending.detachClientSignal?.()
       this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
     }
   }
@@ -1829,39 +1871,64 @@ export class ManagedRelay {
   }
 
   private async getPool(): Promise<ManagedExecutorPoolContract | null> {
-    if (this.poolPromise) {
-      return this.poolPromise
+    if (this.pool) {
+      return this.pool
+    }
+    if (this.poolLoadPromise) {
+      return this.poolLoadPromise
+    }
+    if (this.poolUnavailable && !this.options.poolFactory) {
+      return null
     }
     const load = async (): Promise<ManagedExecutorPoolContract | null> => {
       try {
-        const factory = this.options.poolFactory ?? (async () => {
-          const moduleId: string = './managed-executor-pool.js'
-          const loaded: unknown = await import(moduleId)
-          if (!isManagedExecutorPoolModule(loaded)) {
-            throw new Error('managed-executor-pool.js does not export the ManagedExecutorPool class')
-          }
-          return new loaded.ManagedExecutorPool({
+        const factory =
+          this.options.poolFactory ??
+          createDefaultManagedExecutorPoolFactory({
             onInvalidate: (options) => {
               this.handlePoolInvalidate(options)
             },
           })
-        })
-        return await factory()
+        const pool = await factory()
+        this.pool = pool
+        return pool
       } catch (error) {
-        this.options.logger?.error(
-          '[managed-relay] isolated executor pool unavailable (C worker not integrated yet):',
-          error,
-        )
+        this.poolUnavailable = true
+        this.options.logger?.error('[managed-relay] isolated executor pool unavailable:', error)
         return null
+      } finally {
+        this.poolLoadPromise = null
       }
     }
-    this.poolPromise = load()
-    const pool = await this.poolPromise
-    if (!pool) {
-      // Allow a later request to retry the import instead of caching the failure.
-      this.poolPromise = null
+    this.poolLoadPromise = load()
+    return this.poolLoadPromise
+  }
+
+  /** Existing pool only: releasing/cancelling must never instantiate a pool that
+   *  was never used by this process (and therefore has no worker to release). */
+  private async getExistingPool(): Promise<ManagedExecutorPoolContract | null> {
+    if (this.pool) {
+      return this.pool
     }
-    return pool
+    if (this.options.poolFactory) {
+      return await this.getPool()
+    }
+    return null
+  }
+
+  private isPoolAvailable(): boolean {
+    if (this.options.poolFactory) {
+      return true
+    }
+    return this.pool !== null
+  }
+
+  /** Warm the pool once so capabilities can report the real executor support. */
+  private maybeProbePool(): void {
+    if (this.pool || this.poolUnavailable || this.poolLoadPromise) {
+      return
+    }
+    void this.getPool()
   }
 
   private handlePoolInvalidate(options: { sessionId: string; profileId: string; connectionEpoch: string }): void {
@@ -1883,7 +1950,7 @@ export class ManagedRelay {
     this.abortPendingForSession(sessionId, 'session-released')
     this.invalidateSessionExecutions({ sessionId, reason: 'session released' })
     try {
-      const pool = await this.getPool()
+      const pool = await this.getExistingPool()
       if (pool) {
         await pool.releaseSession({ sessionId })
       }
@@ -1949,7 +2016,7 @@ export class ManagedRelay {
     profileId: string
   }): Promise<void> {
     try {
-      const pool = await this.getPool()
+      const pool = await this.getExistingPool()
       if (pool) {
         await pool.cancel({ sessionId, requestId })
       }
@@ -2009,7 +2076,7 @@ export class ManagedRelay {
       return {
         ok: false,
         code: 'stale-snapshot',
-        reason: `stale browserEpoch ${request.browserEpoch} (current ${snapshot.browserEpoch})`,
+        reason: 'stale browser epoch',
       }
     }
     const key = slotKey(request.sessionId, profileId)
@@ -2174,9 +2241,9 @@ export class ManagedRelay {
         targetIds: new Set(),
         tabIds: new Set(),
         ownedCdpSessionIds: new Set(),
-        ownedFrameIds: new Set(),
-        iframeSessionIds: new Set(),
-        iframeTargetIds: new Set(),
+        frameOwners: new Map(),
+        iframeSessionParents: new Map(),
+        iframeTargetParents: new Map(),
       }
       this.scopes.set(key, scope)
     }
@@ -2185,11 +2252,13 @@ export class ManagedRelay {
     // Session/frame sets are re-derived from the cached inventory and the
     // extension target map on every access, so stale ids cannot accumulate.
     scope.ownedCdpSessionIds.clear()
-    scope.ownedFrameIds.clear()
+    scope.frameOwners.clear()
     const snapshot = this.state.profiles.get(profileId)
     if (snapshot) {
       for (const tab of snapshot.tabs.values()) {
-        if (tab.sessionId !== sessionId || tab.state === 'released') {
+        // Only ready tabs in the current browser epoch are addressable. Released,
+        // disconnected or needs-rebind resources never grant CDP access.
+        if (tab.sessionId !== sessionId || tab.state !== 'ready' || tab.browserEpoch !== snapshot.browserEpoch) {
           continue
         }
         scope.tabIds.add(tab.tabId)
@@ -2201,95 +2270,117 @@ export class ManagedRelay {
         }
       }
     }
+    this.pruneIframeGrants(scope)
     return scope
   }
 
-  /** cdp-relay fills session ids and frame ids resolved from the extension target map. */
+  /** Child-frame grants die with the page target that owns them. */
+  private pruneIframeGrants(scope: ManagedScopeView): void {
+    for (const [cdpSessionId, parentTargetId] of Array.from(scope.iframeSessionParents)) {
+      if (!scope.targetIds.has(parentTargetId)) {
+        scope.iframeSessionParents.delete(cdpSessionId)
+      }
+    }
+    for (const [targetId, parentTargetId] of Array.from(scope.iframeTargetParents)) {
+      if (!scope.targetIds.has(parentTargetId)) {
+        scope.iframeTargetParents.delete(targetId)
+      }
+    }
+  }
+
+  /** cdp-relay re-fills session ids and frame ownership from the extension target map. */
   noteOwnedTargetState({
     scope,
     cdpSessionIds,
-    frameIds,
+    frames,
   }: {
     scope: ManagedScopeView
     cdpSessionIds: Iterable<string>
-    frameIds: Iterable<string>
+    frames: Iterable<{ frameId: string; ownerTargetId: string }>
   }): void {
     for (const sessionId of cdpSessionIds) {
       scope.ownedCdpSessionIds.add(sessionId)
     }
-    for (const frameId of frameIds) {
-      scope.ownedFrameIds.add(frameId)
+    for (const frame of frames) {
+      scope.frameOwners.set(frame.frameId, frame.ownerTargetId)
     }
   }
 
-  noteIframeSession({ scope, cdpSessionId, targetId }: { scope: ManagedScopeView; cdpSessionId?: string; targetId?: string }): void {
+  noteIframeSession({
+    scope,
+    cdpSessionId,
+    targetId,
+    parentTargetId,
+  }: {
+    scope: ManagedScopeView
+    cdpSessionId?: string
+    targetId?: string
+    parentTargetId: string
+  }): void {
     if (cdpSessionId) {
-      scope.iframeSessionIds.add(cdpSessionId)
+      scope.iframeSessionParents.set(cdpSessionId, parentTargetId)
     }
     if (targetId) {
-      scope.iframeTargetIds.add(targetId)
+      scope.iframeTargetParents.set(targetId, parentTargetId)
     }
   }
 
   forgetIframeSession({ scope, cdpSessionId, targetId }: { scope: ManagedScopeView; cdpSessionId?: string; targetId?: string }): void {
     if (cdpSessionId) {
-      scope.iframeSessionIds.delete(cdpSessionId)
+      scope.iframeSessionParents.delete(cdpSessionId)
     }
     if (targetId) {
-      scope.iframeTargetIds.delete(targetId)
+      scope.iframeTargetParents.delete(targetId)
     }
   }
 
   isTargetInScope({ scope, targetId }: { scope: ManagedScopeView; targetId: string }): boolean {
-    return scope.targetIds.has(targetId) || scope.iframeTargetIds.has(targetId)
+    return scope.targetIds.has(targetId) || scope.iframeTargetParents.has(targetId)
   }
 
   isCdpSessionInScope({ scope, cdpSessionId }: { scope: ManagedScopeView; cdpSessionId: string }): boolean {
-    return scope.ownedCdpSessionIds.has(cdpSessionId) || scope.iframeSessionIds.has(cdpSessionId)
+    return scope.ownedCdpSessionIds.has(cdpSessionId) || scope.iframeSessionParents.has(cdpSessionId)
   }
 
   /**
    * Per-CDP-command authorization for managed clients. Returns a rejection message
-   * or null when the command is allowed. This runs in addition to (not instead of)
-   * list filtering, so a command referencing another session's target/session fails.
+   * or null when the command is allowed.
+   *
+   * Managed clients may only use commands that are explicitly rooted in their own
+   * session or target: root-level operations come from a small allowlist, so a
+   * page-bound domain method can never be smuggled through as a profile-wide call.
+   * Inner `params.sessionId` wrappers (Target.sendMessageToTarget,
+   * Target.detachFromTarget, ...) are validated against the same scope.
    */
   validateCdpCommand({ scope, method, params, sessionId }: ManagedCommandContext): string | null {
-    const deniedMethods = new Set([
-      'Browser.close',
-      'Browser.crash',
-      'Browser.crashGpuProcess',
-      'Browser.grantPermissions',
-      'Browser.resetPermissions',
-      'Browser.setPermission',
-      'Browser.setDockTile',
-      'Target.createTarget',
-      'Target.createBrowserContext',
-      'Target.disposeBrowserContext',
-    ])
-    if (deniedMethods.has(method)) {
+    if (MANAGED_DENIED_METHODS.has(method)) {
       return `${method} is not allowed for managed sessions`
     }
     if (method.startsWith('Browser.') && method !== 'Browser.getVersion' && method !== 'Browser.setDownloadBehavior') {
       return `${method} is a profile-wide operation and is not allowed for managed sessions`
     }
-    if (sessionId) {
-      if (!this.isCdpSessionInScope({ scope, cdpSessionId: sessionId })) {
-        return `session ${sessionId} does not belong to this managed session`
-      }
+    const record = isRecord(params) ? params : null
+    const innerSessionId = record && typeof record.sessionId === 'string' ? record.sessionId : null
+    const targetId = record && typeof record.targetId === 'string' ? record.targetId : null
+    if (sessionId && !this.isCdpSessionInScope({ scope, cdpSessionId: sessionId })) {
+      return `session ${sessionId} does not belong to this managed session`
     }
-    const targetId = isRecord(params) && typeof params.targetId === 'string' ? params.targetId : null
+    if (innerSessionId && !this.isCdpSessionInScope({ scope, cdpSessionId: innerSessionId })) {
+      return `session ${innerSessionId} does not belong to this managed session`
+    }
     if (targetId && !this.isTargetInScope({ scope, targetId })) {
       return `target ${targetId} does not belong to this managed session`
     }
-    if (!sessionId && !targetId && requiresCdpSession(method)) {
-      return `${method} requires an explicit managed session`
+    if (!sessionId && !innerSessionId && !targetId && !MANAGED_ROOT_METHODS.has(method)) {
+      return `${method} is not allowed for managed sessions without an explicit target/session`
     }
     return null
   }
 
   /**
    * Event authorization for managed clients. Events for other sessions/profiles are
-   * dropped; legal child-frame attaches are remembered so their later events pass.
+   * dropped; legal child-frame attaches are recorded with their parent page so the
+   * grant disappears with that page.
    */
   isEventInScope({ scope, method, sessionId, params }: { scope: ManagedScopeView; method: string; sessionId?: string; params?: unknown }): boolean {
     const record = isRecord(params) ? params : null
@@ -2303,9 +2394,10 @@ export class ManagedRelay {
         return true
       }
       const parentFrameId = targetInfo && typeof targetInfo.parentFrameId === 'string' ? targetInfo.parentFrameId : null
-      if (parentFrameId && scope.ownedFrameIds.has(parentFrameId)) {
+      const parentTargetId = parentFrameId ? scope.frameOwners.get(parentFrameId) : undefined
+      if (parentTargetId && scope.targetIds.has(parentTargetId)) {
         const childSessionId = record && typeof record.sessionId === 'string' ? record.sessionId : undefined
-        this.noteIframeSession({ scope, cdpSessionId: childSessionId, targetId })
+        this.noteIframeSession({ scope, cdpSessionId: childSessionId, targetId, parentTargetId })
         return true
       }
       return false
@@ -2355,8 +2447,8 @@ export class ManagedRelay {
     for (const slot of this.slots.values()) {
       this.invalidateSlot({ sessionId: slot.sessionId, profileId: slot.profileId, reason: 'relay shutting down' })
     }
-    const pool = this.poolPromise ? await this.poolPromise : null
-    this.poolPromise = null
+    const pool = await this.getExistingPool()
+    this.pool = null
     if (pool) {
       try {
         await pool.dispose()
@@ -2375,11 +2467,13 @@ export class ManagedRelay {
     requestId,
     profileId,
     kind,
+    clientSignal,
   }: {
     sessionId: string
     requestId: string
     profileId: string
     kind: BrowserOperation['kind']
+    clientSignal?: AbortSignal
   }): PendingManagedRequest {
     const pending: PendingManagedRequest = {
       sessionId,
@@ -2390,10 +2484,47 @@ export class ManagedRelay {
       started: false,
       cancelRequested: false,
       sessionReleased: false,
+      clientDisconnected: false,
       timedOut: false,
+      detachClientSignal: null,
+    }
+    if (clientSignal) {
+      pending.detachClientSignal = this.attachClientSignal({ pending, signal: clientSignal })
     }
     this.pending.set(`${sessionId}\u0000${requestId}`, pending)
     return pending
+  }
+
+  /** A dropped HTTP client stops the work it started (it can no longer read the
+   *  result); the outcome stays `unknown` for anything already sent. */
+  private attachClientSignal({ pending, signal }: { pending: PendingManagedRequest; signal: AbortSignal }): () => void {
+    const onAbort = () => {
+      this.abortPendingForClient(pending)
+    }
+    if (signal.aborted) {
+      onAbort()
+      return () => {}
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    return () => {
+      signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  private abortPendingForClient(pending: PendingManagedRequest): void {
+    if (pending.cancelRequested) {
+      return
+    }
+    pending.clientDisconnected = true
+    pending.cancelRequested = true
+    pending.controller.abort(new Error('client disconnected'))
+    if (isPageOperationKind(pending.kind)) {
+      void this.cancelPoolRequest({
+        sessionId: pending.sessionId,
+        requestId: pending.requestId,
+        profileId: pending.profileId,
+      })
+    }
   }
 
   private abortPendingForSession(sessionId: string, reason: 'session-released'): void {
@@ -2688,6 +2819,13 @@ function buildRequestFingerprint(request: BrowserRequest): string {
   })
 }
 
+function failureFromErrorResponse(response: BrowserResponse): ManagedFailure {
+  if (response.ok) {
+    return { code: 'internal-error', message: 'unexpected success response', outcome: 'unknown' }
+  }
+  return { code: response.error.code, message: response.error.message, outcome: response.error.outcome }
+}
+
 function describeTransportFailure(error: unknown): ManagedFailure {
   if (error instanceof ManagedTransportError) {
     return { code: error.code, message: error.message, outcome: error.outcome }
@@ -2703,6 +2841,27 @@ function slotKey(sessionId: string, profileId: string): string {
   return `${sessionId}\u0000${profileId}`
 }
 
+/**
+ * TEMPORARY (owner-C integration): the isolated executor module does not exist in
+ * this branch yet. When it is merged the runtime should use a normal top-level
+ * `import { ManagedExecutorPool } from './managed-executor-pool.js'` instead of
+ * this lazy loader, and this fallback must be deleted.
+ */
+function createDefaultManagedExecutorPoolFactory({
+  onInvalidate,
+}: {
+  onInvalidate: (options: { sessionId: string; profileId: string; connectionEpoch: string }) => void
+}): () => Promise<ManagedExecutorPoolContract> {
+  return async () => {
+    const moduleId: string = './managed-executor-pool.js'
+    const loaded: unknown = await import(moduleId)
+    if (!isManagedExecutorPoolModule(loaded)) {
+      throw new Error('managed-executor-pool.js does not export the ManagedExecutorPool class')
+    }
+    return new loaded.ManagedExecutorPool({ onInvalidate })
+  }
+}
+
 function isManagedExecutorPoolModule(value: unknown): value is {
   ManagedExecutorPool: new (options?: ManagedExecutorPoolOptions) => ManagedExecutorPoolContract
 } {
@@ -2713,56 +2872,43 @@ function isManagedExecutorPoolModule(value: unknown): value is {
   return typeof candidate === 'function'
 }
 
-/** CDP domains that only act on a page/target and therefore require an explicit session. */
-const SESSION_BOUND_DOMAINS = new Set([
-  'Accessibility',
-  'Animation',
-  'Audits',
-  'CSS',
-  'CacheStorage',
-  'Cast',
-  'DOM',
-  'DOMDebugger',
-  'DOMSnapshot',
-  'DOMStorage',
-  'Debugger',
-  'DeviceOrientation',
-  'Emulation',
-  'EventBreakpoints',
-  'FedCm',
-  'HeadlessExperimental',
-  'HeapProfiler',
-  'IndexedDB',
-  'Input',
-  'Inspector',
-  'LayerTree',
-  'Log',
-  'Media',
-  'Memory',
-  'Network',
-  'Overlay',
-  'PWA',
-  'Page',
-  'Performance',
-  'Profiler',
-  'Runtime',
-  'ServiceWorker',
-  'Storage',
-  'Tracing',
-  'WebAudio',
-  'WebAuthn',
+/**
+ * Root-level (no sessionId/targetId) CDP methods managed clients may call. Kept
+ * explicit so a page-bound method from any domain can never be used profile-wide.
+ * Every entry still has its inner target/session ownership validated separately.
+ */
+const MANAGED_ROOT_METHODS = new Set([
+  'Browser.getVersion',
+  'Browser.setDownloadBehavior',
+  'Schema.getDomains',
+  'Target.activateTarget',
+  'Target.attachToTarget',
+  'Target.closeTarget',
+  'Target.detachFromTarget',
+  'Target.getBrowserContexts',
+  'Target.getTargetInfo',
+  'Target.getTargets',
+  'Target.sendMessageToTarget',
+  'Target.setAutoAttach',
+  'Target.setDiscoverTargets',
 ])
 
-function requiresCdpSession(method: string): boolean {
-  if (method.startsWith('Target.')) {
-    return false
-  }
-  if (method.startsWith('Browser.')) {
-    return false
-  }
-  if (method === 'Schema.getDomains' || method === 'SystemInfo.getInfo') {
-    return false
-  }
-  const domain = method.split('.')[0]
-  return SESSION_BOUND_DOMAINS.has(domain)
-}
+/** Methods that always affect the whole browser profile, even with a session. */
+const MANAGED_DENIED_METHODS = new Set([
+  'Browser.close',
+  'Browser.crash',
+  'Browser.crashGpuProcess',
+  'Browser.grantPermissions',
+  'Browser.resetPermissions',
+  'Browser.setPermission',
+  'Browser.setDockTile',
+  'Network.clearBrowserCache',
+  'Network.clearBrowserCookies',
+  'Storage.clearCookies',
+  'Storage.clearDataForOrigin',
+  'Storage.clearDataForStorageKey',
+  'Storage.clearSiteData',
+  'Target.createBrowserContext',
+  'Target.createTarget',
+  'Target.disposeBrowserContext',
+])

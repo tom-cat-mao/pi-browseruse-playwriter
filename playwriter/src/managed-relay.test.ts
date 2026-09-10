@@ -680,7 +680,7 @@ async function connectTrackedCdpClient(options: { port: number; query: string })
 
 describe('managed /browser/v1 HTTP surface', () => {
   test('capabilities are static, profiles require auth when a token is configured', async () => {
-    const relay = await startTrackedRelay({ token: 'sekret' })
+    const relay = await startTrackedRelay({ token: 'sekret', poolFactory: async () => createTestPool() })
 
     const unauthorizedCapabilities = await getJson({ port: relay.port, path: '/browser/v1/capabilities' })
     expect(unauthorizedCapabilities.status).toBe(401)
@@ -715,6 +715,22 @@ describe('managed /browser/v1 HTTP surface', () => {
         "status": 200,
       }
     `)
+  })
+
+  test('isolatedExecution capability is false when the executor pool is unavailable', async () => {
+    const relay = await startTrackedRelay()
+    const withoutPool = await getJson({ port: relay.port, path: '/browser/v1/capabilities' })
+    expect(withoutPool.body).toMatchObject({ isolatedExecution: false })
+
+    const poolRelay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
+    const withPool = await getJson({ port: poolRelay.port, path: '/browser/v1/capabilities' })
+    expect(withPool.body).toMatchObject({
+      explicitTabs: true,
+      isolatedExecution: true,
+      managedGroups: true,
+      persistentOwnership: true,
+      protocolVersion: 1,
+    })
   })
 
   test('malformed bodies are rejected with 400 before any protocol work', async () => {
@@ -902,7 +918,7 @@ describe('extension origin allowlist', () => {
 
 describe('managed inventory registry', () => {
   test('profiles, groups and tabs come from the extension inventory and are session filtered', async () => {
-    const relay = await startTrackedRelay()
+    const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1', email: 'a@b.c' })
     extension.sendInventory(
       makeInventory({
@@ -1635,6 +1651,137 @@ describe('managed page execution', () => {
     expect(pool.executions).toHaveLength(1)
     const cdpUrl = new URL(pool.executions[0].cdpUrl)
     expect(cdpUrl.searchParams.get('token')).toBe('sekret')
+    expect(relay.logs.join('\n')).not.toContain('sekret')
+  })
+
+  test('page execution re-validates release state after waiting in the profile queue', async () => {
+    const pool = createTestPool()
+    pool.hold = true
+    const relay = await startTrackedRelay({ poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+    extension.sendInventory(
+      makeInventory({
+        revision: 1,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 's1' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+
+    const first = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'queue-a',
+        sessionId: 's1',
+        operation: { kind: 'page.navigate', tabId: 't1', url: 'https://example.com/a' },
+      },
+    })
+    const second = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'queue-b',
+        sessionId: 's1',
+        operation: { kind: 'page.navigate', tabId: 't2', url: 'https://example.com/b' },
+      },
+    })
+    await waitForCondition(
+      () => {
+        return pool.executions.length === 1
+      },
+      { message: 'first execution is running and second is queued' },
+    )
+
+    // The user releases t2 while the second request waits in the profile queue.
+    extension.sendInventory(
+      makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 's1', state: 'released' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=2')
+        })
+      },
+      { message: 'release revision applied while queued' },
+    )
+
+    pool.releaseAll()
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult.body).toMatchObject({ ok: true })
+    expect(secondResult.body).toMatchObject({
+      ok: false,
+      error: { code: 'resource-released', outcome: 'not-started' },
+    })
+    expect(pool.executions).toHaveLength(1)
+    expect(
+      extension.received.filter((entry) => {
+        return entry.operation.kind === 'tab.resolve'
+      }),
+    ).toHaveLength(1)
+  })
+
+  test('a dropped HTTP client cancels the in-flight page operation', async () => {
+    const pool = createTestPool()
+    pool.hold = true
+    const relay = await startTrackedRelay({ poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+
+    const controller = new AbortController()
+    const responsePromise = fetch(`http://127.0.0.1:${relay.port}/browser/v1/request`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        requestId: 'page-disconnect',
+        sessionId: 's1',
+        operation: { kind: 'page.navigate', tabId: 't1', url: 'https://example.com/' },
+      }),
+      signal: controller.signal,
+    })
+    await waitForCondition(
+      () => {
+        return pool.executions.length === 1
+      },
+      { message: 'execution started before the client dropped' },
+    )
+    controller.abort()
+    await expect(responsePromise).rejects.toThrow()
+    await waitForCondition(
+      () => {
+        return pool.cancels.length === 1
+      },
+      { message: 'client disconnect cancels the pool request' },
+    )
+    expect(pool.cancels[0]).toEqual({ sessionId: 's1', requestId: 'page-disconnect' })
   })
 
   test('page operations on a released or foreign tab fail before the executor runs', async () => {
@@ -1902,6 +2049,296 @@ describe('managed CDP scoping', () => {
     expect(managed.attachedTargets()).toEqual(['target-t1'])
   })
 
+  test('profile-wide, wrapper and unlisted root CDP commands are denied for managed clients', async () => {
+    const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [
+          makeGroup({ groupId: 'g1', sessionId: 'session-a' }),
+          makeGroup({ groupId: 'g2', sessionId: 'session-b' }),
+        ],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g2', sessionId: 'session-b' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+    const managed = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({
+        browserSessionId: 'session-a',
+        profileId: 'profile-1',
+        browserEpoch: 'epoch-1',
+      }).toString(),
+    })
+    const targetInfo = (targetId: string, url: string) => {
+      return {
+        targetId,
+        type: 'page',
+        title: targetId,
+        url,
+        attached: true,
+        canAccessOpener: false,
+      }
+    }
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t1',
+      params: {
+        sessionId: 'pw-t1',
+        targetInfo: targetInfo('target-t1', 'https://example.com/a'),
+        waitingForDebugger: false,
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t2',
+      params: {
+        sessionId: 'pw-t2',
+        targetInfo: targetInfo('target-t2', 'https://example.com/b'),
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return managed.attachedTargets().length === 1
+      },
+      { message: 'managed attach scope resolved' },
+    )
+
+    const denied = [
+      { id: 10, method: 'Network.clearBrowserCookies' },
+      { id: 11, method: 'Network.clearBrowserCache' },
+      {
+        id: 12,
+        method: 'Storage.clearDataForOrigin',
+        sessionId: 'pw-t1',
+        params: { origin: 'https://example.com', storageTypes: 'all' },
+      },
+      { id: 13, method: 'Page.enable' },
+      { id: 14, method: 'Target.sendMessageToTarget', params: { sessionId: 'pw-t2', message: '{}' } },
+      { id: 15, method: 'Target.detachFromTarget', params: { sessionId: 'pw-t2' } },
+    ]
+    for (const command of denied) {
+      managed.send(command)
+    }
+    for (const command of denied) {
+      const response = await managed.waitForResponse(command.id)
+      expect(response.error).toMatchObject({ message: expect.any(String) })
+    }
+    expect(extension.forwardCommands).toHaveLength(0)
+
+    // Own-session wrappers and download behavior stay usable, scoped to own tabs.
+    managed.send({ id: 16, method: 'Target.detachFromTarget', params: { sessionId: 'pw-t1' } })
+    await managed.waitForResponse(16)
+    managed.send({ id: 17, method: 'Browser.setDownloadBehavior', params: { behavior: 'allow', downloadPath: '/tmp/downloads' } })
+    await managed.waitForResponse(17)
+    expect(
+      extension.forwardCommands.map((command) => {
+        return `${command.method}:${command.sessionId ?? '-'}`
+      }),
+    ).toEqual(['Target.detachFromTarget:-', 'Page.setDownloadBehavior:pw-t1'])
+  })
+
+  test('managed scope only grants ready tabs in the current epoch', async () => {
+    const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't-ready', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't-rebind', groupId: 'g1', sessionId: 'session-a', state: 'needs-rebind' }),
+          makeTab({ tabId: 't-off', groupId: 'g1', sessionId: 'session-a', state: 'disconnected' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+    const managed = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({
+        browserSessionId: 'session-a',
+        profileId: 'profile-1',
+        browserEpoch: 'epoch-1',
+      }).toString(),
+    })
+    const targetInfo = (targetId: string) => {
+      return {
+        targetId,
+        type: 'page',
+        title: targetId,
+        url: 'https://example.com/',
+        attached: true,
+        canAccessOpener: false,
+      }
+    }
+    for (const tab of [
+      { sessionId: 'pw-ready', targetId: 'target-t-ready' },
+      { sessionId: 'pw-rebind', targetId: 'target-t-rebind' },
+      { sessionId: 'pw-off', targetId: 'target-t-off' },
+    ]) {
+      extension.sendForwardCdpEvent({
+        method: 'Target.attachedToTarget',
+        sessionId: tab.sessionId,
+        params: { sessionId: tab.sessionId, targetInfo: targetInfo(tab.targetId), waitingForDebugger: false },
+      })
+    }
+    await waitForCondition(
+      () => {
+        return managed.attachedTargets().length === 1
+      },
+      { message: 'only the ready target reaches the managed client' },
+    )
+    expect(managed.attachedTargets()).toEqual(['target-t-ready'])
+
+    managed.send({ id: 1, method: 'Target.getTargets' })
+    const targets = await managed.waitForResponse(1)
+    expect(targets.result).toMatchObject({ targetInfos: [{ targetId: 'target-t-ready' }] })
+
+    for (const [id, cdpSessionId] of [
+      [2, 'pw-rebind'],
+      [3, 'pw-off'],
+    ] as const) {
+      managed.send({ id, method: 'Runtime.evaluate', sessionId: cdpSessionId, params: { expression: '1' } })
+      const response = await managed.waitForResponse(id)
+      expect(response.error).toMatchObject({ message: expect.stringContaining('does not belong to this managed session') })
+    }
+  })
+
+  test('iframe grants die with the page that owns them', async () => {
+    const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+    extension.sendInventory(
+      makeInventory({
+        revision: 1,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+    const managed = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({
+        browserSessionId: 'session-a',
+        profileId: 'profile-1',
+        browserEpoch: 'epoch-1',
+      }).toString(),
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t1',
+      params: {
+        sessionId: 'pw-t1',
+        targetInfo: {
+          targetId: 'target-t1',
+          type: 'page',
+          title: 't1',
+          url: 'https://example.com/',
+          attached: true,
+          canAccessOpener: false,
+        },
+        waitingForDebugger: false,
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Page.frameAttached',
+      sessionId: 'pw-t1',
+      params: { frameId: 'frame-1', parentFrameId: '' },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-frame',
+      params: {
+        sessionId: 'pw-frame',
+        targetInfo: {
+          targetId: 'target-frame',
+          type: 'iframe',
+          title: 'frame',
+          url: 'https://example.com/frame',
+          parentFrameId: 'frame-1',
+          attached: true,
+          canAccessOpener: false,
+        },
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return managed.attachedTargets().includes('target-frame')
+      },
+      { message: 'owned iframe attach forwarded' },
+    )
+    managed.send({ id: 1, method: 'Runtime.evaluate', sessionId: 'pw-frame', params: { expression: '1' } })
+    await managed.waitForResponse(1)
+    expect(extension.forwardCommands.map((command) => command.sessionId)).toContain('pw-frame')
+
+    // The user releases the parent page: the iframe grant must disappear with it.
+    extension.sendInventory(
+      makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a', state: 'released' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=2')
+        })
+      },
+      { message: 'release revision applied' },
+    )
+    managed.send({ id: 2, method: 'Runtime.evaluate', sessionId: 'pw-frame', params: { expression: '1' } })
+    const afterRelease = await managed.waitForResponse(2)
+    expect(afterRelease.error).toMatchObject({ message: expect.stringContaining('does not belong to this managed session') })
+
+    const before = managed.attachedTargets().length
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-frame-2',
+      params: {
+        sessionId: 'pw-frame-2',
+        targetInfo: {
+          targetId: 'target-frame-2',
+          type: 'iframe',
+          title: 'frame2',
+          url: 'https://example.com/frame2',
+          parentFrameId: 'frame-1',
+          attached: true,
+          canAccessOpener: false,
+        },
+        waitingForDebugger: false,
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30)
+    })
+    expect(managed.attachedTargets()).toHaveLength(before)
+  })
+
   test('stale browserEpoch and stale connectionEpoch managed connections are rejected', async () => {
     const relay = await startTrackedRelay()
     const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
@@ -1930,7 +2367,7 @@ describe('managed CDP scoping', () => {
     })
     expect(await staleEpoch.waitForClose()).toMatchObject({
       code: 4002,
-      reason: expect.stringContaining('stale browserEpoch'),
+      reason: expect.stringContaining('stale browser epoch'),
     })
 
     const staleConnection = await connectTrackedCdpClient({

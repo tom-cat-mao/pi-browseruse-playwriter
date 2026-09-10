@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { cors } from 'hono/cors'
 import { createAdaptorServer } from '@hono/node-server'
 import { getConnInfo } from '@hono/node-server/conninfo'
@@ -595,8 +596,10 @@ export async function startPlayWriterCDPRelayServer({
       cdpSessionIds: owned.map((target) => {
         return target.sessionId
       }),
-      frameIds: owned.flatMap((target) => {
-        return Array.from(target.frameIds)
+      frames: owned.flatMap((target) => {
+        return Array.from(target.frameIds).map((frameId) => {
+          return { frameId, ownerTargetId: target.targetId }
+        })
       }),
     })
     return view
@@ -614,7 +617,11 @@ export async function startPlayWriterCDPRelayServer({
     if (managedRelay.isTargetInScope({ scope, targetId })) {
       return true
     }
-    return Boolean(parentFrameId && scope.ownedFrameIds.has(parentFrameId))
+    if (!parentFrameId) {
+      return false
+    }
+    const ownerTargetId = scope.frameOwners.get(parentFrameId)
+    return Boolean(ownerTargetId && scope.targetIds.has(ownerTargetId))
   }
 
   const recordingRelays = new Map<string, RecordingRelay>()
@@ -1271,32 +1278,36 @@ export async function startPlayWriterCDPRelayServer({
     return c.json({ profiles: managedRelay.listProfiles() })
   })
 
-  app.post('/browser/v1/request', async (c) => {
-    const contentType = c.req.header('content-type') || ''
-    if (!contentType.includes('application/json')) {
-      return c.json({ error: 'Content-Type must be application/json' }, 400)
-    }
-    const declaredLength = Number(c.req.header('content-length') || '0')
-    if (Number.isFinite(declaredLength) && declaredLength > MANAGED_REQUEST_BODY_LIMIT_BYTES) {
-      return c.json({ error: `request body exceeds ${MANAGED_REQUEST_BODY_LIMIT_BYTES} bytes` }, 400)
-    }
-    const raw = await c.req.text()
-    if (Buffer.byteLength(raw, 'utf8') > MANAGED_REQUEST_BODY_LIMIT_BYTES) {
-      return c.json({ error: `request body exceeds ${MANAGED_REQUEST_BODY_LIMIT_BYTES} bytes` }, 400)
-    }
-    let bodyValue: unknown
-    try {
-      bodyValue = JSON.parse(raw)
-    } catch {
-      return c.json({ error: 'malformed JSON request body' }, 400)
-    }
-    const parsed = parseBrowserRequest(bodyValue)
-    if (!parsed.ok) {
-      return c.json({ error: parsed.message }, 400)
-    }
-    const response = await managedRelay.handleRequest(parsed.value)
-    return c.json(response)
-  })
+  app.post(
+    '/browser/v1/request',
+    // Enforced while streaming, so an oversized or chunked body cannot buffer
+    // unbounded memory before the check runs.
+    bodyLimit({
+      maxSize: MANAGED_REQUEST_BODY_LIMIT_BYTES,
+      onError: (c) => {
+        return c.json({ error: `request body exceeds ${MANAGED_REQUEST_BODY_LIMIT_BYTES} bytes` }, 400)
+      },
+    }),
+    async (c) => {
+      const contentType = c.req.header('content-type') || ''
+      if (!contentType.includes('application/json')) {
+        return c.json({ error: 'Content-Type must be application/json' }, 400)
+      }
+      const raw = await c.req.text()
+      let bodyValue: unknown
+      try {
+        bodyValue = JSON.parse(raw)
+      } catch {
+        return c.json({ error: 'malformed JSON request body' }, 400)
+      }
+      const parsed = parseBrowserRequest(bodyValue)
+      if (!parsed.ok) {
+        return c.json({ error: parsed.message }, 400)
+      }
+      const response = await managedRelay.handleRequest(parsed.value, { clientSignal: c.req.raw.signal })
+      return c.json(response)
+    },
+  )
 
   // CDP Discovery Endpoints - Standard Chrome DevTools Protocol HTTP API
   // Allows tools like Playwright to discover the WebSocket URL via http://host:port
@@ -1475,7 +1486,7 @@ export async function startPlayWriterCDPRelayServer({
             managedRelay.noteManagedClientOpen({ clientId, scope: managedClientScope })
             logger?.log(
               pc.green(
-                `Managed CDP client connected: ${clientId} (session ${managedClientScope.sessionId}, profile ${managedClientScope.profileId}, browserEpoch ${managedClientScope.browserEpoch})`,
+                `Managed CDP client connected: ${clientId} (session ${managedClientScope.sessionId}, profile ${managedClientScope.profileId})`,
               ),
             )
           }
@@ -1900,7 +1911,7 @@ export async function startPlayWriterCDPRelayServer({
               if (result.accepted) {
                 logger?.log(
                   pc.magenta(
-                    `[managed-relay] inventory profile=${result.profile.profileId} epoch=${result.profile.browserEpoch} revision=${result.profile.revision} groups=${result.profile.groups.size} tabs=${result.profile.tabs.size}`,
+                    `[managed-relay] inventory profile=${result.profile.profileId} revision=${result.profile.revision} groups=${result.profile.groups.size} tabs=${result.profile.tabs.size}`,
                   ),
                 )
               }
