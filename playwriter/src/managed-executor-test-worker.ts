@@ -9,6 +9,10 @@ import {
   type ManagedExecutorWorkerWireMessage,
 } from './managed-executor-protocol.js'
 
+process.on('exit', () => {
+  fs.writeFileSync(path.join(process.cwd(), `worker-exit-${process.pid}.txt`), 'exited')
+})
+
 function writeMessage(message: ManagedExecutorWorkerWireMessage): void {
   process.stdout.write(encodeManagedWorkerMessage(message))
 }
@@ -55,6 +59,25 @@ async function handleCommand(command: ManagedExecutorWorkerCommand): Promise<voi
       })
     }, 80)
     return
+  }
+
+  if (request.operation.code === 'malformed-response') {
+    process.stderr.write('fixture diagnostic '.repeat(10_000))
+    process.stdout.write(`${'x'.repeat(8 * 1024 * 1024 + 1)}\n`)
+    return
+  }
+
+  if (request.operation.code === 'stdin-broken') {
+    process.stdin.on('error', () => {})
+    process.stdin.destroy(new Error('fixture stdin broken'))
+    setTimeout(() => {
+      process.exit(0)
+    }, 20)
+    return
+  }
+
+  if (request.operation.code === 'stderr-burst') {
+    process.stderr.write('fixture diagnostic '.repeat(10_000))
   }
 
   writeMessage({

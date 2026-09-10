@@ -7,6 +7,7 @@ import type {
   Locator,
   Page,
 } from '@xmorse/playwright-core'
+import type { ManagedExecutionLease } from './managed-executor-lease.js'
 
 type Callable = (...args: unknown[]) => unknown
 type PlaywrightObject = Browser | BrowserContext | ElementHandle | Frame | FrameLocator | Locator | Page
@@ -22,7 +23,7 @@ const PAGE_LOCATOR_METHODS = new Set<string>([
   'locator',
 ])
 
-const PAGE_FRAME_METHODS = new Set<string>(['frame', 'mainFrame'])
+const PAGE_FRAME_METHODS = new Set<string>(['frame', 'frames', 'mainFrame'])
 const PAGE_FRAME_LOCATOR_METHODS = new Set<string>(['frameLocator'])
 const PAGE_ELEMENT_METHODS = new Set<string>(['$', '$$', 'waitForSelector'])
 const LOCATOR_METHODS = new Set<string>([
@@ -42,6 +43,7 @@ const LOCATOR_METHODS = new Set<string>([
   'nth',
   'or',
 ])
+const LOCATOR_ELEMENT_METHODS = new Set<string>(['elementHandle', 'elementHandles'])
 const FRAME_LOCATOR_METHODS = new Set<string>([
   'getByAltText',
   'getByLabel',
@@ -52,7 +54,7 @@ const FRAME_LOCATOR_METHODS = new Set<string>([
   'getByTitle',
   'locator',
 ])
-const ELEMENT_METHODS = new Set<string>(['$', '$$', 'contentFrame'])
+const ELEMENT_METHODS = new Set<string>(['$', '$$', 'contentFrame', 'ownerFrame'])
 const EVENT_METHODS = new Set<string>(['addListener', 'on', 'once', 'prependListener'])
 const REMOVE_EVENT_METHODS = new Set<string>(['off', 'removeListener'])
 
@@ -60,6 +62,13 @@ export interface ManagedPlaywrightFacadeOptions {
   context: BrowserContext
   browser: Browser
   allowedTargetIds: Set<string>
+  lease?: ManagedExecutionLease
+}
+
+interface EventSubscription {
+  target: PlaywrightObject
+  event: string
+  listener: Callable
 }
 
 /**
@@ -74,6 +83,7 @@ export class ManagedPlaywrightFacade {
   private readonly context: BrowserContext
   private readonly browser: Browser
   private readonly allowedTargetIds: Set<string>
+  private readonly lease?: ManagedExecutionLease
   private readonly pageProxies = new WeakMap<Page, Page>()
   private readonly pageRaws = new WeakMap<Page, Page>()
   private readonly contextProxies = new WeakMap<BrowserContext, BrowserContext>()
@@ -89,11 +99,13 @@ export class ManagedPlaywrightFacade {
   private readonly elementProxies = new WeakMap<ElementHandle, ElementHandle>()
   private readonly elementRaws = new WeakMap<ElementHandle, ElementHandle>()
   private readonly listenerWrappers = new WeakMap<object, Map<Callable, Callable>>()
+  private readonly eventSubscriptions: EventSubscription[] = []
 
   constructor(options: ManagedPlaywrightFacadeOptions) {
     this.context = options.context
     this.browser = options.browser
     this.allowedTargetIds = options.allowedTargetIds
+    this.lease = options.lease
   }
 
   wrapPage(page: Page): Page {
@@ -110,32 +122,36 @@ export class ManagedPlaywrightFacade {
         if (property === 'close') {
           return this.forbidden('page.close')
         }
+        if (property === 'keyboard' || property === 'mouse' || property === 'touchscreen') {
+          return undefined
+        }
         if (property === 'context') {
           return () => {
+            this.assertActive()
             return this.wrapContext(target.context())
           }
         }
         if (property === 'locator' || (typeof property === 'string' && PAGE_LOCATOR_METHODS.has(property))) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapLocatorResult(result)
           }
         }
         if (typeof property === 'string' && PAGE_FRAME_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapFrameResult(result)
           }
         }
         if (typeof property === 'string' && PAGE_FRAME_LOCATOR_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapFrameLocator(result as FrameLocator)
           }
         }
         if (typeof property === 'string' && PAGE_ELEMENT_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapElementResult(result)
           }
         }
@@ -155,7 +171,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           if (property === 'waitForEvent' && args[0] === 'popup') {
             return this.wrapPageResult(result)
           }
@@ -185,11 +201,13 @@ export class ManagedPlaywrightFacade {
         }
         if (property === 'browser') {
           return () => {
+            this.assertActive()
             return this.wrapBrowser(target.browser() ?? this.browser)
           }
         }
         if (property === 'pages') {
           return () => {
+            this.assertActive()
             return target
               .pages()
               .filter((page) => this.isAllowedPage(page))
@@ -208,7 +226,7 @@ export class ManagedPlaywrightFacade {
         }
         if (property === 'getExistingCDPSession') {
           return (...args: unknown[]) => {
-            return invoke({ target, property, args: this.unwrapArguments(args) })
+            return this.invoke({ target, property, args: this.unwrapArguments(args) })
           }
         }
 
@@ -217,7 +235,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           if (property === 'waitForEvent' && args[0] === 'page') {
             return this.wrapPageResult(result)
           }
@@ -247,6 +265,7 @@ export class ManagedPlaywrightFacade {
         }
         if (property === 'contexts') {
           return () => {
+            this.assertActive()
             return target.contexts().map((context) => {
               return this.wrapContext(context)
             })
@@ -258,7 +277,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           return this.wrapGeneralResult(result)
         }
       },
@@ -282,24 +301,33 @@ export class ManagedPlaywrightFacade {
         }
         if (property === 'page') {
           return () => {
+            this.assertActive()
             return this.wrapPage(target.page())
           }
         }
         if (property === 'ownerFrame') {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            this.assertActive()
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapFrameResult(result)
           }
         }
         if (property === 'contentFrame') {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            this.assertActive()
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapFrameLocatorResult(result)
+          }
+        }
+        if (typeof property === 'string' && LOCATOR_ELEMENT_METHODS.has(property)) {
+          return (...args: unknown[]) => {
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
+            return this.wrapElementResult(result)
           }
         }
         if (typeof property === 'string' && LOCATOR_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapLocatorResult(result)
           }
         }
@@ -309,7 +337,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           return this.wrapGeneralResult(result)
         }
       },
@@ -333,18 +361,19 @@ export class ManagedPlaywrightFacade {
         }
         if (property === 'page') {
           return () => {
+            this.assertActive()
             return this.wrapPage(target.page())
           }
         }
         if (typeof property === 'string' && FRAME_LOCATOR_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapLocatorResult(result)
           }
         }
         if (property === 'frameLocator') {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapFrameLocator(result as FrameLocator)
           }
         }
@@ -354,7 +383,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           return this.wrapGeneralResult(result)
         }
       },
@@ -378,7 +407,7 @@ export class ManagedPlaywrightFacade {
         }
         if (typeof property === 'string' && FRAME_LOCATOR_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
             return this.wrapLocatorResult(result)
           }
         }
@@ -388,7 +417,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           return this.wrapGeneralResult(result)
         }
       },
@@ -412,8 +441,8 @@ export class ManagedPlaywrightFacade {
         }
         if (typeof property === 'string' && ELEMENT_METHODS.has(property)) {
           return (...args: unknown[]) => {
-            const result = invoke({ target, property, args: this.unwrapArguments(args) })
-            if (property === 'contentFrame') {
+            const result = this.invoke({ target, property, args: this.unwrapArguments(args) })
+            if (property === 'contentFrame' || property === 'ownerFrame') {
               return this.wrapFrameResult(result)
             }
             return this.wrapElementResult(result)
@@ -425,7 +454,7 @@ export class ManagedPlaywrightFacade {
           return this.wrapGeneralResult(value)
         }
         return (...args: unknown[]) => {
-          const result = invoke({ target, property, args: this.unwrapArguments(args), method: value })
+          const result = this.invoke({ target, property, args: this.unwrapArguments(args), method: value })
           return this.wrapGeneralResult(result)
         }
       },
@@ -438,6 +467,25 @@ export class ManagedPlaywrightFacade {
 
   unwrapPage(page: Page): Page {
     return this.pageRaws.get(page) ?? page
+  }
+
+  assertActive(): void {
+    this.lease?.assertActive()
+  }
+
+  dispose(): void {
+    this.eventSubscriptions.forEach((subscription) => {
+      const remover = Reflect.get(subscription.target, 'removeListener', subscription.target)
+      if (!isCallable(remover)) {
+        return
+      }
+      try {
+        Reflect.apply(remover, subscription.target, [subscription.event, subscription.listener])
+      } catch (error) {
+        console.error('[managed-executor] failed to remove raw listener:', error)
+      }
+    })
+    this.eventSubscriptions.length = 0
   }
 
   unwrapContext(context: BrowserContext): BrowserContext {
@@ -453,6 +501,7 @@ export class ManagedPlaywrightFacade {
   }
 
   isAllowedPage(page: Page): boolean {
+    this.assertActive()
     const targetId = page.targetId()
     return targetId !== undefined && this.allowedTargetIds.has(targetId)
   }
@@ -563,9 +612,12 @@ export class ManagedPlaywrightFacade {
   }): unknown {
     const listener = args.at(-1)
     if (!isCallable(listener)) {
-      return invoke({ target, property, args: this.unwrapArguments(args) })
+      return this.invoke({ target, property, args: this.unwrapArguments(args) })
     }
     const wrapper: Callable = (...eventArgs: unknown[]) => {
+      if (this.lease && !this.lease.isActive()) {
+        return undefined
+      }
       const wrappedArgs = eventArgs.map((eventArg) => {
         return this.wrapEventValue(eventArg)
       })
@@ -575,8 +627,12 @@ export class ManagedPlaywrightFacade {
       return listener(...wrappedArgs)
     }
     this.getListenerMap(target).set(listener, wrapper)
+    const event = args[0]
+    if (typeof event === 'string') {
+      this.eventSubscriptions.push({ target, event, listener: wrapper })
+    }
     const nextArgs = [...args.slice(0, -1), wrapper]
-    return invoke({ target, property, args: this.unwrapArguments(nextArgs) })
+    return this.invoke({ target, property, args: this.unwrapArguments(nextArgs) })
   }
 
   private invokeRemoveEventMethod({
@@ -591,9 +647,18 @@ export class ManagedPlaywrightFacade {
     const listener = args.at(-1)
     const wrappedListener = isCallable(listener) ? this.getListenerMap(target).get(listener) : undefined
     const nextArgs = wrappedListener ? [...args.slice(0, -1), wrappedListener] : args
-    const result = invoke({ target, property, args: this.unwrapArguments(nextArgs) })
+    const result = this.invoke({ target, property, args: this.unwrapArguments(nextArgs) })
     if (isCallable(listener)) {
       this.getListenerMap(target).delete(listener)
+      const event = args[0]
+      if (typeof event === 'string' && wrappedListener) {
+        const subscriptionIndex = this.eventSubscriptions.findIndex((subscription) => {
+          return subscription.target === target && subscription.event === event && subscription.listener === wrappedListener
+        })
+        if (subscriptionIndex >= 0) {
+          this.eventSubscriptions.splice(subscriptionIndex, 1)
+        }
+      }
     }
     return result
   }
@@ -635,6 +700,21 @@ export class ManagedPlaywrightFacade {
         value
       )
     })
+  }
+
+  private invoke({
+    target,
+    property,
+    args,
+    method,
+  }: {
+    target: PlaywrightObject
+    property: string | symbol
+    args: unknown[]
+    method?: Callable
+  }): unknown {
+    this.assertActive()
+    return invoke({ target, property, args, method })
   }
 
   private forbidden(operation: string): () => never {

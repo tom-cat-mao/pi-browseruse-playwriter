@@ -99,6 +99,7 @@ describe('ManagedExecutorPool child-process lifecycle', () => {
       const replacement = await pool.execute(
         createExecution({ requestId: 'replacement', code: 'immediate', cwd, timeoutMs: 1_000 }),
       )
+      expect(fs.existsSync(path.join(cwd, `worker-exit-${firstPid}.txt`))).toBe(true)
       expect(responsePid(replacement)).not.toBe(firstPid)
     } finally {
       await pool.dispose()
@@ -150,6 +151,87 @@ describe('ManagedExecutorPool child-process lifecycle', () => {
       expect(fs.existsSync(path.join(cwd, 'silent-worker-started.txt'))).toBe(true)
       await waitForMilliseconds(700)
       expect(fs.existsSync(path.join(cwd, 'silent-worker-late.txt'))).toBe(false)
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('captures sync and async onInvalidate failures before completing termination', async () => {
+    const cwd = createTestDirectory('managed-executor-invalidate-')
+    const callbackCalls: string[] = []
+    const pool = new ManagedExecutorPool({
+      workerPath: workerPath('managed-executor-test-worker.ts'),
+      onInvalidate: () => {
+        callbackCalls.push('called')
+        if (callbackCalls.length === 1) {
+          throw new Error('sync invalidate failure')
+        }
+        return Promise.reject(new Error('async invalidate failure'))
+      },
+    })
+    try {
+      await pool.execute(createExecution({ requestId: 'warmup', code: 'immediate', cwd, timeoutMs: 1_000 }))
+      const timedOut = await pool.execute(
+        createExecution({ requestId: 'timeout', code: 'delayed-80', cwd, timeoutMs: 10 }),
+      )
+      expect(timedOut).toMatchObject({
+        requestId: 'timeout',
+        ok: false,
+        error: { code: 'timeout', outcome: 'unknown' },
+      })
+      await waitForMilliseconds(140)
+      expect(fs.existsSync(path.join(cwd, 'late.txt'))).toBe(false)
+
+      await pool.execute(createExecution({ requestId: 'replacement', code: 'immediate', cwd, timeoutMs: 1_000 }))
+      await pool.releaseSession({ sessionId: 'session-1' })
+      expect(callbackCalls).toEqual(['called', 'called'])
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('contains malformed stdout and stderr without taking down the parent', async () => {
+    const cwd = createTestDirectory('managed-executor-budget-')
+    const pool = new ManagedExecutorPool({ workerPath: workerPath('managed-executor-test-worker.ts') })
+    try {
+      const malformed = await pool.execute(
+        createExecution({ requestId: 'malformed', code: 'malformed-response', cwd, timeoutMs: 2_000 }),
+      )
+      expect(malformed).toMatchObject({
+        requestId: 'malformed',
+        ok: false,
+        error: { outcome: 'unknown' },
+      })
+
+      const stderrPool = new ManagedExecutorPool({ workerPath: workerPath('managed-executor-test-worker.ts') })
+      try {
+        const response = await stderrPool.execute(
+          createExecution({ requestId: 'stderr', code: 'stderr-burst', cwd, timeoutMs: 2_000 }),
+        )
+        expect(responsePid(response)).toBeGreaterThan(0)
+      } finally {
+        await stderrPool.dispose()
+      }
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('reports a broken worker stdin as an unknown in-flight outcome', async () => {
+    const cwd = createTestDirectory('managed-executor-stdin-')
+    const pool = new ManagedExecutorPool({ workerPath: workerPath('managed-executor-test-worker.ts') })
+    try {
+      const response = await pool.execute(
+        createExecution({ requestId: 'stdin', code: 'stdin-broken', cwd, timeoutMs: 2_000 }),
+      )
+      expect(response).toMatchObject({
+        requestId: 'stdin',
+        ok: false,
+        error: { code: 'outcome-unknown', outcome: 'unknown' },
+      })
     } finally {
       await pool.dispose()
       fs.rmSync(cwd, { recursive: true, force: true })

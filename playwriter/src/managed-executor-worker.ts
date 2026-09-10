@@ -19,9 +19,11 @@ import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
 import { getChromium } from './playwright-import.js'
 import { waitForPageLoad } from './wait-for-page-load.js'
 import { ManagedPlaywrightFacade } from './managed-executor-facade.js'
+import { LeasedCDPSession, ManagedExecutionLease, ManagedTimerScope } from './managed-executor-lease.js'
 import {
   encodeManagedWorkerMessage,
   errorMessage,
+  MAX_MANAGED_WORKER_MESSAGE_BYTES,
   parseManagedWorkerCommand,
   serializeBrowserJson,
   splitManagedWorkerLines,
@@ -94,6 +96,7 @@ interface SnapshotOptions {
   interactiveOnly?: boolean
   offset?: number
   limit?: number
+  markSideEffectsStarted?: () => void
 }
 
 interface RawConsole {
@@ -157,6 +160,7 @@ export class ManagedExecutorWorkerRuntime {
 
   async execute(execution: ManagedExecution): Promise<BrowserResponse> {
     const requestId = execution.request.requestId
+    let sideEffectsStarted = false
     try {
       this.validateExecution(execution)
       this.setSessionCwd(execution.request.cwd)
@@ -173,10 +177,13 @@ export class ManagedExecutorWorkerRuntime {
       const data = await this.executeOperation({
         request: execution.request,
         page,
+        markSideEffectsStarted: () => {
+          sideEffectsStarted = true
+        },
       })
       return { requestId, ok: true, data }
     } catch (error) {
-      return this.errorResponse({ requestId, error })
+      return this.errorResponse({ requestId, error, sideEffectsStarted })
     }
   }
 
@@ -441,11 +448,19 @@ export class ManagedExecutorWorkerRuntime {
     return page
   }
 
-  private async executeOperation({ request, page }: { request: BrowserRequest & { operation: Extract<BrowserRequest['operation'], { kind: `page.${string}` }> }; page: Page }): Promise<BrowserResultData> {
+  private async executeOperation({
+    request,
+    page,
+    markSideEffectsStarted,
+  }: {
+    request: BrowserRequest & { operation: Extract<BrowserRequest['operation'], { kind: `page.${string}` }> }
+    page: Page
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
     const operation = request.operation
     switch (operation.kind) {
       case 'page.navigate':
-        return await this.navigate({ page, url: operation.url })
+        return await this.navigate({ page, url: operation.url, markSideEffectsStarted })
       case 'page.snapshot':
         return await this.snapshot({
           page,
@@ -453,24 +468,27 @@ export class ManagedExecutorWorkerRuntime {
           search: operation.search,
           full: operation.full,
           interactiveOnly: operation.interactiveOnly,
+          markSideEffectsStarted,
         })
       case 'page.click':
-        return await this.click({ page, selector: operation.selector, snapshotId: operation.snapshotId })
+        return await this.click({ page, selector: operation.selector, snapshotId: operation.snapshotId, markSideEffectsStarted })
       case 'page.fill':
         return await this.fill({
           page,
           selector: operation.selector,
           snapshotId: operation.snapshotId,
           value: operation.value,
+          markSideEffectsStarted,
         })
       case 'page.evaluate':
-        return await this.evaluate({ page, code: operation.code })
+        return await this.evaluate({ page, code: operation.code, markSideEffectsStarted })
       case 'page.screenshot':
         return await this.screenshot({
           page,
           path: operation.path,
           fullPage: operation.fullPage,
           labels: operation.labels,
+          markSideEffectsStarted,
         })
       case 'page.network':
         return this.network({
@@ -481,14 +499,23 @@ export class ManagedExecutorWorkerRuntime {
       case 'page.logs':
         return this.logs({ state: this.requirePageState({ page }), limit: operation.limit })
       case 'page.execute':
-        return await this.executeJavaScript({ page, code: operation.code })
+        return await this.executeJavaScript({ page, code: operation.code, markSideEffectsStarted })
       default:
         return assertNever(operation)
     }
   }
 
-  private async navigate({ page, url }: { page: Page; url: string }): Promise<BrowserResultData> {
+  private async navigate({
+    page,
+    url,
+    markSideEffectsStarted,
+  }: {
+    page: Page
+    url: string
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
     validateNavigationUrl(url)
+    markSideEffectsStarted()
     const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout: DEFAULT_NAVIGATION_TIMEOUT_MS,
@@ -504,8 +531,19 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
-  private async click({ page, selector, snapshotId }: { page: Page; selector: string; snapshotId?: string }): Promise<BrowserResultData> {
+  private async click({
+    page,
+    selector,
+    snapshotId,
+    markSideEffectsStarted,
+  }: {
+    page: Page
+    selector: string
+    snapshotId?: string
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
     const locator = this.resolveActionLocator({ page, selector, snapshotId })
+    markSideEffectsStarted()
     await locator.click()
     this.invalidateSnapshot({ page })
     return {
@@ -519,15 +557,18 @@ export class ManagedExecutorWorkerRuntime {
     selector,
     snapshotId,
     value,
+    markSideEffectsStarted,
   }: {
     page: Page
     selector: string
     snapshotId?: string
     value: string
+    markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const locator = this.resolveActionLocator({ page, selector, snapshotId })
     // Chrome debugger keyboard input follows the OS-focused surface. A real
     // click immediately before fill keeps extension-backed tabs focused.
+    markSideEffectsStarted()
     await locator.click()
     await locator.fill(value)
     this.invalidateSnapshot({ page })
@@ -568,7 +609,16 @@ export class ManagedExecutorWorkerRuntime {
     return page.locator(locator)
   }
 
-  private async evaluate({ page, code }: { page: Page; code: string }): Promise<BrowserResultData> {
+  private async evaluate({
+    page,
+    code,
+    markSideEffectsStarted,
+  }: {
+    page: Page
+    code: string
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
+    markSideEffectsStarted()
     const value = await page.evaluate((source) => {
       return eval(source) as unknown
     }, wrapCodeForEvaluation(code))
@@ -581,11 +631,13 @@ export class ManagedExecutorWorkerRuntime {
     path: requestedPath,
     fullPage = false,
     labels = false,
+    markSideEffectsStarted,
   }: {
     page: Page
     path?: string
     fullPage?: boolean
     labels?: boolean
+    markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const outputPath = requestedPath ? resolveArtifactPath({ requestedPath, cwd: this.sessionCwd }) : undefined
     const images: Array<{ data: string; mimeType: string }> = []
@@ -593,7 +645,7 @@ export class ManagedExecutorWorkerRuntime {
     let text = 'Screenshot captured'
 
     if (labels) {
-      const snapshot = await this.snapshot({ page, full: false, interactiveOnly: true })
+      const snapshot = await this.snapshot({ page, full: false, interactiveOnly: true, markSideEffectsStarted })
       const collector: ScreenshotResult[] = []
       try {
         await screenshotWithAccessibilityLabels({ page, collector })
@@ -610,11 +662,13 @@ export class ManagedExecutorWorkerRuntime {
         artifacts.push({ path: labeled.path, mimeType: labeled.mimeType })
       }
       if (outputPath) {
+        markSideEffectsStarted()
         await page.screenshot({ path: outputPath, fullPage, scale: 'css', type: 'png' })
         artifacts.push({ path: outputPath, mimeType: 'image/png' })
       }
       text = `Screenshot captured with accessibility labels; snapshotId ${String(snapshot.snapshotId)}`
     } else {
+      markSideEffectsStarted()
       const buffer = await page.screenshot({
         ...(outputPath ? { path: outputPath } : {}),
         fullPage,
@@ -712,16 +766,31 @@ export class ManagedExecutorWorkerRuntime {
     return { logs: boundedLimit === 0 ? [] : state.logs.slice(-boundedLimit) }
   }
 
-  private async executeJavaScript({ page, code }: { page: Page; code: string }): Promise<BrowserResultData> {
+  private async executeJavaScript({
+    page,
+    code,
+    markSideEffectsStarted,
+  }: {
+    page: Page
+    code: string
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
     const context = this.context
     const browser = this.browser
-    const facade = this.facade
-    if (!context || !browser || !facade) {
+    if (!context || !browser || !this.facade) {
       throw new ManagedExecutorOperationError({
         code: 'profile-disconnected',
         message: 'Managed profile is not connected',
       })
     }
+    const lease = new ManagedExecutionLease()
+    const timerScope = new ManagedTimerScope(lease)
+    const facade = new ManagedPlaywrightFacade({
+      browser,
+      context,
+      allowedTargetIds: this.allowedTargetIds,
+      lease,
+    })
     const pageFacade = facade.wrapPage(page)
     const contextFacade = facade.wrapContext(context)
     const operationLogs: string[] = []
@@ -746,6 +815,7 @@ export class ManagedExecutorWorkerRuntime {
     this.userState.page = pageFacade
     this.userState.context = contextFacade
     const snapshot = async (options: SnapshotOptions = {}): Promise<string> => {
+      lease.assertActive()
       const targetPage = options.page ? facade.unwrapPage(options.page) : page
       this.assertAllowedPage({ page: targetPage })
       const targetLocator = options.locator ? facade.unwrapLocator(options.locator) : undefined
@@ -757,10 +827,12 @@ export class ManagedExecutorWorkerRuntime {
         interactiveOnly: options.interactiveOnly,
         offset: options.offset,
         limit: options.limit,
+        markSideEffectsStarted,
       })
       return result.text ?? ''
     }
-    const refToLocator = ({ ref, targetPage }: { ref: string; targetPage?: Page }): string | null => {
+    const refToLocator = ({ ref, page: targetPage }: { ref: string; page?: Page }): string | null => {
+      lease.assertActive()
       const rawPage = targetPage ? facade.unwrapPage(targetPage) : page
       this.assertAllowedPage({ page: rawPage })
       return this.requirePageState({ page: rawPage }).latestSnapshot?.refs.get(ref) ?? null
@@ -773,11 +845,14 @@ export class ManagedExecutorWorkerRuntime {
       return boundedCount === 0 ? [] : pageState.logs.slice(-boundedCount)
     }
     const getCDPSession = async ({ page: targetPage }: { page: Page }): Promise<ICDPSession> => {
+      lease.assertActive()
       const rawPage = facade.unwrapPage(targetPage)
       this.assertAllowedPage({ page: rawPage })
-      return await getCDPSessionForPage({ page: rawPage })
+      const session = await getCDPSessionForPage({ page: rawPage })
+      return new LeasedCDPSession({ session, lease })
     }
     const screenshotHelper = async ({ page: targetPage }: { page?: Page } = {}): Promise<void> => {
+      lease.assertActive()
       const rawPage = targetPage ? facade.unwrapPage(targetPage) : page
       this.assertAllowedPage({ page: rawPage })
       const collector: ScreenshotResult[] = []
@@ -785,6 +860,12 @@ export class ManagedExecutorWorkerRuntime {
     }
     const vmContextObject: Record<string, unknown> = {
       ...SAFE_NODE_GLOBALS,
+      clearInterval: (timer: ReturnType<typeof setInterval>) => {
+        timerScope.clearInterval(timer)
+      },
+      clearTimeout: (timer: ReturnType<typeof setTimeout>) => {
+        timerScope.clearTimeout(timer)
+      },
       console: customConsole,
       context: contextFacade,
       getCDPSession,
@@ -792,16 +873,23 @@ export class ManagedExecutorWorkerRuntime {
       page: pageFacade,
       refToLocator,
       screenshotWithAccessibilityLabels: screenshotHelper,
+      setInterval: (handler: unknown, delay?: number) => {
+        return timerScope.setInterval(handler, delay)
+      },
+      setTimeout: (handler: unknown, delay?: number) => {
+        return timerScope.setTimeout(handler, delay)
+      },
       snapshot,
       state: this.userState,
       waitForPageLoad,
       process: this.createProcessFacade(),
     }
     const vmContext = vm.createContext(vmContextObject)
-    const script = new vm.Script(wrapCodeForExecution(code), {
-      filename: path.join(this.sessionCwd ?? process.cwd(), '.managed-executor-eval.js'),
-    })
     try {
+      const script = new vm.Script(wrapCodeForExecution(code), {
+        filename: path.join(this.sessionCwd ?? process.cwd(), '.managed-executor-eval.js'),
+      })
+      markSideEffectsStarted()
       const result = await script.runInContext(vmContext, {
         timeout: DEFAULT_PAGE_TIMEOUT_MS,
         displayErrors: true,
@@ -817,6 +905,10 @@ export class ManagedExecutorWorkerRuntime {
         message: `page.execute failed: ${errorMessage(error)}`,
         cause: error,
       })
+    } finally {
+      lease.release()
+      timerScope.dispose()
+      facade.dispose()
     }
   }
 
@@ -877,8 +969,10 @@ export class ManagedExecutorWorkerRuntime {
     interactiveOnly,
     offset = 0,
     limit,
+    markSideEffectsStarted,
   }: SnapshotOptions & { page: Page }): Promise<BrowserResultData> {
     const pageState = this.requirePageState({ page })
+    markSideEffectsStarted?.()
     const result = await getAriaSnapshot({
       page,
       locator,
@@ -916,7 +1010,16 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
-  private errorResponse({ requestId, error }: { requestId: string; error: unknown }): BrowserResponse {
+  private errorResponse({
+    requestId,
+    error,
+    sideEffectsStarted,
+  }: {
+    requestId: string
+    error: unknown
+    sideEffectsStarted: boolean
+  }): BrowserResponse {
+    const requestedOutcome = error instanceof ManagedExecutorOperationError ? error.outcome : 'not-started'
     if (error instanceof ManagedExecutorOperationError) {
       return {
         requestId,
@@ -924,7 +1027,7 @@ export class ManagedExecutorWorkerRuntime {
         error: {
           code: error.code,
           message: error.message,
-          outcome: error.outcome,
+          outcome: resolveManagedOperationOutcome({ sideEffectsStarted, outcome: requestedOutcome }),
         },
       }
     }
@@ -934,10 +1037,20 @@ export class ManagedExecutorWorkerRuntime {
       error: {
         code: 'execution-failed',
         message: errorMessage(error),
-        outcome: 'not-started',
+        outcome: resolveManagedOperationOutcome({ sideEffectsStarted, outcome: requestedOutcome }),
       },
     }
   }
+}
+
+export function resolveManagedOperationOutcome({
+  sideEffectsStarted,
+  outcome,
+}: {
+  sideEffectsStarted: boolean
+  outcome: 'not-started' | 'unknown'
+}): 'not-started' | 'unknown' {
+  return sideEffectsStarted ? 'unknown' : outcome
 }
 
 function formatSnapshotText({
@@ -1142,25 +1255,36 @@ export async function runManagedExecutorWorker(): Promise<void> {
   let commandQueue: Promise<void> = Promise.resolve()
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', (chunk: string) => {
-    const split = splitManagedWorkerLines({ buffer, chunk })
-    buffer = split.remainder
-    split.lines.forEach((line) => {
-      const message = parseManagedWorkerCommand(line)
-      if (!message) {
-        return
+    try {
+      const split = splitManagedWorkerLines({ buffer, chunk })
+      buffer = split.remainder
+      if (Buffer.byteLength(buffer, 'utf8') > MAX_MANAGED_WORKER_MESSAGE_BYTES) {
+        throw new Error('Managed executor worker input exceeded the protocol buffer limit')
       }
-      commandQueue = commandQueue
-        .then(async () => {
-          await handleWorkerCommand({ runtime, command: message })
-        })
-        .catch((error) => {
-          writeWorkerMessage({
-            type: 'error',
-            id: message.id,
-            error: { message: errorMessage(error) },
+      split.lines.forEach((line) => {
+        if (Buffer.byteLength(line, 'utf8') > MAX_MANAGED_WORKER_MESSAGE_BYTES) {
+          throw new Error('Managed executor worker command exceeded the protocol message limit')
+        }
+        const message = parseManagedWorkerCommand(line)
+        if (!message) {
+          return
+        }
+        commandQueue = commandQueue
+          .then(async () => {
+            await handleWorkerCommand({ runtime, command: message })
           })
-        })
-    })
+          .catch((error) => {
+            writeWorkerMessage({
+              type: 'error',
+              id: message.id,
+              error: { message: errorMessage(error) },
+            })
+          })
+      })
+    } catch (error) {
+      console.error('[managed-executor] invalid worker input:', errorMessage(error))
+      process.exit(1)
+    }
   })
   process.stdin.on('end', () => {
     commandQueue = commandQueue.then(async () => {
@@ -1189,12 +1313,32 @@ async function handleWorkerCommand({
 }
 
 function writeWorkerMessage(message: ManagedExecutorWorkerWireMessage): void {
+  let encoded: string
   try {
-    process.stdout.write(encodeManagedWorkerMessage(message))
+    encoded = encodeManagedWorkerMessage(message)
   } catch (error) {
     console.error('[managed-executor] could not serialize worker message:', errorMessage(error))
-    process.exitCode = 1
+    const fallback = message.type === 'response'
+      ? {
+          type: 'error' as const,
+          id: message.id,
+          error: { message: 'Managed executor response exceeded the protocol message limit' },
+        }
+      : {
+          type: 'error' as const,
+          error: { message: 'Managed executor worker response could not be serialized' },
+        }
+    try {
+      process.stdout.write(encodeManagedWorkerMessage(fallback), () => {
+        process.exit(1)
+      })
+    } catch (fallbackError) {
+      console.error('[managed-executor] could not serialize worker fallback:', errorMessage(fallbackError))
+      process.exit(1)
+    }
+    return
   }
+  process.stdout.write(encoded)
 }
 
 function isWorkerEntry(): boolean {
