@@ -1,6 +1,8 @@
 ---
 title: Pi Browser Use
-description: Source-built Pi tools plus a forked Playwriter runtime and Chrome extension that drive your own browser.
+description: >-
+  Source-built Pi tools over a forked Playwriter runtime and Chrome
+  extension that drive your own browser.
 prompt: |
   用户要求把根 README 从上游 WebStore/npm 安装入口改成 Pi Browser Use 产品
   README（约 1-2 屏），且不得假称已发布。需覆盖：
@@ -15,7 +17,8 @@ prompt: |
   - managed 语义：一个 Pi session 多个命名分组、显式 groupId/tabId、
     每分组绑定一个 profile；断线不散组、用户释放不拉回、完整 Chrome 重启
     无法核验时标 needs-rebind；只提供工具，不含 agent/HITL/业务工作流。
-    契约见 @docs/exec/browser-runtime-contract.md @playwriter/src/browser-protocol.ts。
+    契约见 @docs/exec/browser-runtime-contract.md
+    与 @playwriter/src/browser-protocol.ts。
   - 如实说明最终独立 review 当前 FAIL（C outcome/lease 修复中）、Chrome
     验收未开始，链接 @docs/exec/browser-rebuild-progress.md；不写短期测试数字。
   - 保留上游版权/来源链接与 LICENSE，不带广告/云账单长文；旧 README 用
