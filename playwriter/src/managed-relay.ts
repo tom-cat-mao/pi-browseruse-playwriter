@@ -25,6 +25,7 @@
  * (to the extension or to a worker) must report `unknown` on abnormal termination and
  * must never be replayed automatically.
  */
+import { ManagedExecutorPool } from './managed-executor-pool.js'
 import {
   BROWSER_PROTOCOL_VERSION,
   type BrowserCapabilities,
@@ -40,7 +41,6 @@ import {
   type BrowserResultData,
   type BrowserTab,
   type ManagedExecutorPoolContract,
-  type ManagedExecutorPoolOptions,
 } from './browser-protocol.js'
 
 export const MANAGED_REQUEST_BODY_LIMIT_BYTES = 4 * 1024 * 1024
@@ -1391,7 +1391,6 @@ export class ManagedRelay {
   private readonly managedClients = new Map<string, ManagedClientEntry>()
   private pool: ManagedExecutorPoolContract | null = null
   private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
-  private poolUnavailable = false
   private disposed = false
 
   constructor(options: ManagedRelayOptions) {
@@ -1403,13 +1402,11 @@ export class ManagedRelay {
   }
 
   getCapabilities(): BrowserCapabilities {
-    this.maybeProbePool()
-    return buildBrowserCapabilities({ isolatedExecution: this.isPoolAvailable() })
+    return buildBrowserCapabilities({ isolatedExecution: true })
   }
 
   listProfiles(): BrowserProfile[] {
-    this.maybeProbePool()
-    return listManagedProfiles(this.state, { isolatedExecution: this.isPoolAvailable() })
+    return listManagedProfiles(this.state, { isolatedExecution: true })
   }
 
   noteConnectionOpened({ connectionId }: { connectionId: string }): void {
@@ -1965,24 +1962,21 @@ export class ManagedRelay {
     if (this.poolLoadPromise) {
       return this.poolLoadPromise
     }
-    if (this.poolUnavailable && !this.options.poolFactory) {
-      return null
-    }
     const load = async (): Promise<ManagedExecutorPoolContract | null> => {
       try {
-        const factory =
-          this.options.poolFactory ??
-          createDefaultManagedExecutorPoolFactory({
+        // The isolated executor module is statically linked; tests may still
+        // inject a pool through poolFactory.
+        const pool =
+          (await this.options.poolFactory?.()) ??
+          new ManagedExecutorPool({
             onInvalidate: (options) => {
               this.handlePoolInvalidate(options)
             },
           })
-        const pool = await factory()
         this.pool = pool
         return pool
       } catch (error) {
-        this.poolUnavailable = true
-        this.options.logger?.error('[managed-relay] isolated executor pool unavailable:', error)
+        this.options.logger?.error('[managed-relay] isolated executor pool failed to start:', error)
         return null
       } finally {
         this.poolLoadPromise = null
@@ -2002,21 +1996,6 @@ export class ManagedRelay {
       return await this.getPool()
     }
     return null
-  }
-
-  private isPoolAvailable(): boolean {
-    if (this.options.poolFactory) {
-      return true
-    }
-    return this.pool !== null
-  }
-
-  /** Warm the pool once so capabilities can report the real executor support. */
-  private maybeProbePool(): void {
-    if (this.pool || this.poolUnavailable || this.poolLoadPromise) {
-      return
-    }
-    void this.getPool()
   }
 
   private handlePoolInvalidate(options: { sessionId: string; profileId: string; connectionEpoch: string }): void {
@@ -3005,37 +2984,6 @@ function describeTransportFailure(error: unknown): ManagedFailure {
 
 function slotKey(sessionId: string, profileId: string): string {
   return `${sessionId}\u0000${profileId}`
-}
-
-/**
- * TEMPORARY (owner-C integration): the isolated executor module does not exist in
- * this branch yet. When it is merged the runtime should use a normal top-level
- * `import { ManagedExecutorPool } from './managed-executor-pool.js'` instead of
- * this lazy loader, and this fallback must be deleted.
- */
-function createDefaultManagedExecutorPoolFactory({
-  onInvalidate,
-}: {
-  onInvalidate: (options: { sessionId: string; profileId: string; connectionEpoch: string }) => void
-}): () => Promise<ManagedExecutorPoolContract> {
-  return async () => {
-    const moduleId: string = './managed-executor-pool.js'
-    const loaded: unknown = await import(moduleId)
-    if (!isManagedExecutorPoolModule(loaded)) {
-      throw new Error('managed-executor-pool.js does not export the ManagedExecutorPool class')
-    }
-    return new loaded.ManagedExecutorPool({ onInvalidate })
-  }
-}
-
-function isManagedExecutorPoolModule(value: unknown): value is {
-  ManagedExecutorPool: new (options?: ManagedExecutorPoolOptions) => ManagedExecutorPoolContract
-} {
-  if (!value || typeof value !== 'object') {
-    return false
-  }
-  const candidate = (value as { ManagedExecutorPool?: unknown }).ManagedExecutorPool
-  return typeof candidate === 'function'
 }
 
 /**
