@@ -28,7 +28,7 @@ import * as util from 'node:util'
 import * as readlinePromises from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
 
-import type { BrowserGroup, BrowserOperation, BrowserProfile, BrowserResponse, BrowserTab } from '../../src/browser-protocol.ts'
+import type { BrowserGroup, BrowserJson, BrowserOperation, BrowserProfile, BrowserResponse, BrowserTab } from '../../src/browser-protocol.ts'
 import {
   ACCEPTANCE_ENV,
   DAILY_RELAY_PORT,
@@ -60,6 +60,7 @@ import {
   type RuntimeEndpoint,
 } from './acceptance-client.ts'
 import { readFixtureCounters, startFixtureServer, type FixtureServer } from './fixture-server.ts'
+import { parseSnapshotRefs, selectSnapshotRef } from './snapshot-refs.ts'
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(scriptDir, '..', '..', '..')
@@ -472,14 +473,28 @@ async function snapshotTab({
   state: RunState
   sessionId: string
   tabId: string
-}): Promise<{ snapshotId: string; text: string }> {
+}): Promise<{ snapshotId: string; text: string; value: BrowserJson | undefined }> {
   const { response } = await apiCall({ state, sessionId, operation: { kind: 'page.snapshot', tabId } })
   const data = requireSuccess({ response, what: 'page.snapshot' })
   if (!data.snapshotId) {
     throw new Error('page.snapshot returned no snapshotId; click/fill snapshot verification cannot continue')
   }
   state.lastSnapshotId = data.snapshotId
-  return { snapshotId: data.snapshotId, text: data.text || '' }
+  return { snapshotId: data.snapshotId, text: data.text || '', value: data.value }
+}
+
+function snapshotRefSelector({
+  snapshot,
+  role,
+  name,
+}: {
+  snapshot: { value: BrowserJson | undefined }
+  role: string
+  name: string
+}): string {
+  const refs = parseSnapshotRefs({ value: snapshot.value })
+  const entry = selectSnapshotRef({ refs, role, name })
+  return `aria-ref=${entry.ref}`
 }
 
 async function evaluateInTab({
@@ -499,6 +514,16 @@ async function evaluateInTab({
 
 async function readCounters({ state }: { state: RunState }): Promise<Record<string, number>> {
   return await readFixtureCounters({ baseUrl: state.fixtureBaseUrl })
+}
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+
+function readPngDimensions({ buffer }: { buffer: Buffer }): { width: number; height: number } {
+  const signatureMatches = PNG_SIGNATURE.every((byte, index) => buffer[index] === byte)
+  if (!signatureMatches || buffer.length < 24) {
+    throw new Error(`not a PNG buffer (first bytes ${buffer.subarray(0, 8).toString('hex')})`)
+  }
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
 }
 
 // ---------------------------------------------------------------------------
@@ -918,22 +943,99 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
 
   await runStep({
     state,
-    id: 'snapshot-click',
-    title: 'page.snapshot -> page.click on a snapshot locator',
+    id: 'page-navigate',
+    title: 'page.navigate reloads the fixture URL on the recorded tab',
     fn: async () => {
-      const { snapshotId, text } = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
+      // Same marker as the original tabs.create URL on purpose: later steps
+      // assert on A1-<runId>, and a fresh marker would break them.
+      const url = `${state.fixtureBaseUrl}/group-page.html?marker=A1-${state.runId}`
+      const { response } = await apiCall({
+        state,
+        sessionId: state.config.sessionA,
+        operation: { kind: 'page.navigate', tabId: state.ids.tabA1, url },
+      })
+      const data = requireSuccess({ response, what: 'page.navigate' })
+      const value = (data.value ?? {}) as { url?: string; title?: string }
+      if (value.url !== url) {
+        throw new Error(`page.navigate reported url ${JSON.stringify(value.url)}, expected ${JSON.stringify(url)}`)
+      }
+      const markerRead = await evaluateInTab({
+        state,
+        sessionId: state.config.sessionA,
+        tabId: state.ids.tabA1,
+        code: `document.querySelector('[data-testid="marker"]').textContent`,
+      })
+      const markerData = requireSuccess({ response: markerRead, what: 'page.evaluate marker after navigate' })
+      const expectedMarker = `acceptance:A1-${state.runId}`
+      const observed = String(markerData.value ?? markerData.text ?? '')
+      if (observed !== expectedMarker) {
+        throw new Error(`marker after navigate is ${JSON.stringify(observed)}, expected ${JSON.stringify(expectedMarker)}`)
+      }
+      return {
+        evidence: `page.navigate ${state.ids.tabA1} -> ${url} (title ${JSON.stringify(value.title ?? '')}), marker reads ${expectedMarker}`,
+        details: { url, title: value.title ?? null },
+      }
+    },
+  })
+
+  await runStep({
+    state,
+    id: 'page-screenshot',
+    title: 'page.screenshot returns PNG bytes and writes a repo-local artifact',
+    fn: async () => {
+      const artifactPath = path.resolve(state.config.reportDir, 'artifacts', `screenshot-${state.runId}.png`)
+      fs.mkdirSync(path.dirname(artifactPath), { recursive: true })
+      const { response } = await apiCall({
+        state,
+        sessionId: state.config.sessionA,
+        operation: { kind: 'page.screenshot', tabId: state.ids.tabA1, path: artifactPath },
+      })
+      const data = requireSuccess({ response, what: 'page.screenshot' })
+      const image = (data.images || [])[0]
+      if (!image) {
+        throw new Error('page.screenshot returned no images')
+      }
+      if (image.mimeType !== 'image/png') {
+        throw new Error(`page.screenshot mimeType is ${JSON.stringify(image.mimeType)}, expected image/png`)
+      }
+      const bytes = Buffer.from(image.data || '', 'base64')
+      if (bytes.length === 0) {
+        throw new Error('page.screenshot returned an empty image')
+      }
+      const dimensions = readPngDimensions({ buffer: bytes })
+      const artifacts = data.artifacts || []
+      const artifact = artifacts.find((entry) => path.resolve(entry.path) === path.resolve(artifactPath))
+      if (!artifact) {
+        throw new Error(`page.screenshot did not report the artifact path ${artifactPath}: ${JSON.stringify(artifacts)}`)
+      }
+      if (!fs.existsSync(artifactPath)) {
+        throw new Error(`page.screenshot artifact file ${artifactPath} does not exist`)
+      }
+      const fileBytes = fs.readFileSync(artifactPath)
+      readPngDimensions({ buffer: fileBytes })
+      return {
+        evidence: `page.screenshot returned a ${bytes.length}-byte PNG (${dimensions.width}x${dimensions.height}) and wrote ${truncate({ value: artifactPath, max: 160 })} (${fileBytes.length} bytes)`,
+        details: { artifactPath, mimeType: image.mimeType, bytes: bytes.length, dimensions },
+      }
+    },
+  })
+
+  await runStep({
+    state,
+    id: 'snapshot-click',
+    title: 'page.snapshot -> page.click on the runtime Submit ref',
+    fn: async () => {
+      const snapshot = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
       const marker = `acceptance:A1-${state.runId}`
-      if (!text.includes(marker)) {
+      if (!snapshot.text.includes(marker)) {
         throw new Error(`snapshot text does not contain the fixture marker ${marker}`)
       }
-      if (!text.includes('submit-fill')) {
-        throw new Error('snapshot text does not expose the fixture submit locator; cannot click from the snapshot')
-      }
+      const selector = snapshotRefSelector({ snapshot, role: 'button', name: 'Submit' })
       state.countersBefore = await readCounters({ state })
       const { response } = await apiCall({
         state,
         sessionId: state.config.sessionA,
-        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: '[data-testid="submit-fill"]', snapshotId },
+        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector, snapshotId: snapshot.snapshotId },
       })
       requireSuccess({ response, what: 'page.click' })
       const tag = `submit-fill-A1-${state.runId}`
@@ -951,8 +1053,8 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         },
       })
       return {
-        evidence: `snapshot returned snapshotId=${snapshotId} and the fixture locator; click accepted it and the counter delta is 1 (plain locators may omit snapshotId per contract, the ref binding is checked by the stale/unknown ref steps)`,
-        details: { after },
+        evidence: `snapshot text selected ${selector} with snapshotId=${snapshot.snapshotId}; the click was accepted and the counter delta is 1`,
+        details: { after, selector },
       }
     },
   })
@@ -960,14 +1062,15 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
   await runStep({
     state,
     id: 'fill-and-verify',
-    title: 'page.fill on the snapshot locator with visible value check',
+    title: 'page.fill on the runtime Name ref with visible value check',
     fn: async () => {
       const value = `acceptance-value-${state.runId}`
       const fresh = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
+      const fillSelector = snapshotRefSelector({ snapshot: fresh, role: 'textbox', name: 'Name' })
       const { response: fillResponse } = await apiCall({
         state,
         sessionId: state.config.sessionA,
-        operation: { kind: 'page.fill', tabId: state.ids.tabA1, selector: '[data-testid="name-input"]', value, snapshotId: fresh.snapshotId },
+        operation: { kind: 'page.fill', tabId: state.ids.tabA1, selector: fillSelector, value, snapshotId: fresh.snapshotId },
       })
       requireSuccess({ response: fillResponse, what: 'page.fill' })
       const valueRead = await evaluateInTab({
@@ -983,10 +1086,11 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
       }
       const beforeClick = await readCounters({ state })
       const second = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
+      const clickSelector = snapshotRefSelector({ snapshot: second, role: 'button', name: 'Submit' })
       const { response: clickResponse } = await apiCall({
         state,
         sessionId: state.config.sessionA,
-        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: '[data-testid="submit-fill"]', snapshotId: second.snapshotId },
+        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: clickSelector, snapshotId: second.snapshotId },
       })
       requireSuccess({ response: clickResponse, what: 'page.click after fill' })
       const echoRead = await evaluateInTab({
@@ -1008,13 +1112,13 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
       }
       const tag = `submit-fill-A1-${state.runId}`
       const counters = await pollUntil({
-        description: `fixture counter ${tag} reaches 2`,
+        description: `fixture counter ${tag} gets one more click`,
         timeoutMs: 8000,
         intervalMs: 300,
         check: async () => {
           const current = await readCounters({ state })
           const delta = counterDelta({ before: beforeClick, after: current, tag })
-          if (delta === 2) {
+          if (delta === 1) {
             return { done: true as const, value: current }
           }
           return { done: false as const, detail: `delta=${delta}` }
@@ -1022,8 +1126,8 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
       })
       state.countersBefore = counters
       return {
-        evidence: `fill(${value}) verified in DOM, click produced echo+log, counter delta exactly 2`,
-        details: { snapshotId: fresh.snapshotId, submittedLog, logLines: logLines.length },
+        evidence: `fill(${value}) via ${fillSelector} verified in DOM, click via ${clickSelector} produced echo+log, counter delta exactly 1 for this submit`,
+        details: { snapshotId: fresh.snapshotId, fillSelector, clickSelector, submittedLog, logLines: logLines.length },
       }
     },
   })
@@ -1045,17 +1149,18 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
       if (fresh.snapshotId === staleSnapshotId) {
         throw new Error('snapshotId did not change between two snapshots; stale detection cannot be exercised')
       }
+      const selector = snapshotRefSelector({ snapshot: fresh, role: 'button', name: 'Submit' })
       const before = await readCounters({ state })
       const { response: staleResponse } = await apiCall({
         state,
         sessionId: state.config.sessionA,
-        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: '@e1', snapshotId: staleSnapshotId },
+        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector, snapshotId: staleSnapshotId },
       })
       const staleFailure = requireFailure({ response: staleResponse, what: 'click with stale snapshotId', allowedCodes: ['stale-snapshot'] })
       const { response: missingIdResponse } = await apiCall({
         state,
         sessionId: state.config.sessionA,
-        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: 'aria-ref=e1' },
+        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector },
       })
       const missingIdFailure = requireFailure({ response: missingIdResponse, what: 'click with a ref but no snapshotId', allowedCodes: ['stale-snapshot'] })
       await new Promise((resolve) => {
@@ -1067,7 +1172,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         throw new Error(`stale snapshot refs produced a side effect (counter delta ${delta})`)
       }
       return {
-        evidence: `old snapshotId rejected with ${staleFailure.code}, ref without snapshotId rejected with ${missingIdFailure.code}; fixture counter delta 0`,
+        evidence: `${selector} with the old snapshotId rejected with ${staleFailure.code} (${staleFailure.message}); the same ref without snapshotId rejected with ${missingIdFailure.code}; fixture counter delta 0`,
       }
     },
   })
@@ -1077,7 +1182,9 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
     id: 'unknown-ref',
     title: 'unknown snapshot ref fails without clicking anything',
     fn: async () => {
-      const fresh = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
+      // page.evaluate invalidates the page snapshot in the managed worker, so
+      // the value/counter reads must happen before the snapshot and the
+      // unknown ref must be sent against a snapshot that is still fresh.
       const valueBefore = await evaluateInTab({
         state,
         sessionId: state.config.sessionA,
@@ -1086,12 +1193,16 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
       })
       const beforeData = requireSuccess({ response: valueBefore, what: 'page.evaluate input value' })
       const before = await readCounters({ state })
+      const fresh = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
       const { response } = await apiCall({
         state,
         sessionId: state.config.sessionA,
         operation: { kind: 'page.fill', tabId: state.ids.tabA1, selector: 'aria-ref=e99999', value: 'should-not-apply', snapshotId: fresh.snapshotId },
       })
       const failure = requireFailure({ response, what: 'fill with unknown aria-ref', allowedCodes: ['stale-snapshot'] })
+      if (!failure.message.includes('is not present in snapshot')) {
+        throw new Error(`expected an unknown-ref rejection, got ${failure.code}: ${failure.message}`)
+      }
       const valueAfter = await evaluateInTab({
         state,
         sessionId: state.config.sessionA,
@@ -1107,7 +1218,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
       if (delta !== 0) {
         throw new Error(`unknown snapshot ref produced a side effect (counter delta ${delta})`)
       }
-      return { evidence: `rejected with ${failure.code} (${failure.outcome}); input unchanged, no fixture side effect` }
+      return { evidence: `rejected with ${failure.code} (${failure.outcome}): ${failure.message}; input unchanged, no fixture side effect` }
     },
   })
 
@@ -2260,7 +2371,9 @@ async function main(): Promise<void> {
       'POST /browser/v1/request groups.create x3 (same name)',
       'POST /browser/v1/request groups.list / tabs.list (session filtered)',
       'POST /browser/v1/request tabs.create for A1, A2, B1',
-      'POST /browser/v1/request page.snapshot -> page.click / page.fill (snapshotId)',
+      'POST /browser/v1/request page.navigate on the recorded A1 tab',
+      'POST /browser/v1/request page.screenshot -> PNG artifact under tmp/acceptance',
+      'POST /browser/v1/request page.snapshot -> ref-driven page.click / page.fill (snapshotId)',
       'POST /browser/v1/request page.logs, page.network start/list/stop',
       'POST /browser/v1/request tabs.release, session.release, request.cancel',
       'POST /browser/v1/request tabs.close / groups.close (recorded ids only)',

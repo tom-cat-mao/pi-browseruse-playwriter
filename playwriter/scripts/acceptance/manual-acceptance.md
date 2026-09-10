@@ -20,8 +20,18 @@ prompt: |
 # What this harness does and never does
 
 The harness drives the real `/browser/v1` HTTP API of a test runtime and
-checks ownership, grouping, popups, snapshot/click/fill, logs, network,
-release and cancel behaviour with real browser events.
+checks ownership, grouping, popups, navigation, screenshots,
+snapshot/click/fill, logs, network, release and cancel behaviour with real
+browser events.
+
+The snapshot steps take the element ref from the `refs` array that the
+page.snapshot response carries in its `value` (entries of
+`{ ref, role, name }`, the same short refs the runtime ref map is keyed
+by), pick the unique entry for a role+name pair, and send it as
+`aria-ref=<ref>` together with the `snapshotId` of that same snapshot.
+Nothing is derived from CSS selectors, from parsing the snapshot text or
+from position numbers: a missing or ambiguous ref fails the step with a
+clear error.
 
 It never launches Chrome, never starts or kills a relay, never touches
 port 19988, never uses Playwright and never guesses resource owners by
@@ -181,7 +191,8 @@ During the run the harness will ask you once to visually confirm that
 the two fixture popups are inside the same Chrome group as their opener.
 Press Enter after looking. Everything else is automated; each step
 prints PASS/FAIL/SKIPPED with its evidence, and the run ends with a
-report path under `tmp/acceptance/`.
+report path under `tmp/acceptance/` plus a PNG screenshot artifact in
+`tmp/acceptance/artifacts/`.
 
 If several managed profiles are connected, pass `--profile <id>` once
 per profile: the harness refuses to guess between profiles, and the
@@ -315,10 +326,12 @@ The harness labels every mode and report with what it actually touched:
 A complete pass reports PASS for: capabilities, explicit profile
 selection, same-name groups without merging, session-filtered listings,
 multi-profile isolation (or SKIPPED with reason when only one profile is
-connected), tab creation, snapshot/click/fill with snapshotId, stale
-snapshot and unknown-ref rejection, logs, network, both popup kinds in
-the source group, cross-session rejection, tab release, session release
-retention, cancel without replay, and own-resources-only cleanup.
+connected), tab creation, page.navigate with a marker check,
+page.screenshot returning PNG bytes plus a repo-local artifact,
+snapshot-ref-driven click/fill with snapshotId, stale snapshot and
+unknown-ref rejection, logs, network, both popup kinds in the source
+group, cross-session rejection, tab release, session release retention,
+cancel without replay, and own-resources-only cleanup.
 
 Anything the harness could not observe is reported as SKIPPED with the
 reason (for example the CDP cross-check without
