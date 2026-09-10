@@ -11,8 +11,9 @@ prompt: |
 # 当前阶段
 
 Step 3：用户已连接隔离Chrome并授权CodeBuddy完成第一轮主体真机验收。
-run e93b0af2：18 PASS / 3 FAIL / 4 SKIP；正在修复一个实际状态回报问题
-及验收脚本误判。只做实际问题的小修与复测，不扩展设计。
+run e93b0af2：18 PASS / 3 FAIL / 4 SKIP；实际状态回报与验收脚本修复
+已集成，测试扩展0.0.127已构建，等待用户重载后由CodeBuddy复测。
+只做实际问题的小修与复测，不扩展设计。
 用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
 全部执行 agent 使用默认 model/effort；禁止 Reasonix。
 codebuddy-6 原先显式 effort=high，已依用户要求停止，由默认配置的
@@ -24,13 +25,13 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
 | E 工具链/发行/日志 | CodeBuddy11/15 | feat/browser-runtime-foundation | eab8301已集成，产品README/legacy测试入口完成 |
-| A 扩展归属/分组 | CodeBuddy7/18 | feat/browser-owned-groups | 原实现已集成；R1 released inventory小修中 |
+| A 扩展归属/分组 | CodeBuddy7/18 | feat/browser-owned-groups | 3e638d1已集成，0.0.127待用户重载 |
 | B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 33e6ab2已集成，独立复验通过 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验通过 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 首轮18/3/4；修evaluate读取及popup记账后复测 |
+| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 983bd1c已集成，23selfchecks通过，等待复测 |
 | 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS+134233d差异通过；Chrome INCOMPLETE |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
@@ -184,6 +185,16 @@ executor、pi-tools、integration。主目录 main 未修改。
   重启/拖出及真实Pi交互端仍未验收，不把SKIP算PASS。
 - harness/fixture进程已退出，用户runtime与Chrome保留；扩展修复集成构建后
   再请用户reload，随后仅复测这些实际路径，不追无影响下载配置日志。
+- H1/H2修复983bd1c已集成：5处evaluate显式return、idsOf优先tabId，
+  两popup必须不同ID；增加普通page.execute返回title的成功值检查。
+- R1修复3e638d1已集成：完整inventory发布released状态，不授予CDP控制；
+  内部active-only列表与释放不复活语义不变。manifest0.0.127，本地tag
+  extension@0.0.127已存在，未push tag/发布。
+- 协调者在8b6981b重跑extension tsc+35tests、managed-relay32tests、harness
+  strict+23selfchecks均通过；已构建原loaded目录extension/dist-acceptance，
+  版本0.0.127、端口19990。未重载Chrome或重启用户runtime。
+- 下一步请用户重载测试扩展并确认版本，再让CodeBuddy用新run复测；旧run
+  及证据保留，重载后旧资源可能needs-rebind，不将其混入新run。
 - 以上不等于完整Chrome验收通过，不提前merge main。
 
 # 待完成门槛
