@@ -37,6 +37,7 @@ import {
   describeEvidenceLevel,
   counterDelta,
   faultChecklist,
+  idsOf,
   mainChecklist,
   makeBrowserRequest,
   redactAcceptanceConfig,
@@ -340,10 +341,6 @@ function resultContainsString({ response, needle }: { response: BrowserResponse;
     return false
   }
   return JSON.stringify(response.data).includes(needle)
-}
-
-function idsOf({ values }: { values: { groupId?: string; tabId?: string }[] }): string[] {
-  return values.map((value) => value.groupId || value.tabId || '').filter(Boolean)
 }
 
 function sameIdSet({ left, right }: { left: string[]; right: string[] }): boolean {
@@ -963,7 +960,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         state,
         sessionId: state.config.sessionA,
         tabId: state.ids.tabA1,
-        code: `document.querySelector('[data-testid="marker"]').textContent`,
+        code: `return document.querySelector('[data-testid="marker"]').textContent`,
       })
       const markerData = requireSuccess({ response: markerRead, what: 'page.evaluate marker after navigate' })
       const expectedMarker = `acceptance:A1-${state.runId}`
@@ -975,6 +972,25 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         evidence: `page.navigate ${state.ids.tabA1} -> ${url} (title ${JSON.stringify(value.title ?? '')}), marker reads ${expectedMarker}`,
         details: { url, title: value.title ?? null },
       }
+    },
+  })
+
+  await runStep({
+    state,
+    id: 'page-execute',
+    title: 'page.execute returns the fixture title from the Node sandbox',
+    fn: async () => {
+      const { response } = await apiCall({
+        state,
+        sessionId: state.config.sessionA,
+        operation: { kind: 'page.execute', tabId: state.ids.tabA1, code: 'return await page.title()' },
+      })
+      const data = requireSuccess({ response, what: 'page.execute title' })
+      const title = String(data.value ?? '')
+      if (title !== 'Acceptance Group Page') {
+        throw new Error(`page.execute returned title ${JSON.stringify(title)}, expected "Acceptance Group Page"`)
+      }
+      return { evidence: `page.execute (Node sandbox) returned ${JSON.stringify(title)} for tab ${state.ids.tabA1}` }
     },
   })
 
@@ -1077,7 +1093,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         state,
         sessionId: state.config.sessionA,
         tabId: state.ids.tabA1,
-        code: `document.querySelector('[data-testid="name-input"]').value`,
+        code: `return document.querySelector('[data-testid="name-input"]').value`,
       })
       const readData = requireSuccess({ response: valueRead, what: 'page.evaluate input value' })
       const observed = String(readData.value ?? readData.text ?? '')
@@ -1097,7 +1113,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         state,
         sessionId: state.config.sessionA,
         tabId: state.ids.tabA1,
-        code: `document.querySelector('[data-testid="echo"]').textContent`,
+        code: `return document.querySelector('[data-testid="echo"]').textContent`,
       })
       const echoData = requireSuccess({ response: echoRead, what: 'page.evaluate echo text' })
       if (String(echoData.value ?? echoData.text ?? '') !== value) {
@@ -1189,7 +1205,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         state,
         sessionId: state.config.sessionA,
         tabId: state.ids.tabA1,
-        code: `document.querySelector('[data-testid="name-input"]').value`,
+        code: `return document.querySelector('[data-testid="name-input"]').value`,
       })
       const beforeData = requireSuccess({ response: valueBefore, what: 'page.evaluate input value' })
       const before = await readCounters({ state })
@@ -1207,7 +1223,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
         state,
         sessionId: state.config.sessionA,
         tabId: state.ids.tabA1,
-        code: `document.querySelector('[data-testid="name-input"]').value`,
+        code: `return document.querySelector('[data-testid="name-input"]').value`,
       })
       const afterData = requireSuccess({ response: valueAfter, what: 'page.evaluate input value' })
       if (String(afterData.value ?? afterData.text ?? '') !== String(beforeData.value ?? beforeData.text ?? '')) {
@@ -1341,8 +1357,15 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
           return { done: false as const, detail: `tabs: ${tabs.map((tab) => `${tab.tabId}:${tab.url}`).join(', ')}` }
         },
       })
+      const firstPopup = state.ledger.tabs.find((tab) => tab.purpose === 'popup-target-blank')
+      if (!firstPopup) {
+        throw new Error('popup-target-blank recorded no tab in this run ledger')
+      }
+      if (popup.tabId === firstPopup.tabId) {
+        throw new Error(`window.open reported the target=_blank popup tab ${popup.tabId}; expected a distinct popup tab`)
+      }
       recordTab({ state, tab: popup, purpose: 'popup-window-open' })
-      return { evidence: `popup tabId=${popup.tabId} groupId=${popup.groupId} url=${popup.url}` }
+      return { evidence: `popup tabId=${popup.tabId} groupId=${popup.groupId} url=${popup.url} (distinct from target=_blank tab ${firstPopup.tabId})` }
     },
   })
 
