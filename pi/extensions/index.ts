@@ -62,6 +62,11 @@ const MAX_INLINE_IMAGES = 2;
 const MAX_INLINE_IMAGE_BASE64 = 16 * 1024 * 1024; // ~12MB raw per image
 const MAX_TEXT_CHARS = 48_000; // ~12k tokens
 const MAX_STRUCTURED_CHARS = 24_000; // budget for the structured-ids JSON block
+const MAX_LOG_LINES = 50; // most recent N log lines
+const MAX_LOG_CHARS = 20_000; // total chars across surfaced log lines
+// Hard ceiling on the total text we emit into `content` (excludes image bytes).
+// Structured ids are laid down first and are never dropped for text/logs.
+const MAX_TOTAL_TEXT_CHARS = 90_000;
 
 // --- rendering helpers -------------------------------------------------------
 
@@ -136,7 +141,13 @@ export default function (pi: ExtensionAPI) {
     if (options.signal?.aborted) {
       throw new Error("request cancelled before it started");
     }
-    await runtime.ensureRuntime();
+    // Launch/probe the shared runtime, but let THIS caller bail if it cancels
+    // mid-launch — without killing the shared launch other callers may await.
+    await runtime.ensureRuntime(options.signal);
+    // A cancel that landed during launch must stop us before we send a request.
+    if (options.signal?.aborted) {
+      throw new Error("request cancelled before it started");
+    }
     const client = runtime.getClient();
     const sessionId = runtime.sessionId(options.ctx);
     const requestId = options.toolCallId;
@@ -152,9 +163,10 @@ export default function (pi: ExtensionAPI) {
         signal: options.signal,
       });
     } catch (e) {
-      // On caller cancellation, ask the runtime to cancel this request with a
-      // fresh (non-aborted) signal. Best-effort; the action is never replayed.
-      if (options.signal?.aborted && e instanceof RuntimeRequestError && e.category === "timeout") {
+      // On ANY timeout — whether the caller aborted or our own deadline fired —
+      // ask the runtime to cancel this request with a fresh (non-aborted)
+      // signal. Best-effort; the action is never replayed.
+      if (e instanceof RuntimeRequestError && e.category === "timeout") {
         await client.cancel({ sessionId, requestId: `${requestId}:cancel`, targetRequestId: requestId });
       }
       // If the daemon went away, drop cached process state so a later tool call
@@ -179,20 +191,46 @@ export default function (pi: ExtensionAPI) {
    */
   function shapeResult(ctx: ExtensionContext, data: BrowserResultData): { content: ContentBlock[]; details: Json } {
     const content: ContentBlock[] = [];
-    const textOut = data.text != null ? data.text.slice(0, MAX_TEXT_CHARS) : "";
-    const truncated = data.text != null && data.text.length > MAX_TEXT_CHARS;
-    if (textOut) content.push(text(truncated ? `${textOut}\n…[truncated]` : textOut));
+    // Track the running text budget so the total content never blows past
+    // MAX_TOTAL_TEXT_CHARS. Structured ids are laid down FIRST and always fit
+    // (bounded by MAX_STRUCTURED_CHARS) so groupId/tabId/snapshotId can never be
+    // pushed out by a large snapshot body or a wall of logs.
+    let remaining = MAX_TOTAL_TEXT_CHARS;
+    const pushText = (t: string): void => {
+      if (!t || remaining <= 0) return;
+      if (t.length <= remaining) {
+        content.push(text(t));
+        remaining -= t.length;
+        return;
+      }
+      content.push(text(`${t.slice(0, remaining)}\n…[truncated]`));
+      remaining = 0;
+    };
 
-    // Structured resources → compact JSON text so the LLM actually receives the
-    // ids/values. De-duplicated (single vs list) and byte-budgeted below.
+    // 1) Structured resources (ids/value) — highest priority, compact JSON.
     const structured = buildStructuredText(data);
-    if (structured) content.push(text(structured));
+    if (structured) pushText(structured);
 
+    // 2) Primary text (snapshot/navigate/etc.), truncated to its own cap first.
+    const textTruncated = data.text != null && data.text.length > MAX_TEXT_CHARS;
+    if (data.text) pushText(textTruncated ? `${data.text.slice(0, MAX_TEXT_CHARS)}\n…[truncated]` : data.text);
+
+    // 3) Page logs — last N lines, capped in total chars.
+    let logTruncated = false;
     if (data.logs && data.logs.length > 0) {
-      content.push(text(`\nPage logs:\n${data.logs.slice(-50).join("\n")}`));
+      const tail = data.logs.slice(-MAX_LOG_LINES);
+      let joined = tail.join("\n");
+      if (tail.length < data.logs.length) logTruncated = true;
+      if (joined.length > MAX_LOG_CHARS) {
+        joined = joined.slice(0, MAX_LOG_CHARS);
+        logTruncated = true;
+      }
+      pushText(`\nPage logs:\n${joined}`);
     }
+
+    // 4) Artifact paths (small).
     if (data.artifacts && data.artifacts.length > 0) {
-      content.push(text(`\nartifacts: ${data.artifacts.map((a) => `${a.path} (${a.mimeType})`).join(", ")}`));
+      pushText(`\nartifacts: ${data.artifacts.map((a) => `${a.path} (${a.mimeType})`).join(", ")}`);
     }
 
     const canSee = ctx.model?.input?.includes("image") ?? false;
@@ -220,7 +258,8 @@ export default function (pi: ExtensionAPI) {
       logs: data.logs,
       imageCount: data.images?.length ?? 0,
       imagesInlined: inlined,
-      textTruncated: truncated,
+      textTruncated,
+      logTruncated,
     };
     return { content, details };
   }
@@ -231,19 +270,47 @@ export default function (pi: ExtensionAPI) {
    * are emitted; list fields collapse to their essential columns so a large
    * listing stays within budget. Returns "" when there is nothing structured.
    */
+  /**
+   * Serialize the structured fields the LLM must see (ids, snapshotId, evaluate
+   * value) as compact JSON, bounded by MAX_STRUCTURED_CHARS.
+   *
+   * Resource ids (snapshotId, group/tab/list ids) are ALWAYS emitted intact —
+   * they are small and must never be dropped. Only the free-form evaluate
+   * `value` can be large; if including it would blow the budget we omit it from
+   * the JSON and surface it separately as an explicitly-truncated string, so the
+   * ids block stays valid parseable JSON and the value is never sliced into
+   * invalid JSON. Returns "" when there is nothing structured.
+   */
   function buildStructuredText(data: BrowserResultData): string {
-    const out: Json = {};
-    if (data.snapshotId) out.snapshotId = data.snapshotId;
-    if (data.value !== undefined) out.value = data.value;
-    if (data.group) out.group = compactGroup(data.group);
-    if (data.tab) out.tab = compactTab(data.tab);
-    if (data.profiles) out.profiles = data.profiles.map(compactProfile);
-    if (data.groups) out.groups = data.groups.map(compactGroup);
-    if (data.tabs) out.tabs = data.tabs.map(compactTab);
-    if (Object.keys(out).length === 0) return "";
-    const json = JSON.stringify(out);
-    if (json.length <= MAX_STRUCTURED_CHARS) return json;
-    return `${json.slice(0, MAX_STRUCTURED_CHARS)}\n…[structured output truncated; narrow the query]`;
+    const ids: Json = {};
+    if (data.snapshotId) ids.snapshotId = data.snapshotId;
+    if (data.group) ids.group = compactGroup(data.group);
+    if (data.tab) ids.tab = compactTab(data.tab);
+    if (data.profiles) ids.profiles = data.profiles.map(compactProfile);
+    if (data.groups) ids.groups = data.groups.map(compactGroup);
+    if (data.tabs) ids.tabs = data.tabs.map(compactTab);
+
+    // Try the full object (ids + value) first — the common, small case.
+    if (data.value !== undefined) {
+      const full = JSON.stringify({ ...ids, value: data.value });
+      if (full.length <= MAX_STRUCTURED_CHARS) return full;
+    } else {
+      if (Object.keys(ids).length === 0) return "";
+      const idsJson = JSON.stringify(ids);
+      if (idsJson.length <= MAX_STRUCTURED_CHARS) return idsJson;
+      // ids alone somehow exceed budget (huge listing): keep valid JSON by
+      // dropping array bodies rather than slicing into invalid JSON.
+      return JSON.stringify({ ...ids, note: "listing too large; narrow with a filter" });
+    }
+
+    // value is present and oversize: emit ids as valid JSON, then value as an
+    // explicitly-truncated standalone string (never sliced JSON).
+    const idsJson = Object.keys(ids).length > 0 ? JSON.stringify(ids) : "";
+    const budgetForValue = Math.max(0, MAX_STRUCTURED_CHARS - idsJson.length - 64);
+    const valueStr = typeof data.value === "string" ? data.value : JSON.stringify(data.value);
+    const valuePreview = (valueStr ?? "").slice(0, budgetForValue);
+    const valueBlock = `value (truncated, ${(valueStr ?? "").length} chars total):\n${valuePreview}\n…[value truncated; read it in smaller pieces via browser_evaluate]`;
+    return idsJson ? `${idsJson}\n${valueBlock}` : valueBlock;
   }
 
   const groupLine = (g: BrowserGroup): string => `${g.name} [${g.groupId}] profile=${g.profileId} ${g.state}`;

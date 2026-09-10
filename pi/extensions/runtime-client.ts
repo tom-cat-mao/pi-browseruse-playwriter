@@ -183,7 +183,12 @@ function byteLength(s: string): number {
 
 /** Map a non-2xx status onto a transport error, reading the body for detail. */
 async function httpError(res: Response, endpoint: string): Promise<RuntimeRequestError> {
-  const body = await res.text().catch(() => "");
+  // Read the error body for context. If the read itself fails — typically an
+  // abort/timeout while the body is still streaming — rethrow the raw error so
+  // the caller's boundary (toTransportError, which knows the signal + mutating
+  // flag) can classify it as a timeout (outcome:unknown for a mutating request)
+  // rather than reporting a misleading plain http error.
+  const body = await res.text();
   const detail = body ? `: ${body.slice(0, 512)}` : "";
   if (res.status === 401) {
     return new RuntimeRequestError("unauthorized", `runtime rejected auth on ${endpoint} (401)${detail}`, {
@@ -202,21 +207,23 @@ function toTransportError(
   baseUrl: string,
   opts: { mutating?: boolean; signal?: AbortSignal } = {},
 ): RuntimeRequestError {
-  if (e instanceof RuntimeRequestError) return e;
   // An abort can surface as an AbortError/TimeoutError DOMException, or — when
-  // the caller aborts with a custom reason — as that reason itself. Treat a
-  // caller signal that is now aborted as a timeout regardless of the error name.
+  // the caller aborts with a custom reason — as that reason itself. It can also
+  // surface INDIRECTLY: a non-2xx body read that is cut short by the abort
+  // resolves with a partial body and yields a plain http error, but the signal
+  // is now aborted. In all these cases a mutating POST may already have run, so
+  // treat a caller-aborted exchange as a timeout regardless of the concrete
+  // error, and attach outcome:"unknown" for mutating requests (reads carry no
+  // outcome).
   const abortedName = e instanceof Error && (e.name === "AbortError" || e.name === "TimeoutError");
   const callerAborted = opts.signal?.aborted ?? false;
   if (abortedName || callerAborted) {
-    // A POST /request that aborts after the body was sent may have already run
-    // the page action — surface outcome "unknown" so the LLM knows not to
-    // assume it did nothing. Reads (capabilities/profiles) carry no outcome.
     return new RuntimeRequestError("timeout", `${endpoint} aborted before a response arrived`, {
       cause: e,
       ...(opts.mutating ? { outcome: "unknown" as const } : {}),
     });
   }
+  if (e instanceof RuntimeRequestError) return e;
   return new RuntimeRequestError(
     "runtime-unreachable",
     `browser runtime at ${baseUrl} is not reachable (${String(e)})`,
@@ -381,37 +388,39 @@ export class BrowserRuntimeClient {
   /** GET /browser/v1/capabilities. */
   async getCapabilities(signal?: AbortSignal): Promise<BrowserCapabilities> {
     const endpoint = "/browser/v1/capabilities";
-    let res: Response;
+    // The whole exchange — fetch, non-2xx mapping, and body read/validation — is
+    // inside the boundary so a stream that aborts mid-body (headers already in)
+    // is classified as a timeout, not a raw AbortError. This is a read, so no
+    // outcome is attached (never a business "unknown").
     try {
-      res = await fetch(`${this.config.baseUrl}${endpoint}`, {
+      const res = await fetch(`${this.config.baseUrl}${endpoint}`, {
         headers: authHeaders(this.config),
         signal: withTimeout(3000, signal),
       });
+      if (!res.ok) throw await httpError(res, endpoint);
+      return validateCapabilities(await readJson(res));
     } catch (e) {
-      throw toTransportError(e, endpoint, this.config.baseUrl);
+      throw toTransportError(e, endpoint, this.config.baseUrl, { signal });
     }
-    if (!res.ok) throw await httpError(res, endpoint);
-    return validateCapabilities(await readJson(res));
   }
 
   /** GET /browser/v1/profiles. Connection metadata; not filtered by session. */
   async listProfiles(signal?: AbortSignal): Promise<BrowserProfile[]> {
     const endpoint = "/browser/v1/profiles";
-    let res: Response;
     try {
-      res = await fetch(`${this.config.baseUrl}${endpoint}`, {
+      const res = await fetch(`${this.config.baseUrl}${endpoint}`, {
         headers: authHeaders(this.config),
         signal: withTimeout(5000, signal),
       });
+      if (!res.ok) throw await httpError(res, endpoint);
+      const body = await readJson(res);
+      if (!isRecord(body) || !Array.isArray(body.profiles)) {
+        throw new RuntimeRequestError("protocol", "profiles response is missing a profiles array");
+      }
+      return body.profiles.map(validateProfile);
     } catch (e) {
-      throw toTransportError(e, endpoint, this.config.baseUrl);
+      throw toTransportError(e, endpoint, this.config.baseUrl, { signal });
     }
-    if (!res.ok) throw await httpError(res, endpoint);
-    const body = await readJson(res);
-    if (!isRecord(body) || !Array.isArray(body.profiles)) {
-      throw new RuntimeRequestError("protocol", "profiles response is missing a profiles array");
-    }
-    return body.profiles.map(validateProfile);
   }
 
   /**
@@ -439,19 +448,24 @@ export class BrowserRuntimeClient {
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
     };
-    let res: Response;
+    // The ENTIRE exchange is inside the boundary: fetch, non-2xx body read, and
+    // success body read/validation. Once the POST body is on the wire the page
+    // action may already be running, so ANY failure past that point — including
+    // a stream that aborts mid-body or an errorBody read that is cut off — must
+    // surface outcome "unknown" (mutating:true) rather than a raw AbortError.
+    // Protocol/HTTP errors already carry their own semantics and pass through.
     try {
-      res = await fetch(`${this.config.baseUrl}${endpoint}`, {
+      const res = await fetch(`${this.config.baseUrl}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders(this.config) },
         body: JSON.stringify(body),
         signal: withTimeout(timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, opts.signal),
       });
+      if (!res.ok) throw await httpError(res, endpoint);
+      return validateResponse(await readJson(res), opts.requestId);
     } catch (e) {
       throw toTransportError(e, endpoint, this.config.baseUrl, { mutating: true, signal: opts.signal });
     }
-    if (!res.ok) throw await httpError(res, endpoint);
-    return validateResponse(await readJson(res), opts.requestId);
   }
 
   /**

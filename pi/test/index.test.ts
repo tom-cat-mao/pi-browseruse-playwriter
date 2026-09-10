@@ -241,4 +241,36 @@ describe("tool execution shaping (real HTTP runtime)", () => {
       nav.execute("call-7", { tabId: "missing", url: "https://x.com" }, undefined, undefined, makeCtx()),
     ).rejects.toThrow(/resource-not-found/);
   });
+
+  it("keeps snapshotId intact and emits an explicit truncation when an evaluate value is oversize", async () => {
+    // A ~200k-char string value cannot fit the structured budget; the ids must
+    // still be present + parseable and the value must be flagged as truncated
+    // (never sliced into invalid JSON).
+    const huge = "x".repeat(200_000);
+    runtimeHandler(() => ({ snapshotId: "snap-keep", value: huge }));
+    const evaluate = toolByName("browser_evaluate");
+    const res = await evaluate.execute("call-8", { tabId: "t", code: "return big" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    // snapshotId survives as valid JSON on its own line.
+    const idsLine = t.split("\n").find((l) => l.startsWith("{"))!;
+    expect(() => JSON.parse(idsLine)).not.toThrow();
+    expect(JSON.parse(idsLine).snapshotId).toBe("snap-keep");
+    expect(t).toContain("value truncated");
+    expect(res.details.value).toBe(huge); // details keeps the full value for the UI
+  });
+
+  it("bounds total content text so a giant snapshot plus logs cannot overflow", async () => {
+    runtimeHandler(() => ({
+      text: "T".repeat(500_000),
+      logs: Array.from({ length: 500 }, (_v, i) => `line ${i} ${"L".repeat(500)}`),
+      snapshotId: "snap-big",
+    }));
+    const snap = toolByName("browser_snapshot");
+    const res = await snap.execute("call-9", { tabId: "t" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    // Total emitted text stays within the hard ceiling (plus small markers).
+    expect(t.length).toBeLessThan(95_000);
+    // The tiny structured id is never dropped.
+    expect(t).toContain("snap-big");
+  });
 });
