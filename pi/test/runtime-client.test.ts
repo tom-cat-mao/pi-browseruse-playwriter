@@ -181,6 +181,61 @@ describe("request", () => {
     ac.abort(new Error("user cancelled"));
     await expect(p).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
   });
+
+  it("surfaces outcome:unknown when a mutating request aborts mid-BODY (headers already sent)", async () => {
+    // Send headers + a partial chunk, then hang. The abort fires while the body
+    // stream is being read — the boundary must still classify it as timeout
+    // + outcome:unknown, not a raw AbortError leaking out.
+    server.setStreamHandler((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"requestId":"c","ok":true,"da');
+      // never end
+    });
+    const ac = new AbortController();
+    const p = client().request({
+      requestId: "c",
+      sessionId: "s",
+      operation: { kind: "page.click", tabId: "t", selector: "#go" },
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort(new Error("user cancelled mid-body"));
+    await expect(p).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
+  });
+
+  it("does NOT attach an outcome when a read (capabilities) aborts mid-body", async () => {
+    server.setStreamHandler((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"protocolVersi');
+    });
+    const ac = new AbortController();
+    const p = client().getCapabilities(ac.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort(new Error("cancelled"));
+    const err = await p.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RuntimeRequestError);
+    expect((err as RuntimeRequestError).category).toBe("timeout");
+    expect((err as RuntimeRequestError).outcome).toBeUndefined();
+  });
+
+  it("classifies a slow HTTP error body that aborts as timeout+unknown for a mutating request", async () => {
+    // Non-2xx status, but the error body itself stalls; aborting during that
+    // read must still be treated as mutating timeout (the action may have run).
+    server.setStreamHandler((_req, res) => {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.write("internal error deta");
+    });
+    const ac = new AbortController();
+    const p = client().request({
+      requestId: "c",
+      sessionId: "s",
+      operation: { kind: "page.fill", tabId: "t", selector: "#x", value: "v" },
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort(new Error("cancelled during error body"));
+    await expect(p).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
+  });
 });
 
 describe("cancel", () => {

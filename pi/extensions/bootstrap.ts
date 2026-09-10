@@ -63,16 +63,37 @@ export function sessionId(ctx: ExtensionContext): string {
 
 /**
  * Ensure the paired managed runtime is reachable, launching it once if needed.
- * Returns the negotiated capabilities. Concurrent callers share one launch.
+ * Returns the negotiated capabilities. Concurrent callers share one launch, so
+ * the launch promise is NOT bound to any single caller's signal — a caller that
+ * cancels races the shared launch (below) and bails for itself without killing
+ * the daemon start other callers are still awaiting.
  */
-export async function ensureRuntime(): Promise<BrowserCapabilities> {
+export async function ensureRuntime(signal?: AbortSignal): Promise<BrowserCapabilities> {
   if (capabilities) return capabilities;
   if (!inflightStart) {
     inflightStart = doEnsureRuntime().finally(() => {
       inflightStart = null;
     });
   }
-  return inflightStart;
+  const shared = inflightStart;
+  if (!signal) return shared;
+  // Race the shared launch against this caller's cancellation. abortRace rejects
+  // when the signal fires; the shared launch keeps running for other callers.
+  return Promise.race([shared, abortRace(signal)]);
+}
+
+/** Reject as soon as `signal` aborts; never resolves. Used to let a caller bail. */
+function abortRace(signal: AbortSignal): Promise<never> {
+  if (signal.aborted) return Promise.reject(new Error("browser runtime launch cancelled"));
+  return new Promise<never>((_resolve, reject) => {
+    signal.addEventListener(
+      "abort",
+      () => {
+        reject(new Error("browser runtime launch cancelled"));
+      },
+      { once: true },
+    );
+  });
 }
 
 async function doEnsureRuntime(): Promise<BrowserCapabilities> {

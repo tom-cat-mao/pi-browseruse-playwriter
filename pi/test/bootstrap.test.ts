@@ -109,6 +109,20 @@ describe("ensureRuntime", () => {
     process.env.PI_BROWSER_HOST = "http://runtime.invalid:19989";
     await expect(bootstrap.ensureRuntime()).rejects.toThrow(/remote host/);
   });
+
+  it("lets a caller bail when its signal aborts during launch, without settling from its own abort", async () => {
+    // Point at a slow server that never answers capabilities so the shared
+    // launch stays in-flight; the caller's signal aborts and only that caller's
+    // promise rejects. The shared launch is not bound to this signal.
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    server.setStreamHandler(() => {
+      // never respond
+    });
+    const ac = new AbortController();
+    const p = bootstrap.ensureRuntime(ac.signal);
+    ac.abort(new Error("caller cancelled during launch"));
+    await expect(p).rejects.toThrow(/launch cancelled/);
+  });
 });
 
 describe("reset", () => {

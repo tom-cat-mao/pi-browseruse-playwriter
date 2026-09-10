@@ -17,6 +17,9 @@ export type RecordedRequest = {
 };
 
 export type HandlerResult = { status?: number; json?: unknown; raw?: string; contentType?: string };
+// A handler may instead take over the raw response — used to test bodies that
+// arrive in chunks and then hang (mid-body abort) or slow error bodies.
+export type StreamHandler = (req: RecordedRequest, res: http.ServerResponse) => void;
 export type Handler = (req: RecordedRequest) => HandlerResult | Promise<HandlerResult>;
 
 export type TestServer = {
@@ -24,6 +27,7 @@ export type TestServer = {
   port: number;
   requests: RecordedRequest[];
   setHandler: (handler: Handler) => void;
+  setStreamHandler: (handler: StreamHandler | null) => void;
   close: () => Promise<void>;
 };
 
@@ -34,6 +38,7 @@ export async function startTestServer(initial?: Handler): Promise<TestServer> {
     (() => {
       return { status: 404, json: { error: "no handler" } };
     });
+  let streamHandler: StreamHandler | null = null;
 
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -58,6 +63,10 @@ export async function startTestServer(initial?: Handler): Promise<TestServer> {
           body,
         };
         requests.push(recorded);
+        if (streamHandler) {
+          streamHandler(recorded, res);
+          return;
+        }
         const result = await handler(recorded);
         const status = result.status ?? 200;
         const payload = result.raw !== undefined ? result.raw : JSON.stringify(result.json ?? null);
@@ -82,6 +91,9 @@ export async function startTestServer(initial?: Handler): Promise<TestServer> {
     requests,
     setHandler: (h: Handler) => {
       handler = h;
+    },
+    setStreamHandler: (h: StreamHandler | null) => {
+      streamHandler = h;
     },
     close: () =>
       new Promise<void>((resolve, reject) => {
