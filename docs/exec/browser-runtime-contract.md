@@ -63,8 +63,10 @@ PI_BROWSER_TOKEN / PI_BROWSER_DATA_DIR，不抢占日常 19988。
    { id: number, method: 'browserRequest', params: BrowserRequest }。
 4. extension -> relay 使用旧 envelope：
    { id: number, result: BrowserResponse }。
-5. extension 处理 groups.* / tabs.* / tab.resolve。
-   profiles.list / session.release / request.cancel 由 relay 处理。
+5. extension 处理 groups.* / tabs.* / tab.resolve，以及 request.cancel。
+   profiles.list / session.release 由 relay 处理。request.cancel 在 relay
+   撤销 worker 的同时，对已发往 extension 的控制请求转发取消，使用
+   相同 sessionId + targetRequestId；取消不得被普通 per-group 队列阻塞。
 6. tabs.create 必须先在组窗口创建空白标签并立即入组，再导航目标 URL；
    持久记录和实际 groupId 校验完成后返回 ready，附 targetId/cdpSessionId。
 7. 正在离线时 Chrome 组仍存在；transport reconnect 不调用 ungroup。
@@ -72,6 +74,16 @@ PI_BROWSER_TOKEN / PI_BROWSER_DATA_DIR，不抢占日常 19988。
 9. 原始 CDP Target.createTarget 不能生成 managed 未归属标签；新 managed
    executor 不使用 context.newPage，创建统一经 tabs.create。
 10. legacy profile 不发送 inventory，managed 功能明确 unsupported。
+11. 每个 WS 有独立连接代际和控制请求 AbortController。socket close 立即
+    使其失效；每次 await 后再做 Chrome 写操作前核验代际/owner/release。
+    旧 socket 的请求结果不得通过新的 socket 发送。timeout/cancel 后只能
+    停止后续操作，已发出的 Chrome 动作如实报告 outcome unknown。
+12. 持久 create ledger 在首个有副作用阶段登记 pending/resource ID，再在
+    成功阶段标 completed。SW 中断或取消后重试不能因缺 completed ledger
+    重复创建资源；未确认结果返回 outcome unknown并列出可核验资源。
+13. registry保存失败不伪装成功；下一次重试必须使用新的健康写队列并读取
+    权威持久状态。恢复观察异步完成后重新对账用户释放/新revision，不能
+    用旧Chrome快照覆盖期间写入的release tombstone。
 
 # Managed CDP 路由
 

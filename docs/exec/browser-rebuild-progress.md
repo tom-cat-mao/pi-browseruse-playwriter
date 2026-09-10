@@ -21,13 +21,14 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
-| E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 7d0f92b 已集成，发行默认值修订中 |
-| A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | bf29f36 已集成，P0 修订中 |
-| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 543b636 已集成，CDP作用域补强中 |
+| E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 4500349 已集成 |
+| A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | b3fa70b 已集成，transport/取消修订中 |
+| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 0364558 已集成，inventory/控制取消修订中 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 运行中 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 运行中 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
-| 独立验收 | 全新 agent，实施后启动 | 待创建 | 未开始 |
+| 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 进行中，非最终验收 |
+| 最终独立验收 | 另一全新 agent，实施后启动 | 待创建 | 未开始 |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -59,7 +60,16 @@ executor、pi-tools、integration。主目录 main 未修改。
   流式body限额、队列执行前再校验owner/epoch/释放。
 - E二审要求：ownbin不覆盖全局playwriter、production fork不退19988、
   CI加入各新模块/Pi/extension测试、logger序列化与既有文件计量。
-- 以上是协调者初审，不能代替最后的全新agent独立验收。
+- A b3fa70b、B0364558、E4500349已合入；协调者重跑 runtime build、
+  249/249无浏览器runtime tests、23/23extension state tests。
+- Pi旧原型59/59测试和typecheck仍过，但D新版尚未合入，这不是新版验收。
+- 已创建Draft PR #1：
+  https://github.com/tom-cat-mao/pi-browseruse-playwriter/pull/1
+- 首次push7a5fb61的GitHub CI通过；后续集成待再次push/CI。
+- 中期全新CodeBuddy只读审查已启动，避免实现者自验收。
+- 契约补全控制请求取消必须透传extension、旧WS代际结果不得送新socket、
+  pending/completed create ledger防SW中断重复创建；A/B在各自分支落实。
+- 以上不能代替最后的全新agent独立验收与用户Chrome验收。
 
 # 待完成门槛
 
