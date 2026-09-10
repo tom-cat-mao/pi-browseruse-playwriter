@@ -102,6 +102,35 @@ describe('managed resource registry ownership', () => {
     `)
   })
 
+  test('session storage loss makes old records needs-rebind instead of reusing chrome ids', () => {
+    const registry = createRegistryWithGroup()
+
+    // Same Chrome process, but storage.session was cleared: a fresh epoch arrives
+    // while the old chromeTabId/chromeGroupId numbers may already point at
+    // unrelated tabs. These records must not be silently adopted.
+    const result = reconcileRegistry(registry, {
+      browserEpoch: 'epoch-after-storage-loss',
+      observedTabs: [observedTab({ chromeTabId: 101, chromeGroupId: 11 })],
+      observedChromeGroupIds: [11],
+    })
+
+    expect({
+      tabState: findTab(result.registry, 'pt-1')?.state,
+      tabKeptLogicalId: findTab(result.registry, 'pt-1')?.tabId,
+      groupState: findGroup(result.registry, 'pg-1')?.state,
+      groupChromeGroupId: findGroup(result.registry, 'pg-1')?.chromeGroupId,
+      reattach: result.reattachTabIds,
+    }).toMatchInlineSnapshot(`
+      {
+        "groupChromeGroupId": undefined,
+        "groupState": "needs-rebind",
+        "reattach": [],
+        "tabKeptLogicalId": "pt-1",
+        "tabState": "needs-rebind",
+      }
+    `)
+  })
+
   test('same-epoch reconcile reattaches tabs still in the group and releases moved tabs', () => {
     let registry = createRegistryWithGroup()
     registry = addTab(registry, {

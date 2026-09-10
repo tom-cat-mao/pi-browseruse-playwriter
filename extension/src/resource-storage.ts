@@ -43,6 +43,13 @@ export interface BrowserEpochResult {
   restarted: boolean
 }
 
+/**
+ * Returns the browser-run epoch. A missing session value means the browser was
+ * restarted OR session storage was cleared; either way the previous run's
+ * chromeTabId/chromeGroupId values may now belong to unrelated tabs (Chrome
+ * hands out low numeric ids again after a restart), so callers must reconcile
+ * those records into needs-rebind instead of reusing the numeric Chrome ids.
+ */
 export async function ensureBrowserEpoch(): Promise<BrowserEpochResult> {
   const stored = await chrome.storage.session.get(BROWSER_EPOCH_STORAGE_KEY)
   const existingEpoch = stored[BROWSER_EPOCH_STORAGE_KEY]

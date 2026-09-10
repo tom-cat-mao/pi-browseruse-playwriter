@@ -1838,6 +1838,7 @@ async function resetDebugger(): Promise<void> {
 const OUR_EXTENSION_IDS = [
   'jfeammnjpkecdekppnclgkkffahnhfhe', // Production extension (Chrome Web Store)
   'pebbngnfojnignonigcnkdilknapkgid', // Dev extension (stable ID from manifest key)
+  'eeklahpecooapnailfaebkjjembkjhhg', // Fork dev extension (built with PLAYWRITER_FORK_DEV_KEY=1)
 ]
 
 // undefined URL is for about:blank pages (not restricted) and chrome:// URLs (restricted).

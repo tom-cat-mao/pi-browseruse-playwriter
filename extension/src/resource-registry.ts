@@ -404,9 +404,10 @@ export interface ReconcileResult {
  * still has the same chromeTabId inside the recorded Chrome group. Anything the
  * user moved out / closed while we were offline becomes a tombstone.
  *
- * New browserEpoch: Chrome restarted. Old chromeTabId/windowId/group ids may be
- * reused by unrelated tabs, so nothing is auto-adopted. Active records switch to
- * needs-rebind and keep their logical identity; stale tombstones are dropped.
+ * New browserEpoch (Chrome restarted, or storage.session was cleared): old
+ * chromeTabId/windowId/group ids may now belong to unrelated tabs, so nothing is
+ * auto-adopted. Active records switch to needs-rebind and keep their logical
+ * identity; stale tombstones are dropped.
  */
 export function reconcileRegistry(registry: ManagedResourceRegistry, options: ReconcileOptions): ReconcileResult {
   if (registry.browserEpoch !== options.browserEpoch) {
