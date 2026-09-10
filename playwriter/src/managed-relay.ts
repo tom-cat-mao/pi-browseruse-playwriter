@@ -1071,11 +1071,79 @@ export function noteManagedConnectionOpened(
  *   reported through epochChanged so executors/control connections are revoked.
  * The relay never resurrects resources missing from a newer snapshot.
  */
+/**
+ * Cross-record validation for one inventory snapshot. The extension is the source
+ * of truth for ownership, but an internally contradictory snapshot must be
+ * rejected instead of being cached: duplicate ids, tabs pointing at missing or
+ * foreign groups, wrong profile/session owners and `ready` resources without the
+ * live Chrome/CDP identity would all make scoped routing unsound.
+ */
+export function validateManagedInventoryConsistency({
+  inventory,
+  installId,
+}: {
+  inventory: BrowserInventory
+  installId?: string
+}): { ok: true } | { ok: false; reason: string } {
+  if (!installId) {
+    return { ok: false, reason: 'extension connection has no installId' }
+  }
+  if (inventory.profileId !== installId) {
+    return { ok: false, reason: 'profileId does not match the extension install identity' }
+  }
+  const groupsById = new Map<string, BrowserGroup>()
+  for (const group of inventory.groups) {
+    if (groupsById.has(group.groupId)) {
+      return { ok: false, reason: `duplicate groupId ${group.groupId}` }
+    }
+    groupsById.set(group.groupId, group)
+    if (group.profileId !== inventory.profileId) {
+      return { ok: false, reason: `group ${group.groupId} belongs to another profile` }
+    }
+    if (group.state === 'ready' && group.browserEpoch !== inventory.browserEpoch) {
+      return { ok: false, reason: `ready group ${group.groupId} has a different browserEpoch` }
+    }
+  }
+  const tabIds = new Set<string>()
+  for (const tab of inventory.tabs) {
+    if (tabIds.has(tab.tabId)) {
+      return { ok: false, reason: `duplicate tabId ${tab.tabId}` }
+    }
+    tabIds.add(tab.tabId)
+    if (tab.profileId !== inventory.profileId) {
+      return { ok: false, reason: `tab ${tab.tabId} belongs to another profile` }
+    }
+    const group = groupsById.get(tab.groupId)
+    if (!group) {
+      return { ok: false, reason: `tab ${tab.tabId} references unknown group ${tab.groupId}` }
+    }
+    if (group.sessionId !== tab.sessionId) {
+      return { ok: false, reason: `tab ${tab.tabId} owner differs from its group owner` }
+    }
+    if (tab.state === 'ready') {
+      if (tab.browserEpoch !== inventory.browserEpoch) {
+        return { ok: false, reason: `ready tab ${tab.tabId} has a different browserEpoch` }
+      }
+      if (!tab.cdpSessionId) {
+        return { ok: false, reason: `ready tab ${tab.tabId} is missing cdpSessionId` }
+      }
+      if (!(tab.chromeTabId >= 0)) {
+        return { ok: false, reason: `ready tab ${tab.tabId} is missing chromeTabId` }
+      }
+    }
+  }
+  return { ok: true }
+}
+
 export function applyBrowserInventory(
   state: ManagedRelayState,
   input: { connectionId: string; info: ManagedInventoryInfo; inventory: BrowserInventory },
 ): { state: ManagedRelayState; result: ManagedInventoryResult } {
   const { inventory } = input
+  const consistency = validateManagedInventoryConsistency({ inventory, installId: input.info.installId })
+  if (!consistency.ok) {
+    return { state, result: { accepted: false, reason: consistency.reason } }
+  }
   const connectionSeq = state.connectionSeq.get(input.connectionId) ?? state.nextConnectionSeq + 1
   const existing = state.profiles.get(inventory.profileId)
   if (existing) {
@@ -1189,7 +1257,8 @@ export function findManagedGroup(
 ): { profile: ManagedProfileSnapshot; group: BrowserGroup } | null {
   for (const profile of sortedProfiles(state)) {
     const group = profile.groups.get(groupId)
-    if (group) {
+    // Ownership boundary: a cached record must belong to the profile that stores it.
+    if (group && group.profileId === profile.profileId) {
       return { profile, group }
     }
   }
@@ -1202,9 +1271,15 @@ export function findManagedTab(
 ): { profile: ManagedProfileSnapshot; tab: BrowserTab } | null {
   for (const profile of sortedProfiles(state)) {
     const tab = profile.tabs.get(tabId)
-    if (tab) {
-      return { profile, tab }
+    if (!tab || tab.profileId !== profile.profileId) {
+      continue
     }
+    const group = profile.groups.get(tab.groupId)
+    const groupIsConsistent = Boolean(group && group.sessionId === tab.sessionId)
+    if (!groupIsConsistent) {
+      continue
+    }
+    return { profile, tab }
   }
   return null
 }
@@ -1217,7 +1292,7 @@ export function listManagedGroups(
   return profiles.flatMap((profile) => {
     return Array.from(profile.groups.values())
       .filter((group) => {
-        return group.sessionId === sessionId
+        return group.sessionId === sessionId && group.profileId === profile.profileId
       })
       .map((group) => {
         return { ...group, state: effectiveResourceState({ profile, state: group.state }) }
@@ -1233,7 +1308,15 @@ export function listManagedTabs(
   return profiles.flatMap((profile) => {
     return Array.from(profile.tabs.values())
       .filter((tab) => {
-        return tab.sessionId === sessionId && (!groupId || tab.groupId === groupId)
+        if (tab.sessionId !== sessionId || tab.profileId !== profile.profileId) {
+          return false
+        }
+        if (groupId && tab.groupId !== groupId) {
+          return false
+        }
+        // The tab must still resolve to a group owned by the same session/profile.
+        const group = profile.groups.get(tab.groupId)
+        return Boolean(group && group.sessionId === sessionId && group.profileId === profile.profileId)
       })
       .map((tab) => {
         return { ...tab, state: effectiveResourceState({ profile, state: tab.state }) }
@@ -1573,6 +1656,11 @@ export class ManagedRelay {
       kind: request.operation.kind,
       clientSignal,
     })
+    // Relay-side deadline: on expiry the extension gets an explicit request.cancel
+    // notice instead of waiting for its own transport timeout.
+    const timer = setTimeout(() => {
+      this.abortPending({ pending, reason: 'timeout' })
+    }, timeoutMs)
     try {
       const transportPromise = this.options.transport.sendBrowserRequest({
         profileId: profile.profileId,
@@ -1607,6 +1695,7 @@ export class ManagedRelay {
     } catch (error) {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
     } finally {
+      clearTimeout(timer)
       pending.detachClientSignal?.()
       this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
     }
@@ -1676,8 +1765,7 @@ export class ManagedRelay {
       clientSignal,
     })
     const timer = setTimeout(() => {
-      pending.timedOut = true
-      pending.controller.abort(new Error('timeout'))
+      this.abortPending({ pending, reason: 'timeout' })
     }, timeoutMs)
     try {
       const response = await this.queue.run({
@@ -1852,7 +1940,7 @@ export class ManagedRelay {
         ok: false,
         failure: {
           code: 'needs-rebind',
-          message: `tab ${operation.tabId} needs to be re-bound before execution`,
+          message: `tab ${operation.tabId} needs to be re-bound after a browser restart; re-attach the tab before retrying (its ownership is preserved)`,
           outcome: 'not-started',
         },
       }
@@ -1998,12 +2086,98 @@ export class ManagedRelay {
         outcome: 'not-started',
       })
     }
-    pending.cancelRequested = true
-    pending.controller.abort(new Error('cancelled'))
-    if (isPageOperationKind(pending.kind)) {
-      void this.cancelPoolRequest({ sessionId, requestId: targetRequestId, profileId: pending.profileId })
-    }
+    this.abortPending({ pending, reason: 'cancelled' })
     return successResponse(requestId, { text: `cancellation requested for ${targetRequestId}` })
+  }
+
+  /**
+   * Stop one in-flight request and notify whatever is executing it. Control
+   * commands already sent to the extension get a `request.cancel` browserRequest
+   * carrying sessionId + targetRequestId; page operations cancel the worker. This
+   * runs outside the per-profile queue so cancellation is never blocked by queued
+   * work, and the original request keeps its `unknown` outcome (never replayed).
+   */
+  private abortPending({
+    pending,
+    reason,
+  }: {
+    pending: PendingManagedRequest
+    reason: 'cancelled' | 'timeout' | 'client-disconnected' | 'session-released'
+  }): void {
+    if (reason === 'cancelled') {
+      pending.cancelRequested = true
+    }
+    if (reason === 'timeout') {
+      pending.timedOut = true
+    }
+    if (reason === 'client-disconnected') {
+      pending.cancelRequested = true
+      pending.clientDisconnected = true
+    }
+    if (reason === 'session-released') {
+      pending.cancelRequested = true
+      pending.sessionReleased = true
+    }
+    pending.controller.abort(new Error(reason))
+    this.signalCancellationToOwner({ pending, reason })
+  }
+
+  private signalCancellationToOwner({
+    pending,
+    reason,
+  }: {
+    pending: PendingManagedRequest
+    reason: 'cancelled' | 'timeout' | 'client-disconnected' | 'session-released'
+  }): void {
+    if (isPageOperationKind(pending.kind)) {
+      void this.cancelPoolRequest({
+        sessionId: pending.sessionId,
+        requestId: pending.requestId,
+        profileId: pending.profileId,
+      })
+      return
+    }
+    void this.notifyExtensionCancel({
+      sessionId: pending.sessionId,
+      targetRequestId: pending.requestId,
+      profileId: pending.profileId,
+      reason,
+    })
+  }
+
+  /** Fire-and-forget cancel for a control command the extension is still running. */
+  private async notifyExtensionCancel({
+    sessionId,
+    targetRequestId,
+    profileId,
+    reason,
+  }: {
+    sessionId: string
+    targetRequestId: string
+    profileId: string
+    reason: string
+  }): Promise<void> {
+    const profile = this.state.profiles.get(profileId)
+    if (!profile?.connected) {
+      return
+    }
+    const cancelRequest: BrowserRequest = {
+      requestId: `${targetRequestId}#cancel`,
+      sessionId,
+      operation: { kind: 'request.cancel', targetRequestId },
+    }
+    try {
+      await this.options.transport.sendBrowserRequest({
+        profileId,
+        stableKey: profile.stableKey,
+        request: cancelRequest,
+        timeoutMs: MANAGED_DEFAULT_TIMEOUT_MS,
+      })
+    } catch (error) {
+      this.options.logger?.log(
+        `[managed-relay] extension cancel notice failed (${reason}): ${(error as Error).message}`,
+      )
+    }
   }
 
   private async cancelPoolRequest({
@@ -2349,8 +2523,10 @@ export class ManagedRelay {
    * Managed clients may only use commands that are explicitly rooted in their own
    * session or target: root-level operations come from a small allowlist, so a
    * page-bound domain method can never be smuggled through as a profile-wide call.
-   * Inner `params.sessionId` wrappers (Target.sendMessageToTarget,
-   * Target.detachFromTarget, ...) are validated against the same scope.
+   * Inner `params.sessionId` values (Target.detachFromTarget, ...) are validated
+   * against the same scope. Wrapper transports that carry an inner CDP message
+   * (Target.sendMessageToTarget / Target.sendMessageToBrowserTarget) are denied
+   * outright because their payload can smuggle profile-wide methods.
    */
   validateCdpCommand({ scope, method, params, sessionId }: ManagedCommandContext): string | null {
     if (MANAGED_DENIED_METHODS.has(method)) {
@@ -2515,25 +2691,15 @@ export class ManagedRelay {
     if (pending.cancelRequested) {
       return
     }
-    pending.clientDisconnected = true
-    pending.cancelRequested = true
-    pending.controller.abort(new Error('client disconnected'))
-    if (isPageOperationKind(pending.kind)) {
-      void this.cancelPoolRequest({
-        sessionId: pending.sessionId,
-        requestId: pending.requestId,
-        profileId: pending.profileId,
-      })
-    }
+    this.abortPending({ pending, reason: 'client-disconnected' })
   }
 
   private abortPendingForSession(sessionId: string, reason: 'session-released'): void {
-    for (const pending of this.pending.values()) {
+    for (const pending of Array.from(this.pending.values())) {
       if (pending.sessionId !== sessionId) {
         continue
       }
-      pending.sessionReleased = reason === 'session-released'
-      pending.controller.abort(new Error('session released'))
+      this.abortPending({ pending, reason })
     }
   }
 
@@ -2888,7 +3054,6 @@ const MANAGED_ROOT_METHODS = new Set([
   'Target.getBrowserContexts',
   'Target.getTargetInfo',
   'Target.getTargets',
-  'Target.sendMessageToTarget',
   'Target.setAutoAttach',
   'Target.setDiscoverTargets',
 ])
@@ -2911,4 +3076,9 @@ const MANAGED_DENIED_METHODS = new Set([
   'Target.createBrowserContext',
   'Target.createTarget',
   'Target.disposeBrowserContext',
+  // Wrapper transports: the inner message can smuggle profile-wide or destructive
+  // methods (Target.createTarget, Browser.close, ...) past a session check, and
+  // managed clients use flattened sessions instead.
+  'Target.sendMessageToBrowserTarget',
+  'Target.sendMessageToTarget',
 ])
