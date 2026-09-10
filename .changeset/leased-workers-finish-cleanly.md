@@ -1,5 +1,5 @@
 ---
-'playwriter': patch
+'@tom-cat/pi-browser-runtime': patch
 ---
 
 Fix managed executor request lifetimes and invalidation ordering. Timed-out or

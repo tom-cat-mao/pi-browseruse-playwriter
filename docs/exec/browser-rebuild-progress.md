@@ -25,12 +25,12 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | E 工具链/发行/日志 | CodeBuddy11/15 | feat/browser-runtime-foundation | eab8301已集成，产品README/legacy测试入口完成 |
 | A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 42eb198 已集成 |
 | B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
-| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | f10b201已集成，CDP订阅/终止顺序补验中 |
-| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 6595df2已集成，单资源/联合列表输出边界补验中 |
+| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 0e4867a已集成，独立复验中 |
+| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验中 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
 | 验收脚本准备 | CodeBuddy13/16 | feat/browser-acceptance-harness | 5f4c19f已集成；计数/ref/核心操作覆盖收尾 |
-| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | d607439原outcome/timer/facade探针通过；C/D pending待复审 |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669冻结候选复验中；Chrome未开始 |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -139,14 +139,24 @@ executor、pi-tools、integration。主目录 main 未修改。
   snapshot ref、unknown-ref前evaluate会使snapshot过期、navigate/screenshot
   尚无主流程覆盖。默认CodeBuddy16接续旧13工作树，只针对四点收尾。
   所有改动仅准备验收，不运行live Chrome。
-- a063e72已推到Draft PR，Linux CI进行中；main仍为8cbf68b。
+- a063e72的两条Linux CI均通过；main仍为8cbf68b。
+- C0e4867a与D2e54b87已集成，冻结产品候选a4e1669交CodeBuddy14独立
+  复验CDP监听/旧lease、async timer rejection、worker exit-before-response
+  与输出预算；原d607439报告及证据保全不覆盖。
+- 协调者重跑a4e1669：runtime build/smoke、unit228、process integration34、
+  Pi60与12工具load-check、extension34、各包typecheck均通过。
+  日志：tmp/validation-a4e1669/suites.log。harness原17selfchecks仍过，
+  CodeBuddy16新修订待集成后另跑strict/selfchecks/dry-run。
+- C新增changeset仍用旧包名playwriter，协调者仅修正为
+  @tom-cat/pi-browser-runtime；没有改公共版本号或发布。
 - 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
 
 - [x] 五个 owner 首轮提交及真实无浏览器验证结果。
 - [x] 集成跨层接口、类型和依赖配置。
-- [ ] C/D审查修复收尾及修订后的验证结果。
+- [x] C/D审查修复提交及协调者无浏览器验证。
+- [ ] 验收harness误判修复与核心操作覆盖。
 - [ ] 独立全新 agent 代码审查及无浏览器验收。
 - [ ] 用户配合加载测试 Chrome 扩展。
 - [ ] 多 profile/多组/断线不散组/用户释放 Chrome 验收。
