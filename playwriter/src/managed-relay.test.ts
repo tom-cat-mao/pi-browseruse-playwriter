@@ -17,6 +17,7 @@ import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
 import {
   MANAGED_REQUEST_BODY_LIMIT_BYTES,
+  ManagedRelay,
   applyBrowserInventory,
   createManagedRelayState,
   findManagedGroup,
@@ -193,6 +194,8 @@ type TestPool = ManagedExecutorPoolContract & {
   releasedSessions: string[]
   disconnectedProfiles: string[]
   hold: boolean
+  /** Executions currently parked by the verifier pool (handshake for releaseAll). */
+  held: () => number
   releaseAll: () => void
   maxConcurrent: () => number
   resolveAll: () => Promise<void>
@@ -212,6 +215,9 @@ function createTestPool(): TestPool {
     releasedSessions,
     disconnectedProfiles,
     hold: false,
+    held: () => {
+      return pending.length
+    },
     releaseAll: () => {
       const resolvers = pending
       pending = []
@@ -236,8 +242,28 @@ function createTestPool(): TestPool {
       maxConcurrent = Math.max(maxConcurrent, concurrent)
       try {
         await new Promise<void>((resolve, reject) => {
+          let settled = false
+          const settle = (fn: () => void) => {
+            if (settled) {
+              return
+            }
+            settled = true
+            signal?.removeEventListener('abort', onAbort)
+            fn()
+          }
+          const release = () => {
+            settle(() => {
+              resolve()
+            })
+          }
           const onAbort = () => {
-            reject(signal?.reason instanceof Error ? signal.reason : new Error('aborted'))
+            const index = pending.indexOf(release)
+            if (index >= 0) {
+              pending.splice(index, 1)
+            }
+            settle(() => {
+              reject(signal?.reason instanceof Error ? signal.reason : new Error('aborted'))
+            })
           }
           if (signal?.aborted) {
             onAbort()
@@ -245,17 +271,10 @@ function createTestPool(): TestPool {
           }
           signal?.addEventListener('abort', onAbort, { once: true })
           if (pool.hold) {
-            pending.push(() => {
-              signal?.removeEventListener('abort', onAbort)
-              resolve()
-            })
+            pending.push(release)
             return
           }
-          const timer = setTimeout(() => {
-            signal?.removeEventListener('abort', onAbort)
-            resolve()
-          }, 20)
-          void timer
+          setTimeout(release, 20)
         })
         return { requestId: request.requestId, ok: true, data: { text: `executed ${request.operation.kind}` } }
       } finally {
@@ -722,10 +741,10 @@ describe('managed /browser/v1 HTTP surface', () => {
     `)
   })
 
-  test('isolatedExecution capability is false when the executor pool is unavailable', async () => {
+  test('isolatedExecution is advertised from the statically linked executor', async () => {
     const relay = await startTrackedRelay()
-    const withoutPool = await getJson({ port: relay.port, path: '/browser/v1/capabilities' })
-    expect(withoutPool.body).toMatchObject({ isolatedExecution: false })
+    const withoutInjectedPool = await getJson({ port: relay.port, path: '/browser/v1/capabilities' })
+    expect(withoutInjectedPool.body).toMatchObject({ isolatedExecution: true })
 
     const poolRelay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const withPool = await getJson({ port: poolRelay.port, path: '/browser/v1/capabilities' })
@@ -1605,9 +1624,9 @@ describe('managed control routing', () => {
     })
     await waitForCondition(
       () => {
-        return pool.executions.length === 1
+        return pool.executions.length === 1 && pool.held() === 1
       },
-      { message: 'page operation occupies the profile queue' },
+      { message: 'page operation is running and held by the verifier pool' },
     )
 
     extension.holdResponses = true
@@ -1822,7 +1841,7 @@ describe('managed page execution', () => {
     })
     await waitForCondition(
       () => {
-        return pool.executions.length === 2
+        return pool.executions.length === 2 && pool.held() === 1
       },
       { message: 'first held execution started' },
     )
@@ -1831,7 +1850,7 @@ describe('managed page execution', () => {
     pool.releaseAll()
     await waitForCondition(
       () => {
-        return pool.executions.length === 3
+        return pool.executions.length === 3 && pool.held() === 1
       },
       { message: 'second held execution started' },
     )
@@ -2056,6 +2075,9 @@ describe('managed page execution', () => {
       { message: 'inventory accepted' },
     )
 
+    // Send the first request alone and wait until it actually occupies the profile
+    // queue (parked in the verifier pool). Only then send the second one, otherwise
+    // undici may deliver them in either order and the second could be the parked one.
     const first = browserRequest({
       port: relay.port,
       request: {
@@ -2064,6 +2086,16 @@ describe('managed page execution', () => {
         operation: { kind: 'page.navigate', tabId: 't1', url: 'https://example.com/a' },
       },
     })
+    await waitForCondition(
+      () => {
+        return (
+          pool.executions.length === 1 &&
+          pool.held() === 1 &&
+          pool.executions[0]?.request.requestId === 'queue-a'
+        )
+      },
+      { message: 'first request occupies the profile queue' },
+    )
     const second = browserRequest({
       port: relay.port,
       request: {
@@ -2072,14 +2104,9 @@ describe('managed page execution', () => {
         operation: { kind: 'page.navigate', tabId: 't2', url: 'https://example.com/b' },
       },
     })
-    await waitForCondition(
-      () => {
-        return pool.executions.length === 1
-      },
-      { message: 'first execution is running and second is queued' },
-    )
 
-    // The user releases t2 while the second request waits in the profile queue.
+    // The user releases t2 while the second request is in flight or queued behind
+    // the first; both paths must reject it without running the executor.
     extension.sendInventory(
       makeInventory({
         revision: 2,
@@ -2099,6 +2126,14 @@ describe('managed page execution', () => {
       { message: 'release revision applied while queued' },
     )
 
+    // Handshake: release only after the pool confirms queue-a is parked, never
+    // before, or the resolver would not exist yet.
+    await waitForCondition(
+      () => {
+        return pool.held() === 1 && pool.executions[0]?.request.requestId === 'queue-a'
+      },
+      { message: 'queue-a is parked in the verifier pool' },
+    )
     pool.releaseAll()
     const [firstResult, secondResult] = await Promise.all([first, second])
     expect(firstResult.body).toMatchObject({ ok: true })
@@ -2147,9 +2182,9 @@ describe('managed page execution', () => {
     })
     await waitForCondition(
       () => {
-        return pool.executions.length === 1
+        return pool.executions.length === 1 && pool.held() === 1
       },
-      { message: 'execution started before the client dropped' },
+      { message: 'execution is held before the client dropped' },
     )
     controller.abort()
     await expect(responsePromise).rejects.toThrow()
@@ -2206,6 +2241,121 @@ describe('managed page execution', () => {
       error: { code: 'ownership-mismatch', outcome: 'not-started' },
     })
     expect(pool.executions).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Direct relay queue re-validation
+// ---------------------------------------------------------------------------
+
+describe('managed queue re-validation', () => {
+  test('a queued page operation re-checks the tab inside the profile queue', async () => {
+    const pool = createTestPool()
+    pool.hold = true
+    const tabsById = new Map<string, BrowserTab>()
+    const transportCalls: BrowserRequest[] = []
+    const relay = new ManagedRelay({
+      host: '127.0.0.1',
+      port: 1,
+      poolFactory: async () => pool,
+      hasConnectedExtensions: () => {
+        return true
+      },
+      closeManagedClient: () => {},
+      transport: {
+        sendBrowserRequest: async ({ request }) => {
+          transportCalls.push(request)
+          const operation = request.operation
+          if (operation.kind === 'tab.resolve') {
+            const tab = tabsById.get(operation.tabId)
+            if (!tab || tab.sessionId !== request.sessionId) {
+              return {
+                requestId: request.requestId,
+                ok: false,
+                error: {
+                  code: 'resource-not-found',
+                  message: `tab ${operation.tabId} not found`,
+                  outcome: 'not-started',
+                },
+              }
+            }
+            return { requestId: request.requestId, ok: true, data: { tab } }
+          }
+          return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+        },
+      },
+    })
+    relay.noteConnectionOpened({ connectionId: 'connection-1' })
+    const firstInventory = makeInventory({
+      revision: 1,
+      groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+      tabs: [
+        makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' }),
+        makeTab({ tabId: 't2', groupId: 'g1', sessionId: 's1' }),
+      ],
+    })
+    expect(
+      relay.handleInventory({
+        connectionId: 'connection-1',
+        info: { browser: 'Chrome', installId: 'profile-1', stableKey: 'install:Chrome:profile-1' },
+        inventory: firstInventory,
+      }).accepted,
+    ).toBe(true)
+    for (const tab of firstInventory.tabs) {
+      tabsById.set(tab.tabId, tab)
+    }
+
+    const first = relay.handleRequest({
+      requestId: 'direct-a',
+      sessionId: 's1',
+      operation: { kind: 'page.navigate', tabId: 't1', url: 'https://example.com/a' },
+    })
+    await waitForCondition(
+      () => {
+        return (
+          pool.executions.length === 1 &&
+          pool.held() === 1 &&
+          pool.executions[0]?.request.requestId === 'direct-a'
+        )
+      },
+      { message: 'first direct request is parked' },
+    )
+
+    // handleRequest enqueues synchronously, so direct-b is waiting in the profile
+    // queue when the release lands; its in-task re-check must reject it.
+    const second = relay.handleRequest({
+      requestId: 'direct-b',
+      sessionId: 's1',
+      operation: { kind: 'page.navigate', tabId: 't2', url: 'https://example.com/b' },
+    })
+    const released = relay.handleInventory({
+      connectionId: 'connection-1',
+      info: { browser: 'Chrome', installId: 'profile-1', stableKey: 'install:Chrome:profile-1' },
+      inventory: makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 's1', state: 'released' }),
+        ],
+      }),
+    })
+    expect(released.accepted).toBe(true)
+
+    pool.releaseAll()
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult).toMatchObject({ ok: true })
+    expect(secondResult).toMatchObject({
+      ok: false,
+      error: { code: 'resource-released', outcome: 'not-started' },
+    })
+    expect(pool.executions).toHaveLength(1)
+    expect(
+      transportCalls.filter((request) => {
+        return request.operation.kind === 'tab.resolve'
+      }),
+    ).toHaveLength(1)
+    await relay.dispose()
   })
 })
 
