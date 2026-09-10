@@ -24,6 +24,7 @@ import {
   removeRequestLedgerEntry,
   renameGroup,
   setGroupChromeBinding,
+  setGroupState,
   setGroupWindowId,
   setTabAttachment,
   setTabPageInfo,
@@ -100,14 +101,77 @@ describe('managed resource registry ownership', () => {
     expect({
       state: findTab(result.registry, 'pt-1')?.state,
       reattach: result.reattachTabIds,
-      inventoryTabs: buildInventory(result.registry).tabs.length,
+      inventoryTabs: buildInventory(result.registry).tabs.map((tab) => {
+        return {
+          tabId: tab.tabId,
+          state: tab.state,
+          hasTarget: tab.targetId !== undefined,
+          hasCdpSession: tab.cdpSessionId !== undefined,
+        }
+      }),
+      listedTabs: listSessionTabs(result.registry, 'session-1').map((tab) => tab.tabId),
       changed: result.changed,
     }).toMatchInlineSnapshot(`
       {
         "changed": false,
-        "inventoryTabs": 0,
+        "inventoryTabs": [
+          {
+            "hasCdpSession": false,
+            "hasTarget": false,
+            "state": "released",
+            "tabId": "pt-1",
+          },
+        ],
+        "listedTabs": [],
         "reattach": [],
         "state": "released",
+      }
+    `)
+  })
+
+  test('released groups and their tabs stay published as tombstones without re-authorizing', () => {
+    let registry = createRegistryWithGroup()
+    registry = releaseTab(registry, 'pt-1')
+    registry = setGroupState(registry, { groupId: 'pg-1', state: 'released' })
+
+    const inventory = buildInventory(registry)
+
+    expect({
+      groups: inventory.groups.map((group) => {
+        return { groupId: group.groupId, state: group.state }
+      }),
+      tabs: inventory.tabs.map((tab) => {
+        return {
+          tabId: tab.tabId,
+          groupId: tab.groupId,
+          state: tab.state,
+          hasTarget: tab.targetId !== undefined,
+          hasCdpSession: tab.cdpSessionId !== undefined,
+        }
+      }),
+      activeLookup: findActiveTabByChromeTabId(registry, { chromeTabId: 101, browserEpoch: epoch }),
+      listedGroups: listSessionGroups(registry, 'session-1').map((group) => group.groupId),
+      listedTabs: listSessionTabs(registry, 'session-1').map((tab) => tab.tabId),
+    }).toMatchInlineSnapshot(`
+      {
+        "activeLookup": undefined,
+        "groups": [
+          {
+            "groupId": "pg-1",
+            "state": "released",
+          },
+        ],
+        "listedGroups": [],
+        "listedTabs": [],
+        "tabs": [
+          {
+            "groupId": "pg-1",
+            "hasCdpSession": false,
+            "hasTarget": false,
+            "state": "released",
+            "tabId": "pt-1",
+          },
+        ],
       }
     `)
   })
