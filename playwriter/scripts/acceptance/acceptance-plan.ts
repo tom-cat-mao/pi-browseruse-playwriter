@@ -351,6 +351,13 @@ export function mainChecklist(): ChecklistItem[] {
         'reload the recorded A1 tab through page.navigate with the same fixture marker URL used by tabs.create; the response URL/title and a page-marker check must confirm the navigation',
     },
     {
+      id: 'page-execute',
+      title: 'page.execute returns a real Playwright value from the Node sandbox',
+      how: 'auto',
+      detail:
+        'run `return await page.title()` through page.execute on the A1 tab and require the fixture title as the serialized value',
+    },
+    {
       id: 'page-screenshot',
       title: 'page.screenshot returns a non-empty PNG and writes an artifact',
       how: 'auto',
@@ -585,6 +592,13 @@ export function counterDelta({
   const previous = before[tag] || 0
   const current = after[tag] || 0
   return current - previous
+}
+
+export function idsOf({ values }: { values: { groupId?: string; tabId?: string }[] }): string[] {
+  // Tabs carry both ids and their identity in tab listings is the tabId, so it
+  // wins when present (preferring groupId made popup steps treat the first
+  // popup as "new" again). Groups only have a groupId.
+  return values.map((value) => value.tabId || value.groupId || '').filter(Boolean)
 }
 
 export type OwnedResourceSelection = {
@@ -831,6 +845,14 @@ export function runAcceptanceSelfChecks(): SelfCheck[] {
     fn: () => {
       const delta = counterDelta({ before: { a: 1 }, after: { a: 3, b: 9 }, tag: 'a' })
       return delta === 2 ? null : `expected 2, got ${delta}`
+    },
+  })
+
+  run({
+    name: 'idsOf prefers tabId so popup steps diff real new tabs',
+    fn: () => {
+      const ids = idsOf({ values: [{ groupId: 'g1', tabId: 't1' }, { groupId: 'g1' }] })
+      return ids.join(',') === 't1,g1' ? null : `expected t1,g1 got ${ids.join(',')}`
     },
   })
 
