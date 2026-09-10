@@ -23,11 +23,11 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | --- | --- | --- | --- |
 | E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 4500349 已集成 |
 | A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | b3fa70b 已集成，transport/取消修订中 |
-| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 0364558 已集成，inventory/控制取消修订中 |
+| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 3909817 已集成，待实际worker联调 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 运行中 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 运行中 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
-| 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 进行中，非最终验收 |
+| 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
 | 最终独立验收 | 另一全新 agent，实施后启动 | 待创建 | 未开始 |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
@@ -65,7 +65,11 @@ executor、pi-tools、integration。主目录 main 未修改。
 - Pi旧原型59/59测试和typecheck仍过，但D新版尚未合入，这不是新版验收。
 - 已创建Draft PR #1：
   https://github.com/tom-cat-mao/pi-browseruse-playwriter/pull/1
-- 首次push7a5fb61的GitHub CI通过；后续集成待再次push/CI。
+- 首次push7a5fb61的GitHub CI通过。
+- 1583c00两次Linux CI在Vitest进程池报ERR_IPC_CHANNEL_CLOSED，已交E
+  查明根因，不能以本地通过替代。GitHub run34464546572/34464543374。
+- B3909817已合入：控制取消转发、矛盾inventory拒绝、nested CDP包装拒绝。
+- 已预留独立acceptance工作树；最终验收须在C/D完成后更新到冻结候选提交。
 - 中期全新CodeBuddy只读审查已启动，避免实现者自验收。
 - 契约补全控制请求取消必须透传extension、旧WS代际结果不得送新socket、
   pending/completed create ledger防SW中断重复创建；A/B在各自分支落实。
