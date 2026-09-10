@@ -2054,6 +2054,10 @@ export class ManagedRelay {
     }
     scope.targetIds.clear()
     scope.tabIds.clear()
+    // Session/frame sets are re-derived from the cached inventory and the
+    // extension target map on every access, so stale ids cannot accumulate.
+    scope.ownedCdpSessionIds.clear()
+    scope.ownedFrameIds.clear()
     const snapshot = this.state.profiles.get(profileId)
     if (snapshot) {
       for (const tab of snapshot.tabs.values()) {
@@ -2113,11 +2117,7 @@ export class ManagedRelay {
   }
 
   isCdpSessionInScope({ scope, cdpSessionId }: { scope: ManagedScopeView; cdpSessionId: string }): boolean {
-    return (
-      scope.ownedCdpSessionIds.has(cdpSessionId) ||
-      scope.iframeSessionIds.has(cdpSessionId) ||
-      scope.iframeTargetIds.has(cdpSessionId)
-    )
+    return scope.ownedCdpSessionIds.has(cdpSessionId) || scope.iframeSessionIds.has(cdpSessionId)
   }
 
   /**
