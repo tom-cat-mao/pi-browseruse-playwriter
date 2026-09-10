@@ -2,11 +2,17 @@ import { describe, expect, test } from 'vitest'
 import {
   addGroup,
   addTab,
+  appendRequestLedgerEntry,
+  buildCreateRequestFingerprint,
   buildInventory,
+  classifyCreateRequestDedupe,
+  classifyFailedCreateCleanup,
   clearGroupChromeBinding,
   clearTabAttachment,
   createEmptyRegistry,
+  findActiveTabByChromeTabId,
   findGroup,
+  findRequestLedgerEntry,
   findTab,
   isChromeTabTombstoned,
   listSessionGroups,
@@ -16,6 +22,7 @@ import {
   releaseTab,
   renameGroup,
   setGroupChromeBinding,
+  setGroupWindowId,
   setTabAttachment,
   setTabPageInfo,
 } from '../src/resource-registry'
@@ -381,12 +388,296 @@ describe('managed resource registry ownership', () => {
     `)
   })
 
+  test('create dedup ledger persists payload fingerprints and prunes old entries', () => {
+    const tabsFingerprint = buildCreateRequestFingerprint({
+      kind: 'tabs.create',
+      groupId: 'pg-1',
+      url: 'https://example.com/',
+    })
+    let registry = createEmptyRegistry({ profileId, browserEpoch: epoch })
+    registry = appendRequestLedgerEntry(registry, {
+      entry: {
+        sessionId: 'session-1',
+        requestId: 'req-1',
+        operation: 'tabs.create',
+        fingerprint: tabsFingerprint,
+        createdAt: 1000,
+        tabId: 'pt-1',
+      },
+      now: 1000,
+      maxEntries: 2,
+      maxAgeMs: 1000,
+    })
+    registry = appendRequestLedgerEntry(registry, {
+      entry: {
+        sessionId: 'session-1',
+        requestId: 'req-2',
+        operation: 'tabs.create',
+        fingerprint: tabsFingerprint,
+        createdAt: 1500,
+        tabId: 'pt-2',
+      },
+      now: 1500,
+      maxEntries: 2,
+      maxAgeMs: 1000,
+    })
+    // Overwriting the same sessionId+requestId replaces the old entry; the age
+    // filter then drops req-2 because its payload is older than 1000ms.
+    registry = appendRequestLedgerEntry(registry, {
+      entry: {
+        sessionId: 'session-1',
+        requestId: 'req-1',
+        operation: 'tabs.create',
+        fingerprint: 'changed',
+        createdAt: 2600,
+        tabId: 'pt-3',
+      },
+      now: 2600,
+      maxEntries: 2,
+      maxAgeMs: 1000,
+    })
+
+    expect({
+      req1: findRequestLedgerEntry(registry, { sessionId: 'session-1', requestId: 'req-1' }),
+      req2: findRequestLedgerEntry(registry, { sessionId: 'session-1', requestId: 'req-2' }),
+      otherSession: findRequestLedgerEntry(registry, { sessionId: 'session-2', requestId: 'req-1' }),
+      fingerprints: {
+        groups: buildCreateRequestFingerprint({ kind: 'groups.create', name: 'tasks' }),
+        tabs: tabsFingerprint,
+      },
+    }).toMatchInlineSnapshot(`
+      {
+        "fingerprints": {
+          "groups": "groups.create|name=tasks",
+          "tabs": "tabs.create|groupId=pg-1|url=https://example.com/",
+        },
+        "otherSession": undefined,
+        "req1": {
+          "createdAt": 2600,
+          "fingerprint": "changed",
+          "operation": "tabs.create",
+          "requestId": "req-1",
+          "sessionId": "session-1",
+          "tabId": "pt-3",
+        },
+        "req2": undefined,
+      }
+    `)
+  })
+
+  test('create request dedup decisions reject payload reuse and replay completed creates', () => {
+    const entry = {
+      sessionId: 'session-1',
+      requestId: 'req-1',
+      operation: 'tabs.create' as const,
+      fingerprint: 'tabs.create|groupId=pg-1|url=https://example.com/',
+      createdAt: 1000,
+      tabId: 'pt-1',
+    }
+
+    expect({
+      noEntry: classifyCreateRequestDedupe({
+        ledgerEntry: undefined,
+        operation: 'tabs.create',
+        fingerprint: entry.fingerprint,
+      }),
+      replay: classifyCreateRequestDedupe({
+        ledgerEntry: entry,
+        operation: 'tabs.create',
+        fingerprint: entry.fingerprint,
+      }),
+      differentPayload: classifyCreateRequestDedupe({
+        ledgerEntry: entry,
+        operation: 'tabs.create',
+        fingerprint: 'tabs.create|groupId=pg-1|url=https://other.example/',
+      }),
+      differentOperation: classifyCreateRequestDedupe({
+        ledgerEntry: entry,
+        operation: 'groups.create',
+        fingerprint: entry.fingerprint,
+      }),
+    }).toMatchInlineSnapshot(`
+      {
+        "differentOperation": "reject-payload-mismatch",
+        "differentPayload": "reject-payload-mismatch",
+        "noEntry": "proceed",
+        "replay": "replay",
+      }
+    `)
+  })
+
+  test('chrome-id lookups are pinned to the current epoch and skip released/needs-rebind', () => {
+    let registry = createRegistryWithGroup()
+    registry = addTab(registry, {
+      tabId: 'pt-2',
+      groupId: 'pg-1',
+      sessionId: 'session-1',
+      chromeTabId: 102,
+      url: 'https://example.com/',
+      title: 'Example',
+      browserEpoch: epoch,
+    })
+    registry = releaseTab(registry, 'pt-2')
+    const restarted = reconcileRegistry(registry, {
+      browserEpoch: 'epoch-b',
+      observedTabs: [],
+      observedChromeGroupIds: [],
+    }).registry
+
+    expect({
+      currentEpoch: findActiveTabByChromeTabId(registry, { chromeTabId: 101, browserEpoch: epoch })?.tabId,
+      released: findActiveTabByChromeTabId(registry, { chromeTabId: 102, browserEpoch: epoch }),
+      wrongEpoch: findActiveTabByChromeTabId(restarted, { chromeTabId: 101, browserEpoch: 'epoch-b' }),
+      tombstoneCurrentEpoch: isChromeTabTombstoned(registry, 102, { browserEpoch: epoch }),
+      tombstoneWrongEpoch: isChromeTabTombstoned(registry, 102, { browserEpoch: 'epoch-b' }),
+    }).toMatchInlineSnapshot(`
+      {
+        "currentEpoch": "pt-1",
+        "released": undefined,
+        "tombstoneCurrentEpoch": true,
+        "tombstoneWrongEpoch": false,
+        "wrongEpoch": undefined,
+      }
+    `)
+  })
+
+  test('failed create cleanup only removes tabs that are still provably ours', () => {
+    const cases: Array<{ name: string; options: Parameters<typeof classifyFailedCreateCleanup>[0] }> = [
+      {
+        name: 'still-ours',
+        options: {
+          recordState: 'ready',
+          recordBrowserEpoch: epoch,
+          browserEpoch: epoch,
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: 11,
+        },
+      },
+      {
+        name: 'user-released',
+        options: {
+          recordState: 'released',
+          recordBrowserEpoch: epoch,
+          browserEpoch: epoch,
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: 11,
+        },
+      },
+      {
+        name: 'user-moved',
+        options: {
+          recordState: 'ready',
+          recordBrowserEpoch: epoch,
+          browserEpoch: epoch,
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: 99,
+        },
+      },
+      {
+        name: 'epoch-mismatch',
+        options: {
+          recordState: 'ready',
+          recordBrowserEpoch: 'epoch-a',
+          browserEpoch: 'epoch-b',
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: 11,
+        },
+      },
+      {
+        name: 'missing-record-in-group',
+        options: {
+          recordState: 'missing',
+          recordBrowserEpoch: undefined,
+          browserEpoch: epoch,
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: 11,
+        },
+      },
+      {
+        name: 'missing-record-moved',
+        options: {
+          recordState: 'missing',
+          recordBrowserEpoch: undefined,
+          browserEpoch: epoch,
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: 99,
+        },
+      },
+      {
+        name: 'tab-gone',
+        options: {
+          recordState: 'missing',
+          recordBrowserEpoch: undefined,
+          browserEpoch: epoch,
+          approvedChromeGroupId: 11,
+          observedChromeGroupId: null,
+        },
+      },
+    ]
+
+    expect(
+      cases.map((entry) => {
+        return { name: entry.name, decision: classifyFailedCreateCleanup(entry.options) }
+      }),
+    ).toMatchInlineSnapshot(`
+      [
+        {
+          "decision": "remove-chrome-tab",
+          "name": "still-ours",
+        },
+        {
+          "decision": "leave-user-tab",
+          "name": "user-released",
+        },
+        {
+          "decision": "leave-user-tab",
+          "name": "user-moved",
+        },
+        {
+          "decision": "leave-user-tab",
+          "name": "epoch-mismatch",
+        },
+        {
+          "decision": "remove-chrome-tab",
+          "name": "missing-record-in-group",
+        },
+        {
+          "decision": "leave-user-tab",
+          "name": "missing-record-moved",
+        },
+        {
+          "decision": "remove-chrome-tab",
+          "name": "tab-gone",
+        },
+      ]
+    `)
+  })
+
+  test('group window binding follows the user moving the group', () => {
+    const registry = createRegistryWithGroup()
+    const moved = setGroupWindowId(registry, { groupId: 'pg-1', windowId: 12 })
+    const same = setGroupWindowId(moved, { groupId: 'pg-1', windowId: 12 })
+
+    expect({
+      windowId: findGroup(moved, 'pg-1')?.windowId,
+      noopKeepsReference: same === moved,
+    }).toMatchInlineSnapshot(`
+      {
+        "noopKeepsReference": true,
+        "windowId": 12,
+      }
+    `)
+  })
+
   test('persisted registries round-trip and malformed payloads are rejected', () => {
     const registry = createRegistryWithGroup()
     const roundTripped = parseRegistry(JSON.parse(JSON.stringify(registry)))
+    const legacyPayload: Record<string, unknown> = JSON.parse(JSON.stringify(registry))
+    delete legacyPayload.requestLedger
 
     expect({
       roundTripped: roundTripped,
+      legacyWithoutLedger: parseRegistry(legacyPayload)?.requestLedger,
       wrongVersion: parseRegistry({ ...JSON.parse(JSON.stringify(registry)), version: 2 }),
       badGroupsShape: parseRegistry({
         version: 1,
@@ -407,6 +698,7 @@ describe('managed resource registry ownership', () => {
     }).toMatchInlineSnapshot(`
       {
         "badGroupsShape": null,
+        "legacyWithoutLedger": [],
         "missingField": null,
         "roundTripped": {
           "browserEpoch": "epoch-a",
@@ -424,6 +716,7 @@ describe('managed resource registry ownership', () => {
             },
           ],
           "profileId": "profile-1",
+          "requestLedger": [],
           "revision": 4,
           "tabs": [
             {

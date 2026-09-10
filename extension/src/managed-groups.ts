@@ -11,11 +11,17 @@ import {
   activeTabsForGroup,
   addGroup,
   addTab,
+  appendRequestLedgerEntry,
+  buildCreateRequestFingerprint,
   buildInventory,
+  classifyCreateRequestDedupe,
+  classifyFailedCreateCleanup,
   clearGroupChromeBinding,
   clearTabAttachment,
   createEmptyRegistry,
+  findActiveTabByChromeTabId,
   findGroup,
+  findRequestLedgerEntry,
   findTab,
   findTabByChromeTabId,
   isChromeTabTombstoned,
@@ -26,17 +32,20 @@ import {
   renameGroup,
   setGroupChromeBinding,
   setGroupState,
+  setGroupWindowId,
   setTabAttachment,
   setTabPageInfo,
 } from './resource-registry'
-import type { ManagedResourceRegistry, ObservedChromeTab } from './resource-registry'
+import type { ManagedResourceRegistry, ObservedChromeTab, RequestLedgerEntry } from './resource-registry'
 import {
   createOpaqueId,
   ensureBrowserEpoch,
   loadRegistry,
   saveRegistry,
-  restrictSessionStorageToTrustedContexts,
+  restrictStorageToTrustedContexts,
 } from './resource-storage'
+import { KeyedSerialQueue } from './keyed-queue'
+import { InternalMoves } from './internal-moves'
 
 /**
  * Managed (Pi) ownership runtime.
@@ -45,12 +54,19 @@ import {
  * tab creation, popup inheritance, user-move release tombstones and inventory
  * broadcasts. Everything here assumes background.ts wires the dependencies;
  * the module itself never guesses ownership from URLs or group titles.
+ *
+ * Failure policy: when the persisted registry cannot be read or written the
+ * managed layer becomes unavailable (all managed requests fail with
+ * internal-error, no inventory is advertised) instead of pretending success or
+ * overwriting records it could not read. Legacy behaviour stays untouched.
  */
 
 const MANAGED_GROUP_COLORS: chrome.tabGroups.ColorEnum[] = ['blue', 'red', 'yellow', 'pink', 'purple', 'cyan', 'orange']
 const GROUP_NAME_MAX_LENGTH = 200
 const INTERNAL_MOVE_TTL_MS = 3000
-const MAX_REQUEST_CACHE_ENTRIES = 200
+const MAX_LEDGER_ENTRIES = 200
+const LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const TAB_ID_NONE = -1
 
 export interface ManagedGroupsDeps {
   getProfileId: () => Promise<string>
@@ -148,19 +164,28 @@ function sleep(ms: number): Promise<void> {
   })
 }
 
+interface CreateDedupeContext {
+  key: string
+  operation: 'groups.create' | 'tabs.create'
+  fingerprint: string
+  ledgerEntry: RequestLedgerEntry | undefined
+}
+
 export class ManagedGroups {
   private readonly deps: ManagedGroupsDeps
   private registry: ManagedResourceRegistry | null = null
   private browserEpoch = ''
   private generation = 0
   private readyPromise: Promise<void> | null = null
+  private unavailableReason: string | null = null
   private persistQueue: Promise<void> = Promise.resolve()
   private publishQueue: Promise<void> = Promise.resolve()
   private connectQueue: Promise<void> = Promise.resolve()
-  private readonly internalMoves = new Map<number, number>()
+  private readonly groupQueue = new KeyedSerialQueue()
+  private readonly internalMoves = new InternalMoves(INTERNAL_MOVE_TTL_MS)
   private readonly adoptingChromeTabIds = new Set<number>()
-  private readonly requestTabIds = new Map<string, string>()
-  private readonly inFlightRequests = new Map<string, Promise<BrowserResponse>>()
+  private readonly pendingAdoptions = new Set<number>()
+  private readonly inFlightRequests = new Map<string, { fingerprint?: string; promise: Promise<BrowserResponse> }>()
 
   constructor(deps: ManagedGroupsDeps) {
     this.deps = deps
@@ -170,35 +195,52 @@ export class ManagedGroups {
   initialize(): Promise<void> {
     if (!this.readyPromise) {
       this.readyPromise = this.loadState().catch((error: unknown) => {
-        this.readyPromise = null
-        throw error
+        this.unavailableReason = error instanceof Error ? error.message : String(error)
+        this.registry = null
+        this.deps.logger.error('Managed registry unavailable, managed features disabled:', error)
       })
     }
     return this.readyPromise
   }
 
+  /** Retries a failed load once (used by WS connect and requests) so transient errors recover. */
+  private retryInitialize(): Promise<void> {
+    if (this.unavailableReason !== null) {
+      this.readyPromise = null
+      this.unavailableReason = null
+    }
+    return this.initialize()
+  }
+
+  private isAvailable(): boolean {
+    return this.registry !== null && this.unavailableReason === null
+  }
+
+  private ensureAvailable(): void {
+    if (!this.isAvailable()) {
+      throw new ManagedGroupsError({
+        code: 'internal-error',
+        message: `managed registry unavailable: ${this.unavailableReason ?? 'not initialized'}`,
+      })
+    }
+  }
+
   private async loadState(): Promise<void> {
-    await restrictSessionStorageToTrustedContexts()
-    // Storage failures must not break the legacy extension: fall back to an
-    // in-memory epoch/profile and keep running in needs-rebind style isolation.
-    const epoch = await ensureBrowserEpoch().catch((error: unknown) => {
-      this.deps.logger.error('Managed registry: session storage unavailable, using volatile epoch:', error)
-      return { browserEpoch: createOpaqueId('epoch'), restarted: false }
-    })
-    const profileId = await this.deps.getProfileId().catch((error: unknown) => {
-      this.deps.logger.error('Managed registry: could not read the install id:', error)
-      return 'profile-unavailable'
-    })
+    await restrictStorageToTrustedContexts()
+    const epoch = await ensureBrowserEpoch()
+    const profileId = await this.deps.getProfileId()
     this.browserEpoch = epoch.browserEpoch
 
-    const stored = await loadRegistry().catch((error: unknown) => {
-      this.deps.logger.error('Managed registry: could not read persisted ownership:', error)
-      return null
-    })
+    const stored = await loadRegistry()
     if (!stored) {
       this.registry = createEmptyRegistry({ profileId, browserEpoch: this.browserEpoch })
       await this.persist()
       return
+    }
+
+    if (stored.profileId !== profileId) {
+      // Keep the records on disk untouched; this profile must not adopt them.
+      throw new Error(`persisted managed registry belongs to profile ${stored.profileId}, not ${profileId}`)
     }
 
     this.registry = stored
@@ -224,17 +266,22 @@ export class ManagedGroups {
 
   private async persist(): Promise<void> {
     const snapshot = this.getRegistry()
-    this.persistQueue = this.persistQueue
-      .then(() => {
-        return saveRegistry(snapshot)
-      })
-      .catch((error: unknown) => {
-        this.deps.logger.error('Failed to persist managed registry:', error)
-      })
-    await this.persistQueue
+    this.persistQueue = this.persistQueue.then(() => {
+      return saveRegistry(snapshot)
+    })
+    try {
+      await this.persistQueue
+    } catch (error: unknown) {
+      // Never advertise ownership that could not be persisted. A later successful
+      // load re-reads storage (the authoritative copy) and discards in-memory drift.
+      this.unavailableReason = error instanceof Error ? error.message : String(error)
+      this.deps.logger.error('Failed to persist managed registry:', error)
+      throw error
+    }
   }
 
   async publishInventory(): Promise<void> {
+    if (!this.isAvailable()) return
     const snapshot = this.getRegistry()
     this.publishQueue = this.publishQueue
       .then(() => {
@@ -252,26 +299,37 @@ export class ManagedGroups {
   getManagedChromeGroupIds(): number[] {
     if (!this.registry) return []
     return this.registry.groups
-      .filter((group) => group.state !== 'released' && group.chromeGroupId !== undefined)
+      .filter((group) => {
+        return (
+          group.chromeGroupId !== undefined &&
+          group.browserEpoch === this.browserEpoch &&
+          group.state !== 'released' &&
+          group.state !== 'needs-rebind'
+        )
+      })
       .map((group) => group.chromeGroupId as number)
   }
 
   getManagedChromeTabIds(): number[] {
-    if (!this.registry) return []
-    return this.registry.tabs.filter((tab) => tab.state !== 'released').map((tab) => tab.chromeTabId)
+    const pending = Array.from(this.pendingAdoptions)
+    if (!this.registry) return pending
+    const active = this.registry.tabs
+      .filter((tab) => {
+        return tab.browserEpoch === this.browserEpoch && tab.state !== 'released' && tab.state !== 'needs-rebind'
+      })
+      .map((tab) => tab.chromeTabId)
+    return [...active, ...pending]
   }
 
   isManagedChromeTabId(chromeTabId: number): boolean {
+    if (this.pendingAdoptions.has(chromeTabId)) return true
     if (!this.registry) return false
-    const tab = findTabByChromeTabId(this.registry, chromeTabId)
-    return tab !== undefined && tab.state !== 'released'
+    return findActiveTabByChromeTabId(this.registry, { chromeTabId, browserEpoch: this.browserEpoch }) !== undefined
   }
 
   findManagedTabByChromeTabId(chromeTabId: number): BrowserTab | undefined {
     if (!this.registry) return undefined
-    const tab = findTabByChromeTabId(this.registry, chromeTabId)
-    if (!tab || tab.state === 'released') return undefined
-    return tab
+    return findActiveTabByChromeTabId(this.registry, { chromeTabId, browserEpoch: this.browserEpoch })
   }
 
   /** Called after every WS (re)connect: restore bindings before any CDP routing. */
@@ -287,7 +345,11 @@ export class ManagedGroups {
   }
 
   private async restoreOnConnect(): Promise<void> {
-    await this.initialize()
+    await this.retryInitialize()
+    if (!this.isAvailable()) {
+      this.deps.logger.warn('Skipping managed restore: registry unavailable')
+      return
+    }
     this.generation += 1
     const generation = this.generation
 
@@ -313,7 +375,7 @@ export class ManagedGroups {
       .map((tab) => {
         return {
           chromeTabId: tab.id as number,
-          chromeGroupId: tab.groupId ?? -1,
+          chromeGroupId: tab.groupId ?? TAB_ID_NONE,
           windowId: tab.windowId,
           url: tab.url ?? '',
           title: tab.title ?? '',
@@ -327,12 +389,12 @@ export class ManagedGroups {
     for (const chromeTabId of chromeTabIds) {
       if (generation !== this.generation) return
       const tab = findTabByChromeTabId(this.getRegistry(), chromeTabId)
-      if (!tab || tab.state === 'released' || tab.state !== 'disconnected') continue
-      if (isChromeTabTombstoned(this.getRegistry(), chromeTabId)) continue
+      if (!tab || tab.browserEpoch !== this.browserEpoch || tab.state !== 'disconnected') continue
+      if (isChromeTabTombstoned(this.getRegistry(), chromeTabId, { browserEpoch: this.browserEpoch })) continue
 
       const exists = await this.chromeTabExists(chromeTabId)
       if (!exists) {
-        await this.releaseManagedTab({ tabId: tab.tabId, reason: 'tab-disappeared-before-reattach' })
+        await this.releaseManagedTab({ tabId: tab.tabId, reason: 'tab-disappeared-before-reattach', ungroup: false })
         continue
       }
       try {
@@ -370,9 +432,10 @@ export class ManagedGroups {
   async handleBrowserRequest(request: BrowserRequest): Promise<BrowserResponse> {
     const requestId = typeof request?.requestId === 'string' ? request.requestId : ''
     try {
-      await this.initialize()
+      await this.retryInitialize()
       // Wait for an in-flight restore so requests never observe a half-reconciled registry.
       await this.connectQueue
+      this.ensureAvailable()
       if (!requestId) {
         throw new ManagedGroupsError({ code: 'invalid-request', message: 'requestId must not be empty' })
       }
@@ -383,19 +446,122 @@ export class ManagedGroups {
         throw new ManagedGroupsError({ code: 'invalid-request', message: 'operation.kind is required' })
       }
 
-      const existing = this.inFlightRequests.get(requestId)
-      if (existing) return existing
+      const dedupe = this.buildCreateDedupeContext(request)
+      if (dedupe) {
+        const decision = classifyCreateRequestDedupe({
+          ledgerEntry: dedupe.ledgerEntry,
+          operation: dedupe.operation,
+          fingerprint: dedupe.fingerprint,
+        })
+        if (decision === 'reject-payload-mismatch') {
+          throw new ManagedGroupsError({
+            code: 'invalid-request',
+            message: `requestId ${requestId} was already used with a different payload`,
+          })
+        }
+        if (decision === 'replay' && dedupe.ledgerEntry) {
+          return this.replayCompletedCreate(requestId, dedupe.ledgerEntry)
+        }
+      }
+
+      const inFlightKey = dedupe?.key ?? `${request.sessionId}\u0000${requestId}`
+      const existing = this.inFlightRequests.get(inFlightKey)
+      if (existing) {
+        if (dedupe && existing.fingerprint !== undefined && existing.fingerprint !== dedupe.fingerprint) {
+          throw new ManagedGroupsError({
+            code: 'invalid-request',
+            message: `requestId ${requestId} is in flight with a different payload`,
+          })
+        }
+        return existing.promise
+      }
 
       const promise = this.dispatchRequest(request)
-      this.inFlightRequests.set(requestId, promise)
+      this.inFlightRequests.set(inFlightKey, { fingerprint: dedupe?.fingerprint, promise })
       try {
         return await promise
       } finally {
-        this.inFlightRequests.delete(requestId)
+        this.inFlightRequests.delete(inFlightKey)
       }
     } catch (error: unknown) {
       return this.errorResponse(requestId, error)
     }
+  }
+
+  /**
+   * Completed-create dedup is persisted in the registry, so a retry with the
+   * same sessionId + requestId + payload returns the original resource instead
+   * of creating a duplicate after a reconnect or service-worker restart. Reusing
+   * the same requestId with a different payload is rejected.
+   */
+  private buildCreateDedupeContext(request: BrowserRequest): CreateDedupeContext | null {
+    const operation = request.operation
+    if (operation.kind !== 'groups.create' && operation.kind !== 'tabs.create') return null
+    const fingerprint =
+      operation.kind === 'groups.create'
+        ? buildCreateRequestFingerprint({ kind: 'groups.create', name: validateGroupName(operation.name) })
+        : buildCreateRequestFingerprint({
+            kind: 'tabs.create',
+            groupId: operation.groupId,
+            url: validateNavigationUrl(operation.url),
+          })
+
+    const ledgerEntry = findRequestLedgerEntry(this.getRegistry(), {
+      sessionId: request.sessionId,
+      requestId: request.requestId,
+    })
+    return {
+      key: `${request.sessionId}\u0000${request.requestId}`,
+      operation: operation.kind,
+      fingerprint,
+      ledgerEntry,
+    }
+  }
+
+  private replayCompletedCreate(requestId: string, entry: RequestLedgerEntry): BrowserResponse {
+    const registry = this.getRegistry()
+    if (entry.operation === 'groups.create') {
+      const group = entry.groupId ? findGroup(registry, entry.groupId) : undefined
+      if (!group || group.state === 'released') {
+        throw new ManagedGroupsError({
+          code: 'resource-released',
+          message: 'the group created by this request is no longer active',
+        })
+      }
+      return ok(requestId, { group })
+    }
+    const tab = entry.tabId ? findTab(registry, entry.tabId) : undefined
+    if (!tab || tab.state === 'released') {
+      throw new ManagedGroupsError({
+        code: 'resource-released',
+        message: 'the tab created by this request is no longer active',
+      })
+    }
+    return ok(requestId, { tab })
+  }
+
+  private rememberCreate(
+    request: BrowserRequest,
+    options: { fingerprint: string; groupId?: string; tabId?: string; now: number },
+  ): void {
+    const operation = request.operation.kind === 'groups.create' ? 'groups.create' : 'tabs.create'
+    const entry: RequestLedgerEntry = {
+      sessionId: request.sessionId,
+      requestId: request.requestId,
+      operation,
+      fingerprint: options.fingerprint,
+      createdAt: options.now,
+      ...(options.groupId !== undefined ? { groupId: options.groupId } : {}),
+      ...(options.tabId !== undefined ? { tabId: options.tabId } : {}),
+    }
+    this.mutate((registry) => {
+      return appendRequestLedgerEntry(registry, {
+        entry,
+        now: options.now,
+        maxEntries: MAX_LEDGER_ENTRIES,
+        maxAgeMs: LEDGER_MAX_AGE_MS,
+      })
+    })
   }
 
   private async dispatchRequest(request: BrowserRequest): Promise<BrowserResponse> {
@@ -412,7 +578,9 @@ export class ManagedGroups {
       case 'tabs.list':
         return this.handleTabsList(request, operation)
       case 'tabs.create':
-        return this.handleTabsCreate(request, operation)
+        return this.groupQueue.run(operation.groupId, () => {
+          return this.handleTabsCreate(request, operation)
+        })
       case 'tabs.close':
         return this.handleTabsClose(request, operation)
       case 'tabs.release':
@@ -490,6 +658,11 @@ export class ManagedGroups {
         browserEpoch: this.browserEpoch,
       })
     })
+    this.rememberCreate(request, {
+      fingerprint: buildCreateRequestFingerprint({ kind: 'groups.create', name }),
+      groupId,
+      now: Date.now(),
+    })
     await this.persist()
     await this.publishInventory()
     const group = findGroup(this.getRegistry(), groupId)
@@ -503,65 +676,71 @@ export class ManagedGroups {
     request: BrowserRequest,
     operation: Extract<BrowserOperation, { kind: 'groups.rename' }>,
   ): Promise<BrowserResponse> {
-    const name = validateGroupName(operation.name)
-    const group = this.requireGroup({ groupId: operation.groupId, sessionId: request.sessionId })
-    if (group.state === 'released') {
-      throw new ManagedGroupsError({ code: 'resource-released', message: `group ${group.groupId} is released` })
-    }
-    if (group.state === 'needs-rebind') {
-      throw new ManagedGroupsError({
-        code: 'needs-rebind',
-        message: `group ${group.groupId} needs to be rebound after a browser restart`,
-      })
-    }
-
-    if (group.chromeGroupId !== undefined) {
-      const bound = group.chromeGroupId
-      const exists = await this.chromeGroupExists(bound)
-      if (exists) {
-        await chrome.tabGroups.update(bound, { title: name })
-      } else {
-        this.mutate((registry) => {
-          return clearGroupChromeBinding(registry, { groupId: group.groupId })
+    return this.groupQueue.run(operation.groupId, async () => {
+      const name = validateGroupName(operation.name)
+      // Re-read inside the per-group critical section: a concurrent first tab
+      // creation may have just bound the Chrome group.
+      const group = this.requireGroup({ groupId: operation.groupId, sessionId: request.sessionId })
+      if (group.state === 'released') {
+        throw new ManagedGroupsError({ code: 'resource-released', message: `group ${group.groupId} is released` })
+      }
+      if (group.state === 'needs-rebind' || group.browserEpoch !== this.browserEpoch) {
+        throw new ManagedGroupsError({
+          code: 'needs-rebind',
+          message: `group ${group.groupId} needs to be rebound after a browser restart`,
         })
       }
-    }
 
-    this.mutate((registry) => {
-      return renameGroup(registry, { groupId: group.groupId, name })
+      if (group.chromeGroupId !== undefined) {
+        const bound = group.chromeGroupId
+        const exists = await this.chromeGroupExists(bound)
+        if (exists) {
+          await chrome.tabGroups.update(bound, { title: name })
+        } else {
+          this.mutate((registry) => {
+            return clearGroupChromeBinding(registry, { groupId: group.groupId })
+          })
+        }
+      }
+
+      this.mutate((registry) => {
+        return renameGroup(registry, { groupId: group.groupId, name })
+      })
+      await this.persist()
+      await this.publishInventory()
+      const updated = findGroup(this.getRegistry(), group.groupId)
+      if (!updated) {
+        throw new ManagedGroupsError({ code: 'internal-error', message: 'group disappeared during rename' })
+      }
+      return ok(request.requestId, { group: updated })
     })
-    await this.persist()
-    await this.publishInventory()
-    const updated = findGroup(this.getRegistry(), group.groupId)
-    if (!updated) {
-      throw new ManagedGroupsError({ code: 'internal-error', message: 'group disappeared during rename' })
-    }
-    return ok(request.requestId, { group: updated })
   }
 
   private async handleGroupsClose(
     request: BrowserRequest,
     operation: Extract<BrowserOperation, { kind: 'groups.close' }>,
   ): Promise<BrowserResponse> {
-    const group = this.requireGroup({ groupId: operation.groupId, sessionId: request.sessionId })
-    if (group.state === 'released') {
-      return ok(request.requestId, { group })
-    }
+    return this.groupQueue.run(operation.groupId, async () => {
+      const group = this.requireGroup({ groupId: operation.groupId, sessionId: request.sessionId })
+      if (group.state === 'released') {
+        return ok(request.requestId, { group })
+      }
 
-    for (const tab of activeTabsForGroup(this.getRegistry(), group.groupId)) {
-      await this.closeManagedTab(tab.tabId)
-    }
+      for (const tab of activeTabsForGroup(this.getRegistry(), group.groupId)) {
+        await this.closeManagedTab(tab.tabId)
+      }
 
-    this.mutate((registry) => {
-      return setGroupState(registry, { groupId: group.groupId, state: 'released' })
+      this.mutate((registry) => {
+        return setGroupState(registry, { groupId: group.groupId, state: 'released' })
+      })
+      await this.persist()
+      await this.publishInventory()
+      const closed = findGroup(this.getRegistry(), group.groupId)
+      if (!closed) {
+        throw new ManagedGroupsError({ code: 'internal-error', message: 'group disappeared during close' })
+      }
+      return ok(request.requestId, { group: closed })
     })
-    await this.persist()
-    await this.publishInventory()
-    const closed = findGroup(this.getRegistry(), group.groupId)
-    if (!closed) {
-      throw new ManagedGroupsError({ code: 'internal-error', message: 'group disappeared during close' })
-    }
-    return ok(request.requestId, { group: closed })
   }
 
   // ---------------------------------------------------------------------------
@@ -585,20 +764,13 @@ export class ManagedGroups {
     request: BrowserRequest,
     operation: Extract<BrowserOperation, { kind: 'tabs.create' }>,
   ): Promise<BrowserResponse> {
-    const cachedTabId = this.requestTabIds.get(request.requestId)
-    if (cachedTabId) {
-      const cached = findTab(this.getRegistry(), cachedTabId)
-      if (cached && cached.state !== 'released') {
-        return ok(request.requestId, { tab: cached })
-      }
-      this.requestTabIds.delete(request.requestId)
-    }
-
+    // Re-read the group inside the per-group critical section: concurrent first
+    // creates for one group must reuse the Chrome group the first one bound.
     const group = this.requireGroup({ groupId: operation.groupId, sessionId: request.sessionId })
     if (group.state === 'released') {
       throw new ManagedGroupsError({ code: 'resource-released', message: `group ${group.groupId} is released` })
     }
-    if (group.state === 'needs-rebind') {
+    if (group.state === 'needs-rebind' || group.browserEpoch !== this.browserEpoch) {
       throw new ManagedGroupsError({
         code: 'needs-rebind',
         message: `group ${group.groupId} needs to be rebound after a browser restart`,
@@ -616,11 +788,16 @@ export class ManagedGroups {
     if (chromeTabId === undefined) {
       throw new ManagedGroupsError({ code: 'internal-error', message: 'Chrome did not return a tab id' })
     }
-    this.markInternalMove(chromeTabId)
 
     let tabId: string | undefined
+    let approvedChromeGroupId: number | undefined
     try {
-      const chromeGroupId = await this.ensureTabInManagedGroup({ chromeTabId, group, windowId: created.windowId })
+      const chromeGroupId = await this.ensureTabInManagedGroup({
+        chromeTabId,
+        group,
+        windowId: created.windowId,
+      })
+      approvedChromeGroupId = chromeGroupId
 
       // Record persisted before attach: even if attach/navigate fail the tab is
       // tracked (and tombstoned on cleanup) instead of leaking as a fake ready tab.
@@ -675,6 +852,11 @@ export class ManagedGroups {
           title: verified.title ?? '',
         })
       })
+      this.rememberCreate(request, {
+        fingerprint: buildCreateRequestFingerprint({ kind: 'tabs.create', groupId: operation.groupId, url }),
+        tabId: newTabId,
+        now: Date.now(),
+      })
       await this.persist()
       await this.publishInventory()
 
@@ -682,32 +864,59 @@ export class ManagedGroups {
       if (!tab) {
         throw new ManagedGroupsError({ code: 'internal-error', message: 'created tab vanished from the registry' })
       }
-      this.rememberRequest(request.requestId, newTabId)
       return ok(request.requestId, { tab })
     } catch (error: unknown) {
-      await this.cleanupFailedCreate({ chromeTabId, tabId })
+      await this.cleanupFailedCreate({ chromeTabId, tabId, approvedChromeGroupId })
       throw error
     }
   }
 
-  private async cleanupFailedCreate(options: { chromeTabId: number; tabId?: string }): Promise<void> {
-    const failedTabId = options.tabId
-    if (failedTabId) {
-      this.mutate((registry) => {
-        return releaseTab(registry, failedTabId)
+  /**
+   * Cleans up a failed `tabs.create`. The Chrome tab is only removed while it is
+   * still provably ours: same epoch, record not released, and still inside the
+   * group this operation created. If the user released or moved it meanwhile we
+   * stop touching Chrome and just drop control.
+   */
+  private async cleanupFailedCreate(options: {
+    chromeTabId: number
+    tabId?: string
+    approvedChromeGroupId?: number
+  }): Promise<void> {
+    const registry = this.getRegistry()
+    const record = options.tabId ? findTab(registry, options.tabId) : undefined
+    const observed = await chrome.tabs.get(options.chromeTabId).catch(() => {
+      return null
+    })
+    const decision = classifyFailedCreateCleanup({
+      recordState: record ? record.state : 'missing',
+      recordBrowserEpoch: record?.browserEpoch,
+      browserEpoch: this.browserEpoch,
+      approvedChromeGroupId: options.approvedChromeGroupId ?? TAB_ID_NONE,
+      observedChromeGroupId: observed ? (observed.groupId ?? TAB_ID_NONE) : null,
+    })
+
+    const recordIsCurrent =
+      record !== undefined && record.browserEpoch === this.browserEpoch && record.state !== 'released'
+    if (options.tabId && recordIsCurrent) {
+      const failedTabId = options.tabId
+      this.mutate((current) => {
+        return releaseTab(current, failedTabId)
       })
     }
+
     this.deps.detachManagedTab(options.chromeTabId)
-    const removed = await chrome.tabs.remove(options.chromeTabId).then(
-      () => {
-        return true
-      },
-      () => {
-        return false
-      },
-    )
-    this.deps.logger.warn(`Cleaned up failed tabs.create (chromeTabId=${options.chromeTabId}, removed=${removed})`)
-    if (failedTabId) {
+    if (decision === 'remove-chrome-tab') {
+      await chrome.tabs.remove(options.chromeTabId).catch((error: unknown) => {
+        this.deps.logger.debug(`Failed create cleanup: tab ${options.chromeTabId} already gone:`, error)
+      })
+      this.deps.logger.warn(`Cleaned up failed tabs.create (chromeTabId=${options.chromeTabId})`)
+    } else {
+      this.deps.logger.warn(
+        `tabs.create failed after tab ${options.chromeTabId} was taken over by the user; leaving it open`,
+      )
+    }
+
+    if (options.tabId && recordIsCurrent) {
       await this.persist()
       await this.publishInventory()
     }
@@ -740,7 +949,7 @@ export class ManagedGroups {
     operation: Extract<BrowserOperation, { kind: 'tab.resolve' }>,
   ): Promise<BrowserResponse> {
     const tab = this.requireTab({ tabId: operation.tabId, sessionId: request.sessionId })
-    if (tab.state === 'needs-rebind') {
+    if (tab.state === 'needs-rebind' || tab.browserEpoch !== this.browserEpoch) {
       return ok(request.requestId, { tab })
     }
 
@@ -748,7 +957,7 @@ export class ManagedGroups {
       return null
     })
     if (!chromeTab) {
-      await this.releaseManagedTab({ tabId: tab.tabId, reason: 'resolved-tab-missing' })
+      await this.releaseManagedTab({ tabId: tab.tabId, reason: 'resolved-tab-missing', ungroup: false })
       throw new ManagedGroupsError({
         code: 'resource-released',
         message: `tab ${tab.tabId} no longer exists in Chrome`,
@@ -805,19 +1014,27 @@ export class ManagedGroups {
     if (boundGroupId !== undefined) {
       const stillExists = await this.chromeGroupExists(boundGroupId)
       if (stillExists) {
-        this.markInternalMove(options.chromeTabId)
+        this.internalMoves.register(options.chromeTabId, {
+          expectedChromeGroupId: boundGroupId,
+          ...(options.windowId !== undefined ? { windowId: options.windowId } : {}),
+        })
         await chrome.tabs.group({ tabIds: [options.chromeTabId], groupId: boundGroupId })
         return boundGroupId
       }
     }
 
-    this.markInternalMove(options.chromeTabId)
     const groupCount = this.getRegistry().groups.filter((group) => group.state !== 'released').length
     const chromeGroupId = await chrome.tabs.group({
       tabIds: [options.chromeTabId],
       createProperties: {
         ...(options.windowId !== undefined ? { windowId: options.windowId } : {}),
       },
+    })
+    // Registered right after the call resolves, before the onUpdated event task
+    // runs, so the resulting move is recognised as ours.
+    this.internalMoves.register(options.chromeTabId, {
+      expectedChromeGroupId: chromeGroupId,
+      ...(options.windowId !== undefined ? { windowId: options.windowId } : {}),
     })
     await chrome.tabGroups.update(chromeGroupId, {
       title: options.group.name,
@@ -838,7 +1055,7 @@ export class ManagedGroups {
       return releaseTab(registry, tabId)
     })
 
-    if (tab.state !== 'needs-rebind') {
+    if (tab.state !== 'needs-rebind' && tab.browserEpoch === this.browserEpoch) {
       this.deps.detachManagedTab(tab.chromeTabId)
       await chrome.tabs.remove(tab.chromeTabId).catch((error: unknown) => {
         this.deps.logger.debug(`Tab ${tab.chromeTabId} was already gone during close:`, error)
@@ -860,19 +1077,25 @@ export class ManagedGroups {
     if (!tab || tab.state === 'released') return
     const group = findGroup(this.getRegistry(), tab.groupId)
 
-    this.deps.detachManagedTab(tab.chromeTabId)
-
-    if (options.ungroup !== false && group?.chromeGroupId !== undefined && tab.state !== 'needs-rebind') {
-      const stillInGroup = await this.isTabInChromeGroup({
-        chromeTabId: tab.chromeTabId,
-        chromeGroupId: group.chromeGroupId,
-      })
-      if (stillInGroup) {
-        this.markInternalMove(tab.chromeTabId)
-        await chrome.tabs.ungroup(tab.chromeTabId).catch((error: unknown) => {
-          this.deps.logger.debug(`Failed to ungroup released tab ${tab.chromeTabId}:`, error)
+    // Old-epoch records point at numeric Chrome ids that may now belong to
+    // unrelated tabs; never touch Chrome for them.
+    const canTouchChrome = tab.browserEpoch === this.browserEpoch && tab.state !== 'needs-rebind'
+    if (canTouchChrome) {
+      this.deps.detachManagedTab(tab.chromeTabId)
+      if (options.ungroup !== false && group?.chromeGroupId !== undefined) {
+        const stillInGroup = await this.isTabInChromeGroup({
+          chromeTabId: tab.chromeTabId,
+          chromeGroupId: group.chromeGroupId,
         })
+        if (stillInGroup) {
+          this.internalMoves.register(tab.chromeTabId, { expectedChromeGroupId: TAB_ID_NONE })
+          await chrome.tabs.ungroup(tab.chromeTabId).catch((error: unknown) => {
+            this.deps.logger.debug(`Failed to ungroup released tab ${tab.chromeTabId}:`, error)
+          })
+        }
       }
+    } else {
+      this.deps.logger.debug(`Skipping Chrome for stale record ${tab.tabId} (${options.reason})`)
     }
 
     this.mutate((registry) => {
@@ -887,6 +1110,7 @@ export class ManagedGroups {
   private async clearGroupBindingIfEmpty(groupId: string): Promise<void> {
     const group = findGroup(this.getRegistry(), groupId)
     if (!group) return
+    if (group.state === 'needs-rebind' || group.browserEpoch !== this.browserEpoch) return
     if (activeTabsForGroup(this.getRegistry(), groupId).length > 0) return
     if (group.chromeGroupId === undefined) return
     const stillHasChromeGroup = await this.chromeGroupExists(group.chromeGroupId)
@@ -915,25 +1139,6 @@ export class ManagedGroups {
     return tab !== null
   }
 
-  private markInternalMove(chromeTabId: number): void {
-    this.internalMoves.set(chromeTabId, Date.now() + INTERNAL_MOVE_TTL_MS)
-  }
-
-  private consumeInternalMove(chromeTabId: number): boolean {
-    const expiresAt = this.internalMoves.get(chromeTabId)
-    if (expiresAt === undefined) return false
-    this.internalMoves.delete(chromeTabId)
-    return expiresAt > Date.now()
-  }
-
-  private rememberRequest(requestId: string, tabId: string): void {
-    this.requestTabIds.set(requestId, tabId)
-    if (this.requestTabIds.size > MAX_REQUEST_CACHE_ENTRIES) {
-      const oldest = this.requestTabIds.keys().next().value
-      if (oldest !== undefined) this.requestTabIds.delete(oldest)
-    }
-  }
-
   // ---------------------------------------------------------------------------
   // Chrome event handlers
   // ---------------------------------------------------------------------------
@@ -942,6 +1147,7 @@ export class ManagedGroups {
   async handleChromeTabRemoved(chromeTabId: number): Promise<void> {
     try {
       await this.initialize()
+      if (!this.isAvailable()) return
       const tab = this.findManagedTabByChromeTabId(chromeTabId)
       if (!tab) return
       this.mutate((registry) => {
@@ -964,8 +1170,10 @@ export class ManagedGroups {
   async handleChromeGroupRemoved(chromeGroupId: number): Promise<void> {
     try {
       await this.initialize()
+      if (!this.isAvailable()) return
       const group = this.getRegistry().groups.find((candidate) => candidate.chromeGroupId === chromeGroupId)
-      if (!group || group.state === 'released') return
+      if (!group || group.state === 'released' || group.state === 'needs-rebind') return
+      if (group.browserEpoch !== this.browserEpoch) return
       if (activeTabsForGroup(this.getRegistry(), group.groupId).length > 0) return
       this.mutate((registry) => {
         return clearGroupChromeBinding(registry, { groupId: group.groupId })
@@ -979,19 +1187,67 @@ export class ManagedGroups {
   }
 
   /**
-   * chrome.tabs.onUpdated with a groupId change. Our own grouping operations are
-   * marked internal; any other move out of the managed group means the user took
-   * the tab back and it becomes a release tombstone.
+   * The user renamed or moved a managed Chrome group. Identity is the Chrome
+   * group id, never the title: the manual rename is recorded as the new logical
+   * name (so later operations do not fight it) and window moves update the
+   * stored window binding.
+   */
+  async handleChromeGroupUpdated(options: { chromeGroupId: number; title?: string; windowId?: number }): Promise<void> {
+    try {
+      await this.initialize()
+      if (!this.isAvailable()) return
+      const group = this.getRegistry().groups.find((candidate) => candidate.chromeGroupId === options.chromeGroupId)
+      if (!group || group.state === 'released' || group.state === 'needs-rebind') return
+      if (group.browserEpoch !== this.browserEpoch) return
+
+      let changed = false
+      const nextTitle = options.title?.trim()
+      // Never let a cleared Chrome title erase the required logical name.
+      if (nextTitle !== undefined && nextTitle.length > 0 && nextTitle !== group.name) {
+        this.mutate((registry) => {
+          return renameGroup(registry, { groupId: group.groupId, name: nextTitle })
+        })
+        changed = true
+      }
+      const nextWindowId = options.windowId
+      if (nextWindowId !== undefined && nextWindowId !== group.windowId) {
+        this.mutate((registry) => {
+          return setGroupWindowId(registry, { groupId: group.groupId, windowId: nextWindowId })
+        })
+        changed = true
+      }
+      if (!changed) return
+      this.deps.logger.debug(`Managed group ${options.chromeGroupId} updated in Chrome, registry synced`)
+      await this.persist()
+      await this.publishInventory()
+    } catch (error: unknown) {
+      this.deps.logger.error('Failed to handle managed group update:', error)
+    }
+  }
+
+  /**
+   * chrome.tabs.onUpdated with a groupId change. Only a move that matches an
+   * operation we just started is treated as internal; any other move out of the
+   * managed group means the user took the tab back and becomes a tombstone.
    */
   async handleChromeTabUpdatedGroup(options: {
     chromeTabId: number
     chromeGroupId: number
+    windowId?: number
     url: string
     title: string
   }): Promise<void> {
     try {
       await this.initialize()
-      if (this.consumeInternalMove(options.chromeTabId)) return
+      if (!this.isAvailable()) return
+      if (
+        this.internalMoves.matches(options.chromeTabId, {
+          chromeGroupId: options.chromeGroupId,
+          ...(options.windowId !== undefined ? { windowId: options.windowId } : {}),
+        })
+      ) {
+        return
+      }
       const tab = this.findManagedTabByChromeTabId(options.chromeTabId)
       if (!tab) return
       const group = findGroup(this.getRegistry(), tab.groupId)
@@ -1019,30 +1275,31 @@ export class ManagedGroups {
   }
 
   /**
-   * Debugger detach. Only CANCELED_BY_USER (the Chrome infobar "Cancel") is a
-   * user release; everything else keeps ownership and re-attaches later.
+   * Debugger detach. The Chrome infobar cancel is extension-wide: it stops all
+   * automation, so every managed tab becomes a released record (no auto
+   * re-attach on reconnect) while logical groups and the Chrome tab layout are
+   * left intact. Other detach reasons keep ownership and re-attach later.
    */
   async handleDebuggerDetached(
     chromeTabId: number,
     reason: string,
-    options: { releaseAllReady?: boolean } = {},
+    options: { userCanceledAll?: boolean } = {},
   ): Promise<void> {
     try {
       await this.initialize()
-      const tab = this.findManagedTabByChromeTabId(chromeTabId)
-      if (!tab) return
+      if (!this.isAvailable()) return
       if (reason === 'canceled_by_user') {
-        await this.releaseManagedTab({ tabId: tab.tabId, reason: 'debugger-canceled-by-user', ungroup: true })
-        if (options.releaseAllReady) {
-          // Chrome cancels every debugger session of this extension at once, so the
-          // remaining ready tabs are no longer attached. Ownership is kept (only a
-          // reconnect restores the attachment); they are not tombstones.
-          this.disconnectOtherReadyTabs(tab.tabId)
-          await this.persist()
-          await this.publishInventory()
+        if (options.userCanceledAll) {
+          await this.releaseAllForUserCancel()
+          return
         }
+        const tab = this.findManagedTabByChromeTabId(chromeTabId)
+        if (!tab) return
+        await this.releaseManagedTab({ tabId: tab.tabId, reason: 'debugger-canceled-by-user', ungroup: true })
         return
       }
+      const tab = this.findManagedTabByChromeTabId(chromeTabId)
+      if (!tab) return
       this.mutate((registry) => {
         return clearTabAttachment(registry, tab.tabId)
       })
@@ -1053,22 +1310,28 @@ export class ManagedGroups {
     }
   }
 
-  private disconnectOtherReadyTabs(exceptTabId: string): void {
-    const readyTabs = this.getRegistry().tabs.filter((tab) => {
-      return tab.state === 'ready' && tab.tabId !== exceptTabId
+  private async releaseAllForUserCancel(): Promise<void> {
+    const tabs = this.getRegistry().tabs.filter((tab) => {
+      return tab.browserEpoch === this.browserEpoch && tab.state !== 'released' && tab.state !== 'needs-rebind'
     })
-    if (readyTabs.length === 0) return
-    let registry = this.getRegistry()
-    for (const tab of readyTabs) {
-      registry = clearTabAttachment(registry, tab.tabId)
+    for (const tab of tabs) {
+      this.deps.detachManagedTab(tab.chromeTabId)
     }
-    this.registry = registry
+    for (const tab of tabs) {
+      this.mutate((registry) => {
+        return releaseTab(registry, tab.tabId)
+      })
+    }
+    this.deps.logger.warn(`User canceled automation in Chrome: released ${tabs.length} managed tab(s), groups kept`)
+    await this.persist()
+    await this.publishInventory()
   }
 
   /** Re-attaches a managed tab without changing ownership (used by the icon click). */
   async restoreChromeTab(chromeTabId: number): Promise<void> {
     try {
       await this.initialize()
+      if (!this.isAvailable()) return
       const tab = this.findManagedTabByChromeTabId(chromeTabId)
       if (!tab || tab.state === 'released' || tab.state === 'needs-rebind') return
       const attached = await this.deps.attachTab(chromeTabId)
@@ -1090,34 +1353,73 @@ export class ManagedGroups {
    * A new tab/window was opened from a managed tab (target=_blank, window.open,
    * OAuth popup). It inherits the source tab's group; unrelated user popups are
    * ignored because only a managed source tab triggers adoption.
+   *
+   * Order is deliberate: pre-register the tab so the legacy sync cannot claim it,
+   * move it into the target group window, group it, persist the record, and only
+   * then attach. Every await re-checks that the source tab is still owned; on
+   * failure the tab is left open (never a controlled, unregistered tab).
    */
   async adoptInheritedTab(options: { chromeTabId: number; sourceChromeTabId: number }): Promise<void> {
     try {
       await this.initialize()
+      if (!this.isAvailable()) return
       if (this.adoptingChromeTabIds.has(options.chromeTabId)) return
-      const sourceTab = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
-      if (!sourceTab || sourceTab.state !== 'ready') return
-      const group = findGroup(this.getRegistry(), sourceTab.groupId)
-      if (!group || group.state !== 'ready') return
-      if (findTabByChromeTabId(this.getRegistry(), options.chromeTabId)) return
-      if (isChromeTabTombstoned(this.getRegistry(), options.chromeTabId)) return
+      const initialSource = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
+      if (!initialSource || initialSource.state !== 'ready') return
+      const initialGroup = findGroup(this.getRegistry(), initialSource.groupId)
+      if (!initialGroup || initialGroup.state !== 'ready') return
+      if (
+        findActiveTabByChromeTabId(this.getRegistry(), {
+          chromeTabId: options.chromeTabId,
+          browserEpoch: this.browserEpoch,
+        })
+      ) {
+        return
+      }
+      if (isChromeTabTombstoned(this.getRegistry(), options.chromeTabId, { browserEpoch: this.browserEpoch })) {
+        return
+      }
 
       this.adoptingChromeTabIds.add(options.chromeTabId)
+      this.pendingAdoptions.add(options.chromeTabId)
       try {
-        const chromeTab = await this.waitForChromeTab(options.chromeTabId)
-        if (!chromeTab) return
-        if (this.deps.isRestrictedUrl(chromeTab.url)) return
+        await this.groupQueue.run(initialGroup.groupId, async () => {
+          // Re-read under the per-group lock: a concurrent close/release may have
+          // changed ownership while we waited.
+          const sourceTab = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
+          if (!sourceTab || sourceTab.state !== 'ready') return
+          const group = findGroup(this.getRegistry(), sourceTab.groupId)
+          if (!group || group.state !== 'ready') return
 
-        const attached = await this.deps.attachTab(options.chromeTabId)
-        let registered = false
-        try {
-          if (isChromeTabTombstoned(this.getRegistry(), options.chromeTabId)) return
+          const chromeTab = await this.waitForChromeTab(options.chromeTabId)
+          if (!chromeTab) return
+          if (this.deps.isRestrictedUrl(chromeTab.url)) return
+          if (isChromeTabTombstoned(this.getRegistry(), options.chromeTabId, { browserEpoch: this.browserEpoch })) {
+            return
+          }
+
+          const targetWindowId = await this.resolveAdoptionWindow(group, sourceTab)
+          if (targetWindowId !== undefined && chromeTab.windowId !== targetWindowId) {
+            this.internalMoves.register(options.chromeTabId, {
+              expectedChromeGroupId: TAB_ID_NONE,
+              windowId: targetWindowId,
+            })
+            await chrome.tabs
+              .move(options.chromeTabId, { windowId: targetWindowId, index: -1 })
+              .catch((error: unknown) => {
+                this.deps.logger.warn(`Failed to move inherited tab ${options.chromeTabId} to the group window:`, error)
+              })
+          }
+
+          const sourceStillOwned = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
+          if (!sourceStillOwned || sourceStillOwned.state !== 'ready') return
 
           const chromeGroupId = await this.ensureTabInManagedGroup({
             chromeTabId: options.chromeTabId,
             group,
-            windowId: chromeTab.windowId,
+            windowId: targetWindowId ?? chromeTab.windowId,
           })
+
           const tabId = createOpaqueId('ptab')
           this.mutate((registry) => {
             return addTab(registry, {
@@ -1131,37 +1433,87 @@ export class ManagedGroups {
             })
           })
           this.mutate((registry) => {
-            return setTabAttachment(registry, {
-              tabId,
-              targetId: attached.targetInfo.targetId,
-              cdpSessionId: attached.sessionId,
-            })
-          })
-          this.mutate((registry) => {
-            return setGroupChromeBindingIfMissing(registry, {
+            return setGroupChromeBindingMissing(registry, {
               groupId: group.groupId,
               chromeGroupId,
-              windowId: chromeTab.windowId,
+              windowId: targetWindowId ?? chromeTab.windowId,
             })
           })
-          registered = true
-          this.deps.logger.debug(
-            `Adopted inherited tab ${options.chromeTabId} into managed group ${group.groupId} (source=${options.sourceChromeTabId})`,
-          )
           await this.persist()
-          await this.publishInventory()
-        } finally {
-          // Never keep controlling a tab that we could not register as owned.
-          if (!registered) {
-            this.deps.detachManagedTab(options.chromeTabId)
+
+          const sourceAfterPersist = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
+          if (!sourceAfterPersist || sourceAfterPersist.state !== 'ready') {
+            await this.dropAdoptedTab({ tabId, chromeTabId: options.chromeTabId, chromeGroupId })
+            return
           }
-        }
+
+          try {
+            const attached = await this.deps.attachTab(options.chromeTabId)
+            this.mutate((registry) => {
+              return setTabAttachment(registry, {
+                tabId,
+                targetId: attached.targetInfo.targetId,
+                cdpSessionId: attached.sessionId,
+              })
+            })
+            this.deps.logger.debug(
+              `Adopted inherited tab ${options.chromeTabId} into managed group ${group.groupId} (source=${options.sourceChromeTabId})`,
+            )
+            await this.persist()
+            await this.publishInventory()
+          } catch (error: unknown) {
+            // Attach failed: never keep a grouped-but-uncontrolled claim on the
+            // user's tab. Tombstone the record and ungroup it, leaving it open.
+            await this.dropAdoptedTab({ tabId, chromeTabId: options.chromeTabId, chromeGroupId })
+            throw error
+          }
+        })
       } finally {
+        this.pendingAdoptions.delete(options.chromeTabId)
         this.adoptingChromeTabIds.delete(options.chromeTabId)
       }
     } catch (error: unknown) {
       this.deps.logger.warn(`Failed to adopt inherited tab ${options.chromeTabId}:`, error)
     }
+  }
+
+  private async dropAdoptedTab(options: { tabId: string; chromeTabId: number; chromeGroupId: number }): Promise<void> {
+    const stillOurs = this.findManagedTabByChromeTabId(options.chromeTabId)
+    if (stillOurs && stillOurs.tabId === options.tabId) {
+      const releasedTabId = options.tabId
+      this.mutate((registry) => {
+        return releaseTab(registry, releasedTabId)
+      })
+    }
+    const chromeTab = await chrome.tabs.get(options.chromeTabId).catch(() => {
+      return null
+    })
+    if (chromeTab && chromeTab.groupId === options.chromeGroupId) {
+      this.internalMoves.register(options.chromeTabId, { expectedChromeGroupId: TAB_ID_NONE })
+      await chrome.tabs.ungroup(options.chromeTabId).catch((error: unknown) => {
+        this.deps.logger.debug(`Failed to ungroup dropped adopted tab ${options.chromeTabId}:`, error)
+      })
+    }
+    await this.persist()
+    await this.publishInventory()
+  }
+
+  private async resolveAdoptionWindow(group: BrowserGroup, sourceTab: BrowserTab): Promise<number | undefined> {
+    if (group.windowId !== undefined) {
+      const exists = await chrome.windows.get(group.windowId).then(
+        () => {
+          return true
+        },
+        () => {
+          return false
+        },
+      )
+      if (exists) return group.windowId
+    }
+    const sourceChromeTab = await chrome.tabs.get(sourceTab.chromeTabId).catch(() => {
+      return null
+    })
+    return sourceChromeTab?.windowId
   }
 
   private async waitForChromeTab(chromeTabId: number): Promise<chrome.tabs.Tab | null> {
@@ -1178,18 +1530,30 @@ export class ManagedGroups {
   /** Explicit user/API release through legacy paths (icon click, disconnect all). */
   async releaseChromeTab(chromeTabId: number, reason: string): Promise<void> {
     await this.initialize()
+    if (!this.isAvailable()) return
     const tab = this.findManagedTabByChromeTabId(chromeTabId)
     if (!tab) return
     await this.releaseManagedTab({ tabId: tab.tabId, reason, ungroup: true })
   }
 
-  /** Releases every managed tab (explicit disconnect-everything, not a transport drop). */
+  /**
+   * Releases every managed tab without touching the Chrome side beyond detaching
+   * (explicit disconnect-everything, not a transport drop). Group layout is kept.
+   */
   async releaseAllChromeTabs(reason: string): Promise<void> {
     try {
       await this.initialize()
-      const chromeTabIds = this.getManagedChromeTabIds()
-      for (const chromeTabId of chromeTabIds) {
-        await this.releaseChromeTab(chromeTabId, reason)
+      if (!this.isAvailable()) return
+      const tabs = this.getRegistry().tabs.filter((tab) => {
+        return (
+          tab.browserEpoch === this.browserEpoch &&
+          tab.state !== 'released' &&
+          tab.state !== 'needs-rebind' &&
+          !this.pendingAdoptions.has(tab.chromeTabId)
+        )
+      })
+      for (const tab of tabs) {
+        await this.releaseManagedTab({ tabId: tab.tabId, reason, ungroup: false })
       }
     } catch (error: unknown) {
       this.deps.logger.error('Failed to release all managed tabs:', error)
@@ -1197,7 +1561,7 @@ export class ManagedGroups {
   }
 }
 
-function setGroupChromeBindingIfMissing(
+function setGroupChromeBindingMissing(
   registry: ManagedResourceRegistry,
   options: { groupId: string; chromeGroupId: number; windowId: number },
 ): ManagedResourceRegistry {

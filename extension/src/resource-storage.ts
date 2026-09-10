@@ -10,12 +10,20 @@ import { parseRegistry } from './resource-registry'
  *   restarts but is cleared when Chrome shuts down, which is exactly how we tell
  *   "same Chrome run, worker restarted" apart from "Chrome restarted".
  *
- * Session storage defaults to trusted contexts; we set it explicitly so the
- * ownership/epoch data can never be read from content scripts.
+ * Both areas are pinned to trusted contexts so ownership/epoch data can never be
+ * read from content scripts. Read/write failures are surfaced, never swallowed:
+ * the managed layer must not advertise state it could not persist.
  */
 
 const REGISTRY_STORAGE_KEY = 'piBrowserRegistry'
 const BROWSER_EPOCH_STORAGE_KEY = 'piBrowserEpoch'
+
+export class RegistryStorageError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RegistryStorageError'
+  }
+}
 
 export function createOpaqueId(prefix: string): string {
   const values = new Uint32Array(2)
@@ -28,12 +36,17 @@ export function createOpaqueId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${random}`
 }
 
-export async function restrictSessionStorageToTrustedContexts(): Promise<void> {
+export async function restrictStorageToTrustedContexts(): Promise<void> {
   try {
     await chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
   } catch {
     // Older Chrome builds may not expose setAccessLevel; session storage is
     // already trusted-context-only by default, so this is best-effort.
+  }
+  try {
+    await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+  } catch {
+    // Same for local storage; access-level pinning is defense in depth.
   }
 }
 
@@ -62,9 +75,25 @@ export async function ensureBrowserEpoch(): Promise<BrowserEpochResult> {
   return { browserEpoch, restarted: true }
 }
 
+/**
+ * Reads the persisted registry.
+ *
+ * - returns null only when nothing was ever stored;
+ * - throws when storage is unreadable or the stored value is malformed, so the
+ *   caller can keep the managed layer unavailable instead of overwriting records
+ *   it could not read.
+ */
 export async function loadRegistry(): Promise<ManagedResourceRegistry | null> {
   const stored = await chrome.storage.local.get(REGISTRY_STORAGE_KEY)
-  return parseRegistry(stored[REGISTRY_STORAGE_KEY])
+  const raw = stored[REGISTRY_STORAGE_KEY]
+  if (raw === undefined || raw === null) {
+    return null
+  }
+  const registry = parseRegistry(raw)
+  if (!registry) {
+    throw new RegistryStorageError('persisted managed registry is malformed')
+  }
+  return registry
 }
 
 export async function saveRegistry(registry: ManagedResourceRegistry): Promise<void> {

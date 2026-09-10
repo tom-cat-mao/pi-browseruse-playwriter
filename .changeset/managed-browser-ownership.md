@@ -11,4 +11,8 @@ the extension now keeps an authoritative ownership registry in `chrome.storage.l
 - `tabs.create` creates a blank tab in the group window, groups it immediately, persists the record, attaches the debugger, navigates, then verifies the Chrome group before returning `ready` with `targetId`/`cdpSessionId`
 - popups and `target=_blank` tabs opened from a managed tab inherit its group; unrelated user popups are left untouched
 - dragging a tab out of a managed group, the Chrome debugger infobar cancel, or an explicit release writes a release tombstone that reconnects never pull back
-- relay reconnects and service-worker restarts restore verifiable bindings without replaying page actions; after a full Chrome restart unverifiable resources become `needs-rebind` instead of being adopted by URL/title guessing
+- relay reconnects and service-worker restarts restore verifiable bindings without replaying page actions; after a full Chrome restart (or lost `storage.session`) unverifiable resources become `needs-rebind` instead of being adopted by reused numeric Chrome ids
+- persisted create dedup ledger: retrying the same sessionId + requestId + payload returns the original group/tab across reconnects and service-worker restarts, and reusing a requestId with a different payload is rejected
+- per-group serialized mutations, so concurrent first tab creates cannot materialize two Chrome groups for one logical group
+- ownership is never touched through stale numeric ids: chrome-id lookups are pinned to the current browser epoch, failed creates only remove tabs that are still provably ours, and a browser-wide debugger cancel stops automation without dissolving logical groups
+- managed storage failures surface as `internal-error` (no inventory advertised, records never overwritten); manual Chrome group renames/window moves are synced by Chrome group id, never by title

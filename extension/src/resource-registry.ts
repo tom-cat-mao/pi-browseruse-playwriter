@@ -30,6 +30,22 @@ export interface ManagedResourceRegistry {
   revision: number
   groups: BrowserGroup[]
   tabs: BrowserTab[]
+  requestLedger: RequestLedgerEntry[]
+}
+
+/**
+ * Completed-create dedup ledger. Persisted so a retried create request cannot
+ * create a second group/tab after a relay reconnect or service-worker restart.
+ */
+export interface RequestLedgerEntry {
+  sessionId: string
+  requestId: string
+  operation: 'groups.create' | 'tabs.create'
+  /** Payload fingerprint; a retry with the same requestId must match it. */
+  fingerprint: string
+  createdAt: number
+  groupId?: string
+  tabId?: string
 }
 
 export function createEmptyRegistry(options: { profileId: string; browserEpoch: string }): ManagedResourceRegistry {
@@ -40,6 +56,7 @@ export function createEmptyRegistry(options: { profileId: string; browserEpoch: 
     revision: 0,
     groups: [],
     tabs: [],
+    requestLedger: [],
   }
 }
 
@@ -133,7 +150,27 @@ function readTab(value: unknown): BrowserTab | null {
   }
 }
 
-const EMPTY_REGISTRY: ManagedResourceRegistry = createEmptyRegistry({ profileId: '', browserEpoch: '' })
+function readLedgerEntry(value: unknown): RequestLedgerEntry | null {
+  if (!isRecord(value)) return null
+  const sessionId = readString(value.sessionId)
+  const requestId = readString(value.requestId)
+  const operation =
+    value.operation === 'groups.create' || value.operation === 'tabs.create' ? value.operation : undefined
+  const fingerprint = readString(value.fingerprint)
+  const createdAt = readNumber(value.createdAt)
+  if (!sessionId || !requestId || !operation || !fingerprint || createdAt === undefined) return null
+  const groupId = readString(value.groupId)
+  const tabId = readString(value.tabId)
+  return {
+    sessionId,
+    requestId,
+    operation,
+    fingerprint,
+    createdAt,
+    ...(groupId !== undefined ? { groupId } : {}),
+    ...(tabId !== undefined ? { tabId } : {}),
+  }
+}
 
 /** Defensive parse of persisted JSON - storage can hold anything. */
 export function parseRegistry(raw: unknown): ManagedResourceRegistry | null {
@@ -149,7 +186,14 @@ export function parseRegistry(raw: unknown): ManagedResourceRegistry | null {
   const tabs = raw.tabs.map(readTab).filter((tab): tab is BrowserTab => tab !== null)
   if (groups.length !== raw.groups.length || tabs.length !== raw.tabs.length) return null
 
-  return { version: MANAGED_REGISTRY_VERSION, profileId, browserEpoch, revision, groups, tabs }
+  // The ledger is dedup metadata, not ownership: unknown fields and malformed
+  // entries are dropped instead of rejecting the whole registry.
+  const ledgerRaw = raw.requestLedger
+  const requestLedger = Array.isArray(ledgerRaw)
+    ? ledgerRaw.map(readLedgerEntry).filter((entry): entry is RequestLedgerEntry => entry !== null)
+    : []
+
+  return { version: MANAGED_REGISTRY_VERSION, profileId, browserEpoch, revision, groups, tabs, requestLedger }
 }
 
 export function findGroup(registry: ManagedResourceRegistry, groupId: string): BrowserGroup | undefined {
@@ -164,9 +208,37 @@ export function findTabByChromeTabId(registry: ManagedResourceRegistry, chromeTa
   return registry.tabs.find((tab) => tab.chromeTabId === chromeTabId)
 }
 
+/**
+ * Chrome numeric ids are only meaningful inside one browser run: after a restart
+ * (or cleared session storage) the same number can belong to an unrelated tab.
+ * Runtime lookups must therefore always pin the current epoch and skip records
+ * that are released or waiting for a rebind.
+ */
+export function findActiveTabByChromeTabId(
+  registry: ManagedResourceRegistry,
+  options: { chromeTabId: number; browserEpoch: string },
+): BrowserTab | undefined {
+  return registry.tabs.find((tab) => {
+    return (
+      tab.chromeTabId === options.chromeTabId &&
+      tab.browserEpoch === options.browserEpoch &&
+      tab.state !== 'released' &&
+      tab.state !== 'needs-rebind'
+    )
+  })
+}
+
 /** Tombstone lookup used to block stale async flows from re-adopting a released tab. */
-export function isChromeTabTombstoned(registry: ManagedResourceRegistry, chromeTabId: number): boolean {
-  return registry.tabs.some((tab) => tab.chromeTabId === chromeTabId && tab.state === 'released')
+export function isChromeTabTombstoned(
+  registry: ManagedResourceRegistry,
+  chromeTabId: number,
+  options: { browserEpoch?: string } = {},
+): boolean {
+  return registry.tabs.some((tab) => {
+    if (tab.chromeTabId !== chromeTabId || tab.state !== 'released') return false
+    if (options.browserEpoch !== undefined && tab.browserEpoch !== options.browserEpoch) return false
+    return true
+  })
 }
 
 export function activeTabsForGroup(registry: ManagedResourceRegistry, groupId: string): BrowserTab[] {
@@ -199,13 +271,14 @@ export function listSessionTabs(registry: ManagedResourceRegistry, sessionId: st
 
 function cloneWithRevision(
   registry: ManagedResourceRegistry,
-  changes: { groups?: BrowserGroup[]; tabs?: BrowserTab[] },
+  changes: { groups?: BrowserGroup[]; tabs?: BrowserTab[]; requestLedger?: RequestLedgerEntry[] },
 ): ManagedResourceRegistry {
   const next: ManagedResourceRegistry = {
     ...registry,
     revision: registry.revision + 1,
     groups: changes.groups ?? registry.groups,
     tabs: changes.tabs ?? registry.tabs,
+    requestLedger: changes.requestLedger ?? registry.requestLedger,
   }
   return next
 }
@@ -262,6 +335,20 @@ export function clearGroupChromeBinding(
     if (group.groupId !== options.groupId || group.chromeGroupId === undefined) return group
     const { chromeGroupId: _chromeGroupId, ...rest } = group
     return { ...rest, revision: registry.revision + 1 }
+  })
+  return cloneWithRevision(registry, { groups })
+}
+
+/** Tracks where the Chrome group lives after the user moves it between windows. */
+export function setGroupWindowId(
+  registry: ManagedResourceRegistry,
+  options: { groupId: string; windowId: number },
+): ManagedResourceRegistry {
+  const group = findGroup(registry, options.groupId)
+  if (!group || group.windowId === options.windowId) return registry
+  const groups = registry.groups.map((candidate) => {
+    if (candidate.groupId !== options.groupId) return candidate
+    return { ...candidate, windowId: options.windowId, revision: registry.revision + 1 }
   })
   return cloneWithRevision(registry, { groups })
 }
@@ -362,6 +449,87 @@ export function setTabPageInfo(
   return updateTab(registry, options.tabId, (current) => {
     return { ...current, url: options.url, title: options.title, revision: registry.revision + 1 }
   })
+}
+
+export type CreateDedupeDecision = 'proceed' | 'replay' | 'reject-payload-mismatch'
+
+/**
+ * Pure decision for a create request that may have completed before (ledger
+ * entry) or be retried with the same requestId. Reusing a requestId with a
+ * different operation or payload is always rejected.
+ */
+export function classifyCreateRequestDedupe(options: {
+  ledgerEntry: RequestLedgerEntry | undefined
+  operation: RequestLedgerEntry['operation']
+  fingerprint: string
+}): CreateDedupeDecision {
+  const entry = options.ledgerEntry
+  if (!entry) return 'proceed'
+  if (entry.operation !== options.operation || entry.fingerprint !== options.fingerprint) {
+    return 'reject-payload-mismatch'
+  }
+  return 'replay'
+}
+
+/** Stable payload fingerprint for create dedup: retries must match it exactly. */
+export function buildCreateRequestFingerprint(
+  operation: { kind: 'groups.create'; name: string } | { kind: 'tabs.create'; groupId: string; url: string },
+): string {
+  if (operation.kind === 'groups.create') {
+    return `groups.create|name=${operation.name}`
+  }
+  return `tabs.create|groupId=${operation.groupId}|url=${operation.url}`
+}
+
+export function findRequestLedgerEntry(
+  registry: ManagedResourceRegistry,
+  options: { sessionId: string; requestId: string },
+): RequestLedgerEntry | undefined {
+  return registry.requestLedger.find((entry) => {
+    return entry.sessionId === options.sessionId && entry.requestId === options.requestId
+  })
+}
+
+export function appendRequestLedgerEntry(
+  registry: ManagedResourceRegistry,
+  options: { entry: RequestLedgerEntry; now: number; maxEntries: number; maxAgeMs: number },
+): ManagedResourceRegistry {
+  const kept = registry.requestLedger.filter((entry) => {
+    return !(entry.sessionId === options.entry.sessionId && entry.requestId === options.entry.requestId)
+  })
+  const maxEntries = Math.max(0, Math.floor(options.maxEntries))
+  const requestLedger = [...kept, options.entry]
+    .filter((entry) => {
+      return options.now - entry.createdAt <= options.maxAgeMs
+    })
+    .slice(-maxEntries)
+  return cloneWithRevision(registry, { requestLedger })
+}
+
+export type FailedCreateCleanup = 'remove-chrome-tab' | 'leave-user-tab'
+
+/**
+ * Decides whether a failed `tabs.create` may still remove the Chrome tab it
+ * created. If the user released it, moved it out of the created group, or the
+ * record belongs to another browser epoch, the tab is no longer ours and must
+ * be left open untouched.
+ */
+export function classifyFailedCreateCleanup(options: {
+  recordState: BrowserResourceState | 'missing'
+  recordBrowserEpoch: string | undefined
+  browserEpoch: string
+  approvedChromeGroupId: number
+  observedChromeGroupId: number | null
+}): FailedCreateCleanup {
+  if (options.recordState === 'released') return 'leave-user-tab'
+  if (options.recordState === 'missing') {
+    if (options.observedChromeGroupId === null) return 'remove-chrome-tab'
+    return options.observedChromeGroupId === options.approvedChromeGroupId ? 'remove-chrome-tab' : 'leave-user-tab'
+  }
+  if (options.recordBrowserEpoch !== options.browserEpoch) return 'leave-user-tab'
+  if (options.observedChromeGroupId === null) return 'remove-chrome-tab'
+  if (options.observedChromeGroupId !== options.approvedChromeGroupId) return 'leave-user-tab'
+  return 'remove-chrome-tab'
 }
 
 export function buildInventory(registry: ManagedResourceRegistry): BrowserInventory {
