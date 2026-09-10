@@ -883,6 +883,83 @@ describe('managed resource registry ownership', () => {
     `)
   })
 
+  test('a tab attached in place survives reconcile and keeps its origin and source', () => {
+    // An in-place group has no Chrome group binding on purpose: it must not be
+    // released for "not being in a task group", which is what a task tab would
+    // get for the same observed state.
+    let registry = createEmptyRegistry({ profileId, browserEpoch: epoch })
+    registry = addGroup(registry, {
+      groupId: 'pg-1',
+      sessionId: 'session-1',
+      name: 'Invoice draft',
+      browserEpoch: epoch,
+      origin: 'existing',
+    })
+    registry = addTab(registry, {
+      tabId: 'pt-1',
+      groupId: 'pg-1',
+      sessionId: 'session-1',
+      chromeTabId: 101,
+      url: 'https://billing.example.com/draft',
+      title: 'Invoice draft',
+      browserEpoch: epoch,
+      origin: 'existing',
+    })
+    registry = setTabAttachment(registry, { tabId: 'pt-1', targetId: 'target-1', cdpSessionId: 'pw-tab-1' })
+    registry = addTab(registry, {
+      tabId: 'pt-2',
+      groupId: 'pg-1',
+      sessionId: 'session-1',
+      chromeTabId: 102,
+      url: 'https://example.com/ref',
+      title: 'Reference',
+      browserEpoch: epoch,
+      origin: 'existing',
+      sourceTabId: 'pt-1',
+    })
+
+    const result = reconcileRegistry(registry, {
+      browserEpoch: epoch,
+      observedTabs: [
+        observedTab({ chromeTabId: 101, chromeGroupId: -1 }),
+        observedTab({ chromeTabId: 102, chromeGroupId: -1 }),
+      ],
+      observedChromeGroupIds: [],
+    })
+
+    expect({
+      groupOrigin: findGroup(result.registry, 'pg-1')?.origin,
+      groupChromeGroupId: findGroup(result.registry, 'pg-1')?.chromeGroupId,
+      tabs: result.registry.tabs.map((tab) => {
+        return { tabId: tab.tabId, state: tab.state, origin: tab.origin, sourceTabId: tab.sourceTabId }
+      }),
+      reattach: result.reattachTabIds,
+    }).toMatchInlineSnapshot(`
+      {
+        "groupChromeGroupId": undefined,
+        "groupOrigin": "existing",
+        "reattach": [
+          101,
+          102,
+        ],
+        "tabs": [
+          {
+            "origin": "existing",
+            "sourceTabId": undefined,
+            "state": "disconnected",
+            "tabId": "pt-1",
+          },
+          {
+            "origin": "existing",
+            "sourceTabId": "pt-1",
+            "state": "disconnected",
+            "tabId": "pt-2",
+          },
+        ],
+      }
+    `)
+  })
+
   test('group window binding follows the user moving the group', () => {
     const registry = createRegistryWithGroup()
     const moved = setGroupWindowId(registry, { groupId: 'pg-1', windowId: 12 })

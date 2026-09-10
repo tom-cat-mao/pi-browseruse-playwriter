@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Browser Use",
-  "version": "0.0.127",
+  "version": "0.0.129",
   "description": "Automate your Browser using Cursor, Claude, VS Code. More capable and context efficient than Playwright MCP.",
   "permissions": [
     "debugger",

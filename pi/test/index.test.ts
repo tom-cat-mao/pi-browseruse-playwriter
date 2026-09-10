@@ -399,4 +399,122 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     const truncatedKeys = Object.keys(parsed).filter((k) => k.endsWith("Truncated"));
     expect(truncatedKeys.length).toBeGreaterThan(0);
   });
+  it("puts discovered existing tabs (with candidateId and window/active state) into content", async () => {
+    runtimeHandler(() => ({
+      text: "Discovered 2 existing tab(s) across 1 connected profile(s).",
+      candidates: [
+        {
+          candidateId: "pcdt:profile-1:epoch-a:7",
+          profileId: "profile-1",
+          profileLabel: "work@example.com",
+          browser: "chrome",
+          browserEpoch: "epoch-a",
+          windowId: 3,
+          active: true,
+          windowFocused: false,
+          chromeTabId: 7,
+          url: "https://billing.example.com/draft",
+          title: "Invoice draft",
+          managed: false,
+          ownedByThisSession: false,
+          attachable: true,
+        },
+        {
+          candidateId: "pcdt:profile-1:epoch-a:9",
+          profileId: "profile-1",
+          profileLabel: "work@example.com",
+          browser: "chrome",
+          browserEpoch: "epoch-a",
+          windowId: 4,
+          active: true,
+          windowFocused: true,
+          chromeTabId: 9,
+          url: "https://billing.example.com/archive",
+          title: "Invoice archive",
+          managed: false,
+          ownedByThisSession: false,
+          attachable: true,
+        },
+      ],
+    }));
+    const tool = toolByName("browser_tabs");
+    const res = await tool.execute("call-16", { action: "discover", query: "invoice" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    expect(t).toContain("pcdt:profile-1:epoch-a:7");
+    expect(t).toContain("pcdt:profile-1:epoch-a:9");
+    const jsonLine = t.split("\n").find((l) => l.startsWith("{"))!;
+    const parsed = JSON.parse(jsonLine) as {
+      candidates: Array<{ windowId: number; active: boolean; windowFocused: boolean; browser: string; profileLabel: string }>;
+    };
+    // Every window keeps its own active flag: nothing is collapsed into a
+    // single "current tab".
+    expect(parsed.candidates.map((c) => [c.windowId, c.active, c.windowFocused])).toEqual([
+      [3, true, false],
+      [4, true, true],
+    ]);
+    // Browser + profile label survive so two Chrome builds/profiles with the
+    // same tab title can be told apart.
+    expect(parsed.candidates.map((c) => [c.browser, c.profileLabel])).toEqual([
+      ["chrome", "work@example.com"],
+      ["chrome", "work@example.com"],
+    ]);
+    const post = server.requests.find((r) => r.url === "/browser/v1/request");
+    expect(post?.body).toMatchObject({ operation: { kind: "tabs.discover", query: "invoice" } });
+  });
+
+  it("attach sends the candidateId and surfaces the real tabId it returns", async () => {
+    runtimeHandler(() => ({
+      tab: {
+        tabId: "tab-existing-1",
+        groupId: "grp-internal",
+        sessionId: "s",
+        profileId: "profile-1",
+        url: "https://billing.example.com/draft",
+        title: "Invoice draft",
+        state: "ready",
+        browserEpoch: "epoch-a",
+        revision: 1,
+        chromeTabId: 7,
+        origin: "existing",
+      },
+    }));
+    const tool = toolByName("browser_tabs");
+    const res = await tool.execute(
+      "call-17",
+      { action: "attach", candidateId: "pcdt:profile-1:epoch-a:7" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(textOf(res.content)).toContain("tab-existing-1");
+    const post = server.requests.find((r) => r.url === "/browser/v1/request");
+    expect(post?.body).toMatchObject({ operation: { kind: "tabs.attach", candidateId: "pcdt:profile-1:epoch-a:7" } });
+    await expect(
+      tool.execute("call-18", { action: "attach" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/candidateId/);
+  });
+
+  it("sends page.back for history back and never a goto to the old url", async () => {
+    runtimeHandler(() => ({ text: "Went back to https://example.com/list", value: { url: "https://example.com/list", wentBack: true } }));
+    const nav = toolByName("browser_navigate");
+    const res = await nav.execute("call-19", { tabId: "tab-7", action: "back" }, undefined, undefined, makeCtx());
+    const post = server.requests.find((r) => r.url === "/browser/v1/request");
+    expect(post?.body).toMatchObject({ operation: { kind: "page.back", tabId: "tab-7" } });
+    expect((post?.body as { operation: Record<string, unknown> }).operation.url).toBeUndefined();
+    expect(textOf(res.content)).toContain("Went back");
+  });
+
+  it("activates an existing tab and lists child tabs by their source tab", async () => {
+    runtimeHandler(() => ({ tab: { tabId: "tab-7", groupId: "g", sessionId: "s", profileId: "profile-1", url: "https://x", title: "X", state: "ready", browserEpoch: "e", revision: 1, chromeTabId: 1, sourceTabId: "tab-1" } }));
+    const tool = toolByName("browser_tabs");
+    await tool.execute("call-20", { action: "activate", tabId: "tab-7" }, undefined, undefined, makeCtx());
+    const activate = server.requests.find((r) => r.url === "/browser/v1/request");
+    expect(activate?.body).toMatchObject({ operation: { kind: "tabs.activate", tabId: "tab-7" } });
+
+    await tool.execute("call-21", { action: "list", sourceTabId: "tab-1" }, undefined, undefined, makeCtx());
+    const list = server.requests.filter((r) => r.url === "/browser/v1/request").at(-1);
+    expect(list?.body).toMatchObject({ operation: { kind: "tabs.list", sourceTabId: "tab-1" } });
+    // The source link is part of what the model sees, not just details.
+    expect(textOf((await tool.execute("call-22", { action: "list", sourceTabId: "tab-1" }, undefined, undefined, makeCtx())).content)).toContain("tab-1");
+  });
 });

@@ -1,5 +1,11 @@
 import { BROWSER_PROTOCOL_VERSION } from 'playwriter/src/browser-protocol'
-import type { BrowserGroup, BrowserInventory, BrowserResourceState, BrowserTab } from 'playwriter/src/browser-protocol'
+import type {
+  BrowserGroup,
+  BrowserInventory,
+  BrowserResourceState,
+  BrowserTab,
+  BrowserTabOrigin,
+} from 'playwriter/src/browser-protocol'
 
 /**
  * Persistent ownership registry for managed (Pi) browser resources.
@@ -99,6 +105,7 @@ function readGroup(value: unknown): BrowserGroup | null {
   }
   const chromeGroupId = readNumber(value.chromeGroupId)
   const windowId = readNumber(value.windowId)
+  const origin = readOrigin(value.origin)
   return {
     groupId,
     sessionId,
@@ -109,7 +116,12 @@ function readGroup(value: unknown): BrowserGroup | null {
     revision,
     ...(chromeGroupId !== undefined ? { chromeGroupId } : {}),
     ...(windowId !== undefined ? { windowId } : {}),
+    ...(origin !== undefined ? { origin } : {}),
   }
+}
+
+function readOrigin(value: unknown): BrowserTabOrigin | undefined {
+  return value === 'task' || value === 'existing' ? value : undefined
 }
 
 function readTab(value: unknown): BrowserTab | null {
@@ -140,6 +152,8 @@ function readTab(value: unknown): BrowserTab | null {
   }
   const targetId = readString(value.targetId)
   const cdpSessionId = readString(value.cdpSessionId)
+  const origin = readOrigin(value.origin)
+  const sourceTabId = readString(value.sourceTabId)
   return {
     tabId,
     groupId,
@@ -153,6 +167,8 @@ function readTab(value: unknown): BrowserTab | null {
     chromeTabId,
     ...(targetId !== undefined ? { targetId } : {}),
     ...(cdpSessionId !== undefined ? { cdpSessionId } : {}),
+    ...(origin !== undefined ? { origin } : {}),
+    ...(sourceTabId !== undefined ? { sourceTabId } : {}),
   }
 }
 
@@ -296,7 +312,13 @@ function cloneWithRevision(
 
 export function addGroup(
   registry: ManagedResourceRegistry,
-  options: { groupId: string; sessionId: string; name: string; browserEpoch: string },
+  options: {
+    groupId: string
+    sessionId: string
+    name: string
+    browserEpoch: string
+    origin?: BrowserTabOrigin
+  },
 ): ManagedResourceRegistry {
   const group: BrowserGroup = {
     groupId: options.groupId,
@@ -306,6 +328,7 @@ export function addGroup(
     state: 'ready',
     browserEpoch: options.browserEpoch,
     revision: registry.revision + 1,
+    ...(options.origin !== undefined ? { origin: options.origin } : {}),
   }
   return cloneWithRevision(registry, { groups: [...registry.groups, group] })
 }
@@ -385,6 +408,8 @@ export function addTab(
     url: string
     title: string
     browserEpoch: string
+    origin?: BrowserTabOrigin
+    sourceTabId?: string
   },
 ): ManagedResourceRegistry {
   const tab: BrowserTab = {
@@ -398,6 +423,8 @@ export function addTab(
     browserEpoch: options.browserEpoch,
     revision: registry.revision + 1,
     chromeTabId: options.chromeTabId,
+    ...(options.origin !== undefined ? { origin: options.origin } : {}),
+    ...(options.sourceTabId !== undefined ? { sourceTabId: options.sourceTabId } : {}),
   }
   return cloneWithRevision(registry, { tabs: [...registry.tabs, tab] })
 }

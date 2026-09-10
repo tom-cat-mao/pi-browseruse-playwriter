@@ -32,6 +32,8 @@ export interface BrowserCapabilities {
   persistentOwnership: boolean
   explicitTabs: boolean
   isolatedExecution: boolean
+  /** Optional so a profile served by an older extension keeps working. */
+  existingTabControl?: boolean
 }
 
 export interface BrowserProfile {
@@ -43,6 +45,17 @@ export interface BrowserProfile {
   capabilities: BrowserCapabilities
 }
 
+/**
+ * How a resource came under this session's control. `task` is the original
+ * auto-grouped/task-owned flow; `existing` marks a tab the user was already
+ * using (and the child tabs opened from it) that we attached in place.
+ *
+ * `existing` groups carry no Chrome group binding on purpose: they must never be
+ * released by reconcile/tab.resolve just because the tab is not inside a task
+ * group, and attaching one must not pull the user's other same-group tabs in.
+ */
+export type BrowserTabOrigin = 'task' | 'existing'
+
 export interface BrowserGroup {
   groupId: string
   sessionId: string
@@ -53,6 +66,7 @@ export interface BrowserGroup {
   revision: number
   chromeGroupId?: number
   windowId?: number
+  origin?: BrowserTabOrigin
 }
 
 export interface BrowserTab {
@@ -68,6 +82,67 @@ export interface BrowserTab {
   chromeTabId: number
   targetId?: string
   cdpSessionId?: string
+  origin?: BrowserTabOrigin
+  /** Managed tab a new tab was opened from (target=_blank / window.open). */
+  sourceTabId?: string
+}
+
+/**
+ * One real tab found in a connected profile. Discovery metadata only: listing
+ * candidates never reads page content.
+ *
+ * `candidateId` is what `tabs.attach` takes. It pins profile + browserEpoch +
+ * chromeTabId, so a stale discovery can never attach an unrelated tab.
+ */
+export interface BrowserTabCandidate {
+  candidateId: string
+  profileId: string
+  profileLabel: string
+  browser: string
+  browserEpoch: string
+  windowId: number
+  /** True when this is the active tab of its own window (every window has one). */
+  active: boolean
+  /** True when its window currently has OS focus (false right after the user
+   *  switches back to the terminal - never treated as "the one current tab"). */
+  windowFocused: boolean
+  chromeTabId: number
+  url: string
+  title: string
+  /** Already under this session's control; attach returns the existing tab. */
+  managed: boolean
+  ownedByThisSession: boolean
+  /** Set when the tab is already managed by this session. */
+  tabId?: string
+  /** False when attach would be refused (restricted page, another session...). */
+  attachable: boolean
+  /** Why it cannot be attached, or why it is not listed as attachable. */
+  reason?: 'restricted-url' | 'owned-by-other-session' | 'unsupported-page'
+}
+
+const TAB_CANDIDATE_PREFIX = 'pcdt'
+
+/**
+ * Single source of truth for discovery identity. Every layer (extension, relay,
+ * Pi) uses these instead of re-deriving the format.
+ */
+export function buildTabCandidateId(options: {
+  profileId: string
+  browserEpoch: string
+  chromeTabId: number
+}): string {
+  return `${TAB_CANDIDATE_PREFIX}:${options.profileId}:${options.browserEpoch}:${options.chromeTabId}`
+}
+
+export function parseTabCandidateId(
+  candidateId: string,
+): { profileId: string; browserEpoch: string; chromeTabId: number } | null {
+  if (typeof candidateId !== 'string') return null
+  const parts = candidateId.split(':')
+  if (parts.length !== 4 || parts[0] !== TAB_CANDIDATE_PREFIX) return null
+  const chromeTabId = Number(parts[3])
+  if (!Number.isInteger(chromeTabId) || chromeTabId < 0) return null
+  return { profileId: parts[1], browserEpoch: parts[2], chromeTabId }
 }
 
 export type BrowserOperation =
@@ -76,14 +151,18 @@ export type BrowserOperation =
   | { kind: 'groups.create'; profileId: string; name: string }
   | { kind: 'groups.rename'; groupId: string; name: string }
   | { kind: 'groups.close'; groupId: string }
-  | { kind: 'tabs.list'; groupId?: string }
+  | { kind: 'tabs.list'; groupId?: string; sourceTabId?: string }
   | { kind: 'tabs.create'; groupId: string; url: string }
+  | { kind: 'tabs.discover'; profileId?: string; windowId?: number; query?: string; includeManaged?: boolean }
+  | { kind: 'tabs.attach'; candidateId: string }
+  | { kind: 'tabs.activate'; tabId: string }
   | { kind: 'tabs.close'; tabId: string }
   | { kind: 'tabs.release'; tabId: string }
   | { kind: 'tab.resolve'; tabId: string }
   | { kind: 'session.release' }
   | { kind: 'request.cancel'; targetRequestId: string }
   | { kind: 'page.navigate'; tabId: string; url: string }
+  | { kind: 'page.back'; tabId: string }
   | { kind: 'page.snapshot'; tabId: string; selector?: string; search?: string; full?: boolean; interactiveOnly?: boolean }
   | { kind: 'page.click'; tabId: string; selector: string; snapshotId?: string }
   | { kind: 'page.fill'; tabId: string; selector: string; value: string; snapshotId?: string }
@@ -120,6 +199,7 @@ export interface BrowserResultData {
   profiles?: BrowserProfile[]
   groups?: BrowserGroup[]
   tabs?: BrowserTab[]
+  candidates?: BrowserTabCandidate[]
   group?: BrowserGroup
   tab?: BrowserTab
   snapshotId?: string

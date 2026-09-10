@@ -90,6 +90,17 @@ pi install /path/to/checkout/pi
 The package registers the managed browser tools and talks HTTP to the runtime;
 it does not spawn a browser or call `npx playwriter@latest`.
 
+## Continue in an existing tab
+
+Use `browser_tabs` with `action: "discover"` to find tabs by profile, window,
+title and URL, then `action: "attach"` with the returned `candidateId` to
+continue in place. No replacement tab, reload or regrouping is needed.
+Find opened links with `sourceTabId`, return with `action: "activate"`, or use
+`browser_navigate` with `action: "back"` for normal history navigation.
+Text accessibility snapshots support this workflow without a vision model.
+See [the live results](./docs/exec/existing-tab-control-live-retest.md) and
+[the final reattachment check](./docs/exec/existing-tab-control-final-retest.md).
+
 ## Managed model
 
 - One Pi session can own **multiple named groups**. Every group has exactly one

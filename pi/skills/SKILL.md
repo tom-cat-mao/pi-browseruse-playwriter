@@ -15,17 +15,55 @@ by URL or title. Everything is addressed by id:
 - **Group** — a named tab group owned by *this* Pi session and bound to one fixed
   profile for its lifetime. Create with `browser_groups` (`action:"create"`,
   `name`, `profileId`). Same-name groups are allowed — each has its own `groupId`.
+  Attaching an existing tab creates its own internal group automatically; you
+  never have to name or manage it.
 - **Tab** — created inside a group with `browser_tabs`
-  (`action:"create"`, `groupId`, `url`). Use the returned `tabId` for every page
+  (`action:"create"`, `groupId`, `url`), or adopted from a tab the user already
+  had open with `action:"attach"`. Use the returned `tabId` for every page
   tool. `browser_groups list` / `browser_tabs list` only ever show *this*
   session's resources.
 
-Typical start of a task:
+Typical start of a *new* task:
 
 1. `browser_profiles` → pick a connected `profileId`.
 2. `browser_groups` create with a `name` + that `profileId` → get `groupId`.
 3. `browser_tabs` create with that `groupId` + a `url` → get `tabId`.
 4. Drive the page with `tabId`.
+
+## Joining a tab the user is already using
+
+The common request is *"look at the page I'm on and keep going"*. You do not need
+the URL, you do not open a replacement tab, and you never ask the user to create
+a group first:
+
+1. `browser_tabs` (`action:"discover"`, optionally `query`, `windowId`,
+   `profileId`) lists the real tabs of every connected profile with title, URL,
+   window, whether it is the active tab of its window, and whether its window has
+   focus. It is metadata only — nothing is read from the pages.
+2. Pick the entry that matches what the user described. Several windows can each
+   have an active tab and the browser may have no focus at all while the user
+   types — there is no single "current tab", so match on title/URL/window. If two
+   entries are genuinely indistinguishable, ask one short question instead of
+   guessing.
+3. `browser_tabs` (`action:"attach"`, `candidateId`) takes control **in place**:
+   no reload, no window move, no Chrome group change, scroll and form state
+   survive. You get back an ordinary `tabId` and every page tool works on it.
+   Tabs another session controls are refused, and only the tab you picked is
+   attached — never the rest of its Chrome group.
+4. Continue with the normal loop below.
+
+## Following a link and coming back
+
+- A link that opens a **new tab** is registered with the tab it came from. Find
+  it with `browser_tabs` (`action:"list"`, `sourceTabId: <tab you clicked in>`) —
+  never by URL and never by "the last tab". A popup can take a moment to appear;
+  listing again is enough, there is no need to wait blindly.
+- To go back to the original tab: `browser_tabs` (`action:"activate"`, `tabId`).
+  It becomes the active tab of its window again; nothing is closed or reopened.
+- A link that navigates the **same tab**: `browser_navigate`
+  (`tabId`, `action:"back"`) uses real browser history. Sites restore their own
+  state — scroll/form recovery depends on the site, so re-snapshot instead of
+  assuming. Nothing here re-navigates the old URL or rebuilds the tab.
 
 ## Core loop: observe → act → observe
 
@@ -36,6 +74,9 @@ Never chain actions blindly. For every step:
 3. Act with one tool (`browser_click`, `browser_fill`, ...).
 4. `browser_snapshot` / `browser_evaluate` again to verify. If nothing changed,
    you hit the wrong element or it is still loading — re-observe, don't re-click.
+
+Reading is DOM/accessibility-based, so a text-only model can do all of this;
+screenshots are an optional extra for visual/spatial questions.
 
 ## Selectors: refs over CSS
 

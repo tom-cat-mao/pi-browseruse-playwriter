@@ -34,6 +34,7 @@ import {
 
 const DEFAULT_PAGE_TIMEOUT_MS = 60_000
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const MAX_SNAPSHOT_CHARS = 40_000
 const MAX_SNAPSHOT_LINES = 2_000
 const MAX_LOG_ENTRIES = 1_000
@@ -160,6 +161,7 @@ export class ManagedExecutorWorkerRuntime {
 
   async execute(execution: ManagedExecution): Promise<BrowserResponse> {
     const requestId = execution.request.requestId
+    const requestDeadline = Date.now() + (execution.request.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
     let sideEffectsStarted = false
     try {
       this.validateExecution(execution)
@@ -173,7 +175,7 @@ export class ManagedExecutorWorkerRuntime {
         })
       }
       this.allowedTargetIds.add(targetId)
-      const page = this.getPage({ targetId })
+      const page = await this.getPage({ targetId, deadline: requestDeadline })
       const data = await this.executeOperation({
         request: execution.request,
         page,
@@ -421,31 +423,112 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
-  private getPage({ targetId }: { targetId: string }): Page {
-    if (!this.context) {
+  // Reattaching a physical target creates its Playwright page asynchronously;
+  // wait only for the requested target within the current request deadline.
+  private async getPage({ targetId, deadline }: { targetId: string; deadline: number }): Promise<Page> {
+    const context = this.context
+    if (!context) {
       throw new ManagedExecutorOperationError({
         code: 'profile-disconnected',
         message: 'Managed profile is not connected',
       })
     }
-    const pages = this.context
-      .pages()
-      .filter((page) => !page.isClosed() && page.targetId() === targetId)
-    if (pages.length === 0) {
-      throw new ManagedExecutorOperationError({
-        code: 'resource-not-found',
-        message: `No open Playwright page has targetId ${targetId}`,
+
+    const findPage = (): Page | null => {
+      const pages = context.pages().filter((page) => {
+        return !page.isClosed() && page.targetId() === targetId
+      })
+      if (pages.length > 1) {
+        throw new ManagedExecutorOperationError({
+          code: 'internal-error',
+          message: `Multiple Playwright pages reported targetId ${targetId}`,
+        })
+      }
+      return pages.find((page) => {
+        return page.targetId() === targetId
+      }) ?? null
+    }
+
+    const existingPage = findPage()
+    if (existingPage) {
+      this.registerPage(existingPage)
+      return existingPage
+    }
+
+    const timeoutError = (): ManagedExecutorOperationError => {
+      return new ManagedExecutorOperationError({
+        code: 'timeout',
+        message: `Timed out waiting for Playwright page with targetId ${targetId}`,
       })
     }
-    if (pages.length > 1) {
-      throw new ManagedExecutorOperationError({
-        code: 'internal-error',
-        message: `Multiple Playwright pages reported targetId ${targetId}`,
-      })
+    if (deadline <= Date.now()) {
+      throw timeoutError()
     }
-    const page = pages[0]
-    this.registerPage(page)
-    return page
+
+    return await new Promise<Page>((resolve, reject) => {
+      let settled = false
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null
+      const cleanup = (): void => {
+        context.off('page', onPage)
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle)
+          timeoutHandle = null
+        }
+      }
+      const resolvePage = (page: Page): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        cleanup()
+        this.registerPage(page)
+        resolve(page)
+      }
+      const rejectPage = (error: unknown): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        cleanup()
+        reject(error)
+      }
+      function onPage(page: Page): void {
+        if (page.isClosed() || page.targetId() !== targetId) {
+          return
+        }
+        try {
+          resolvePage(findPage() ?? page)
+        } catch (error) {
+          rejectPage(error)
+        }
+      }
+
+      context.on('page', onPage)
+      if (settled) {
+        return
+      }
+      try {
+        const recheckedPage = findPage()
+        if (recheckedPage) {
+          resolvePage(recheckedPage)
+          return
+        }
+      } catch (error) {
+        rejectPage(error)
+        return
+      }
+      if (settled) {
+        return
+      }
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        rejectPage(timeoutError())
+        return
+      }
+      timeoutHandle = setTimeout(() => {
+        rejectPage(timeoutError())
+      }, remainingMs)
+    })
   }
 
   private async executeOperation({
@@ -461,6 +544,8 @@ export class ManagedExecutorWorkerRuntime {
     switch (operation.kind) {
       case 'page.navigate':
         return await this.navigate({ page, url: operation.url, markSideEffectsStarted })
+      case 'page.back':
+        return await this.goBack({ page, markSideEffectsStarted })
       case 'page.snapshot':
         return await this.snapshot({
           page,
@@ -528,6 +613,39 @@ export class ManagedExecutorWorkerRuntime {
         title: await page.title(),
         status: response?.status() ?? null,
       },
+    }
+  }
+
+  /**
+   * Real browser history back — never a goto() to the previous URL, so the site
+   * keeps whatever it restores from its own history entry. Sites that rebuild
+   * scroll/form state from JS may still not restore it; we report the resulting
+   * URL and never assert more than we know.
+   */
+  private async goBack({
+    page,
+    markSideEffectsStarted,
+  }: {
+    page: Page
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
+    markSideEffectsStarted()
+    const response = await page.goBack({
+      waitUntil: 'domcontentloaded',
+      timeout: DEFAULT_NAVIGATION_TIMEOUT_MS,
+    })
+    this.invalidateSnapshot({ page })
+    const url = page.url()
+    const title = await page.title()
+    // A null response only means "no main-resource response to report" — a
+    // same-document/SPA/hash history entry goes back without one. Never claim
+    // nothing happened; report the tab's real state instead.
+    return {
+      text:
+        response === null
+          ? `Back request completed; the tab is now on ${url} (no navigation response; inspect the page to confirm its state)`
+          : `Went back to ${url}`,
+      value: { url, title, hadNavigationResponse: response !== null },
     }
   }
 

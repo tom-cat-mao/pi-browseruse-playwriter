@@ -25,17 +25,21 @@ import {
   listManagedGroups,
   listManagedTabs,
   noteManagedConnectionOpened,
+  parseBrowserInventory,
   parseBrowserRequest,
   type ManagedProfileSnapshot,
   type ManagedRelayState,
 } from './managed-relay.js'
-import type {
-  BrowserGroup,
-  BrowserInventory,
-  BrowserRequest,
-  BrowserResponse,
-  BrowserTab,
-  ManagedExecutorPoolContract,
+import {
+  buildTabCandidateId,
+  type BrowserGroup,
+  type BrowserInventory,
+  type BrowserRequest,
+  type BrowserResponse,
+  type BrowserResultData,
+  type BrowserTab,
+  type BrowserTabCandidate,
+  type ManagedExecutorPoolContract,
 } from './browser-protocol.js'
 
 const EXTENSION_ORIGIN = 'chrome-extension://pebbngnfojnignonigcnkdilknapkgid'
@@ -721,6 +725,7 @@ describe('managed /browser/v1 HTTP surface', () => {
     expect(capabilities).toMatchInlineSnapshot(`
       {
         "body": {
+          "existingTabControl": true,
           "explicitTabs": true,
           "isolatedExecution": true,
           "managedGroups": true,
@@ -977,6 +982,7 @@ describe('managed inventory registry', () => {
             "browser": "Chrome",
             "browserEpoch": "epoch-1",
             "capabilities": {
+              "existingTabControl": true,
               "explicitTabs": true,
               "isolatedExecution": true,
               "managedGroups": true,
@@ -2577,6 +2583,171 @@ describe('managed CDP scoping', () => {
     expect(managed.attachedTargets()).toEqual(['target-t1'])
   })
 
+  test('inventory arrival announces a cached target once to its owner only', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        revision: 1,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=1')
+        })
+      },
+      { message: 'initial inventory accepted' },
+    )
+
+    const owner = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({ browserSessionId: 'session-a', profileId: 'profile-1', browserEpoch: 'epoch-1' }).toString(),
+    })
+    const foreignOwner = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({ browserSessionId: 'session-b', profileId: 'profile-1', browserEpoch: 'epoch-1' }).toString(),
+    })
+    const targetInfo = {
+      targetId: 'target-t2',
+      type: 'page',
+      title: 'target-t2',
+      url: 'https://example.com/t2',
+      attached: true,
+      canAccessOpener: false,
+    }
+
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t2',
+      params: {
+        sessionId: 'pw-t2',
+        targetInfo,
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('target-t2')
+        })
+      },
+      { message: 'cached attachment received before ownership inventory' },
+    )
+    expect(owner.attachedTargets()).toEqual([])
+    expect(foreignOwner.attachedTargets()).toEqual([])
+
+    extension.sendInventory(
+      makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 'session-a' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return owner.attachedTargets().includes('target-t2')
+      },
+      { message: 'owner receives cached attachment after inventory' },
+    )
+    expect(owner.attachedTargets()).toEqual(['target-t2'])
+    expect(foreignOwner.attachedTargets()).toEqual([])
+
+    extension.sendInventory(
+      makeInventory({
+        revision: 3,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 'session-a' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=3')
+        })
+      },
+      { message: 'duplicate ownership inventory accepted' },
+    )
+    expect(owner.attachedTargets()).toEqual(['target-t2'])
+    expect(foreignOwner.attachedTargets()).toEqual([])
+  })
+
+  test('a ready inventory before the attachment event still announces the target once', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        revision: 1,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=1')
+        })
+      },
+      { message: 'initial inventory accepted' },
+    )
+    const owner = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({ browserSessionId: 'session-a', profileId: 'profile-1', browserEpoch: 'epoch-1' }).toString(),
+    })
+
+    extension.sendInventory(
+      makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 'session-a' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=2')
+        })
+      },
+      { message: 'ready inventory accepted before attachment' },
+    )
+    expect(owner.attachedTargets()).toEqual([])
+
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t2',
+      params: {
+        sessionId: 'pw-t2',
+        targetInfo: {
+          targetId: 'target-t2',
+          type: 'page',
+          title: 'target-t2',
+          url: 'https://example.com/t2',
+          attached: true,
+          canAccessOpener: false,
+        },
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return owner.attachedTargets().includes('target-t2')
+      },
+      { message: 'owner receives attachment after ready inventory' },
+    )
+    expect(owner.attachedTargets()).toEqual(['target-t2'])
+  })
+
   test('profile-wide, wrapper and unlisted root CDP commands are denied for managed clients', async () => {
     const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
@@ -3007,5 +3178,252 @@ describe('managed request parsing', () => {
         operation: { kind: 'tab.resolve', tabId: 't' },
       }),
     ).toMatchObject({ ok: true })
+  })
+
+  test('accepts existing-tab operations and keeps their new optional fields', () => {
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'tabs.discover', query: 'invoice', includeManaged: false },
+      }),
+    ).toMatchObject({ ok: true })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'tabs.attach', candidateId: 'pcdt:profile-1:epoch-a:7' },
+      }),
+    ).toMatchObject({ ok: true })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.back', tabId: 't' },
+      }),
+    ).toMatchObject({ ok: true })
+    // Unknown fields stay rejected so a typo cannot be silently ignored.
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'tabs.attach', candidate: 'nope' },
+      }),
+    ).toMatchObject({ ok: false })
+  })
+
+  test('inventory parsing keeps the in-place origin and the source tab of a popup', () => {
+    const parsed = parseBrowserInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1', origin: 'existing' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1', origin: 'existing', sourceTabId: 't0' })],
+      }),
+    )
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    expect(parsed.value.groups[0]?.origin).toBe('existing')
+    expect(parsed.value.tabs[0]?.origin).toBe('existing')
+    expect(parsed.value.tabs[0]?.sourceTabId).toBe('t0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Existing tab discovery and in-place attach
+// ---------------------------------------------------------------------------
+
+function makeCandidate(options: {
+  profileId: string
+  browserEpoch: string
+  chromeTabId: number
+  windowId: number
+  title: string
+  url: string
+  active?: boolean
+  windowFocused?: boolean
+}): BrowserTabCandidate {
+  return {
+    candidateId: buildTabCandidateId(options),
+    profileId: options.profileId,
+    profileLabel: '',
+    browser: '',
+    browserEpoch: options.browserEpoch,
+    windowId: options.windowId,
+    active: options.active ?? false,
+    windowFocused: options.windowFocused ?? false,
+    chromeTabId: options.chromeTabId,
+    url: options.url,
+    title: options.title,
+    managed: false,
+    ownedByThisSession: false,
+    attachable: true,
+  }
+}
+
+describe('existing tab discovery and in-place attach', () => {
+  test('discovery fans out to every connected profile and keeps real identifiers', async () => {
+    const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
+    const first = await connectTrackedExtension({ port: relay.port, installId: 'profile-1', email: 'work@example.com' })
+    const second = await connectTrackedExtension({ port: relay.port, installId: 'profile-2', email: 'home@example.com' })
+    first.sendInventory(makeInventory({ groups: [], tabs: [] }))
+    second.sendInventory(makeInventory({ profileId: 'profile-2', groups: [], tabs: [] }))
+    await waitForExtensionCount({ port: relay.port, count: 2 })
+
+    first.onRequest = (request) => {
+      return {
+        requestId: request.requestId,
+        ok: true,
+        data: {
+          candidates: [
+            makeCandidate({
+              profileId: 'profile-1',
+              browserEpoch: 'epoch-1',
+              chromeTabId: 7,
+              windowId: 3,
+              title: 'Invoice draft',
+              url: 'https://billing.example.com/draft',
+              active: true,
+            }),
+          ],
+        },
+      }
+    }
+    second.onRequest = (request) => {
+      return {
+        requestId: request.requestId,
+        ok: true,
+        data: {
+          candidates: [
+            makeCandidate({
+              profileId: 'profile-2',
+              browserEpoch: 'epoch-1',
+              chromeTabId: 9,
+              windowId: 4,
+              title: 'Invoice draft',
+              url: 'https://billing.example.com/draft',
+              windowFocused: true,
+            }),
+          ],
+        },
+      }
+    }
+
+    const discovered = await browserRequest({
+      port: relay.port,
+      request: { requestId: 'discover-1', sessionId: 's1', operation: { kind: 'tabs.discover', query: 'invoice' } },
+    })
+    expect(discovered.status).toBe(200)
+    expect(discovered.body).toMatchObject({ ok: true })
+    const data = (discovered.body as { data: BrowserResultData }).data
+    // Both profiles are named so Pi can tell two same-titled tabs apart, and
+    // each entry keeps its own window + active/focus state (no global "current").
+    expect(data.candidates?.map((candidate) => {
+      return {
+        candidateId: candidate.candidateId,
+        profileLabel: candidate.profileLabel,
+        browser: candidate.browser,
+        windowId: candidate.windowId,
+        active: candidate.active,
+        windowFocused: candidate.windowFocused,
+      }
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "active": true,
+          "browser": "Chrome",
+          "candidateId": "pcdt:profile-1:epoch-1:7",
+          "profileLabel": "work@example.com",
+          "windowFocused": false,
+          "windowId": 3,
+        },
+        {
+          "active": false,
+          "browser": "Chrome",
+          "candidateId": "pcdt:profile-2:epoch-1:9",
+          "profileLabel": "home@example.com",
+          "windowFocused": true,
+          "windowId": 4,
+        },
+      ]
+    `)
+
+    const filtered = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'discover-2',
+        sessionId: 's1',
+        operation: { kind: 'tabs.discover', profileId: 'profile-2' },
+      },
+    })
+    const filteredData = (filtered.body as { data: BrowserResultData }).data
+    expect(filteredData.candidates).toHaveLength(1)
+    expect(filteredData.candidates?.[0]?.profileId).toBe('profile-2')
+    expect(first.received.filter((request) => request.operation.kind === 'tabs.discover')).toHaveLength(1)
+    expect(second.received.filter((request) => request.operation.kind === 'tabs.discover')).toHaveLength(2)
+  })
+
+  test('attach routes by the candidate profile and refuses a stale browser epoch', async () => {
+    const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(makeInventory({ groups: [], tabs: [] }))
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+    extension.onRequest = (request) => {
+      return {
+        requestId: request.requestId,
+        ok: true,
+        data: { tab: makeTab({ tabId: 'pt-1', groupId: 'pg-1', sessionId: 's1', origin: 'existing' }) },
+      }
+    }
+
+    const attached = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'attach-1',
+        sessionId: 's1',
+        operation: {
+          kind: 'tabs.attach',
+          candidateId: buildTabCandidateId({ profileId: 'profile-1', browserEpoch: 'epoch-1', chromeTabId: 7 }),
+        },
+      },
+    })
+    expect(attached.body).toMatchObject({ ok: true, data: { tab: { tabId: 'pt-1', sessionId: 's1' } } })
+    expect(extension.received).toHaveLength(1)
+
+    // Chrome tab ids are only valid inside one browser run: a discovery from a
+    // previous epoch must never attach whatever now owns that id.
+    const stale = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'attach-2',
+        sessionId: 's1',
+        operation: {
+          kind: 'tabs.attach',
+          candidateId: buildTabCandidateId({ profileId: 'profile-1', browserEpoch: 'epoch-0', chromeTabId: 7 }),
+        },
+      },
+    })
+    expect(stale.status).toBe(200)
+    expect(stale.body).toMatchObject({
+      ok: false,
+      error: { code: 'stale-snapshot', outcome: 'not-started' },
+    })
+    expect(extension.received).toHaveLength(1)
+
+    const garbage = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'attach-3',
+        sessionId: 's1',
+        operation: { kind: 'tabs.attach', candidateId: 'not-a-discovery' },
+      },
+    })
+    expect(garbage.body).toMatchObject({ ok: false, error: { code: 'invalid-request' } })
+    expect(extension.received).toHaveLength(1)
   })
 })
