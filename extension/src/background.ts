@@ -1298,11 +1298,11 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
     return
   }
 
-  // Managed tabs keep their ownership on transient detaches; only the Chrome
-  // infobar cancel counts as a user release. Chrome cancels every debugger
-  // session at once, so the remaining ready tabs become disconnected.
+  // Managed tabs keep their ownership on transient detaches; the Chrome infobar
+  // cancel applies to every debugger session at once and is treated as a global
+  // user stop (no tab is auto re-attached afterwards).
   void managedGroups.handleDebuggerDetached(tabId, reason, {
-    releaseAllReady: reason === chrome.debugger.DetachReason.CANCELED_BY_USER,
+    userCanceledAll: reason === chrome.debugger.DetachReason.CANCELED_BY_USER,
   })
 
   logger.warn(`DISCONNECT: onDebuggerDetach tabId=${tabId} reason=${reason}`)
@@ -2220,6 +2220,15 @@ chrome.action.onClicked.addListener(onActionClicked)
 // groups are session-owned, so this only drops the stale physical binding.
 chrome.tabGroups.onRemoved.addListener((group) => {
   void managedGroups.handleChromeGroupRemoved(group.id)
+})
+// Manual renames / window moves of a managed group are identified by Chrome
+// group id (never by title) and synced back into the registry.
+chrome.tabGroups.onUpdated.addListener((group) => {
+  void managedGroups.handleChromeGroupUpdated({
+    chromeGroupId: group.id,
+    title: group.title,
+    windowId: group.windowId,
+  })
 })
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void updateIcons()
