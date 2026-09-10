@@ -89,13 +89,15 @@ export function createCdpLogger({
   // Keep half the entries after rotation so we don't rotate on every write
   const keepAfterRotation = Math.floor(resolvedMaxEntries / 2)
 
+  // Append mode creates the file without truncating: a second process racing
+  // for the same data dir must not wipe the running relay's logs.
   const enabled = (() => {
     try {
       const logDir = path.dirname(resolvedLogFilePath)
       if (!fs.existsSync(logDir)) {
         fs.mkdirSync(logDir, { recursive: true })
       }
-      fs.writeFileSync(resolvedLogFilePath, '')
+      fs.appendFileSync(resolvedLogFilePath, '')
       return true
     } catch {
       return false

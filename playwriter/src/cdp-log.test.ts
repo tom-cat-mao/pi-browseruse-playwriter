@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import fs from 'node:fs'
-import path from 'node:path'
-import os from 'node:os'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { createCdpLogger, type CdpLogEntry } from './cdp-log.js'
+import { makeTestTmpDir, removeTestTmpDir } from './test-tmp.js'
 
 function makeTmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-log-test-'))
+  return makeTestTmpDir('cdp-log')
 }
 
 function makeEntry(i: number): CdpLogEntry {
@@ -60,7 +60,7 @@ describe('CDP log rotation', () => {
       ]
     `)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('does not rotate when under maxEntries', async () => {
@@ -78,7 +78,7 @@ describe('CDP log rotation', () => {
     expect(ids[0]).toBe(0)
     expect(ids[29]).toBe(29)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('handles multiple rotations', async () => {
@@ -103,7 +103,21 @@ describe('CDP log rotation', () => {
     // No entries from the very beginning should survive multiple rotations
     expect(ids[0]).toBeGreaterThan(10)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
+  })
+
+  it('appends to an existing log file without truncating it', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'cdp.jsonl')
+    fs.writeFileSync(logFile, `${JSON.stringify(makeEntry(1))}\n`)
+    const logger = createCdpLogger({ logFilePath: logFile })
+
+    logger.log(makeEntry(2))
+    await logger.flush()
+
+    expect(readIds(logFile)).toEqual([1, 2])
+
+    removeTestTmpDir(tmpDir)
   })
 
   it('marks dropped lines when the buffer cap is exceeded', async () => {
@@ -141,7 +155,7 @@ describe('CDP log rotation', () => {
       ]
     `)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('disables itself without throwing when the log path cannot be written', async () => {
@@ -157,7 +171,7 @@ describe('CDP log rotation', () => {
 
     expect(fs.readdirSync(logFile)).toEqual([])
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('keeps logging after an append failure without rejecting the queue', async () => {
@@ -178,7 +192,7 @@ describe('CDP log rotation', () => {
     logger.log(makeEntry(3))
     await expect(logger.flush()).resolves.toBeUndefined()
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 
   it('uses atomic rename for rotation', async () => {
@@ -197,6 +211,6 @@ describe('CDP log rotation', () => {
     const ids = readIds(logFile)
     expect(ids[ids.length - 1]).toBe(14)
 
-    fs.rmSync(tmpDir, { recursive: true })
+    removeTestTmpDir(tmpDir)
   })
 })

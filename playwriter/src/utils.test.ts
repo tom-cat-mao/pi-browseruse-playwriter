@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import os from 'node:os'
-import path from 'node:path'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {
   ALLOWED_EXTENSION_IDS,
   DEFAULT_BROWSER_DATA_DIR,
@@ -8,6 +8,7 @@ import {
   EXTENSION_IDS,
   FORK_EXTENSION_IDS,
   getCdpUrl,
+  isLoopbackHost,
   parseRelayHost,
   resolveBrowserRuntimeConfig,
 } from './utils.js'
@@ -49,11 +50,29 @@ describe('resolveBrowserRuntimeConfig', () => {
     })
   })
 
-  it('ignores invalid ports instead of starting on NaN', () => {
-    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: 'not-a-port' } }).port).toBe(19989)
-    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: '0' } }).port).toBe(19989)
-    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: '-1' } }).port).toBe(19989)
-    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: '19989.5' } }).port).toBe(19989)
+  it('uses the default when the port is unset or empty', () => {
+    expect(resolveBrowserRuntimeConfig({ env: {} }).port).toBe(19989)
+    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: '' } }).port).toBe(19989)
+  })
+
+  it('rejects invalid ports instead of silently falling back', () => {
+    for (const value of ['0', '-1', '65536', '19989.5', 'not-a-port', ' ']) {
+      expect(() => resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: value } })).toThrow(/Invalid PI_BROWSER_PORT/)
+    }
+    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: '1' } }).port).toBe(1)
+    expect(resolveBrowserRuntimeConfig({ env: { PI_BROWSER_PORT: '65535' } }).port).toBe(65535)
+  })
+})
+
+describe('isLoopbackHost', () => {
+  it('accepts loopback names and rejects everything else', () => {
+    expect(isLoopbackHost('127.0.0.1')).toBe(true)
+    expect(isLoopbackHost('127.0.0.2')).toBe(true)
+    expect(isLoopbackHost('localhost')).toBe(true)
+    expect(isLoopbackHost('::1')).toBe(true)
+    expect(isLoopbackHost('0.0.0.0')).toBe(false)
+    expect(isLoopbackHost('192.168.1.10')).toBe(false)
+    expect(isLoopbackHost('runtime.example.com')).toBe(false)
   })
 })
 

@@ -3,7 +3,8 @@
  * Used by both MCP and CLI.
  */
 
-import fs from 'node:fs'
+import * as crypto from 'node:crypto'
+import * as fs from 'node:fs'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,6 +15,7 @@ import {
   sleep,
   LOG_FILE_PATH,
   DEFAULT_BROWSER_RUNTIME_PORT,
+  isLoopbackHost,
   resolveBrowserRuntimeConfig,
 } from './utils.js'
 import { BROWSER_PROTOCOL_VERSION, type BrowserCapabilities } from './browser-protocol.js'
@@ -51,34 +53,55 @@ export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<
 }
 
 export type RelayProbeResult =
-  | { state: 'running'; version: string | null }
+  | { state: 'ready'; version: string }
+  | { state: 'occupied' }
   | { state: 'unauthorized' }
-  | { state: 'down' }
+  | { state: 'unreachable' }
+
+function formatProbeBaseUrl({ host, port }: { host: string; port: number }): string {
+  if (host.startsWith('http://') || host.startsWith('https://')) {
+    const url = new URL(host)
+    if (!url.port) {
+      url.port = String(port)
+    }
+    return url.origin
+  }
+  return `http://${host}:${port}`
+}
 
 /**
- * Probe a relay port without assuming "no version" means "down".
- * HTTP 401/403 means a relay is up but wants a token, and any other HTTP
- * response means something is listening that is not necessarily a relay.
- * Callers must not kill processes based on this result alone.
+ * Probe a relay port. Only a valid /version payload counts as `ready`;
+ * anything else that answers HTTP is `occupied`, 401/403 is `unauthorized`,
+ * and network errors are `unreachable`. Callers must not kill processes based
+ * on this result alone.
  */
 export async function probeRelayServer({
+  host = '127.0.0.1',
   port = RELAY_PORT,
   timeoutMs = 2000,
-}: { port?: number; timeoutMs?: number } = {}): Promise<RelayProbeResult> {
+}: { host?: string; port?: number; timeoutMs?: number } = {}): Promise<RelayProbeResult> {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/version`, {
+    const response = await fetch(`${formatProbeBaseUrl({ host, port })}/version`, {
       signal: AbortSignal.timeout(timeoutMs),
     })
     if (response.status === 401 || response.status === 403) {
       return { state: 'unauthorized' }
     }
     if (!response.ok) {
-      return { state: 'running', version: null }
+      return { state: 'occupied' }
     }
-    const data = (await response.json()) as { version?: unknown }
-    return { state: 'running', version: typeof data.version === 'string' ? data.version : null }
+    let data: unknown
+    try {
+      data = await response.json()
+    } catch {
+      return { state: 'occupied' }
+    }
+    if (typeof data !== 'object' || data === null || typeof (data as { version?: unknown }).version !== 'string') {
+      return { state: 'occupied' }
+    }
+    return { state: 'ready', version: (data as { version: string }).version }
   } catch {
-    return { state: 'down' }
+    return { state: 'unreachable' }
   }
 }
 
@@ -86,7 +109,7 @@ export type ManagedRuntimeProbeResult =
   | { state: 'ready'; version: string | null; capabilities: BrowserCapabilities }
   | { state: 'unsupported'; version: string | null }
   | { state: 'unauthorized' }
-  | { state: 'down' }
+  | { state: 'unreachable' }
 
 function parseBrowserCapabilities(value: unknown): BrowserCapabilities | null {
   if (typeof value !== 'object' || value === null) {
@@ -117,38 +140,34 @@ function parseBrowserCapabilities(value: unknown): BrowserCapabilities | null {
  * endpoints is reported as `unsupported` instead of being replaced.
  */
 export async function probeManagedRuntime({
+  host = '127.0.0.1',
   port = MANAGED_RUNTIME_PORT,
   token,
   timeoutMs = 2000,
-}: { port?: number; token?: string; timeoutMs?: number } = {}): Promise<ManagedRuntimeProbeResult> {
+}: { host?: string; port?: number; token?: string; timeoutMs?: number } = {}): Promise<ManagedRuntimeProbeResult> {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/browser/v1/capabilities`, {
+    const response = await fetch(`${formatProbeBaseUrl({ host, port })}/browser/v1/capabilities`, {
       signal: AbortSignal.timeout(timeoutMs),
       headers: token ? { authorization: `Bearer ${token}` } : undefined,
     })
     if (response.status === 401 || response.status === 403) {
       return { state: 'unauthorized' }
     }
-    if (response.status === 404 || response.status === 405) {
-      const relay = await probeRelayServer({ port, timeoutMs })
-      return { state: 'unsupported', version: relay.state === 'running' ? relay.version : null }
+    if (response.ok) {
+      const capabilities = parseBrowserCapabilities(await response.json().catch(() => null))
+      if (capabilities) {
+        const relay = await probeRelayServer({ host, port, timeoutMs })
+        return {
+          state: 'ready',
+          version: relay.state === 'ready' ? relay.version : null,
+          capabilities,
+        }
+      }
     }
-    if (!response.ok) {
-      const relay = await probeRelayServer({ port, timeoutMs })
-      return { state: 'unsupported', version: relay.state === 'running' ? relay.version : null }
-    }
-    const capabilities = parseBrowserCapabilities(await response.json())
-    if (!capabilities) {
-      return { state: 'unsupported', version: null }
-    }
-    const relay = await probeRelayServer({ port, timeoutMs })
-    return {
-      state: 'ready',
-      version: relay.state === 'running' ? relay.version : null,
-      capabilities,
-    }
+    const relay = await probeRelayServer({ host, port, timeoutMs })
+    return { state: 'unsupported', version: relay.state === 'ready' ? relay.version : null }
   } catch {
-    return { state: 'down' }
+    return { state: 'unreachable' }
   }
 }
 
@@ -384,12 +403,13 @@ async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Pr
     )
   }
 
-  if (!forceRestart && probe.state === 'running') {
-    if (probe.version === null) {
-      throw new Error(
-        `Port ${RELAY_PORT} is serving HTTP but has no playwriter /version endpoint. Refusing to stop a process this client does not own.`,
-      )
-    }
+  if (!forceRestart && probe.state === 'occupied') {
+    throw new Error(
+      `Port ${RELAY_PORT} is serving HTTP that is not a playwriter relay. Refusing to stop a process this client does not own.`,
+    )
+  }
+
+  if (!forceRestart && probe.state === 'ready') {
     if (probe.version === VERSION) {
       return
     }
@@ -412,7 +432,7 @@ async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Pr
     await killRelayServer({ port: RELAY_PORT })
   }
 
-  if (probe.state === 'down') {
+  if (probe.state === 'unreachable') {
     const listeningPids = await getListeningPidsForPort({ port: RELAY_PORT }).catch(() => [])
     if (listeningPids.length > 0) {
       // Something bound the port but /version did not respond yet. It may be a
@@ -509,55 +529,72 @@ function resolveManagedRuntimeEntry(): { command: string; args: string[] } {
   return { command: 'tsx', args: [path.join(packageRoot, 'src', 'runtime-cli.ts')] }
 }
 
-let pendingManagedEnsure: Promise<EnsureManagedRuntimeResult> | null = null
+const pendingManagedEnsures = new Map<string, Promise<EnsureManagedRuntimeResult>>()
+
+function managedEndpointKey({ host, port, token }: { host: string; port: number; token?: string }): string {
+  const tokenFingerprint = token ? crypto.createHash('sha256').update(token).digest('hex').slice(0, 12) : 'none'
+  return `${host}:${port}:${tokenFingerprint}`
+}
 
 /**
  * Ensure the managed @tom-cat/pi-browser-runtime server is running.
- * Capability negotiation replaces version comparison and this never kills a
- * process it does not own: an unknown or token-protected listener on the port
- * is reported as an explicit error instead.
+ * In-flight calls are deduplicated per endpoint, never across hosts or tokens.
+ * This never kills a process it does not own and never spawns for a remote
+ * host: a token-protected or capability-less listener is an explicit error.
  */
 export async function ensureManagedRuntime(
   options: EnsureManagedRuntimeOptions = {},
 ): Promise<EnsureManagedRuntimeResult> {
-  if (pendingManagedEnsure) {
-    return pendingManagedEnsure
+  const baseConfig = resolveBrowserRuntimeConfig()
+  const host = options.host ?? baseConfig.host
+  const port = options.port ?? baseConfig.port
+  const token = options.token ?? baseConfig.token
+  const key = managedEndpointKey({ host, port, token })
+
+  const pending = pendingManagedEnsures.get(key)
+  if (pending) {
+    return pending
   }
-  pendingManagedEnsure = ensureManagedRuntimeImpl(options).finally(() => {
-    pendingManagedEnsure = null
+  const promise = ensureManagedRuntimeImpl({ ...options, host, port, token }).finally(() => {
+    pendingManagedEnsures.delete(key)
   })
-  return pendingManagedEnsure
+  pendingManagedEnsures.set(key, promise)
+  return promise
 }
 
 async function ensureManagedRuntimeImpl(
   options: EnsureManagedRuntimeOptions = {},
 ): Promise<EnsureManagedRuntimeResult> {
-  const { logger, port, host, token, dataDir, env: additionalEnv, timeoutMs = 8000 } = options
+  const { logger, port = MANAGED_RUNTIME_PORT, host = '127.0.0.1', token, dataDir, env: additionalEnv, timeoutMs = 8000 } =
+    options
   const baseConfig = resolveBrowserRuntimeConfig()
-  const resolvedPort = port ?? baseConfig.port
-  const resolvedHost = host ?? baseConfig.host
-  const resolvedToken = token ?? baseConfig.token
   const resolvedDataDir = dataDir ?? baseConfig.dataDir
 
-  const probe = await probeManagedRuntime({ port: resolvedPort, token: resolvedToken })
+  const probe = await probeManagedRuntime({ host, port, token })
 
   if (probe.state === 'ready') {
-    return { started: false, port: resolvedPort, version: probe.version, capabilities: probe.capabilities }
+    return { started: false, port, version: probe.version, capabilities: probe.capabilities }
   }
 
   if (probe.state === 'unauthorized') {
     throw new Error(
-      `Managed runtime on port ${resolvedPort} rejected the request with HTTP 401. Set the same PI_BROWSER_TOKEN for the client and the runtime; refusing to replace the running process.`,
+      `Managed runtime on ${host}:${port} rejected the request with HTTP 401. Set the same PI_BROWSER_TOKEN for the client and the runtime; refusing to replace the running process.`,
     )
   }
 
   if (probe.state === 'unsupported') {
     throw new Error(
-      `Port ${resolvedPort} is serving a relay without the managed browser API (${probe.version ? `v${probe.version}` : 'unknown version'}). Refusing to replace it; run \`pi-browser-runtime\` on another port or stop it yourself.`,
+      `${host}:${port} is serving a listener without the managed browser API (${probe.version ? `v${probe.version}` : 'unknown version'}). Refusing to replace it; run \`pi-browser-runtime\` on another port or stop it yourself.`,
     )
   }
 
-  logger?.log(pc.dim(`Managed runtime not running on port ${resolvedPort}, starting it...`))
+  if (!isLoopbackHost(host)) {
+    throw new Error(
+      `Managed runtime on ${host}:${port} is unreachable. Refusing to start a process for a non-loopback host.`,
+    )
+  }
+
+  logger?.log(pc.dim(`Managed runtime not running on ${host}:${port}, starting it...`))
 
   const entry = resolveManagedRuntimeEntry()
   const serverProcess = spawn(entry.command, entry.args, {
@@ -565,32 +602,31 @@ async function ensureManagedRuntimeImpl(
     stdio: 'ignore',
     env: {
       ...process.env,
-      PI_BROWSER_HOST: resolvedHost,
-      PI_BROWSER_PORT: String(resolvedPort),
+      PI_BROWSER_HOST: host,
+      PI_BROWSER_PORT: String(port),
       PI_BROWSER_DATA_DIR: resolvedDataDir,
-      ...(resolvedToken ? { PI_BROWSER_TOKEN: resolvedToken } : {}),
+      ...(token ? { PI_BROWSER_TOKEN: token } : {}),
       ...additionalEnv,
     },
   })
   serverProcess.unref()
 
+  const runtimeLogPath = path.join(resolvedDataDir, 'relay-server.log')
   const startTime = Date.now()
   while (Date.now() - startTime < timeoutMs) {
     await sleep(200)
-    const newProbe = await probeManagedRuntime({ port: resolvedPort, token: resolvedToken })
+    const newProbe = await probeManagedRuntime({ host, port, token })
     if (newProbe.state === 'ready') {
       logger?.log(pc.green('Managed runtime started successfully'))
-      return { started: true, port: resolvedPort, version: newProbe.version, capabilities: newProbe.capabilities }
+      return { started: true, port, version: newProbe.version, capabilities: newProbe.capabilities }
     }
     if (newProbe.state === 'unauthorized') {
       throw new Error(
-        `Managed runtime on port ${resolvedPort} requires PI_BROWSER_TOKEN that does not match this client. Check the token and the runtime logs at ${path.join(resolvedDataDir, 'relay-server.log')}.`,
+        `Managed runtime on ${host}:${port} requires PI_BROWSER_TOKEN that does not match this client. Check the token and the runtime logs at ${runtimeLogPath}.`,
       )
     }
   }
 
   const waitedMs = Date.now() - startTime
-  throw new Error(
-    `Failed to start managed runtime within ${waitedMs}ms. Check logs at ${path.join(resolvedDataDir, 'relay-server.log')}.`,
-  )
+  throw new Error(`Failed to start managed runtime within ${waitedMs}ms. Check logs at ${runtimeLogPath}.`)
 }
