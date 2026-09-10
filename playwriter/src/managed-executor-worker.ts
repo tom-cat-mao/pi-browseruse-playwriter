@@ -560,7 +560,7 @@ export class ManagedExecutorWorkerRuntime {
     return {
       text:
         response === null
-          ? `Went back; the tab is now on ${url} (no navigation response — normal for same-document or SPA history entries)`
+          ? `Back request completed; the tab is now on ${url} (no navigation response; inspect the page to confirm its state)`
           : `Went back to ${url}`,
       value: { url, title, hadNavigationResponse: response !== null },
     }
