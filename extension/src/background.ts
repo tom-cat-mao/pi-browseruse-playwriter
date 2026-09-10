@@ -543,8 +543,11 @@ class ConnectionManager {
       // request envelope and expects the legacy response envelope back.
       if (message.method === 'browserRequest') {
         const params: BrowserRequest = message.params
+        const requestSocket = this.ws
         const result = await managedGroups.handleBrowserRequest(params)
-        sendMessage({ id: message.id, result })
+        // Answer on the socket this request arrived on (or drop it): a response
+        // must never be sent on a newer connection with the same message id.
+        sendMessageToSocket(requestSocket, { id: message.id, result })
         return
       }
 
@@ -567,9 +570,6 @@ class ConnectionManager {
       logger.debug('WebSocket error:', event)
     }
 
-    chrome.debugger.onEvent.addListener(onDebuggerEvent)
-    chrome.debugger.onDetach.addListener(onDebuggerDetach)
-
     // Restore managed ownership bindings and re-attach debuggers before any
     // CDP routing starts; this never replays page actions, only connections.
     void managedGroups.handleWsConnected()
@@ -591,8 +591,9 @@ class ConnectionManager {
     } catch {}
     logger.warn(`DISCONNECT: WS closed code=${code} reason=${reason || 'none'} stack=${getCallStack()}`)
 
-    chrome.debugger.onEvent.removeListener(onDebuggerEvent)
-    chrome.debugger.onDetach.removeListener(onDebuggerDetach)
+    // Invalidate the dropped connection: its in-flight control requests must not
+    // write to Chrome or send responses on a new socket.
+    managedGroups.handleWsDisconnected()
 
     const isExtensionReplaced = reason === 'Extension Replaced' || code === 4001
     const isExtensionInUse = reason === 'Extension Already In Use' || code === 4002
@@ -601,9 +602,7 @@ class ConnectionManager {
     const { tabs } = store.getState()
 
     for (const [tabId] of tabs) {
-      chrome.debugger.detach({ tabId }).catch((err) => {
-        logger.debug('Error detaching from tab:', tabId, err.message)
-      })
+      detachDebuggerProgrammatically(tabId)
     }
 
     childSessions.clear()
@@ -866,6 +865,19 @@ export function sendMessage(message: any): void {
     } catch (error: any) {
       console.debug('ERROR sending message:', error, 'message type:', message.method || 'response')
     }
+  }
+}
+
+/** Sends a response on the socket a request arrived on; drops it when closed. */
+function sendMessageToSocket(socket: WebSocket | null, message: unknown): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    logger.debug('Dropping response: the request websocket is no longer open')
+    return
+  }
+  try {
+    socket.send(JSON.stringify(message))
+  } catch (error: unknown) {
+    logger.debug('Error sending response on the request socket:', error)
   }
 }
 
@@ -1286,26 +1298,35 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
   })
 }
 
+// Chrome fires chrome.debugger.onDetach for API-initiated detaches too. Track the
+// detaches we request so our own teardown is never mistaken for a user action;
+// the user-control listener itself stays registered for the worker's lifetime.
+const programmaticDetachUntil = new Map<number, number>()
+
+function detachDebuggerProgrammatically(tabId: number): void {
+  programmaticDetachUntil.set(tabId, Date.now() + 3000)
+  chrome.debugger.detach({ tabId }).catch((err: Error) => {
+    logger.debug('Error detaching from tab:', tabId, err.message)
+  })
+}
+
+function consumeProgrammaticDetach(tabId: number): boolean {
+  const until = programmaticDetachUntil.get(tabId)
+  if (until === undefined) return false
+  programmaticDetachUntil.delete(tabId)
+  return until > Date.now()
+}
+
 function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.debugger.DetachReason}`): void {
   const tabId = source.tabId
-  if (!tabId || !store.getState().tabs.has(tabId)) {
-    logger.debug('Ignoring debugger detach event for untracked tab:', tabId)
+  if (!tabId) {
+    logger.debug('Ignoring debugger detach event without a tab id:', reason)
     return
   }
-
-  if (connectionManager.preserveTabsOnDetach) {
-    logger.debug('Ignoring debugger detach during relay reconnect:', tabId, reason)
+  if (consumeProgrammaticDetach(tabId)) {
+    logger.debug('Ignoring debugger detach we requested ourselves:', tabId, reason)
     return
   }
-
-  // Managed tabs keep their ownership on transient detaches; the Chrome infobar
-  // cancel applies to every debugger session at once and is treated as a global
-  // user stop (no tab is auto re-attached afterwards).
-  void managedGroups.handleDebuggerDetached(tabId, reason, {
-    userCanceledAll: reason === chrome.debugger.DetachReason.CANCELED_BY_USER,
-  })
-
-  logger.warn(`DISCONNECT: onDebuggerDetach tabId=${tabId} reason=${reason}`)
 
   const detachTabFromPlaywright = (detachedTabId: number, tab: TabInfo) => {
     sendMessage({
@@ -1319,16 +1340,32 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
   }
 
   if (reason === chrome.debugger.DetachReason.CANCELED_BY_USER) {
-    // Chrome's debugger info bar cancellation detaches every debugger session
-    // in this extension process. Clear every tracked tab so Playwright does not
-    // keep sending commands to tabs Chrome already detached from.
+    // A Chrome infobar cancel detaches every debugger session at once and is a
+    // global user stop. It must be recorded before any reconnect early-return so
+    // a later reconnect can never attach the tabs back.
+    logger.warn(`DISCONNECT: user canceled automation in Chrome (tabId=${tabId})`)
+    void managedGroups.handleDebuggerDetached(tabId, reason, { userCanceledAll: true })
     for (const [detachedTabId, tab] of store.getState().tabs.entries()) {
       detachTabFromPlaywright(detachedTabId, tab)
     }
-
     store.setState({ tabs: new Map(), connectionState: 'idle', errorText: undefined })
     return
   }
+
+  if (connectionManager.preserveTabsOnDetach) {
+    logger.debug('Ignoring debugger detach during relay reconnect:', tabId, reason)
+    return
+  }
+
+  if (!store.getState().tabs.has(tabId)) {
+    logger.debug('Ignoring debugger detach event for untracked tab:', tabId)
+    return
+  }
+
+  // Transient detaches keep managed ownership; a later reconnect re-attaches.
+  void managedGroups.handleDebuggerDetached(tabId, reason)
+
+  logger.warn(`DISCONNECT: onDebuggerDetach tabId=${tabId} reason=${reason}`)
 
   const tab = store.getState().tabs.get(tabId)
   if (tab) {
@@ -1547,7 +1584,7 @@ async function attachTab(
     // Clean up debugger if we attached but failed later
     if (debuggerAttached) {
       logger.debug('Cleaning up debugger after partial attach failure:', tabId)
-      chrome.debugger.detach(debuggee).catch(() => {})
+      detachDebuggerProgrammatically(tabId)
     }
     throw error
   }
@@ -1607,9 +1644,7 @@ function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   emitChildDetachesForTab(tabId)
 
   if (shouldDetachDebugger) {
-    chrome.debugger.detach({ tabId }).catch((err) => {
-      logger.debug('Error detaching debugger from tab:', tabId, err.message)
-    })
+    detachDebuggerProgrammatically(tabId)
   }
 }
 
@@ -1830,7 +1865,10 @@ async function resetDebugger(): Promise<void> {
   targets = targets.filter((x) => x.tabId && x.attached)
   logger.log(`found ${targets.length} existing debugger targets. detaching them before background script starts`)
   for (const target of targets) {
-    await chrome.debugger.detach({ tabId: target.tabId })
+    const tabId = target.tabId
+    if (tabId === undefined) continue
+    programmaticDetachUntil.set(tabId, Date.now() + 3000)
+    await chrome.debugger.detach({ tabId })
   }
 }
 
@@ -2095,8 +2133,20 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
   }
 }
 
-void resetDebugger()
-void connectionManager.maintainLoop()
+// Register the debugger listeners exactly once for the whole worker lifetime.
+// They must NOT be removed on connection close: user actions (debugger infobar
+// cancel, tab moves) still have to be recorded while the relay is offline.
+chrome.debugger.onEvent.addListener(onDebuggerEvent)
+chrome.debugger.onDetach.addListener(onDebuggerDetach)
+
+void (async () => {
+  // Startup order: clear stale debugger sessions from a previous worker first,
+  // then load the ownership registry, and only then start connecting (which
+  // attaches managed tabs) so teardown can never race a fresh attach.
+  await resetDebugger()
+  await managedGroups.initialize()
+  void connectionManager.maintainLoop()
+})()
 
 chrome.contextMenus
   .remove('playwriter-pin-element')
