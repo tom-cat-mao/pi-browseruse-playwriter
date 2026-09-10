@@ -21,7 +21,10 @@ async function buildExtension({ port, distDir }: { port: number; distDir: string
     })
     .then(async () => {
       // Build into a per-port dist to avoid parallel test runs overwriting each other.
-      await execAsync(`TESTING=1 PLAYWRITER_PORT=${port} PLAYWRITER_EXTENSION_DIST=${distDir} pnpm build`, {
+      // These Chrome suites assert the upstream dev extension identity and the
+      // legacy relay only accepts the upstream origin allowlist, so this harness
+      // pins the legacy build: plain `pnpm build` is the fork identity now.
+      await execAsync(`TESTING=1 PLAYWRITER_PORT=${port} PLAYWRITER_EXTENSION_DIST=${distDir} pnpm build:legacy`, {
         cwd: '../extension',
       })
     })
