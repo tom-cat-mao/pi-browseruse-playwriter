@@ -46,9 +46,12 @@ jobs:
         run: pnpm --filter @tom-cat/pi-browser-runtime build
       - name: Distribution smoke check
         run: pnpm --filter @tom-cat/pi-browser-runtime smoke
-      # Browser-free tests only. Chrome tests are a separate, user-authorized phase.
+      # Browser-free tests only. Chrome tests (including locator-selector,
+      # which launches chromium) are a separate, user-authorized phase.
       - name: Runtime unit tests (no browser)
         run: pnpm --filter @tom-cat/pi-browser-runtime test:unit
+      - name: Runtime integration tests (no browser)
+        run: pnpm --filter @tom-cat/pi-browser-runtime test:integration
       - name: Extension tests (no browser)
         run: pnpm --filter mcp-extension test
       - name: Pi package tests
