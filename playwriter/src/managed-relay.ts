@@ -171,6 +171,8 @@ export type ManagedCommandContext = {
 export type ManagedRelayOptions = {
   host: string
   port: number
+  /** Runtime token required by /cdp when configured; managed cdp urls must carry it. */
+  token?: string
   logger?: ManagedRelayLogger
   /** Forward a validated BrowserRequest to the extension that owns the profile.
    *  Must throw ManagedTransportError on failure. */
@@ -197,6 +199,9 @@ type FieldResult<T> = { ok: true; value: T } | { ok: false; message: string }
 
 type DedupEntry = {
   kind: BrowserOperation['kind']
+  /** Full request fingerprint (operation + cwd + deadline): a reused requestId
+   *  with different content is a client bug, not a retry. */
+  fingerprint: string
   timestamp: number
   promise: Promise<BrowserResponse>
 }
@@ -1417,12 +1422,13 @@ export class ManagedRelay {
     }
 
     const dedupKey = `${request.sessionId}\u0000${request.requestId}`
+    const fingerprint = buildRequestFingerprint(request)
     const existing = this.dedup.get(dedupKey)
     if (existing) {
-      if (existing.kind !== operation.kind) {
+      if (existing.kind !== operation.kind || existing.fingerprint !== fingerprint) {
         return failureResponse(request.requestId, {
           code: 'invalid-request',
-          message: `requestId ${request.requestId} was already used for ${existing.kind}`,
+          message: `requestId ${request.requestId} was already used with a different request payload`,
           outcome: 'not-started',
         })
       }
@@ -1432,7 +1438,7 @@ export class ManagedRelay {
     const promise = this.dispatch({ request, timeoutMs }).then((response) => {
       return this.enforceResponseLimit(response, request.requestId)
     })
-    this.dedup.set(dedupKey, { kind: operation.kind, timestamp: Date.now(), promise })
+    this.dedup.set(dedupKey, { kind: operation.kind, fingerprint, timestamp: Date.now(), promise })
     this.pruneDedup()
     return promise
   }
@@ -1661,6 +1667,19 @@ export class ManagedRelay {
         key: tabResult.profile.profileId,
         controller: pending.controller,
         task: async (signal) => {
+          // Authoritative release/ownership re-check with the extension right
+          // before executing: the cached inventory may be a moment behind a
+          // release that happened while this request was queued.
+          const authoritative = await this.resolveTabWithExtension({
+            request,
+            operation,
+            profile: tabResult.profile,
+            timeoutMs,
+            signal,
+          })
+          if (!authoritative.ok) {
+            throw new ManagedTransportError(authoritative.failure)
+          }
           const pool = await this.getPool()
           if (!pool) {
             throw new ManagedTransportError({
@@ -1672,7 +1691,7 @@ export class ManagedRelay {
           pending.started = true
           return await pool.execute({
             request: { ...request, operation },
-            tab: tabResult.tab,
+            tab: authoritative.tab,
             cdpUrl: slot.cdpUrl,
             connectionEpoch: slot.connectionEpoch,
             signal,
@@ -1701,6 +1720,112 @@ export class ManagedRelay {
       clearTimeout(timer)
       this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
     }
+  }
+
+  /**
+   * Ask the extension for the authoritative state of the request tab immediately
+   * before running a page action. The cached inventory is only a snapshot: a tab
+   * released (or rebound) while the request was queued must not be executed.
+   */
+  private async resolveTabWithExtension({
+    request,
+    operation,
+    profile,
+    timeoutMs,
+    signal,
+  }: {
+    request: BrowserRequest
+    operation: BrowserPageOperation
+    profile: ManagedProfileSnapshot
+    timeoutMs: number
+    signal: AbortSignal
+  }): Promise<{ ok: true; tab: BrowserTab } | { ok: false; failure: ManagedFailure }> {
+    const resolveRequest: BrowserRequest = {
+      requestId: `${request.requestId}#tab.resolve`,
+      sessionId: request.sessionId,
+      operation: { kind: 'tab.resolve', tabId: operation.tabId },
+      timeoutMs,
+      ...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
+    }
+    let value: unknown
+    try {
+      const transportPromise = this.options.transport.sendBrowserRequest({
+        profileId: profile.profileId,
+        stableKey: profile.stableKey,
+        request: resolveRequest,
+        timeoutMs,
+      })
+      transportPromise.catch(() => {})
+      value = await this.awaitWithAbort({ promise: transportPromise, signal })
+    } catch (error) {
+      return { ok: false, failure: describeTransportFailure(error) }
+    }
+    const parsed = parseBrowserResponse(value)
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        failure: {
+          code: 'internal-error',
+          message: `extension returned a malformed tab.resolve response: ${parsed.message}`,
+          outcome: 'unknown',
+        },
+      }
+    }
+    if (!parsed.value.ok) {
+      return { ok: false, failure: { ...parsed.value.error } }
+    }
+    if (parsed.value.requestId !== resolveRequest.requestId) {
+      return {
+        ok: false,
+        failure: {
+          code: 'internal-error',
+          message: 'tab.resolve response requestId does not match the request',
+          outcome: 'unknown',
+        },
+      }
+    }
+    const tab = parsed.value.data.tab
+    if (!tab || tab.tabId !== operation.tabId || tab.sessionId !== request.sessionId || tab.profileId !== profile.profileId) {
+      return {
+        ok: false,
+        failure: {
+          code: 'internal-error',
+          message: 'extension returned a tab.resolve payload that does not match this session/profile',
+          outcome: 'unknown',
+        },
+      }
+    }
+    if (tab.state === 'released') {
+      return {
+        ok: false,
+        failure: {
+          code: 'resource-released',
+          message: `tab ${operation.tabId} was released before execution`,
+          outcome: 'not-started',
+        },
+      }
+    }
+    if (tab.state === 'needs-rebind') {
+      return {
+        ok: false,
+        failure: {
+          code: 'needs-rebind',
+          message: `tab ${operation.tabId} needs to be re-bound before execution`,
+          outcome: 'not-started',
+        },
+      }
+    }
+    if (tab.state !== 'ready') {
+      return {
+        ok: false,
+        failure: {
+          code: 'profile-disconnected',
+          message: `tab ${operation.tabId} is not attached (state ${tab.state})`,
+          outcome: 'not-started',
+        },
+      }
+    }
+    return { ok: true, tab }
   }
 
   private async getPool(): Promise<ManagedExecutorPoolContract | null> {
@@ -1986,6 +2111,9 @@ export class ManagedRelay {
     params.set('profileId', profileId)
     params.set('browserEpoch', snapshot?.browserEpoch ?? '')
     params.set('connectionEpoch', connectionEpoch)
+    if (this.options.token) {
+      params.set('token', this.options.token)
+    }
     const host = this.options.host === '0.0.0.0' || this.options.host === '::' ? '127.0.0.1' : this.options.host
     const cdpUrl = `ws://${host}:${this.options.port}/cdp/${clientId}?${params.toString()}`
     const slot: ManagedExecutionSlot = { sessionId, profileId, connectionEpoch, clientId: null, cdpUrl }
@@ -2549,6 +2677,26 @@ export class ManagedRelay {
 
 function isPageOperationKind(kind: BrowserOperation['kind']): boolean {
   return kind.startsWith('page.')
+}
+
+/** Deterministic identity of a request payload for dedup collision detection. */
+function buildRequestFingerprint(request: BrowserRequest): string {
+  return JSON.stringify({
+    operation: request.operation,
+    cwd: request.cwd ?? null,
+    timeoutMs: request.timeoutMs ?? null,
+  })
+}
+
+function describeTransportFailure(error: unknown): ManagedFailure {
+  if (error instanceof ManagedTransportError) {
+    return { code: error.code, message: error.message, outcome: error.outcome }
+  }
+  return {
+    code: 'internal-error',
+    message: error instanceof Error ? error.message : String(error),
+    outcome: 'unknown',
+  }
 }
 
 function slotKey(sessionId: string, profileId: string): string {

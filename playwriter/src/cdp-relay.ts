@@ -526,6 +526,7 @@ export async function startPlayWriterCDPRelayServer({
   const managedRelay = new ManagedRelay({
     host,
     port,
+    token,
     logger: managedRelayLogger,
     transport: {
       sendBrowserRequest: async ({ profileId, stableKey, request, timeoutMs }) => {

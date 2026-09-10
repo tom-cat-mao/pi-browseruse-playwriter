@@ -284,6 +284,7 @@ class FakeExtension {
   readonly forwardCommands: Array<{ method: string; params?: unknown; sessionId?: string }> = []
   readonly closed: Promise<{ code: number; reason: string }>
   readonly inventoryByGroup = new Map<string, BrowserGroup>()
+  readonly inventoryByTab = new Map<string, BrowserTab>()
   holdResponses = false
   onRequest?: (request: BrowserRequest) => BrowserResponse | Promise<BrowserResponse>
   private readonly ws: WebSocket
@@ -343,7 +344,11 @@ class FakeExtension {
       const respond = async () => {
         const response = this.onRequest
           ? await this.onRequest(request)
-          : defaultExtensionResponse({ request, inventoryByGroup: this.inventoryByGroup })
+          : defaultExtensionResponse({
+              request,
+              inventoryByGroup: this.inventoryByGroup,
+              inventoryByTab: this.inventoryByTab,
+            })
         this.ws.send(JSON.stringify({ id: message.id, result: response }))
       }
       if (this.holdResponses) {
@@ -374,6 +379,9 @@ class FakeExtension {
     for (const group of inventory.groups) {
       this.inventoryByGroup.set(group.groupId, group)
     }
+    for (const tab of inventory.tabs) {
+      this.inventoryByTab.set(tab.tabId, tab)
+    }
     this.ws.send(JSON.stringify({ method: 'browserInventory', params: inventory }))
   }
 
@@ -401,11 +409,24 @@ class FakeExtension {
 function defaultExtensionResponse({
   request,
   inventoryByGroup,
+  inventoryByTab,
 }: {
   request: BrowserRequest
   inventoryByGroup: Map<string, BrowserGroup>
+  inventoryByTab: Map<string, BrowserTab>
 }): BrowserResponse {
   const operation = request.operation
+  if (operation.kind === 'tab.resolve') {
+    const tab = inventoryByTab.get(operation.tabId)
+    if (!tab || tab.sessionId !== request.sessionId) {
+      return {
+        requestId: request.requestId,
+        ok: false,
+        error: { code: 'resource-not-found', message: `tab ${operation.tabId} not found`, outcome: 'not-started' },
+      }
+    }
+    return { requestId: request.requestId, ok: true, data: { tab } }
+  }
   if (operation.kind === 'groups.create') {
     return {
       requestId: request.requestId,
@@ -493,13 +514,21 @@ async function startRelay({
   }
 }
 
-async function waitForExtensionRegistered({ port, count = 1 }: { port: number; count?: number }): Promise<void> {
+async function waitForExtensionRegistered({
+  port,
+  count = 1,
+  token,
+}: {
+  port: number
+  count?: number
+  token?: string
+}): Promise<void> {
   const deadline = Date.now() + 3000
   while (Date.now() < deadline) {
-    const status = (await getJson({ port, path: '/extensions/status' })) as {
-      body: { extensions: unknown[] }
+    const status = (await getJson({ port, path: '/extensions/status', token })) as {
+      body: { extensions?: unknown[] }
     }
-    if (status.body.extensions.length >= count) {
+    if ((status.body.extensions?.length ?? 0) >= count) {
       return
     }
     await new Promise((resolve) => {
@@ -513,9 +542,9 @@ async function waitForExtensionCount({ port, count }: { port: number; count: num
   const deadline = Date.now() + 3000
   while (Date.now() < deadline) {
     const status = (await getJson({ port, path: '/extensions/status' })) as {
-      body: { extensions: unknown[] }
+      body: { extensions?: unknown[] }
     }
-    if (status.body.extensions.length === count) {
+    if ((status.body.extensions?.length ?? 0) === count) {
       return
     }
     await new Promise((resolve) => {
@@ -632,10 +661,10 @@ async function startTrackedRelay(options: Parameters<typeof startRelay>[0] = {})
   return relay
 }
 
-async function connectTrackedExtension(options: FakeExtensionOptions): Promise<FakeExtension> {
+async function connectTrackedExtension(options: FakeExtensionOptions & { token?: string }): Promise<FakeExtension> {
   const extension = await FakeExtension.connect(options)
   extensions.push(extension)
-  await waitForExtensionRegistered({ port: options.port })
+  await waitForExtensionRegistered({ port: options.port, token: options.token })
   return extension
 }
 
@@ -1174,9 +1203,9 @@ describe('managed control routing', () => {
       data: { group: { sessionId: 's1', profileId: 'profile-1', name: 'work' } },
     })
 
-    // Reusing a requestId for the same resource operation returns the original
-    // result instead of creating another tab.
-    const replayed = await browserRequest({
+    // A reused requestId with a different payload is rejected instead of being
+    // answered with the stale response or forwarded to the extension.
+    const differentPayload = await browserRequest({
       port: relay.port,
       request: {
         requestId: 'req-create-1',
@@ -1184,8 +1213,11 @@ describe('managed control routing', () => {
         operation: { kind: 'tabs.create', groupId: 'g1', url: 'https://example.com/other' },
       },
     })
-    expect(replayed.status).toBe(200)
-    expect(replayed.body).toEqual(first.body)
+    expect(differentPayload.status).toBe(200)
+    expect(differentPayload.body).toMatchObject({
+      ok: false,
+      error: { code: 'invalid-request', outcome: 'not-started' },
+    })
     expect(extension.received).toHaveLength(2)
 
     // Reusing a requestId for a different operation kind is rejected, not replayed.
@@ -1495,6 +1527,116 @@ describe('managed page execution', () => {
     expect(pool.executions).toHaveLength(2)
   })
 
+  test('page execution re-checks the tab with the extension before running (release race)', async () => {
+    const pool = createTestPool()
+    const relay = await startTrackedRelay({ poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+
+    // The cached inventory still says ready, but the extension has authoritative
+    // knowledge that the tab was released while the request was in flight.
+    extension.onRequest = (request) => {
+      if (request.operation.kind === 'tab.resolve') {
+        return {
+          requestId: request.requestId,
+          ok: false,
+          error: { code: 'resource-released', message: 'tab was released', outcome: 'not-started' },
+        }
+      }
+      return defaultExtensionResponse({
+        request,
+        inventoryByGroup: extension.inventoryByGroup,
+        inventoryByTab: extension.inventoryByTab,
+      })
+    }
+
+    const response = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'page-race',
+        sessionId: 's1',
+        operation: { kind: 'page.click', tabId: 't1', selector: 'button' },
+      },
+    })
+    expect(response.body).toMatchObject({
+      ok: false,
+      error: { code: 'resource-released', outcome: 'not-started' },
+    })
+    expect(pool.executions).toHaveLength(0)
+    expect(extension.received.map((entry) => entry.operation.kind)).toEqual(['tab.resolve'])
+  })
+
+  test('managed cdp urls carry the runtime token and unauthenticated managed connections are rejected', async () => {
+    const pool = createTestPool()
+    const relay = await startTrackedRelay({ token: 'sekret', poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1', token: 'sekret' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted' },
+    )
+
+    await expect(
+      FakeCdpClient.connect({
+        port: relay.port,
+        query: new URLSearchParams({
+          browserSessionId: 's1',
+          profileId: 'profile-1',
+          browserEpoch: 'epoch-1',
+        }).toString(),
+      }),
+    ).rejects.toThrow()
+
+    const managed = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({
+        browserSessionId: 's1',
+        profileId: 'profile-1',
+        browserEpoch: 'epoch-1',
+        token: 'sekret',
+      }).toString(),
+    })
+    managed.send({ id: 1, method: 'Target.getTargets' })
+    const targets = await managed.waitForResponse(1)
+    expect(targets.result).toMatchObject({ targetInfos: [] })
+
+    const response = await browserRequest({
+      port: relay.port,
+      token: 'sekret',
+      request: {
+        requestId: 'page-token',
+        sessionId: 's1',
+        operation: { kind: 'page.navigate', tabId: 't1', url: 'https://example.com/' },
+      },
+    })
+    expect(response.body).toMatchObject({ ok: true })
+    expect(pool.executions).toHaveLength(1)
+    const cdpUrl = new URL(pool.executions[0].cdpUrl)
+    expect(cdpUrl.searchParams.get('token')).toBe('sekret')
+  })
+
   test('page operations on a released or foreign tab fail before the executor runs', async () => {
     const pool = createTestPool()
     const relay = await startTrackedRelay({ poolFactory: async () => pool })
@@ -1673,6 +1815,91 @@ describe('managed CDP scoping', () => {
     expect(extension.forwardCommands.map((command) => command.method)).toContain('Runtime.evaluate')
     expect(extension.forwardCommands.map((command) => command.method)).not.toContain('Target.createTarget')
     expect(extension.forwardCommands.map((command) => command.method)).not.toContain('Browser.close')
+  })
+
+  test('attachment events arriving before the inventory recover once the snapshot arrives', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'install-1' })
+
+    const legacy = await connectTrackedCdpClient({ port: relay.port, query: '' })
+    const targetInfo = (targetId: string, url: string) => {
+      return {
+        targetId,
+        type: 'page',
+        title: targetId,
+        url,
+        attached: true,
+        canAccessOpener: false,
+      }
+    }
+    // Attachment events can reach the relay before the extension registry snapshot
+    // (relay restart, slow restore). They must not leak across sessions and must
+    // become visible to the owner once the inventory arrives.
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t1',
+      params: {
+        sessionId: 'pw-t1',
+        targetInfo: targetInfo('target-t1', 'https://example.com/a'),
+        waitingForDebugger: false,
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t2',
+      params: {
+        sessionId: 'pw-t2',
+        targetInfo: targetInfo('target-t2', 'https://example.com/b'),
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return legacy.attachedTargets().length === 2
+      },
+      { message: 'attachments stored before inventory' },
+    )
+
+    extension.sendInventory(
+      makeInventory({
+        groups: [
+          makeGroup({ groupId: 'g1', sessionId: 'session-a' }),
+          makeGroup({ groupId: 'g2', sessionId: 'session-b' }),
+        ],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g2', sessionId: 'session-b' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'inventory accepted after attachments' },
+    )
+
+    const managed = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({
+        browserSessionId: 'session-a',
+        profileId: 'profile-1',
+        browserEpoch: 'epoch-1',
+      }).toString(),
+    })
+    expect(managed.attachedTargets()).toEqual([])
+
+    managed.send({ id: 1, method: 'Target.setAutoAttach', params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true } })
+    await managed.waitForResponse(1)
+    await waitForCondition(
+      () => {
+        return managed.attachedTargets().includes('target-t1')
+      },
+      { message: 'owner target synthesized after inventory' },
+    )
+    expect(managed.attachedTargets()).toEqual(['target-t1'])
   })
 
   test('stale browserEpoch and stale connectionEpoch managed connections are rejected', async () => {
