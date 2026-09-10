@@ -416,13 +416,15 @@ class ConnectionManager {
         message = JSON.parse(event.data)
       } catch (error: any) {
         logger.debug('Error parsing message:', error)
-        sendMessage({ error: { code: -32700, message: `Error parsing message: ${error.message}` } })
+        // Every reply in this handler goes back on the socket the request arrived
+        // on (or is dropped); never on this.ws, which may already be a new socket.
+        sendMessageToSocket(socket, { error: { code: -32700, message: `Error parsing message: ${error.message}` } })
         return
       }
 
       // Handle ping from server - respond with pong to keep service worker alive
       if (message.method === 'ping') {
-        sendMessage({ method: 'pong' })
+        sendMessageToSocket(socket, { method: 'pong' })
         return
       }
 
@@ -452,7 +454,7 @@ class ConnectionManager {
             setTabConnecting(tab.id)
             const { targetInfo, sessionId } = await attachTab(tab.id, { skipAttachedEvent: true })
             logger.debug('Initial tab created and connected:', tab.id, 'sessionId:', sessionId)
-            sendMessage({
+            sendMessageToSocket(socket, {
               id: message.id,
               result: {
                 success: true,
@@ -466,7 +468,7 @@ class ConnectionManager {
           }
         } catch (error: any) {
           logger.debug('Failed to create initial tab:', error)
-          sendMessage({ id: message.id, error: error.message })
+          sendMessageToSocket(socket, { id: message.id, error: error.message })
         }
         return
       }
@@ -475,10 +477,10 @@ class ConnectionManager {
       if (message.method === 'startRecording') {
         try {
           const result = await handleStartRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to start recording:', error)
-          sendMessage({ id: message.id, result: { success: false, error: error.message } })
+          sendMessageToSocket(socket, { id: message.id, result: { success: false, error: error.message } })
         }
         return
       }
@@ -486,10 +488,10 @@ class ConnectionManager {
       if (message.method === 'stopRecording') {
         try {
           const result = await handleStopRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to stop recording:', error)
-          sendMessage({ id: message.id, result: { success: false, error: error.message } })
+          sendMessageToSocket(socket, { id: message.id, result: { success: false, error: error.message } })
         }
         return
       }
@@ -497,10 +499,10 @@ class ConnectionManager {
       if (message.method === 'isRecording') {
         try {
           const result = await handleIsRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to check recording status:', error)
-          sendMessage({ id: message.id, result: { isRecording: false } })
+          sendMessageToSocket(socket, { id: message.id, result: { isRecording: false } })
         }
         return
       }
@@ -508,10 +510,10 @@ class ConnectionManager {
       if (message.method === 'cancelRecording') {
         try {
           const result = await handleCancelRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to cancel recording:', error)
-          sendMessage({ id: message.id, result: { success: false, error: error.message } })
+          sendMessageToSocket(socket, { id: message.id, result: { success: false, error: error.message } })
         }
         return
       }
@@ -535,7 +537,7 @@ class ConnectionManager {
             await attachTab(tabId)
           }
         }
-        sendMessage({ id: message.id, result })
+        sendMessageToSocket(socket, { id: message.id, result })
         return
       }
 
@@ -543,11 +545,10 @@ class ConnectionManager {
       // request envelope and expects the legacy response envelope back.
       if (message.method === 'browserRequest') {
         const params: BrowserRequest = message.params
-        const requestSocket = this.ws
         const result = await managedGroups.handleBrowserRequest(params)
         // Answer on the socket this request arrived on (or drop it): a response
         // must never be sent on a newer connection with the same message id.
-        sendMessageToSocket(requestSocket, { id: message.id, result })
+        sendMessageToSocket(socket, { id: message.id, result })
         return
       }
 
@@ -559,14 +560,19 @@ class ConnectionManager {
         response.error = error.message
       }
       // logger.debug('Sending response:', response)
-      sendMessage(response)
+      sendMessageToSocket(socket, response)
     }
 
-    this.ws.onclose = (event: CloseEvent) => {
+    socket.onclose = (event: CloseEvent) => {
+      // A stale socket's close must never tear down the current connection.
+      if (this.ws !== socket) {
+        logger.debug('Ignoring close event from a replaced websocket:', event.reason, event.code)
+        return
+      }
       this.handleClose(event.reason, event.code)
     }
 
-    this.ws.onerror = (event: Event) => {
+    socket.onerror = (event: Event) => {
       logger.debug('WebSocket error:', event)
     }
 
@@ -1323,10 +1329,6 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
     logger.debug('Ignoring debugger detach event without a tab id:', reason)
     return
   }
-  if (consumeProgrammaticDetach(tabId)) {
-    logger.debug('Ignoring debugger detach we requested ourselves:', tabId, reason)
-    return
-  }
 
   const detachTabFromPlaywright = (detachedTabId: number, tab: TabInfo) => {
     sendMessage({
@@ -1341,14 +1343,23 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
 
   if (reason === chrome.debugger.DetachReason.CANCELED_BY_USER) {
     // A Chrome infobar cancel detaches every debugger session at once and is a
-    // global user stop. It must be recorded before any reconnect early-return so
-    // a later reconnect can never attach the tabs back.
+    // global user stop. It must be handled before the programmatic-detach
+    // suppression and before any reconnect early-return, so a TTL window or a
+    // transport drop can never swallow a real user cancel.
+    programmaticDetachUntil.delete(tabId)
     logger.warn(`DISCONNECT: user canceled automation in Chrome (tabId=${tabId})`)
     void managedGroups.handleDebuggerDetached(tabId, reason, { userCanceledAll: true })
     for (const [detachedTabId, tab] of store.getState().tabs.entries()) {
       detachTabFromPlaywright(detachedTabId, tab)
     }
     store.setState({ tabs: new Map(), connectionState: 'idle', errorText: undefined })
+    return
+  }
+
+  // Suppression only applies to non-user reasons: a detach we requested ourselves
+  // must not be mistaken for a user action, but it can never hide a real cancel.
+  if (consumeProgrammaticDetach(tabId)) {
+    logger.debug('Ignoring debugger detach we requested ourselves:', tabId, reason)
     return
   }
 
