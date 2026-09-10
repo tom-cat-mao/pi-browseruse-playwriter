@@ -2583,6 +2583,171 @@ describe('managed CDP scoping', () => {
     expect(managed.attachedTargets()).toEqual(['target-t1'])
   })
 
+  test('inventory arrival announces a cached target once to its owner only', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        revision: 1,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=1')
+        })
+      },
+      { message: 'initial inventory accepted' },
+    )
+
+    const owner = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({ browserSessionId: 'session-a', profileId: 'profile-1', browserEpoch: 'epoch-1' }).toString(),
+    })
+    const foreignOwner = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({ browserSessionId: 'session-b', profileId: 'profile-1', browserEpoch: 'epoch-1' }).toString(),
+    })
+    const targetInfo = {
+      targetId: 'target-t2',
+      type: 'page',
+      title: 'target-t2',
+      url: 'https://example.com/t2',
+      attached: true,
+      canAccessOpener: false,
+    }
+
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t2',
+      params: {
+        sessionId: 'pw-t2',
+        targetInfo,
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('target-t2')
+        })
+      },
+      { message: 'cached attachment received before ownership inventory' },
+    )
+    expect(owner.attachedTargets()).toEqual([])
+    expect(foreignOwner.attachedTargets()).toEqual([])
+
+    extension.sendInventory(
+      makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 'session-a' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return owner.attachedTargets().includes('target-t2')
+      },
+      { message: 'owner receives cached attachment after inventory' },
+    )
+    expect(owner.attachedTargets()).toEqual(['target-t2'])
+    expect(foreignOwner.attachedTargets()).toEqual([])
+
+    extension.sendInventory(
+      makeInventory({
+        revision: 3,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 'session-a' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=3')
+        })
+      },
+      { message: 'duplicate ownership inventory accepted' },
+    )
+    expect(owner.attachedTargets()).toEqual(['target-t2'])
+    expect(foreignOwner.attachedTargets()).toEqual([])
+  })
+
+  test('a ready inventory before the attachment event still announces the target once', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        revision: 1,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=1')
+        })
+      },
+      { message: 'initial inventory accepted' },
+    )
+    const owner = await connectTrackedCdpClient({
+      port: relay.port,
+      query: new URLSearchParams({ browserSessionId: 'session-a', profileId: 'profile-1', browserEpoch: 'epoch-1' }).toString(),
+    })
+
+    extension.sendInventory(
+      makeInventory({
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 'session-a' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 'session-a' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 'session-a' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1 revision=2')
+        })
+      },
+      { message: 'ready inventory accepted before attachment' },
+    )
+    expect(owner.attachedTargets()).toEqual([])
+
+    extension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t2',
+      params: {
+        sessionId: 'pw-t2',
+        targetInfo: {
+          targetId: 'target-t2',
+          type: 'page',
+          title: 'target-t2',
+          url: 'https://example.com/t2',
+          attached: true,
+          canAccessOpener: false,
+        },
+        waitingForDebugger: false,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return owner.attachedTargets().includes('target-t2')
+      },
+      { message: 'owner receives attachment after ready inventory' },
+    )
+    expect(owner.attachedTargets()).toEqual(['target-t2'])
+  })
+
   test('profile-wide, wrapper and unlisted root CDP commands are denied for managed clients', async () => {
     const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })

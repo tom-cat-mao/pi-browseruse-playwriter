@@ -80,6 +80,31 @@ function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
   return blockedPrefixes.some((prefix) => url.startsWith(prefix))
 }
 
+function createAttachedTargetEvent({ target }: { target: relayState.ConnectedTarget }): CDPEventFor<'Target.attachedToTarget'> {
+  return {
+    method: 'Target.attachedToTarget',
+    params: {
+      sessionId: target.sessionId,
+      targetInfo: {
+        ...target.targetInfo,
+        attached: true,
+      },
+      waitingForDebugger: false,
+    },
+  }
+}
+
+function getTargetSessionId({ event }: { event: CDPEventBase }): string | null {
+  if (event.method !== 'Target.attachedToTarget' && event.method !== 'Target.detachedFromTarget') {
+    return null
+  }
+  if (!event.params || typeof event.params !== 'object' || Array.isArray(event.params)) {
+    return null
+  }
+  const sessionId = (event.params as { sessionId?: unknown }).sessionId
+  return typeof sessionId === 'string' ? sessionId : null
+}
+
 // CDP events dropped entirely (not forwarded to Playwright clients, not logged).
 // Only events that no Playwright API depends on. See: https://github.com/remorses/playwriter/issues/96
 // NOTE: *ExtraInfo events feed Playwright's ResponseExtraInfoTracker for request/response.allHeaders().
@@ -366,7 +391,18 @@ export async function startPlayWriterCDPRelayServer({
       if (!managedRelay.isEventInScope({ scope, method: event.method, sessionId: event.sessionId, params: event.params })) {
         return
       }
+      const targetSessionId = getTargetSessionId({ event })
+      const announcedTargetSessions = managedAnnouncedTargetSessions.get(client.id)
+      if (event.method === 'Target.attachedToTarget' && targetSessionId && announcedTargetSessions?.has(targetSessionId)) {
+        return
+      }
       safeSend(client)
+      if (event.method === 'Target.attachedToTarget' && targetSessionId) {
+        announcedTargetSessions?.add(targetSessionId)
+      }
+      if (event.method === 'Target.detachedFromTarget' && targetSessionId) {
+        announcedTargetSessions?.delete(targetSessionId)
+      }
     }
 
     if (clientId) {
@@ -575,6 +611,8 @@ export async function startPlayWriterCDPRelayServer({
 
   /** Active managed /cdp clients by clientId (session/profile scoped). */
   const managedCdpClients = new Map<string, ManagedConnectionScope>()
+  /** Target CDP sessions already announced to each managed client. */
+  const managedAnnouncedTargetSessions = new Map<string, Set<string>>()
 
   /**
    * Resolve live ownership sets for one managed scope: page targetIds from the
@@ -622,6 +660,67 @@ export async function startPlayWriterCDPRelayServer({
     }
     const ownerTargetId = scope.frameOwners.get(parentFrameId)
     return Boolean(ownerTargetId && scope.targetIds.has(ownerTargetId))
+  }
+
+  const announceManagedTargetsForInventory = ({
+    connectionId,
+    profileId,
+    browserEpoch,
+  }: {
+    connectionId: string
+    profileId: string
+    browserEpoch: string
+  }): void => {
+    const extensionState = store.getState().extensions.get(connectionId)
+    if (!extensionState) {
+      return
+    }
+
+    for (const [clientId, managedScope] of managedCdpClients) {
+      if (
+        managedScope.profileId !== profileId ||
+        managedScope.browserEpoch !== browserEpoch ||
+        managedScope.extensionConnectionId !== connectionId
+      ) {
+        continue
+      }
+      const announcedTargetSessions = managedAnnouncedTargetSessions.get(clientId)
+      if (!announcedTargetSessions) {
+        continue
+      }
+      const scope = resolveManagedScopeView(managedScope)
+      const visibleTargetSessions = new Set<string>()
+      const targets = Array.from(extensionState.connectedTargets.values()).filter((target) => {
+        return !isRestrictedTarget(target.targetInfo)
+      })
+      for (const target of targets) {
+        const attachedPayload = createAttachedTargetEvent({ target })
+        if (
+          !managedRelay.isEventInScope({
+            scope,
+            method: attachedPayload.method,
+            sessionId: attachedPayload.sessionId,
+            params: attachedPayload.params,
+          })
+        ) {
+          continue
+        }
+        visibleTargetSessions.add(target.sessionId)
+        if (announcedTargetSessions.has(target.sessionId)) {
+          continue
+        }
+        sendToPlaywright({
+          message: attachedPayload,
+          clientId,
+          source: 'server',
+        })
+      }
+      for (const sessionId of Array.from(announcedTargetSessions)) {
+        if (!visibleTargetSessions.has(sessionId)) {
+          announcedTargetSessions.delete(sessionId)
+        }
+      }
+    }
   }
 
   const recordingRelays = new Map<string, RecordingRelay>()
@@ -1483,6 +1582,7 @@ export async function startPlayWriterCDPRelayServer({
           })
           if (managedClientScope) {
             managedCdpClients.set(clientId, managedClientScope)
+            managedAnnouncedTargetSessions.set(clientId, new Set())
             managedRelay.noteManagedClientOpen({ clientId, scope: managedClientScope })
             logger?.log(
               pc.green(
@@ -1705,6 +1805,7 @@ export async function startPlayWriterCDPRelayServer({
         onClose() {
           if (managedCdpClients.has(clientId)) {
             managedCdpClients.delete(clientId)
+            managedAnnouncedTargetSessions.delete(clientId)
             managedRelay.noteManagedClientClosed({ clientId })
           }
           store.setState((s) => relayState.removePlaywrightClient(s, { clientId }))
@@ -1909,6 +2010,11 @@ export async function startPlayWriterCDPRelayServer({
                 inventory: inventoryMessage.inventory,
               })
               if (result.accepted) {
+                announceManagedTargetsForInventory({
+                  connectionId,
+                  profileId: result.profile.profileId,
+                  browserEpoch: result.profile.browserEpoch,
+                })
                 logger?.log(
                   pc.magenta(
                     `[managed-relay] inventory profile=${result.profile.profileId} revision=${result.profile.revision} groups=${result.profile.groups.size} tabs=${result.profile.tabs.size}`,
