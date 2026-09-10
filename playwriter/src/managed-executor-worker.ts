@@ -34,6 +34,7 @@ import {
 
 const DEFAULT_PAGE_TIMEOUT_MS = 60_000
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const MAX_SNAPSHOT_CHARS = 40_000
 const MAX_SNAPSHOT_LINES = 2_000
 const MAX_LOG_ENTRIES = 1_000
@@ -160,6 +161,7 @@ export class ManagedExecutorWorkerRuntime {
 
   async execute(execution: ManagedExecution): Promise<BrowserResponse> {
     const requestId = execution.request.requestId
+    const requestDeadline = Date.now() + (execution.request.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
     let sideEffectsStarted = false
     try {
       this.validateExecution(execution)
@@ -173,7 +175,7 @@ export class ManagedExecutorWorkerRuntime {
         })
       }
       this.allowedTargetIds.add(targetId)
-      const page = this.getPage({ targetId })
+      const page = await this.getPage({ targetId, deadline: requestDeadline })
       const data = await this.executeOperation({
         request: execution.request,
         page,
@@ -421,31 +423,112 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
-  private getPage({ targetId }: { targetId: string }): Page {
-    if (!this.context) {
+  // Reattaching a physical target creates its Playwright page asynchronously;
+  // wait only for the requested target within the current request deadline.
+  private async getPage({ targetId, deadline }: { targetId: string; deadline: number }): Promise<Page> {
+    const context = this.context
+    if (!context) {
       throw new ManagedExecutorOperationError({
         code: 'profile-disconnected',
         message: 'Managed profile is not connected',
       })
     }
-    const pages = this.context
-      .pages()
-      .filter((page) => !page.isClosed() && page.targetId() === targetId)
-    if (pages.length === 0) {
-      throw new ManagedExecutorOperationError({
-        code: 'resource-not-found',
-        message: `No open Playwright page has targetId ${targetId}`,
+
+    const findPage = (): Page | null => {
+      const pages = context.pages().filter((page) => {
+        return !page.isClosed() && page.targetId() === targetId
+      })
+      if (pages.length > 1) {
+        throw new ManagedExecutorOperationError({
+          code: 'internal-error',
+          message: `Multiple Playwright pages reported targetId ${targetId}`,
+        })
+      }
+      return pages.find((page) => {
+        return page.targetId() === targetId
+      }) ?? null
+    }
+
+    const existingPage = findPage()
+    if (existingPage) {
+      this.registerPage(existingPage)
+      return existingPage
+    }
+
+    const timeoutError = (): ManagedExecutorOperationError => {
+      return new ManagedExecutorOperationError({
+        code: 'timeout',
+        message: `Timed out waiting for Playwright page with targetId ${targetId}`,
       })
     }
-    if (pages.length > 1) {
-      throw new ManagedExecutorOperationError({
-        code: 'internal-error',
-        message: `Multiple Playwright pages reported targetId ${targetId}`,
-      })
+    if (deadline <= Date.now()) {
+      throw timeoutError()
     }
-    const page = pages[0]
-    this.registerPage(page)
-    return page
+
+    return await new Promise<Page>((resolve, reject) => {
+      let settled = false
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null
+      const cleanup = (): void => {
+        context.off('page', onPage)
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle)
+          timeoutHandle = null
+        }
+      }
+      const resolvePage = (page: Page): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        cleanup()
+        this.registerPage(page)
+        resolve(page)
+      }
+      const rejectPage = (error: unknown): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        cleanup()
+        reject(error)
+      }
+      function onPage(page: Page): void {
+        if (page.isClosed() || page.targetId() !== targetId) {
+          return
+        }
+        try {
+          resolvePage(findPage() ?? page)
+        } catch (error) {
+          rejectPage(error)
+        }
+      }
+
+      context.on('page', onPage)
+      if (settled) {
+        return
+      }
+      try {
+        const recheckedPage = findPage()
+        if (recheckedPage) {
+          resolvePage(recheckedPage)
+          return
+        }
+      } catch (error) {
+        rejectPage(error)
+        return
+      }
+      if (settled) {
+        return
+      }
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        rejectPage(timeoutError())
+        return
+      }
+      timeoutHandle = setTimeout(() => {
+        rejectPage(timeoutError())
+      }, remainingMs)
+    })
   }
 
   private async executeOperation({
