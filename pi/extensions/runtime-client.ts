@@ -297,7 +297,7 @@ function validateResultData(data: Record<string, unknown>): void {
   if (data.snapshotId !== undefined && typeof data.snapshotId !== "string") {
     throw new RuntimeRequestError("protocol", "result data.snapshotId is not a string");
   }
-  for (const key of ["profiles", "groups", "tabs", "logs", "images", "artifacts"] as const) {
+  for (const key of ["profiles", "groups", "tabs", "candidates", "logs", "images", "artifacts"] as const) {
     if (data[key] !== undefined && !Array.isArray(data[key])) {
       throw new RuntimeRequestError("protocol", `result data.${key} is not an array`);
     }

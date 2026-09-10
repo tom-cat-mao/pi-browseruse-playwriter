@@ -461,6 +461,8 @@ export class ManagedExecutorWorkerRuntime {
     switch (operation.kind) {
       case 'page.navigate':
         return await this.navigate({ page, url: operation.url, markSideEffectsStarted })
+      case 'page.back':
+        return await this.goBack({ page, markSideEffectsStarted })
       case 'page.snapshot':
         return await this.snapshot({
           page,
@@ -528,6 +530,37 @@ export class ManagedExecutorWorkerRuntime {
         title: await page.title(),
         status: response?.status() ?? null,
       },
+    }
+  }
+
+  /**
+   * Real browser history back — never a goto() to the previous URL, so the site
+   * keeps whatever it restores from its own history entry. Sites that rebuild
+   * scroll/form state from JS may still not restore it; we report the result and
+   * do not fake it.
+   */
+  private async goBack({
+    page,
+    markSideEffectsStarted,
+  }: {
+    page: Page
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
+    markSideEffectsStarted()
+    const response = await page.goBack({
+      waitUntil: 'domcontentloaded',
+      timeout: DEFAULT_NAVIGATION_TIMEOUT_MS,
+    })
+    this.invalidateSnapshot({ page })
+    if (!response) {
+      return {
+        text: `No earlier page in this tab's history; still on ${page.url()}`,
+        value: { url: page.url(), title: await page.title(), wentBack: false },
+      }
+    }
+    return {
+      text: `Went back to ${page.url()}`,
+      value: { url: page.url(), title: await page.title(), wentBack: true },
     }
   }
 

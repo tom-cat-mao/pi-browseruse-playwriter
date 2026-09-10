@@ -44,6 +44,7 @@ import type {
   BrowserProfile,
   BrowserResultData,
   BrowserTab,
+  BrowserTabCandidate,
 } from "@tom-cat/pi-browser-runtime/browser-protocol";
 import * as runtime from "./bootstrap.ts";
 import { RuntimeRequestError } from "./runtime-client.ts";
@@ -292,6 +293,7 @@ export default function (pi: ExtensionAPI) {
       profiles: data.profiles,
       groups: data.groups,
       tabs: data.tabs,
+      candidates: data.candidates,
       group: data.group,
       tab: data.tab,
       snapshotId: data.snapshotId,
@@ -327,10 +329,11 @@ export default function (pi: ExtensionAPI) {
     if (data.tab) base.tab = compactTab(data.tab);
 
     // Lists are budgeted: keep as many items as fit, record how many dropped.
-    const lists: Array<{ key: "profiles" | "groups" | "tabs"; items: Json[] }> = [];
+    const lists: Array<{ key: "profiles" | "groups" | "tabs" | "candidates"; items: Json[] }> = [];
     if (data.profiles) lists.push({ key: "profiles", items: data.profiles.map(compactProfile) });
     if (data.groups) lists.push({ key: "groups", items: data.groups.map(compactGroup) });
     if (data.tabs) lists.push({ key: "tabs", items: data.tabs.map(compactTab) });
+    if (data.candidates) lists.push({ key: "candidates", items: data.candidates.map(compactCandidate) });
 
     // Fast path: everything (base + full lists + value) fits.
     const full: Json = { ...base };
@@ -411,6 +414,24 @@ export default function (pi: ExtensionAPI) {
     url: clampField(t.url),
     title: clampField(t.title),
     state: t.state,
+    ...(t.sourceTabId ? { sourceTabId: t.sourceTabId } : {}),
+    ...(t.origin ? { origin: t.origin } : {}),
+  });
+  // A discovered existing tab: everything needed to decide which one the user
+  // means, without reading any page content.
+  const compactCandidate = (c: BrowserTabCandidate): Json => ({
+    candidateId: c.candidateId,
+    title: clampField(c.title),
+    url: clampField(c.url),
+    profileId: c.profileId,
+    profileLabel: clampField(c.profileLabel),
+    windowId: c.windowId,
+    active: c.active,
+    windowFocused: c.windowFocused,
+    managed: c.managed,
+    attachable: c.attachable,
+    ...(c.tabId ? { tabId: c.tabId } : {}),
+    ...(c.reason ? { reason: c.reason } : {}),
   });
   const compactProfile = (p: BrowserProfile): Json => ({
     profileId: p.profileId,
@@ -500,22 +521,50 @@ export default function (pi: ExtensionAPI) {
     name: "browser_tabs",
     label: "Browser Tabs",
     description:
-      "Manage tabs within this session's groups. Actions: list (this session's tabs, optionally filtered by groupId), " +
-      "create (needs groupId and url — the tab opens inside that group), close (a tab), release (relinquish this session's " +
-      "control of a tab so a later reconnect won't pull it back into this session). All actions take explicit ids; there is " +
-      "no implicit current tab.",
-    promptSnippet: "List/create/close/release tabs in this session's groups",
+      "Work with tabs. Actions: list (this session's tabs, optionally filtered by groupId or by the tab a link was opened " +
+      "from), create (needs groupId and url — opens a new tab inside that group), discover (list the real tabs already open " +
+      "in the connected browser profiles with their window, title, URL and active state — use it when the user points you at " +
+      "a page they are already looking at), attach (needs candidateId from discover — take control of that existing tab where " +
+      "it is, without reloading, moving or regrouping it, and get back a normal tabId), activate (make a tab the active tab of " +
+      "its window again after reading a link elsewhere), close, release (relinquish this session's control of a tab so a later " +
+      "reconnect won't pull it back into this session). All actions take explicit ids; there is no implicit current tab.",
+    promptSnippet: "List/create/attach/activate/close/release tabs, or discover the tabs already open",
     promptGuidelines: [
+      "When the user says they are looking at a page and want you to continue there, call browser_tabs with action:\"discover\", pick the matching entry by title/URL/window, then action:\"attach\" with its candidateId — you get a normal tabId and keep working in that same tab (nothing is reloaded or moved).",
       "Use browser_tabs create with a groupId (from browser_groups) and a url to open a managed tab; use the returned tabId for all page tools. Use release to give up control of a tab when you are done with it so a later reconnect won't pull it back into this session.",
+      "After a link opens in a new tab, use browser_tabs list with sourceTabId set to the tab you clicked in to find the real new tab, or browser_tabs activate to go back to the original tab. Never guess by URL or by 'the last tab'.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["list", "create", "close", "release"] as const),
+      action: StringEnum(["list", "discover", "attach", "activate", "create", "close", "release"] as const),
       groupId: Type.Optional(Type.String({ description: "For create (required) or to filter list" })),
       url: Type.Optional(Type.String({ description: "For create (required): initial URL" })),
-      tabId: Type.Optional(Type.String({ description: "For close/release (required)" })),
+      tabId: Type.Optional(Type.String({ description: "For close/release/activate (required); for list: only tabs opened from this tab" })),
+      sourceTabId: Type.Optional(Type.String({ description: "For list: only tabs that were opened from this tabId" })),
+      candidateId: Type.Optional(Type.String({ description: "For attach (required): a candidateId from discover" })),
+      profileId: Type.Optional(Type.String({ description: "For discover: only this profile" })),
+      windowId: Type.Optional(Type.Integer({ description: "For discover: only this browser window" })),
+      query: Type.Optional(Type.String({ description: "For discover: only tabs whose title or URL contains this text" })),
+      includeManaged: Type.Optional(Type.Boolean({ description: "For discover: set false to hide tabs already under this session's control" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       const op = ((): BrowserOperation => {
+        if (params.action === "discover") {
+          return {
+            kind: "tabs.discover",
+            ...(params.profileId ? { profileId: params.profileId } : {}),
+            ...(params.windowId !== undefined ? { windowId: params.windowId } : {}),
+            ...(params.query ? { query: params.query } : {}),
+            ...(params.includeManaged !== undefined ? { includeManaged: params.includeManaged } : {}),
+          };
+        }
+        if (params.action === "attach") {
+          if (!params.candidateId) throw new Error("browser_tabs attach requires candidateId from discover");
+          return { kind: "tabs.attach", candidateId: params.candidateId };
+        }
+        if (params.action === "activate") {
+          if (!params.tabId) throw new Error("browser_tabs activate requires tabId");
+          return { kind: "tabs.activate", tabId: params.tabId };
+        }
         if (params.action === "create") {
           if (!params.groupId || !params.url) {
             throw new Error("browser_tabs create requires both groupId and url");
@@ -530,16 +579,24 @@ export default function (pi: ExtensionAPI) {
           if (!params.tabId) throw new Error("browser_tabs release requires tabId");
           return { kind: "tabs.release", tabId: params.tabId };
         }
-        return { kind: "tabs.list", ...(params.groupId ? { groupId: params.groupId } : {}) };
+        return {
+          kind: "tabs.list",
+          ...(params.groupId ? { groupId: params.groupId } : {}),
+          ...(params.sourceTabId ? { sourceTabId: params.sourceTabId } : {}),
+        };
       })();
       return run({ ctx, toolCallId, signal, operation: op });
     },
     renderCall: makeRenderCall("browser tabs", (a) =>
-      `${a.action}${a.groupId ? ` group=${a.groupId}` : ""}${a.tabId ? ` [${a.tabId}]` : ""}${a.url ? ` ${preview(a.url, 64)}` : ""}`,
+      `${a.action}${a.groupId ? ` group=${a.groupId}` : ""}${a.tabId ? ` [${a.tabId}]` : ""}${a.candidateId ? ` ${a.candidateId}` : ""}${a.url ? ` ${preview(a.url, 64)}` : ""}`,
     ),
     renderResult: makeRenderResult((d) => {
       if (d.tab) return `✓ ${tabLine(d.tab as BrowserTab)}`;
       const tabs = (d.tabs as BrowserTab[] | undefined) ?? [];
+      const candidates = (d.candidates as BrowserTabCandidate[] | undefined) ?? [];
+      if (candidates.length > 0) {
+        return `✓ ${candidates.length} open tab(s) discovered`;
+      }
       return `✓ ${tabs.length} tab(s)`;
     }),
   });
@@ -549,16 +606,27 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "browser_navigate",
     label: "Browser Navigate",
-    description: "Navigate an existing managed tab (by tabId) to a URL. Returns the final URL after any redirects.",
-    promptSnippet: "Navigate a managed tab to a URL",
+    description:
+      "Move an existing managed tab (by tabId). Default action \"goto\" navigates to a URL and returns the final URL after " +
+      "redirects. action:\"back\" performs a normal browser history back in that same tab — use it when a link changed the page " +
+      "you were on and you want the previous page back (it does not reopen or re-navigate the old URL).",
+    promptSnippet: "Navigate a managed tab, or go back in its history",
     promptGuidelines: [
       "Use browser_navigate with a tabId from browser_tabs to load a URL, then browser_snapshot to read the page — pages redirect, so always re-check.",
+      "Use browser_navigate with action:\"back\" (no url) when a link navigated the tab you were working in; the browser restores the previous history entry (scroll/form state depends on the site — re-snapshot to check). To return to an original tab after reading a link that opened a NEW tab, use browser_tabs action:\"activate\" instead.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
-      url: Type.String({ description: "URL to open" }),
+      url: Type.Optional(Type.String({ description: "URL to open (required for action \"goto\")" })),
+      action: Type.Optional(
+        StringEnum(["goto", "back"] as const, { description: "goto (default) or back (browser history)" }),
+      ),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      if (params.action === "back") {
+        return run({ ctx, toolCallId, signal, operation: { kind: "page.back", tabId: params.tabId } });
+      }
+      if (!params.url) throw new Error("browser_navigate requires url unless action is \"back\"");
       return run({ ctx, toolCallId, signal, operation: { kind: "page.navigate", tabId: params.tabId, url: params.url } });
     },
     renderCall: makeRenderCall("browser navigate", (a) => `[${a.tabId}] ${preview(a.url, 80)}`),

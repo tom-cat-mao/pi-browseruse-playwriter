@@ -1,3 +1,7 @@
+import {
+  buildTabCandidateId,
+  parseTabCandidateId,
+} from 'playwriter/src/browser-protocol'
 import type {
   BrowserErrorCode,
   BrowserGroup,
@@ -5,6 +9,7 @@ import type {
   BrowserResponse,
   BrowserResultData,
   BrowserTab,
+  BrowserTabCandidate,
   BrowserOperation,
 } from 'playwriter/src/browser-protocol'
 import {
@@ -167,6 +172,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms)
   })
+}
+
+/** Logical name for the internal group that holds one tab attached in place. */
+function buildExistingGroupName(title: string | undefined): string {
+  const trimmed = (title ?? '').trim().slice(0, GROUP_NAME_MAX_LENGTH)
+  return trimmed.length > 0 ? trimmed : 'Existing tab'
 }
 
 interface CreateDedupeContext {
@@ -656,6 +667,12 @@ export class ManagedGroups {
         return this.handleGroupsClose(request, operation)
       case 'tabs.list':
         return this.handleTabsList(request, operation)
+      case 'tabs.discover':
+        return this.handleTabsDiscover(request, operation)
+      case 'tabs.attach':
+        return this.handleTabsAttach(request, operation, context)
+      case 'tabs.activate':
+        return this.handleTabsActivate(request, operation)
       case 'tabs.create':
         return this.groupQueue.run(operation.groupId, () => {
           return this.handleTabsCreate(request, operation, context)
@@ -911,11 +928,324 @@ export class ManagedGroups {
   ): Promise<BrowserResponse> {
     if (operation.groupId !== undefined) {
       const group = this.requireGroup({ groupId: operation.groupId, sessionId: request.sessionId })
-      const tabs = listSessionTabs(this.getRegistry(), request.sessionId, group.groupId)
+      const tabs = listSessionTabs(this.getRegistry(), request.sessionId, group.groupId).filter((tab) => {
+        return operation.sourceTabId === undefined || tab.sourceTabId === operation.sourceTabId
+      })
       return ok(request.requestId, { tabs })
     }
-    const tabs = listSessionTabs(this.getRegistry(), request.sessionId)
+    const tabs = listSessionTabs(this.getRegistry(), request.sessionId).filter((tab) => {
+      return operation.sourceTabId === undefined || tab.sourceTabId === operation.sourceTabId
+    })
     return ok(request.requestId, { tabs })
+  }
+
+  /**
+   * tabs.discover: metadata-only listing of the real tabs of this profile.
+   *
+   * Returns one entry per tab of every window so Pi can match the user's
+   * description ("the one with the invoice, second window"). There is no single
+   * "current tab": each window has its own active tab and the browser may have
+   * no OS focus at all while the user is typing in the terminal. Listing never
+   * reads page content.
+   */
+  private async handleTabsDiscover(
+    request: BrowserRequest,
+    operation: Extract<BrowserOperation, { kind: 'tabs.discover' }>,
+  ): Promise<BrowserResponse> {
+    const [chromeTabs, windows] = await Promise.all([
+      chrome.tabs.query({}),
+      chrome.windows.getAll({ populate: false }),
+    ])
+    const windowTypes = new Map<number, string>()
+    const focusedWindowIds = new Set<number>()
+    for (const window of windows) {
+      if (window.id === undefined) continue
+      if (window.type !== undefined) windowTypes.set(window.id, window.type)
+      if (window.focused) focusedWindowIds.add(window.id)
+    }
+
+    const query = operation.query?.trim().toLowerCase()
+    const candidates = chromeTabs
+      .filter((tab) => {
+        if (tab.id === undefined) return false
+        if (operation.windowId !== undefined && tab.windowId !== operation.windowId) return false
+        if (query !== undefined && query.length > 0) {
+          const haystack = `${tab.title ?? ''}\n${tab.url ?? ''}`.toLowerCase()
+          if (!haystack.includes(query)) return false
+        }
+        return true
+      })
+      .sort((a, b) => {
+        return a.windowId - b.windowId || a.index - b.index
+      })
+      .map((tab) => {
+        return this.buildCandidate({
+          chromeTab: tab,
+          focusedWindowIds,
+          windowType: windowTypes.get(tab.windowId),
+          sessionId: request.sessionId,
+        })
+      })
+      .filter((candidate) => {
+        return operation.includeManaged === false ? !candidate.managed : true
+      })
+
+    const skipped = candidates.filter((candidate) => !candidate.attachable).length
+    const text =
+      `Discovered ${candidates.length} tab(s) in this profile across ${windows.length} window(s)` +
+      (skipped > 0 ? `; ${skipped} cannot be attached (see reason on each entry)` : '') +
+      `. Listing is metadata only: no page content was read. Other profiles are listed separately by the runtime.`
+    return ok(request.requestId, { candidates, text })
+  }
+
+  private buildCandidate(options: {
+    chromeTab: chrome.tabs.Tab
+    focusedWindowIds: Set<number>
+    windowType: string | undefined
+    sessionId: string
+  }): BrowserTabCandidate {
+    const chromeTab = options.chromeTab
+    const chromeTabId = chromeTab.id as number
+    const url = chromeTab.url ?? ''
+    const title = chromeTab.title ?? ''
+    const managed = findActiveTabByChromeTabId(this.getRegistry(), {
+      chromeTabId,
+      browserEpoch: this.browserEpoch,
+    })
+    // A popup window cannot host a managed page: the debugger target lives in a
+    // window the user did not ask us to control.
+    const unsupported = options.windowType !== undefined && options.windowType !== 'normal'
+    const restricted = this.deps.isRestrictedUrl(url)
+    const ownedByOtherSession = managed !== undefined && managed.sessionId !== options.sessionId
+    const attachable = !unsupported && !restricted && !ownedByOtherSession
+    const base = {
+      candidateId: buildTabCandidateId({
+        profileId: this.getRegistry().profileId,
+        browserEpoch: this.browserEpoch,
+        chromeTabId,
+      }),
+      profileId: this.getRegistry().profileId,
+      profileLabel: '',
+      browser: '',
+      browserEpoch: this.browserEpoch,
+      windowId: chromeTab.windowId,
+      active: chromeTab.active === true,
+      windowFocused: options.focusedWindowIds.has(chromeTab.windowId),
+      chromeTabId,
+      url,
+      title,
+      managed: managed !== undefined,
+      ownedByThisSession: managed !== undefined && !ownedByOtherSession,
+    }
+    if (unsupported) {
+      return { ...base, attachable: false, reason: 'unsupported-page' }
+    }
+    if (restricted) {
+      return { ...base, attachable: false, reason: 'restricted-url' }
+    }
+    if (managed !== undefined) {
+      return {
+        ...base,
+        attachable,
+        tabId: managed.tabId,
+        ...(ownedByOtherSession ? { reason: 'owned-by-other-session' as const } : {}),
+      }
+    }
+    return { ...base, attachable: true }
+  }
+
+  /**
+   * tabs.attach: take control of an existing tab without disturbing it.
+   *
+   * No reload, no window move, no Chrome tab group: the tab keeps its scroll
+   * position, form state and group membership. Only the tab named by the
+   * candidate is attached - never the rest of its Chrome group. The internal
+   * logical group this creates is marked `existing`, which is what stops
+   * reconcile/tab.resolve from releasing it for "not being in a task group".
+   */
+  private async handleTabsAttach(
+    request: BrowserRequest,
+    operation: Extract<BrowserOperation, { kind: 'tabs.attach' }>,
+    context: RequestContext,
+  ): Promise<BrowserResponse> {
+    const parsed = parseTabCandidateId(operation.candidateId)
+    if (!parsed) {
+      throw new ManagedGroupsError({
+        code: 'invalid-request',
+        message: 'candidateId is not a discovery id; run tabs.discover again',
+      })
+    }
+    const registry = this.getRegistry()
+    if (parsed.profileId !== registry.profileId) {
+      throw new ManagedGroupsError({
+        code: 'ownership-mismatch',
+        message: `discovery ${operation.candidateId} belongs to profile ${parsed.profileId}, not this one`,
+      })
+    }
+    // Chrome numeric ids are only meaningful inside one browser run: a stale
+    // discovery must never attach whatever tab reuses that id now.
+    if (parsed.browserEpoch !== this.browserEpoch) {
+      throw new ManagedGroupsError({
+        code: 'stale-snapshot',
+        message: 'this tab was discovered in an earlier browser run; discover it again before attaching',
+      })
+    }
+    this.assertCanContinue(context)
+
+    const chromeTab = await chrome.tabs.get(parsed.chromeTabId).catch(() => {
+      return null
+    })
+    if (!chromeTab) {
+      throw new ManagedGroupsError({
+        code: 'resource-not-found',
+        message: `the discovered tab no longer exists in Chrome (chromeTabId=${parsed.chromeTabId})`,
+      })
+    }
+    if (this.deps.isRestrictedUrl(chromeTab.url)) {
+      throw new ManagedGroupsError({
+        code: 'unsupported-capability',
+        message: 'this page cannot be controlled (browser-internal or restricted page)',
+      })
+    }
+    const chromeTabId = parsed.chromeTabId
+    const url = chromeTab.url ?? ''
+    const title = chromeTab.title ?? ''
+
+    const existing = findActiveTabByChromeTabId(this.getRegistry(), {
+      chromeTabId,
+      browserEpoch: this.browserEpoch,
+    })
+    if (existing) {
+      if (existing.sessionId !== request.sessionId) {
+        throw new ManagedGroupsError({
+          code: 'ownership-mismatch',
+          message: `tab ${existing.tabId} is already controlled by another session`,
+        })
+      }
+      // Reuse the existing claim; only re-attach the debugger when needed.
+      if (existing.state !== 'ready') {
+        const attached = await this.deps.attachTab(chromeTabId)
+        this.assertCanContinue(context, { tabId: existing.tabId })
+        this.mutate((current) => {
+          return setTabAttachment(current, {
+            tabId: existing.tabId,
+            targetId: attached.targetInfo.targetId,
+            cdpSessionId: attached.sessionId,
+          })
+        })
+      }
+      this.mutate((current) => {
+        return setTabPageInfo(current, { tabId: existing.tabId, url, title })
+      })
+      await this.persist()
+      await this.publishInventory()
+      const current = findTab(this.getRegistry(), existing.tabId)
+      if (!current) {
+        throw new ManagedGroupsError({ code: 'internal-error', message: 'tab vanished while re-attaching' })
+      }
+      return ok(request.requestId, { tab: current })
+    }
+
+    const groupId = createOpaqueId('pgrp')
+    const tabId = createOpaqueId('ptab')
+    this.mutate((current) => {
+      return addGroup(current, {
+        groupId,
+        sessionId: request.sessionId,
+        name: buildExistingGroupName(title),
+        browserEpoch: this.browserEpoch,
+        origin: 'existing',
+      })
+    })
+    this.mutate((current) => {
+      return addTab(current, {
+        tabId,
+        groupId,
+        sessionId: request.sessionId,
+        chromeTabId,
+        url,
+        title,
+        browserEpoch: this.browserEpoch,
+        origin: 'existing',
+      })
+    })
+    await this.persist()
+
+    try {
+      this.assertCanContinue(context, { tabId })
+      const attached = await this.deps.attachTab(chromeTabId)
+      this.assertCanContinue(context, { tabId })
+      this.mutate((current) => {
+        return setTabAttachment(current, {
+          tabId,
+          targetId: attached.targetInfo.targetId,
+          cdpSessionId: attached.sessionId,
+        })
+      })
+      this.mutate((current) => {
+        return setTabPageInfo(current, { tabId, url, title })
+      })
+      await this.persist()
+      await this.publishInventory()
+    } catch (error: unknown) {
+      // Never leave a claim on the user's tab when we could not drive it.
+      this.mutate((current) => {
+        return releaseTab(current, tabId)
+      })
+      this.mutate((current) => {
+        return setGroupState(current, { groupId, state: 'released' })
+      })
+      await this.persist()
+      await this.publishInventory()
+      throw error
+    }
+
+    const tab = findTab(this.getRegistry(), tabId)
+    if (!tab) {
+      throw new ManagedGroupsError({ code: 'internal-error', message: 'attached tab vanished from the registry' })
+    }
+    return ok(request.requestId, { tab })
+  }
+
+  /**
+   * tabs.activate: make the original tab the active tab of its window again
+   * after reading a link elsewhere. It never navigates, recreates or closes the
+   * tab, and it does not steal OS focus from the terminal.
+   */
+  private async handleTabsActivate(
+    request: BrowserRequest,
+    operation: Extract<BrowserOperation, { kind: 'tabs.activate' }>,
+  ): Promise<BrowserResponse> {
+    const tab = this.requireTab({ tabId: operation.tabId, sessionId: request.sessionId })
+    if (tab.state === 'needs-rebind' || tab.browserEpoch !== this.browserEpoch) {
+      throw new ManagedGroupsError({
+        code: 'needs-rebind',
+        message: `tab ${tab.tabId} belongs to a previous browser run; its Chrome mapping is not reused`,
+      })
+    }
+    const chromeTab = await chrome.tabs.update(tab.chromeTabId, { active: true }).catch(() => {
+      return null
+    })
+    if (!chromeTab) {
+      await this.releaseManagedTab({ tabId: tab.tabId, reason: 'activate-tab-missing', ungroup: false })
+      throw new ManagedGroupsError({
+        code: 'resource-released',
+        message: `tab ${tab.tabId} no longer exists in Chrome`,
+      })
+    }
+    this.mutate((registry) => {
+      return setTabPageInfo(registry, {
+        tabId: tab.tabId,
+        url: chromeTab.url ?? tab.url,
+        title: chromeTab.title ?? tab.title,
+      })
+    })
+    await this.persist()
+    const activated = findTab(this.getRegistry(), tab.tabId)
+    if (!activated) {
+      throw new ManagedGroupsError({ code: 'internal-error', message: 'tab vanished during activate' })
+    }
+    return ok(request.requestId, { tab: activated })
   }
 
   private async handleTabsCreate(
@@ -1626,6 +1956,9 @@ export class ManagedGroups {
       if (!tab) return
       const group = findGroup(this.getRegistry(), tab.groupId)
       if (!group) return
+      // A tab attached in place was never put into a Chrome group by us, so a
+      // group change is the user's own business and must not release it.
+      if (group.origin === 'existing') return
 
       if (group.chromeGroupId !== undefined && options.chromeGroupId === group.chromeGroupId) {
         // Moved (back) into the managed group - keep ownership.
@@ -1772,27 +2105,39 @@ export class ManagedGroups {
             return
           }
 
-          const targetWindowId = await this.resolveAdoptionWindow(group, sourceTab)
-          if (targetWindowId !== undefined && chromeTab.windowId !== targetWindowId) {
-            this.internalMoves.register(options.chromeTabId, {
-              expectedChromeGroupId: TAB_ID_NONE,
-              windowId: targetWindowId,
-            })
-            await chrome.tabs
-              .move(options.chromeTabId, { windowId: targetWindowId, index: -1 })
-              .catch((error: unknown) => {
-                this.deps.logger.warn(`Failed to move inherited tab ${options.chromeTabId} to the group window:`, error)
+          // A tab attached in place is adopted in place too: the user's window
+          // layout and Chrome groups stay exactly as they were. Task groups keep
+          // their existing "popup joins the group" behaviour.
+          const inPlace = group.origin === 'existing'
+
+          if (!inPlace) {
+            const targetWindowId = await this.resolveAdoptionWindow(group, sourceTab)
+            if (targetWindowId !== undefined && chromeTab.windowId !== targetWindowId) {
+              this.internalMoves.register(options.chromeTabId, {
+                expectedChromeGroupId: TAB_ID_NONE,
+                windowId: targetWindowId,
               })
+              await chrome.tabs
+                .move(options.chromeTabId, { windowId: targetWindowId, index: -1 })
+                .catch((error: unknown) => {
+                  this.deps.logger.warn(
+                    `Failed to move inherited tab ${options.chromeTabId} to the group window:`,
+                    error,
+                  )
+                })
+            }
           }
 
           const sourceStillOwned = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
           if (!sourceStillOwned || sourceStillOwned.state !== 'ready') return
 
-          const chromeGroupId = await this.ensureTabInManagedGroup({
-            chromeTabId: options.chromeTabId,
-            group,
-            windowId: targetWindowId ?? chromeTab.windowId,
-          })
+          const chromeGroupId = inPlace
+            ? undefined
+            : await this.ensureTabInManagedGroup({
+                chromeTabId: options.chromeTabId,
+                group,
+                windowId: chromeTab.windowId,
+              })
 
           const tabId = createOpaqueId('ptab')
           this.mutate((registry) => {
@@ -1804,15 +2149,19 @@ export class ManagedGroups {
               url: chromeTab.url ?? '',
               title: chromeTab.title ?? '',
               browserEpoch: this.browserEpoch,
+              origin: inPlace ? 'existing' : 'task',
+              sourceTabId: sourceTab.tabId,
             })
           })
-          this.mutate((registry) => {
-            return setGroupChromeBindingMissing(registry, {
-              groupId: group.groupId,
-              chromeGroupId,
-              windowId: targetWindowId ?? chromeTab.windowId,
+          if (chromeGroupId !== undefined) {
+            this.mutate((registry) => {
+              return setGroupChromeBindingMissing(registry, {
+                groupId: group.groupId,
+                chromeGroupId,
+                windowId: chromeTab.windowId,
+              })
             })
-          })
+          }
           await this.persist()
 
           const sourceAfterPersist = this.findManagedTabByChromeTabId(options.sourceChromeTabId)
@@ -1851,7 +2200,11 @@ export class ManagedGroups {
     }
   }
 
-  private async dropAdoptedTab(options: { tabId: string; chromeTabId: number; chromeGroupId: number }): Promise<void> {
+  private async dropAdoptedTab(options: {
+    tabId: string
+    chromeTabId: number
+    chromeGroupId?: number
+  }): Promise<void> {
     const stillOurs = this.findManagedTabByChromeTabId(options.chromeTabId)
     if (stillOurs && stillOurs.tabId === options.tabId) {
       const releasedTabId = options.tabId
@@ -1859,14 +2212,16 @@ export class ManagedGroups {
         return releaseTab(registry, releasedTabId)
       })
     }
-    const chromeTab = await chrome.tabs.get(options.chromeTabId).catch(() => {
-      return null
-    })
-    if (chromeTab && chromeTab.groupId === options.chromeGroupId) {
-      this.internalMoves.register(options.chromeTabId, { expectedChromeGroupId: TAB_ID_NONE })
-      await chrome.tabs.ungroup(options.chromeTabId).catch((error: unknown) => {
-        this.deps.logger.debug(`Failed to ungroup dropped adopted tab ${options.chromeTabId}:`, error)
+    if (options.chromeGroupId !== undefined) {
+      const chromeTab = await chrome.tabs.get(options.chromeTabId).catch(() => {
+        return null
       })
+      if (chromeTab && chromeTab.groupId === options.chromeGroupId) {
+        this.internalMoves.register(options.chromeTabId, { expectedChromeGroupId: TAB_ID_NONE })
+        await chrome.tabs.ungroup(options.chromeTabId).catch((error: unknown) => {
+          this.deps.logger.debug(`Failed to ungroup dropped adopted tab ${options.chromeTabId}:`, error)
+        })
+      }
     }
     await this.persist()
     await this.publishInventory()

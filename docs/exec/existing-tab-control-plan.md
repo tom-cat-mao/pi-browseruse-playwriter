@@ -41,6 +41,10 @@ prompt: |
 用户已批准实施；先在此工作树修改与完成无浏览器检查。
 浏览器验收前通知用户准备/重载扩展，不擅自操作当前浏览器。
 
+当前状态：代码、类型检查与无浏览器测试已完成并提交在本分支（扩展 0.0.128 +
+changeset）。共享契约见下文“共享契约（本轮新增，唯一写入处）”。
+浏览器内五项验收尚未开始，等用户加载本工作树的 fork 构建后配合执行。
+
 目标只有一句话：**用户在页面上做到一半，告诉 agent 接着做，agent 就在原标签继续。**
 复用现有读取、点击、填写、导航与隔离执行能力，不重写底座，不做新 agent。
 
@@ -102,6 +106,46 @@ prompt: |
   工具说明遵循“看用户现场并接着做”，不让用户处理内部参数。
 - 具体新增字段由实施前的小型共享契约固定；不为选标签造审批 UI、页面路由器
   或自定义任务状态机，不扩展 Firefox、PDF、全局键鼠和冷启动重绑定。
+
+# 共享契约（本轮新增，唯一写入处）
+
+编译类型来源：playwriter/src/browser-protocol.ts。新增字段/操作以此为准，
+扩展、relay、executor、Pi 不再各自猜接口。全部为**向后兼容新增**：
+旧 WS method/result 格式、旧 manifest/registry、旧客户端行为均不变。
+
+## 新增字段
+
+- `BrowserTabOrigin = 'task' | 'existing'`
+  - `task`：原有自动建组/受控新建的标签（默认语义，缺省等同）。
+  - `existing`：原地接入的用户现有标签及其原地来源的子标签。
+- `BrowserGroup.origin?`：内部逻辑组来源。`existing` 组**没有** chromeGroupId
+  绑定，不参与 Chrome 分组，也不因“不在任务组里”被释放。
+- `BrowserTab.origin?` / `BrowserTab.sourceTabId?`
+  - `sourceTabId`：外链新标签的来源 managed tabId（点击结果或随后列表可查）。
+- `BrowserCapabilities.existingTabs?: boolean`（optional，旧 profile 不失效）。
+- `BrowserResultData.candidates?: BrowserTabCandidate[]`（发现结果，元数据）。
+
+## candidateId（发现目标的真实标识）
+
+- 格式：`pcdt:<profileId>:<browserEpoch>:<chromeTabId>`，由
+  `buildTabCandidateId()` / `parseTabCandidateId()` 生成与解析（放协议文件，
+  各层共用，不各写一份正则）。
+- 不是 managed tabId，不替代 groupId/tabId 的 opaque 身份；它只描述
+  “某次发现到的那个真实标签”。
+- attach 必须用当前 browserEpoch 校验：过期发现 id 直接失败，绝不误接其它标签。
+- 发现结果随取随用，无服务端缓存，SW 重启或 relay 重启后重新发现即可。
+
+## 新增 operation
+
+| kind | 参数 | 处理位置 | 语义 |
+| --- | --- | --- | --- |
+| `tabs.discover` | `profileId?` `windowId?` `query?` `includeManaged?` | relay 扇出到已连接 profile，扩展列举本 profile | 元数据发现（URL/title/window/active/focus），不读取页面正文 |
+| `tabs.attach` | `candidateId` | relay 按 profileId 路由 + epoch 校验，扩展原地接入 | 返回正常 managed tabId；内部建 `existing` 组，不搬动窗口/分组/刷新 |
+| `tabs.activate` | `tabId` | 扩展 | 把原标签设为所在窗口的 active 标签（不抢 OS 焦点、不重建、不 goto） |
+| `page.back` | `tabId` | executor | 浏览器历史后退（`page.goBack()`），不是 goto(旧 URL) |
+
+`tabs.list` 新增可选过滤 `sourceTabId?`（查“某标签点出来的新标签”）；
+默认仍严格只列本 session，语义不变。
 
 # 执行方式
 

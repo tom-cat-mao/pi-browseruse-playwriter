@@ -26,6 +26,7 @@
  * must never be replayed automatically.
  */
 import { ManagedExecutorPool } from './managed-executor-pool.js'
+import { parseTabCandidateId } from './browser-protocol.js'
 import {
   BROWSER_PROTOCOL_VERSION,
   type BrowserCapabilities,
@@ -40,6 +41,8 @@ import {
   type BrowserResponse,
   type BrowserResultData,
   type BrowserTab,
+  type BrowserTabCandidate,
+  type BrowserTabOrigin,
   type ManagedExecutorPoolContract,
 } from './browser-protocol.js'
 
@@ -343,6 +346,10 @@ function isBrowserResourceState(value: unknown): value is BrowserResourceState {
   return value === 'ready' || value === 'disconnected' || value === 'released' || value === 'needs-rebind'
 }
 
+function readOrigin(value: unknown): BrowserTabOrigin | undefined {
+  return value === 'task' || value === 'existing' ? value : undefined
+}
+
 // ---------------------------------------------------------------------------
 // Request parsing (runtime validation, never a bare TypeScript cast)
 // ---------------------------------------------------------------------------
@@ -355,12 +362,16 @@ const OPERATION_KINDS = new Set<BrowserOperation['kind']>([
   'groups.close',
   'tabs.list',
   'tabs.create',
+  'tabs.discover',
+  'tabs.attach',
+  'tabs.activate',
   'tabs.close',
   'tabs.release',
   'tab.resolve',
   'session.release',
   'request.cancel',
   'page.navigate',
+  'page.back',
   'page.snapshot',
   'page.click',
   'page.fill',
@@ -479,12 +490,80 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
       return groupId.ok ? { ok: true, value: { kind: 'groups.close', groupId: groupId.value } } : groupId
     }
     case 'tabs.list': {
-      const fields = withFields(['groupId'])
+      const fields = withFields(['groupId', 'sourceTabId'])
       if (!fields.ok) {
         return fields
       }
       const groupId = readOptionalString(value, 'groupId', { maxLength: IDENTIFIER_MAX_LENGTH })
-      return groupId.ok ? { ok: true, value: { kind: 'tabs.list', groupId: groupId.value } } : groupId
+      if (!groupId.ok) {
+        return groupId
+      }
+      const sourceTabId = readOptionalString(value, 'sourceTabId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      if (!sourceTabId.ok) {
+        return sourceTabId
+      }
+      return {
+        ok: true,
+        value: {
+          kind: 'tabs.list',
+          ...(groupId.value !== undefined ? { groupId: groupId.value } : {}),
+          ...(sourceTabId.value !== undefined ? { sourceTabId: sourceTabId.value } : {}),
+        },
+      }
+    }
+    case 'tabs.discover': {
+      const fields = withFields(['profileId', 'windowId', 'query', 'includeManaged'])
+      if (!fields.ok) {
+        return fields
+      }
+      const profileId = readOptionalString(value, 'profileId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      if (!profileId.ok) {
+        return profileId
+      }
+      const windowId = readOptionalInteger(value, 'windowId', { min: 0, max: Number.MAX_SAFE_INTEGER })
+      if (!windowId.ok) {
+        return windowId
+      }
+      const query = readOptionalString(value, 'query', { maxLength: MESSAGE_MAX_LENGTH, trim: true })
+      if (!query.ok) {
+        return query
+      }
+      const includeManaged = readOptionalBoolean(value, 'includeManaged')
+      if (!includeManaged.ok) {
+        return includeManaged
+      }
+      return {
+        ok: true,
+        value: {
+          kind: 'tabs.discover',
+          ...(profileId.value !== undefined ? { profileId: profileId.value } : {}),
+          ...(windowId.value !== undefined ? { windowId: windowId.value } : {}),
+          ...(query.value !== undefined ? { query: query.value } : {}),
+          ...(includeManaged.value !== undefined ? { includeManaged: includeManaged.value } : {}),
+        },
+      }
+    }
+    case 'tabs.attach': {
+      const fields = withFields(['candidateId'])
+      if (!fields.ok) {
+        return fields
+      }
+      const candidateId = readString(value, 'candidateId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      if (!candidateId.ok) {
+        return candidateId
+      }
+      return { ok: true, value: { kind: 'tabs.attach', candidateId: candidateId.value } }
+    }
+    case 'tabs.activate': {
+      const fields = withFields(['tabId'])
+      if (!fields.ok) {
+        return fields
+      }
+      const tabId = readString(value, 'tabId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      if (!tabId.ok) {
+        return tabId
+      }
+      return { ok: true, value: { kind: 'tabs.activate', tabId: tabId.value } }
     }
     case 'tabs.create': {
       const fields = withFields(['groupId', 'url'])
@@ -543,6 +622,14 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
         return url
       }
       return { ok: true, value: { kind: 'page.navigate', tabId: tabId.value, url: url.value } }
+    }
+    case 'page.back': {
+      const fields = withFields(['tabId'])
+      if (!fields.ok) {
+        return fields
+      }
+      const tabId = readString(value, 'tabId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      return tabId.ok ? { ok: true, value: { kind: 'page.back', tabId: tabId.value } } : tabId
     }
     case 'page.snapshot': {
       const fields = withFields(['tabId', 'selector', 'search', 'full', 'interactiveOnly'])
@@ -760,6 +847,7 @@ function parseGroupValue(value: unknown, index: number): FieldResult<BrowserGrou
     'revision',
     'chromeGroupId',
     'windowId',
+    'origin',
   ])
   const extra = assertNoExtraFields(value, allowed, `groups[${index}]`)
   if (!extra.ok) {
@@ -812,6 +900,7 @@ function parseGroupValue(value: unknown, index: number): FieldResult<BrowserGrou
       revision: revision.value ?? 0,
       ...(chromeGroupId.value !== undefined ? { chromeGroupId: chromeGroupId.value } : {}),
       ...(windowId.value !== undefined ? { windowId: windowId.value } : {}),
+      ...(readOrigin(value.origin) !== undefined ? { origin: readOrigin(value.origin) } : {}),
     },
   }
 }
@@ -833,6 +922,8 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
     'chromeTabId',
     'targetId',
     'cdpSessionId',
+    'origin',
+    'sourceTabId',
   ])
   const extra = assertNoExtraFields(value, allowed, `tabs[${index}]`)
   if (!extra.ok) {
@@ -885,6 +976,11 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
   if (!cdpSessionId.ok) {
     return cdpSessionId
   }
+  const origin = readOrigin(value.origin)
+  const sourceTabId = readOptionalString(value, 'sourceTabId', { maxLength: IDENTIFIER_MAX_LENGTH })
+  if (!sourceTabId.ok) {
+    return sourceTabId
+  }
   return {
     ok: true,
     value: {
@@ -900,6 +996,8 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
       chromeTabId: chromeTabId.value ?? -1,
       ...(targetId.value !== undefined ? { targetId: targetId.value } : {}),
       ...(cdpSessionId.value !== undefined ? { cdpSessionId: cdpSessionId.value } : {}),
+      ...(origin !== undefined ? { origin } : {}),
+      ...(sourceTabId.value !== undefined ? { sourceTabId: sourceTabId.value } : {}),
     },
   }
 }
@@ -1037,6 +1135,9 @@ export function buildBrowserCapabilities({ isolatedExecution }: { isolatedExecut
     persistentOwnership: true,
     explicitTabs: true,
     isolatedExecution,
+    // Optional flag: an extension predating existing-tab control keeps working,
+    // it simply never answers tabs.discover / tabs.attach.
+    existingTabControl: true,
   }
 }
 
@@ -1302,7 +1403,7 @@ export function listManagedGroups(
 
 export function listManagedTabs(
   state: ManagedRelayState,
-  { sessionId, groupId, profileId }: { sessionId: string; groupId?: string; profileId?: string },
+  { sessionId, groupId, profileId, sourceTabId }: { sessionId: string; groupId?: string; profileId?: string; sourceTabId?: string },
 ): BrowserTab[] {
   const profiles = profileId ? Array.from(state.profiles.values()).filter((profile) => profile.profileId === profileId) : sortedProfiles(state)
   return profiles.flatMap((profile) => {
@@ -1312,6 +1413,10 @@ export function listManagedTabs(
           return false
         }
         if (groupId && tab.groupId !== groupId) {
+          return false
+        }
+        // "Which tab did this one open?" — used to continue reading a link.
+        if (sourceTabId && tab.sourceTabId !== sourceTabId) {
           return false
         }
         // The tab must still resolve to a group owned by the same session/profile.
@@ -1498,9 +1603,13 @@ export class ManagedRelay {
       return successResponse(request.requestId, {
         tabs: listManagedTabs(this.state, {
           sessionId: request.sessionId,
-          groupId: operation.groupId,
+          ...(operation.groupId ? { groupId: operation.groupId } : {}),
+          ...(operation.sourceTabId ? { sourceTabId: operation.sourceTabId } : {}),
         }),
       })
+    }
+    if (operation.kind === 'tabs.discover') {
+      return await this.discoverTabs({ request, operation })
     }
     if (operation.kind === 'session.release') {
       return this.releaseSession({ requestId: request.requestId, sessionId: request.sessionId })
@@ -1533,6 +1642,94 @@ export class ManagedRelay {
     this.dedup.set(dedupKey, { kind: operation.kind, fingerprint, timestamp: Date.now(), promise })
     this.pruneDedup()
     return promise
+  }
+
+  /**
+   * tabs.discover: ask every connected profile (or just the requested one) for
+   * its real tabs and merge the metadata. Each extension instance only knows its
+   * own profile, so multi-profile discovery has to be a fan-out here. This never
+   * reads page content and never changes ownership.
+   */
+  private async discoverTabs({
+    request,
+    operation,
+  }: {
+    request: BrowserRequest
+    operation: Extract<BrowserOperation, { kind: 'tabs.discover' }>
+  }): Promise<BrowserResponse> {
+    const timeoutMs = request.timeoutMs ?? MANAGED_DEFAULT_TIMEOUT_MS
+    if (operation.profileId !== undefined) {
+      const profile = this.assertProfile({
+        profileId: operation.profileId,
+        allowOffline: false,
+        requestId: request.requestId,
+      })
+      if (!profile.ok) {
+        return profile.response
+      }
+    }
+    const profiles = sortedProfiles(this.state).filter((profile) => {
+      if (!profile.connected) return false
+      return operation.profileId === undefined || profile.profileId === operation.profileId
+    })
+    if (profiles.length === 0) {
+      return failureResponse(request.requestId, {
+        code: 'profile-disconnected',
+        message: 'no connected browser profile can list its tabs right now',
+        outcome: 'not-started',
+      })
+    }
+
+    const candidates: BrowserTabCandidate[] = []
+    const skipped: string[] = []
+    for (const profile of profiles) {
+      const subRequest: BrowserRequest = {
+        requestId: `${request.requestId}#${profile.profileId}`,
+        sessionId: request.sessionId,
+        operation,
+        ...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
+        timeoutMs,
+      }
+      let value: unknown
+      try {
+        const pending = this.options.transport.sendBrowserRequest({
+          profileId: profile.profileId,
+          stableKey: profile.stableKey,
+          request: subRequest,
+          timeoutMs,
+        })
+        pending.catch(() => {})
+        value = await pending
+      } catch (error) {
+        skipped.push(`${profile.profileId}: ${error instanceof Error ? error.message : String(error)}`)
+        continue
+      }
+      const parsed = parseBrowserResponse(value)
+      if (!parsed.ok) {
+        skipped.push(`${profile.profileId}: malformed response`)
+        continue
+      }
+      if (!parsed.value.ok) {
+        skipped.push(`${profile.profileId}: ${parsed.value.error.code}`)
+        continue
+      }
+      const list = parsed.value.data.candidates
+      if (!Array.isArray(list)) {
+        skipped.push(`${profile.profileId}: no candidate list`)
+        continue
+      }
+      for (const candidate of list) {
+        if (!isCandidateRecord(candidate)) continue
+        candidates.push({ ...candidate, browser: profile.browser, profileLabel: profile.label })
+      }
+    }
+
+    const text =
+      `Discovered ${candidates.length} existing tab(s) across ${profiles.length} connected profile(s). ` +
+      `These are your real tabs (metadata only, no page content was read); pass a candidateId to tabs.attach ` +
+      `to keep working in one of them. Only profiles with this extension connected are listed.` +
+      (skipped.length > 0 ? ` Unavailable: ${skipped.join('; ')}.` : '')
+    return successResponse(request.requestId, { candidates, text })
   }
 
   private async dispatch({
@@ -1587,8 +1784,37 @@ export class ManagedRelay {
           }
           return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
         }
+        case 'tabs.attach': {
+          // The candidate pins profile + browserEpoch, so an old discovery can
+          // never attach the wrong tab after a browser restart.
+          const parsed = parseTabCandidateId(operation.candidateId)
+          if (!parsed) {
+            return failureResponse(request.requestId, {
+              code: 'invalid-request',
+              message: 'candidateId is not a discovery id; run tabs.discover again',
+              outcome: 'not-started',
+            })
+          }
+          const routable = this.requireRoutableProfile({
+            requestId: request.requestId,
+            profileId: parsed.profileId,
+          })
+          if (!routable.ok) {
+            return routable.response
+          }
+          if (routable.profile.browserEpoch !== parsed.browserEpoch) {
+            return failureResponse(request.requestId, {
+              code: 'stale-snapshot',
+              message:
+                'this tab was discovered in an earlier browser run; discover it again before attaching (Chrome tab ids are not reused across runs)',
+              outcome: 'not-started',
+            })
+          }
+          return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
+        }
         case 'tabs.close':
         case 'tabs.release':
+        case 'tabs.activate':
         case 'tab.resolve': {
           const tab = this.resolveTab({ requestId: request.requestId, sessionId: request.sessionId, tabId: operation.tabId })
           if (!tab.ok) {
@@ -1601,6 +1827,7 @@ export class ManagedRelay {
           return await this.sendControl({ request, profile: routable.profile, timeoutMs, clientSignal })
         }
         case 'page.navigate':
+        case 'page.back':
         case 'page.snapshot':
         case 'page.click':
         case 'page.fill':
@@ -1725,6 +1952,12 @@ export class ManagedRelay {
       const tab = response.data.tab
       if (!tab || tab.sessionId !== request.sessionId || tab.groupId !== operation.groupId) {
         return invalid('extension returned a tab that does not belong to this session/group')
+      }
+    }
+    if (operation.kind === 'tabs.attach' || operation.kind === 'tabs.activate') {
+      const tab = response.data.tab
+      if (!tab || tab.sessionId !== request.sessionId) {
+        return invalid('extension returned a tab that does not belong to this session')
       }
     }
     return { ok: true }
@@ -2953,6 +3186,18 @@ export class ManagedRelay {
 
 function isPageOperationKind(kind: BrowserOperation['kind']): boolean {
   return kind.startsWith('page.')
+}
+
+/** Defensive shape check for discovery entries that travel over the WS link. */
+function isCandidateRecord(value: unknown): value is BrowserTabCandidate {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.candidateId === 'string' &&
+    typeof value.profileId === 'string' &&
+    typeof value.browserEpoch === 'string' &&
+    typeof value.chromeTabId === 'number' &&
+    typeof value.windowId === 'number'
+  )
 }
 
 /** Deterministic identity of a request payload for dedup collision detection. */
