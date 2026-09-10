@@ -1,0 +1,70 @@
+---
+title: Pi Browser Use 重构执行进度
+description: 工作树、任务归属、合并顺序与验收状态。
+prompt: |
+  按用户授权的多 agent worktree 工作流记录实际进度。
+  参考 @docs/exec/browser-rebuild-plan.md
+  @docs/exec/browser-runtime-contract.md @playwriter/src/browser-protocol.ts。
+  只记录已执行事实；不得把未执行 Chrome 验收标为通过。
+---
+
+# 当前阶段
+
+Step 1/2：五条工作流并行实施并滚动集成。尚未进行 Chrome 验收。
+用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
+全部执行 agent 使用默认 model/effort；禁止 Reasonix。
+codebuddy-6 原先显式 effort=high，已依用户要求停止，由默认配置的
+codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 agent 均未
+指定 model/effort，无需重启。
+
+# 任务与所有权
+
+| 工作流 | agent / task | 分支 | 状态 |
+| --- | --- | --- | --- |
+| E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 1107228 已集成，复核修订中 |
+| A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | bf29f36 已集成，P0 修订中 |
+| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 运行中 |
+| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 运行中 |
+| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 运行中 |
+| 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
+| 独立验收 | 全新 agent，实施后启动 | 待创建 | 未开始 |
+
+各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
+executor、pi-tools、integration。主目录 main 未修改。
+
+# 已完成
+
+- 主目录 main 8cbf68b，未跟踪 ppe-accept.jpg 保留。
+- 集成分支合入上游 6e563c8，合并提交 f7cef2d。
+- 计划、契约、共享类型提交 859910d。
+- 独立 tsc 检查 browser-protocol.ts 通过。
+- 已创建五个实现 worktree 并派发任务；没有等待 agent。
+- fork origin = tom-cat-mao/pi-browseruse-playwriter。
+- gh 默认仓库可能指向上游，所有后续 GitHub 操作显式 -R fork。
+- fork issues 禁用；参考上游 issue 时使用完整来源，不发上游 PR。
+- E 基础设施 1107228 已合入集成分支；A 主体 20c5fb5/bf29f36 已合入。
+- 集成工作树 pnpm 10.18.1 frozen install 成功；Playwright 子模块已本地
+  reference 初始化到2074cbb1d并保持playwriter分支。
+- 协调者在集成树重跑 runtime build + test:unit：28/28通过，无Chrome。
+- E 复核要求：并发启动不truncate日志、非法HTTP不判down、endpoint隔离、
+  token子进程测试、fork默认构建命令不能指向上游ID/19988/商店。
+- A 复核要求：持久化失败不假ready、scoped持久去重、per-group并发、
+  用户释放时失败cleanup不删用户tab、旧epoch数字不访问Chrome、
+  popup先归属/入组再attach、用户改名事件、全局取消不自动重控。
+- B 已提示 managed CDP URL必须传token，request指纹去重和tab.resolve。
+- 以上是协调者初审，不能代替最后的全新agent独立验收。
+
+# 待完成门槛
+
+- [ ] 五个 owner 提交及真实无浏览器验证结果。
+- [ ] 集成跨层接口、类型和依赖配置。
+- [ ] 独立全新 agent 代码审查及无浏览器验收。
+- [ ] 用户配合加载测试 Chrome 扩展。
+- [ ] 多 profile/多组/断线不散组/用户释放 Chrome 验收。
+- [ ] origin draft PR -> 验收完成后就绪 -> 最终合并。
+- [ ] 归档独有产物，清理所有 swarm worktree。
+
+# 不可越过
+
+未获用户配合前：不启动 Chrome，不调用用户 browser 工具，不动19988。
+未验收完成：不合入 main，不宣称完成，不发布 npm/Chrome 商店。
