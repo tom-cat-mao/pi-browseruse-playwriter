@@ -32,6 +32,37 @@ describe('file logger', () => {
     removeTestTmpDir(tmpDir)
   })
 
+  it('formats bigint values without throwing', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'relay.log')
+    const logger = createFileLogger({ logFilePath: logFile })
+
+    await logger.log('counter', 10n)
+    await logger.flush()
+
+    expect(readLines(logFile)).toEqual(['counter 10n'])
+
+    removeTestTmpDir(tmpDir)
+  })
+
+  it('rotates based on the existing file size after a restart', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'relay.log')
+    const existing = Array.from({ length: 8 }, (_, i) => {
+      return `old-line-${i}-${'x'.repeat(12)}`
+    }).join('\n')
+    fs.writeFileSync(logFile, `${existing}\n`)
+
+    const logger = createFileLogger({ logFilePath: logFile, maxFileBytes: 100 })
+    await logger.log('new-line')
+    await logger.flush()
+
+    // Keeps the newest lines that fit the half-budget after rotation.
+    expect(readLines(logFile)).toEqual(['old-line-7-xxxxxxxxxxxx', 'new-line'])
+
+    removeTestTmpDir(tmpDir)
+  })
+
   it('appends to an existing log file without truncating it', async () => {
     const tmpDir = makeTmpDir()
     const logFile = path.join(tmpDir, 'relay.log')

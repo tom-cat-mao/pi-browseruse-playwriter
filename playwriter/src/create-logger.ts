@@ -67,7 +67,16 @@ export function createFileLogger({ logFilePath, maxBufferedLines, maxFileBytes }
   let queue: Promise<void> = Promise.resolve()
   let buffer: string[] = []
   let droppedLines = 0
+  // Count what is already on disk so a restart with a large existing file
+  // still rotates at the configured budget instead of growing past it.
   let currentBytes = 0
+  if (enabled) {
+    try {
+      currentBytes = fs.statSync(resolvedLogFilePath).size
+    } catch {
+      currentBytes = 0
+    }
+  }
   let flushTimer: ReturnType<typeof setInterval> | undefined
 
   const enqueue = (operation: () => Promise<void>): Promise<void> => {
@@ -139,13 +148,19 @@ export function createFileLogger({ logFilePath, maxBufferedLines, maxFileBytes }
   }
 
   const log = (...args: unknown[]): Promise<void> => {
-    const message = args
-      .map((arg) =>
-        typeof arg === 'string' ? arg : util.inspect(arg, { depth: null, colors: false, maxStringLength: 1000 }),
-      )
-      .join(' ')
     if (!enabled) {
       return Promise.resolve()
+    }
+    let message: string
+    try {
+      message = args
+        .map((arg) =>
+          typeof arg === 'string' ? arg : util.inspect(arg, { depth: null, colors: false, maxStringLength: 1000 }),
+        )
+        .join(' ')
+    } catch (error) {
+      // Log formatting must never take the relay down.
+      message = `[log format error: ${error instanceof Error ? error.message : String(error)}]`
     }
     buffer.push(stripAnsi(message))
     if (buffer.length > resolvedMaxBufferedLines) {

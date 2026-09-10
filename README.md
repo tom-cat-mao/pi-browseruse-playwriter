@@ -247,20 +247,24 @@ pi-browser-runtime
 
 The runtime runs side by side with the legacy `playwriter serve` process. It never stops a relay it does not own: a port is only treated as a usable runtime when it answers a valid capabilities payload, and HTTP 401 is reported as an authentication error instead of "server down". Only loopback hosts are auto-started; remote runtimes are probed, never spawned.
 
-The Pi package (`pi/`) depends on this runtime and type-imports the shared contract from `@tom-cat/pi-browser-runtime/browser-protocol`.
+The Pi package (`pi/`) depends on this runtime and type-imports the shared contract from `@tom-cat/pi-browser-runtime/browser-protocol`. The package installs only the `pi-browser-runtime` executable: the legacy `playwriter` CLI stays in the repo for explicit use (`pnpm cli:legacy`) and is never installed as a bin, so it cannot shadow an upstream global install.
 
 ### Extension builds
 
-`pnpm build` builds the **fork** extension: fork dev ID `eeklahpecooapnailfaebkjjembkjhhg` and managed runtime port `19989`. The upstream identity and legacy relay port stay available as opt-in:
+`pnpm build` builds the **fork** extension: fork dev ID `eeklahpecooapnailfaebkjjembkjhhg` and managed runtime port `19989`. The fork identity and port are fixed in every fork build, including packaged and `PRODUCTION=true` builds (a real store build would replace the dev key in `extension/vite.config.mts`). The upstream identity and legacy relay port stay available as opt-in:
 
 ```bash
 pnpm --filter mcp-extension build        # fork identity + 19989 (default)
 pnpm --filter mcp-extension build:legacy # upstream dev ID + 19988
-pnpm --filter mcp-extension reload:fork  # build fork and open it in Chrome
+pnpm --filter mcp-extension reload:fork  # build fork and print the chrome://extensions URL
 pnpm --filter mcp-extension reload:legacy
 ```
 
-At the repo root, `pnpm reload` and `pnpm release` refuse to run because the old flows restarted port 19988 and targeted the upstream Chrome Web Store listing. Use `pnpm reload:fork`, or the explicit `pnpm reload:legacy` / `pnpm release:legacy` commands. `pnpm release:legacy` still needs `PRODUCTION=true` for a store build, which ignores the fork identity.
+Reload scripts only build and print the URL; they do not launch Chrome, and nothing opens the upstream store listing.
+
+The Chrome test helper `playwriter/src/test-utils.ts` invokes `pnpm build` in `extension/`, which now produces the fork identity; suites that still assert the upstream dev ID must switch that call to `pnpm build:legacy`.
+
+At the repo root, `pnpm reload` and `pnpm release` refuse to run: the old flows restarted port 19988, launched the upstream dev extension and targeted the upstream Chrome Web Store listing. Use `pnpm reload:fork` for the fork, or `pnpm reload:legacy` when you explicitly want the legacy 19988 flow. This fork has no store publish entry.
 
 ## Remote Access
 
