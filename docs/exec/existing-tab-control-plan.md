@@ -44,9 +44,15 @@ prompt: |
 当前状态：功能61456ba与短审修复dcf1a91已提交（扩展0.0.129）。
 协调者重跑类型检查、runtime234项unit/34项integration、extension36项、
 Pi64项及12工具加载检查通过；修订后build/smoke及目标回归亦通过。
-独立CodeBuddy20已核对补丁，可进入用户Chrome验收；不新增检查范围。
-浏览器内五项验收尚未开始，测试构建为本树extension/dist-acceptance，
-固定专用19991端口。不替换现有19989/19990进程或全局Pi配置。
+独立CodeBuddy20已核对补丁。首轮真机发现两profile仅有restricted newtab，
+原地主场景未执行；用户随后改为两个可接入的Linux.do页面并清除旧测试资源。
+普通新建标签回归确认一个实际时序缺口：已连接worker收不到后创建目标的
+attached事件。Codex22已以a6cc285只修relay的inventory/target通知协调，
+保留owner范围与去重；协调者重跑类型检查和38项managed-relay测试通过。
+原始验收报告见existing-tab-control-live-acceptance.md，不以修复代替真机通过。
+下一步用户仅重启19991测试runtime后，继续原地接入与外链往返验收。
+扩展仍为0.0.129（本树extension/dist-acceptance），无须重载；不替换现有
+19989/19990进程或全局Pi配置。
 共享契约见下文“共享契约（本轮新增，唯一写入处）”。
 
 目标只有一句话：**用户在页面上做到一半，告诉 agent 接着做，agent 就在原标签继续。**
