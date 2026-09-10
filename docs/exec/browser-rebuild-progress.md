@@ -10,9 +10,9 @@ prompt: |
 
 # 当前阶段
 
-Step 3：候选134233d已冻结，无浏览器验收与增量独立复核通过。
-停止扩展设计，等待用户打开隔离Chrome进行真机验收。
-尚未进行 Chrome 验收；非浏览器检查通过不代表最终验收通过。
+Step 3：用户已连接隔离Chrome并授权CodeBuddy完成第一轮主体真机验收。
+run e93b0af2：18 PASS / 3 FAIL / 4 SKIP；正在修复一个实际状态回报问题
+及验收脚本误判。只做实际问题的小修与复测，不扩展设计。
 用户明确要求不阻塞等待 agent，需要 Chrome 时通知用户后停下。
 全部执行 agent 使用默认 model/effort；禁止 Reasonix。
 codebuddy-6 原先显式 effort=high，已依用户要求停止，由默认配置的
@@ -24,13 +24,13 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
 | E 工具链/发行/日志 | CodeBuddy11/15 | feat/browser-runtime-foundation | eab8301已集成，产品README/legacy测试入口完成 |
-| A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 42eb198 已集成 |
+| A 扩展归属/分组 | CodeBuddy7/18 | feat/browser-owned-groups | 原实现已集成；R1 released inventory小修中 |
 | B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 33e6ab2已集成，独立复验通过 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 2e54b87已集成，独立复验通过 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备 | CodeBuddy13/16 | feat/browser-acceptance-harness | 62962da已集成，strict+22selfchecks通过 |
+| 验收脚本准备/真机执行 | CodeBuddy13/16/17 | feat/browser-acceptance-harness | 首轮18/3/4；修evaluate读取及popup记账后复测 |
 | 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | a4e1669无浏览器PASS+134233d差异通过；Chrome INCOMPLETE |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
@@ -167,7 +167,24 @@ executor、pi-tools、integration。主目录 main 未修改。
   端口19990；尚未启动测试runtime/Chrome。19988仍为原PID68650。
 - 用户明确要求避免钻牛角尖/过度设计，当前停止新增范围，只做用户配合的
   Chrome真实测试和发现的阻塞修复；未测项目不冒充通过。
-- 以上不能代替用户Chrome验收，不提前merge main。
+- 用户已手动启动测试runtime PID2030（19990），加载隔离profile
+  12h9psg4abxxa；只读capabilities与profiles检查均200/connected。
+  随后明确授权CodeBuddy真实测试及按需external-agent最小修复。
+- CodeBuddy17首轮真实Chrome run e93b0af2已结束：18 PASS/3 FAIL/4 SKIP。
+  报告docs/exec/browser-live-acceptance.md，原始证据在acceptance工作树
+  tmp/live-acceptance-768998e/，未覆盖。截图已由协调者核实为真实fixture。
+- R1：extension buildInventory过滤released tombstone，导致relay list丢记录，
+  后续操作报resource-not-found而非resource-released。CodeBuddy18只修完整
+  inventory保留释放状态，不改内部active过滤或重新授权；需manifest0.0.127。
+- H1/H2：harness五处evaluate裸表达式没有return，导致导航/填写两项假FAIL；
+  idsOf优先groupId使popup beforeIds错用组ID，第二popup记账不准确。
+  CodeBuddy17只修上述脚本及普通execute成功值校验，暂不重跑live。
+- 真机已观察分组/隔离、截图、ref click、network、popup归组、session.release
+  与cancel可用；logs及有效输入不变断言待修脚本后补验。第二profile、人工
+  重启/拖出及真实Pi交互端仍未验收，不把SKIP算PASS。
+- harness/fixture进程已退出，用户runtime与Chrome保留；扩展修复集成构建后
+  再请用户reload，随后仅复测这些实际路径，不追无影响下载配置日志。
+- 以上不等于完整Chrome验收通过，不提前merge main。
 
 # 待完成门槛
 
@@ -177,8 +194,10 @@ executor、pi-tools、integration。主目录 main 未修改。
 - [x] 验收harness误判修复与核心操作覆盖准备。
 - [x] 独立全新 agent 代码审查及a4e1669无浏览器验收。
 - [x] snapshot refs可见性补齐与正向验收脚本复核。
-- [ ] 用户配合加载测试 Chrome 扩展。
-- [ ] 多 profile/多组/断线不散组/用户释放 Chrome 验收。
+- [x] 用户配合加载测试 Chrome 扩展并授权主体真机验收。
+- [x] 第一轮主体真机测试及根因分类。
+- [ ] R1扩展状态回报、H1/H2验收脚本修复后真机复测。
+- [ ] 多 profile/断线不散组/用户拖出等未测项按用户实际需要补验。
 - [ ] origin draft PR -> 验收完成后就绪 -> 最终合并。
 - [ ] 归档独有产物，清理所有 swarm worktree。
 
