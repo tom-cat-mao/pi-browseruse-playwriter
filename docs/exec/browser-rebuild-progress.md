@@ -29,8 +29,8 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 6595df2已集成，单资源/联合列表输出边界补验中 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 5f4c19f已集成，strict+selfcheck17通过 |
-| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | 原23c3ebd FAIL保留；d607439原探针增量复验中 |
+| 验收脚本准备 | CodeBuddy13/16 | feat/browser-acceptance-harness | 5f4c19f已集成；计数/ref/核心操作覆盖收尾 |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | d607439原outcome/timer/facade探针通过；C/D pending待复审 |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -131,6 +131,15 @@ executor、pi-tools、integration。主目录 main 未修改。
   integration34、Pi57与12工具load-check、extension34、全部typechecks
   均通过；acceptance strict tsc、17 self-checks与不联网dry-run也通过。
   这些均未启动Chrome，后续C/D提交仍须重跑对应验证。
+- CodeBuddy14独立增量复验d607439：原outcome、timer/旧proxy、frames/
+  elementHandle链缺陷均由真实worker runtime+桩page探针确认修复，报告
+  docs/exec/browser-independent-revalidation.md。原23c3ebd FAIL不覆盖；
+  CDP/终止顺序与D预算边界仍pending，Chrome仍INCOMPLETE。
+- 协调者read-back验收harness发现：相对单次submit计数错等2、成功操作未用
+  snapshot ref、unknown-ref前evaluate会使snapshot过期、navigate/screenshot
+  尚无主流程覆盖。默认CodeBuddy16接续旧13工作树，只针对四点收尾。
+  所有改动仅准备验收，不运行live Chrome。
+- a063e72已推到Draft PR，Linux CI进行中；main仍为8cbf68b。
 - 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
