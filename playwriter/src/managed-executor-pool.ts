@@ -78,6 +78,7 @@ interface ManagedExecutorValidation {
 export class ManagedExecutorPool implements ManagedExecutorPoolContract {
   private readonly options: ManagedExecutorPoolOptions
   private readonly workers = new Map<string, ManagedWorker>()
+  private readonly invalidations = new Map<string, Promise<void>>()
   private readonly pending = new Map<string, ManagedWorkerTask>()
   private nextCommandId = 0
   private disposed = false
@@ -273,6 +274,10 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     key: string
     task: ManagedWorkerTask
   }): Promise<ManagedWorker> {
+    const invalidation = this.invalidations.get(key)
+    if (invalidation) {
+      await invalidation
+    }
     const existing = this.workers.get(key)
     if (existing && !existing.invalidated) {
       task.worker = existing
@@ -286,6 +291,13 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
         await existing.ready
         return existing
       }
+    }
+
+    const replacement = this.workers.get(key)
+    if (replacement && !replacement.invalidated) {
+      task.worker = replacement
+      await replacement.ready
+      return replacement
     }
 
     const worker = this.spawnWorker({ execution, key })
@@ -373,6 +385,9 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     child.stderr?.setEncoding('utf8')
     child.stderr?.on('data', (chunk: string) => {
       worker.diagnostics = `${worker.diagnostics}${chunk}`.slice(-4_000)
+    })
+    child.stdin?.on('error', (error) => {
+      this.handleWorkerFailure({ worker, error })
     })
     child.on('error', (error) => {
       this.handleWorkerFailure({ worker, error })
@@ -469,7 +484,11 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     })
     if (!worker.invalidated) {
       worker.invalidated = true
-      this.notifyInvalidated({ worker })
+      const shutdown = this.finishFailedWorker({ worker })
+      this.trackInvalidation({ key: worker.key, promise: shutdown })
+      void shutdown.catch((terminationError) => {
+        console.error('[managed-executor] failed to terminate a failed worker:', errorMessage(terminationError))
+      })
     }
   }
 
@@ -574,7 +593,22 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     })
   }
 
-  private async invalidateWorker({
+  private invalidateWorker(options: {
+    worker: ManagedWorker
+    activeCode: BrowserErrorCode
+    activeMessage: string
+    notify?: boolean
+  }): Promise<void> {
+    const existing = this.invalidations.get(options.worker.key)
+    if (existing) {
+      return existing
+    }
+    const invalidation = this.performInvalidation(options)
+    this.trackInvalidation({ key: options.worker.key, promise: invalidation })
+    return invalidation
+  }
+
+  private async performInvalidation({
     worker,
     activeCode,
     activeMessage,
@@ -622,26 +656,53 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
         }),
       })
     })
-    if (notify) {
-      this.notifyInvalidated({ worker })
+    try {
+      if (notify) {
+        await this.notifyInvalidated({ worker })
+      }
+    } finally {
+      await terminateWorkerProcess({ process: worker.process })
     }
-    await terminateWorkerProcess({ process: worker.process })
   }
 
-  private notifyInvalidated({ worker }: { worker: ManagedWorker }): void {
+  private async finishFailedWorker({ worker }: { worker: ManagedWorker }): Promise<void> {
+    try {
+      await this.notifyInvalidated({ worker })
+    } finally {
+      await terminateWorkerProcess({ process: worker.process })
+    }
+  }
+
+  private async notifyInvalidated({ worker }: { worker: ManagedWorker }): Promise<void> {
     const callback = this.options.onInvalidate
     if (!callback) {
       return
     }
-    void Promise.resolve(
-      callback({
+    try {
+      await callback({
         sessionId: worker.sessionId,
         profileId: worker.profileId,
         connectionEpoch: worker.connectionEpoch,
-      }),
-    ).catch((error) => {
+      })
+    } catch (error) {
       console.error('[managed-executor] onInvalidate callback failed:', errorMessage(error))
-    })
+    }
+  }
+
+  private trackInvalidation({ key, promise }: { key: string; promise: Promise<void> }): void {
+    this.invalidations.set(key, promise)
+    void promise.then(
+      () => {
+        if (this.invalidations.get(key) === promise) {
+          this.invalidations.delete(key)
+        }
+      },
+      () => {
+        if (this.invalidations.get(key) === promise) {
+          this.invalidations.delete(key)
+        }
+      },
+    )
   }
 
   private clearStartupTimeout({ worker }: { worker: ManagedWorker }): void {
