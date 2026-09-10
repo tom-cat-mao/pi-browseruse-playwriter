@@ -136,6 +136,21 @@ playwriter serve --token MY_SECRET --replace  # kill existing server first
 
 The relay starts automatically when you use the CLI locally. Use `serve` explicitly when you need it running persistently for remote clients.
 
+## Skill recorder
+
+Record a workflow you perform manually in the browser as events an agent can turn
+into a reusable skill. See [Skill Recorder](/docs/skill-recorder) for the full guide:
+
+```bash
+playwriter recorder start                 # start recording user actions (runs in relay daemon)
+playwriter recorder start -s 1            # attach to an existing session
+playwriter recorder stop                  # stop the only active recording
+playwriter recorder stop 3                # stop recording 3 when several are active
+playwriter recorder events                # thin event timeline of the latest recording
+playwriter recorder events 4 7            # full details of events 4 and 7
+playwriter recorder status                # list active recordings and their page urls
+```
+
 ## Other commands
 
 ```bash

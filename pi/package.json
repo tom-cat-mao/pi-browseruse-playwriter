@@ -1,0 +1,59 @@
+{
+  "name": "@tom-cat/pi-browser-use-extension",
+  "version": "0.1.0",
+  "description": "pi package: drive the user's real Chrome (their login sessions) via the Playwriter relay + browser extension, with 9 typed tools + a browser_execute escape hatch and a distilled usage skill.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tom-cat-mao/pi-browseruse-playwriter"
+  },
+  "keywords": [
+    "pi-package",
+    "browser-use",
+    "browser automation",
+    "playwright",
+    "playwriter",
+    "chrome"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/index.ts"
+    ],
+    "skills": [
+      "skills"
+    ]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0",
+    "@types/node": "^26.1.2",
+    "jiti": "^2.7.0",
+    "typebox": "^1.3.7",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.8"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "load-check": "jiti test/load-check.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tom-cat/pi-browser-runtime": "workspace:*"
+  }
+}

@@ -1,26 +1,48 @@
 {
-  "name": "playwriter",
-  "description": "",
-  "version": "0.4.0",
+  "name": "@tom-cat/pi-browser-runtime",
+  "description": "Self-hosted browser runtime for the Pi browser-use tools. Fork of the playwriter relay with managed sessions, explicit tabs and an isolated executor.",
+  "version": "0.5.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "repository": "https://github.com/remorses/playwriter",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./browser-protocol": {
+      "types": "./src/browser-protocol.ts",
+      "default": "./dist/browser-protocol.js"
+    },
+    "./package.json": "./package.json",
+    "./src/*.ts": "./src/*.ts",
+    "./src/*.js": "./src/*.ts",
+    "./src/*": "./src/*.ts",
+    "./dist/*": "./dist/*"
+  },
+  "repository": "https://github.com/tom-cat-mao/pi-browseruse-playwriter",
   "scripts": {
     "build": "rm -rf dist *.tsbuildinfo && mkdir dist && bun scripts/build-client-bundles.ts && tsc && bun scripts/build-extension-bundle.ts && bun scripts/build-resources.ts",
     "prepublishOnly": "pnpm build",
     "watch": "tsc -w",
-    "cli": "vite-node src/cli.ts",
+    "cli:legacy": "vite-node src/cli.ts",
+    "runtime": "vite-node src/runtime-cli.ts",
     "typecheck": "tsc",
     "mcp": "vite-node src/mcp.ts",
     "test": "vitest run -u",
-    "test:watch": "vitest"
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:watch": "vitest",
+    "smoke": "node scripts/smoke-runtime-package.mjs"
   },
-  "bin": "./bin.js",
+  "bin": {
+    "pi-browser-runtime": "./bin-runtime.js"
+  },
   "files": [
     "dist",
     "src",
-    "bin.js"
+    "bin.js",
+    "bin-runtime.js"
   ],
   "keywords": [],
   "author": "Tommaso De Rossi, morse <beats.by.morse@gmail.com>",
@@ -60,6 +82,7 @@
     "posthtml-beautify": "^0.7.0",
     "string-dedent": "^3.0.2",
     "strip-ansi": "^7.1.2",
+    "undici": "^7.28.0",
     "ws": "^8.18.3",
     "zod": "^4.3.5",
     "zustand": "^5.0.8"

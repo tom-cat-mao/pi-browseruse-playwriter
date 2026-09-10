@@ -1,0 +1,23 @@
+---
+'@tom-cat/pi-browser-runtime': minor
+---
+
+Ship the relay under the `@tom-cat/pi-browser-runtime` name with a second executable, `pi-browser-runtime`, that runs the managed browser runtime on its own port and data directory.
+
+```bash
+pi-browser-runtime
+# listening on 127.0.0.1:19989, logs in ~/.pi-browser-use
+```
+
+Configuration comes from the environment:
+
+- `PI_BROWSER_HOST` (default `127.0.0.1`)
+- `PI_BROWSER_PORT` (default `19989`)
+- `PI_BROWSER_TOKEN` (optional, required for non-loopback binds)
+- `PI_BROWSER_DATA_DIR` (default `~/.pi-browser-use`)
+
+The package installs only the `pi-browser-runtime` executable; the legacy CLI is available as the explicit `pnpm cli:legacy` script so it cannot shadow an upstream `playwriter` global install.
+
+Invalid values for `PI_BROWSER_PORT` (zero, negative, above 65535, or not an integer) now fail the start with a clear error instead of silently falling back to the default; an unset port still means `19989`. `SIGINT`/`SIGTERM` shutdown flushes both log files.
+
+The runtime runs next to the legacy playwriter relay on `19988`: it has its own logs and never stops a process it does not own. The legacy `playwriter` executable, WebSocket protocol and extension imports stay unchanged, and the Pi package now depends on this runtime.

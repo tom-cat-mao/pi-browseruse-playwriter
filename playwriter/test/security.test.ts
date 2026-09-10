@@ -3,6 +3,7 @@ import { startPlayWriterCDPRelayServer } from '../src/cdp-relay.js'
 import { WebSocket } from 'ws'
 import { createFileLogger } from '../src/create-logger.js'
 import { killPortProcess } from '../src/kill-port.js'
+import { createMCPClient } from '../src/mcp-client.js'
 
 const TEST_PORT = 19999
 
@@ -65,6 +66,17 @@ describe('Security Tests', () => {
 
     // 3. Correct token -> Should succeed
     await expect(tryConnect(token)).resolves.not.toThrow()
+  })
+
+  it('starts the MCP against a token-protected remote relay', async () => {
+    const token = 'secret-token'
+    server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, token })
+
+    const mcp = await createMCPClient({
+      args: ['--host', `http://0.0.0.0:${TEST_PORT}`, '--token', token],
+    })
+
+    await mcp.cleanup()
   })
 
   it('should enforce localhost restrictions for /extension endpoint', async () => {
@@ -262,18 +274,130 @@ describe('Security Tests', () => {
       headers: { Authorization: `Bearer ${secretToken}` },
     })
     expect(recordingWithToken.status).toBe(200)
+
+    const mcpLogWithoutToken = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: 'log', args: ['test'] }),
+    })
+    expect(mcpLogWithoutToken.status).toBe(401)
+
+    const mcpLogWithToken = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp-log`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${secretToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ level: 'log', args: ['test'] }),
+    })
+    expect(mcpLogWithToken.status).toBe(200)
   })
 
-  it('should not require token on /cli/* when no token is configured', async () => {
+  it('should enforce token on browser metadata routes when token mode is enabled', async () => {
+    const secretToken = 'test-secret-token'
+    server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, token: secretToken })
+    const paths = ['/extension/status', '/extensions/status', '/json/list']
+
+    const unauthorizedStatuses = await Promise.all(
+      paths.map(async (path) => {
+        const response = await fetch(`http://127.0.0.1:${TEST_PORT}${path}`)
+        return response.status
+      }),
+    )
+    expect(unauthorizedStatuses).toEqual(paths.map(() => 401))
+
+    const authorizedStatuses = await Promise.all(
+      paths.map(async (path) => {
+        const response = await fetch(`http://127.0.0.1:${TEST_PORT}${path}`, {
+          headers: { Authorization: `Bearer ${secretToken}` },
+        })
+        return response.status
+      }),
+    )
+    expect(authorizedStatuses).toEqual(paths.map(() => 200))
+  })
+
+  it('should allow the extension worker to call /recorder/start and /recorder/stop', async () => {
     const logger = createFileLogger()
     server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, logger })
 
-    // Without token mode, /cli/sessions should work with just proper headers
-    const res = await httpRequest({
-      path: '/cli/sessions',
-      method: 'GET',
-      headers: {},
+    // Service worker fetch is Sec-Fetch-Site: cross-site (chrome-extension → localhost).
+    // These two routes skip that block so the toolbar Record button works.
+    const recorderStart = await httpRequest({
+      path: '/recorder/start',
+      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'cross-site' },
     })
-    expect(res.status).toBe(200)
+    expect(recorderStart.status).not.toBe(403)
+
+    const recorderStop = await httpRequest({
+      path: '/recorder/stop',
+      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'cross-site' },
+    })
+    expect(recorderStop.status).not.toBe(403)
+
+    const recorderStatus = await httpRequest({
+      path: '/recorder/status',
+      method: 'GET',
+      headers: { 'Sec-Fetch-Site': 'cross-site' },
+    })
+    expect(recorderStatus.status).toBe(403)
+  })
+
+  it('should not allow a website origin to pass CORS preflight on /recorder/start', async () => {
+    const logger = createFileLogger()
+    server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, logger })
+
+    const preflight = ({ origin }: { origin: string }) => {
+      return fetch(`http://127.0.0.1:${TEST_PORT}/recorder/start`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: origin,
+          'Access-Control-Request-Method': 'POST',
+        },
+      })
+    }
+
+    const website = await preflight({ origin: 'https://evil.com' })
+    expect(website.headers.get('access-control-allow-origin')).toBeNull()
+
+    const extension = await preflight({
+      origin: 'chrome-extension://jfeammnjpkecdekppnclgkkffahnhfhe',
+    })
+    expect(extension.headers.get('access-control-allow-origin')).toBe(
+      'chrome-extension://jfeammnjpkecdekppnclgkkffahnhfhe',
+    )
+  })
+
+  it('should still enforce Content-Type on /recorder/* cross-origin requests', async () => {
+    const logger = createFileLogger()
+    server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, logger })
+
+    // text/plain POST to /recorder/start should still be rejected (415)
+    const textPlain = await httpRequest({
+      path: '/recorder/start',
+      headers: { 'Content-Type': 'text/plain', 'Sec-Fetch-Site': 'cross-site' },
+    })
+    expect(textPlain.status).toBe(415)
+  })
+
+  it('should not require token on local routes when no token is configured', async () => {
+    const logger = createFileLogger()
+    server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, logger })
+
+    const paths = ['/cli/sessions', '/extension/status', '/extensions/status', '/json/list']
+    const statuses = await Promise.all(
+      paths.map(async (path) => {
+        const response = await fetch(`http://127.0.0.1:${TEST_PORT}${path}`)
+        return response.status
+      }),
+    )
+    expect(statuses).toEqual(paths.map(() => 200))
+
+    const mcpLog = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: 'log', args: ['test'] }),
+    })
+    expect(mcpLog.status).toBe(200)
   })
 })

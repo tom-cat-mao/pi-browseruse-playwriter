@@ -136,7 +136,7 @@ export async function handleStartRecording(params: StartRecordingParams): Promis
     logger.debug('Got stream ID for tab:', tabId, 'streamId:', streamId.substring(0, 20) + '...')
 
     // Send message to offscreen document to start recording
-    const result = (await chrome.runtime.sendMessage({
+    const result: OffscreenStartRecordingResult = await chrome.runtime.sendMessage({
       action: 'startRecording',
       tabId,
       streamId,
@@ -144,7 +144,7 @@ export async function handleStartRecording(params: StartRecordingParams): Promis
       videoBitsPerSecond: params.videoBitsPerSecond ?? 2500000,
       audioBitsPerSecond: params.audioBitsPerSecond ?? 128000,
       audio: params.audio ?? false,
-    })) as OffscreenStartRecordingResult
+    })
 
     if (!result.success) {
       return { success: false, error: result.error || 'Failed to start recording in offscreen document' }
@@ -182,10 +182,10 @@ export async function handleStopRecording(params: StopRecordingParams): Promise<
 
   try {
     // Send message to offscreen document to stop recording - include tabId for concurrent support
-    const result = (await chrome.runtime.sendMessage({
+    const result: OffscreenStopRecordingResult = await chrome.runtime.sendMessage({
       action: 'stopRecording',
       tabId,
-    })) as OffscreenStopRecordingResult
+    })
 
     if (!result.success) {
       return { success: false, error: result.error || 'Failed to stop recording in offscreen document' }
@@ -219,10 +219,10 @@ export async function handleIsRecording(params: IsRecordingParams): Promise<IsRe
 
   // Check with offscreen document for actual recording state - include tabId for concurrent support
   try {
-    const result = (await chrome.runtime.sendMessage({
+    const result: OffscreenIsRecordingResult = await chrome.runtime.sendMessage({
       action: 'isRecording',
       tabId,
-    })) as OffscreenIsRecordingResult
+    })
 
     return {
       isRecording: result.isRecording,

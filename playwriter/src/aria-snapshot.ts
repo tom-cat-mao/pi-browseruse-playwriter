@@ -980,23 +980,45 @@ export async function getAriaSnapshot({
   const frameId = resolvedFrame?.frameId() ?? null
 
   if (frameId) {
-    const { targetInfos } = (await session.send('Target.getTargets')) as Protocol.Target.GetTargetsResponse
+    const { targetInfos } = await session.send('Target.getTargets')
     const frameUrl = resolvedFrame!.url()
     const iframeTarget = targetInfos.find((t) => {
       return t.type === 'iframe' && t.url === frameUrl
     })
     if (iframeTarget) {
-      const { sessionId } = (await session.send('Target.attachToTarget', {
+      const { sessionId } = await session.send('Target.attachToTarget', {
         targetId: iframeTarget.targetId,
         flatten: true,
-      })) as Protocol.Target.AttachToTargetResponse
+      })
       oopifSessionId = sessionId
       await session.send('Runtime.runIfWaitingForDebugger', undefined, oopifSessionId)
     }
   }
 
-  await session.send('DOM.enable', undefined, oopifSessionId)
-  await session.send('Accessibility.enable', undefined, oopifSessionId)
+  await Promise.all([
+    session.send('DOM.enable', undefined, oopifSessionId),
+    session.send('Accessibility.enable', undefined, oopifSessionId),
+    // Blink updates its AX cache during rendering, after framework navigation changes the DOM.
+    (resolvedFrame || page).evaluate(() => {
+      return new Promise<void>((resolve) => {
+        const window = document.defaultView
+        if (!window) {
+          resolve()
+          return
+        }
+        if (document.visibilityState !== 'visible') {
+          document.documentElement.getBoundingClientRect()
+          resolve()
+          return
+        }
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            resolve()
+          })
+        })
+      })
+    }),
+  ])
   const scopeAttr = 'data-pw-scope'
   const scopeValue = crypto.randomUUID()
   let scopeApplied = false
@@ -1013,11 +1035,11 @@ export async function getAriaSnapshot({
       scopeApplied = true
     }
 
-    const { nodes: domNodes } = (await session.send(
+    const { nodes: domNodes } = await session.send(
       'DOM.getFlattenedDocument',
       { depth: -1, pierce: true },
       oopifSessionId,
-    )) as Protocol.DOM.GetFlattenedDocumentResponse
+    )
     const { domById, domByBackendId, childrenByParent } = buildDomIndex(domNodes)
 
     let scopeRootNodeId: Protocol.DOM.NodeId | null = null
@@ -1035,11 +1057,11 @@ export async function getAriaSnapshot({
     const allowedBackendIds = scopeRootNodeId ? buildBackendIdSet(scopeRootNodeId, childrenByParent, domById) : null
 
     const axParams = !oopifSessionId && frameId ? { frameId } : undefined
-    const { nodes: axNodes } = (await session.send(
+    const { nodes: axNodes } = await session.send(
       'Accessibility.getFullAXTree',
       axParams,
       oopifSessionId,
-    )) as Protocol.Accessibility.GetFullAXTreeResponse
+    )
 
     const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
     for (const node of axNodes) {
@@ -1244,8 +1266,8 @@ export async function getAriaSnapshot({
         locators.map(async (loc) => {
           try {
             return 'elementHandle' in loc
-              ? await (loc as Locator).elementHandle({ timeout: 1000 })
-              : (loc as ElementHandle)
+              ? await loc.elementHandle({ timeout: 1000 })
+              : loc
           } catch {
             return null
           }
@@ -1396,7 +1418,7 @@ async function getLabelBoxesForRefs({
           const response = await Promise.race([
             session.send('DOM.getBoxModel', {
               backendNodeId: ref.backendNodeId,
-            }) as Promise<Protocol.DOM.GetBoxModelResponse>,
+            }),
             new Promise<null>((resolve) => {
               setTimeout(() => {
                 resolve(null)
@@ -1615,10 +1637,9 @@ export async function screenshotWithAccessibilityLabels({
   const screenshotPath = path.join(tmpDir, filename)
 
   // Get viewport size to clip screenshot to visible area
-  const viewport = (await page.evaluate('({ width: window.innerWidth, height: window.innerHeight })')) as {
-    width: number
-    height: number
-  }
+  const viewport = await page.evaluate(() => {
+    return { width: window.innerWidth, height: window.innerHeight }
+  })
 
   // Check if sharp is available for resizing
   const sharp = await sharpPromise

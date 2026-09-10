@@ -66,7 +66,7 @@ Then install the **skill**. It teaches your agent how to use Playwriter: which
 selectors to use, how to avoid timeouts, how to read snapshots, and all available utilities.
 
 ```bash
-npx -y skills add remorses/playwriter
+npx -y skills add https://playwriter.dev
 ```
 
 ### First commands
@@ -96,20 +96,19 @@ WebSocket to a local relay. Your agent (CLI, MCP, or a Playwright script) connec
 Chrome restart, no flags, no special setup.
 
 ```diagram
-┌─────────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│   BROWSER           │     │   LOCALHOST          │     │   CLIENT        │
-│                     │     │                      │     │                 │
-│  ┌───────────────┐  │     │ WebSocket Server     │     │  ┌───────────┐  │
-│  │   Extension   │<───────┬───>  :19988          │     │  │ CLI / MCP │  │
-│  └───────┬───────┘  │ WS  │                      │     │  └───────────┘  │
-│          │          │     │  /extension          │     │        │        │
-│    chrome.debugger  │     │       │              │     │        v        │
-│          v          │     │       v              │     │  ┌────────────┐ │
-│  ┌───────────────┐  │     │  /cdp/:id <───────────────>│  │ execute    │ │
-│  │ Tab 1 (green) │  │     └──────────────────────┘  WS │  └────────────┘ │
-│  │ Tab 2 (green) │  │                                  │        │        │
-│  │ Tab 3 (gray)  │  │     Tab 3 not controlled         │ Playwright API  │
-└─────────────────────┘     (extension not clicked)      └─────────────────┘
+┌─────────────────────┐      ┌──────────────────────┐      ┌─────────────────┐
+│  BROWSER            │  WS  │  LOCALHOST           │  WS  │  CLIENT         │
+│                     │      │                      │      │                 │
+│  Extension          │<────>│  WebSocket Server    │<────>│  CLI / MCP      │
+│      │              │      │  :19988              │      │      │          │
+│  chrome.debugger    │      │                      │      │      v          │
+│      │              │      │  /extension          │      │  execute tool   │
+│      v              │      │      │               │      │      │          │
+│  Tab 1 (green)      │      │      v               │      │      v          │
+│  Tab 2 (green)      │      │  /cdp/:id            │      │  Playwright API │
+│  Tab 3 (gray)       │      └──────────────────────┘      └─────────────────┘
+└─────────────────────┘
+  Tab 3 not controlled (extension not clicked)
 ```
 
 The relay **multiplexes sessions**, so multiple agents or CLI instances can work with the same
@@ -331,7 +330,7 @@ accepts connections from the extension. No remote server, no account, no telemet
 
 - **Local only:** WebSocket server binds to localhost. Nothing leaves your machine.
 - **Origin validation:** only the Playwriter extension origin is accepted. Browsers cannot spoof the Origin header, so malicious websites cannot connect.
-- **Explicit consent:** only tabs where you clicked the extension icon are controlled. No background access.
+- **Controlled tab scope:** tabs are controlled after an extension click. By default, Playwriter also creates a controlled `about:blank` tab when a client connects with no controlled tabs. Set `PLAYWRITER_AUTO_ENABLE=false` to require a manual click.
 - **Visible automation:** Chrome shows an automation banner on controlled tabs.
 
 ## More resources

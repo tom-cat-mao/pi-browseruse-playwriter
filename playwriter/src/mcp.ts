@@ -78,7 +78,7 @@ async function sendLogToRelayServer(level: string, ...args: any[]) {
  */
 function mcpLog(...args: any[]) {
   console.error(...args)
-  sendLogToRelayServer('log', ...args)
+  void sendLogToRelayServer('log', ...args)
 }
 
 /** MCP-specific logger for executor */
@@ -86,7 +86,7 @@ const mcpLogger = {
   log: (...args: any[]) => mcpLog(...args),
   error: (...args: any[]) => {
     console.error(...args)
-    sendLogToRelayServer('error', ...args)
+    void sendLogToRelayServer('error', ...args)
   },
 }
 
@@ -161,11 +161,12 @@ async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
   return executor
 }
 
-async function checkRemoteServer({ host, port }: { host: string; port: number }): Promise<void> {
+async function checkRemoteServer({ host, port, token }: RemoteConfig): Promise<void> {
   const { httpBaseUrl } = parseRelayHost(host, port)
   const versionUrl = `${httpBaseUrl}/version`
   try {
-    const response = await fetch(versionUrl, { signal: AbortSignal.timeout(3000) })
+    const headers = token ? { Authorization: `Bearer ${token}` } : undefined
+    const response = await fetch(versionUrl, { headers, signal: AbortSignal.timeout(3000) })
     if (!response.ok) {
       throw new Error(`Server responded with status ${response.status}`)
     }
@@ -196,7 +197,7 @@ server.resource(
   'https://playwriter.dev/resources/debugger-api.md',
   { mimeType: 'text/plain' },
   async () => {
-    const packageJsonPath = require.resolve('playwriter/package.json')
+    const packageJsonPath = require.resolve('@tom-cat/pi-browser-runtime/package.json')
     const packageDir = path.dirname(packageJsonPath)
     const content = fs.readFileSync(path.join(packageDir, 'dist', 'debugger-api.md'), 'utf-8')
     return {
@@ -210,7 +211,7 @@ server.resource(
   'https://playwriter.dev/resources/editor-api.md',
   { mimeType: 'text/plain' },
   async () => {
-    const packageJsonPath = require.resolve('playwriter/package.json')
+    const packageJsonPath = require.resolve('@tom-cat/pi-browser-runtime/package.json')
     const packageDir = path.dirname(packageJsonPath)
     const content = fs.readFileSync(path.join(packageDir, 'dist', 'editor-api.md'), 'utf-8')
     return {
@@ -224,7 +225,7 @@ server.resource(
   'https://playwriter.dev/resources/styles-api.md',
   { mimeType: 'text/plain' },
   async () => {
-    const packageJsonPath = require.resolve('playwriter/package.json')
+    const packageJsonPath = require.resolve('@tom-cat/pi-browser-runtime/package.json')
     const packageDir = path.dirname(packageJsonPath)
     const content = fs.readFileSync(path.join(packageDir, 'dist', 'styles-api.md'), 'utf-8')
     return {
@@ -295,7 +296,7 @@ server.tool(
 
       console.error('Error in execute tool:', errorStack)
       if (!isTimeoutError) {
-        sendLogToRelayServer('error', 'Error in execute tool:', errorStack)
+        void sendLogToRelayServer('error', 'Error in execute tool:', errorStack)
       }
 
       const resetHint = isTimeoutError

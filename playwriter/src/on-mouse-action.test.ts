@@ -214,13 +214,19 @@ describe('onMouseAction callback', () => {
     })
 
     const cursorPresent = await page.evaluate(() => {
+      const el = document.getElementById('__playwriter_ghost_cursor__')
+      const html = el?.innerHTML || ''
       return {
         apiPresent: Boolean((globalThis as any).__playwriterGhostCursor),
-        elementPresent: Boolean(document.getElementById('__playwriter_ghost_cursor__')),
+        elementPresent: Boolean(el),
+        hasInlineSvg: html.includes('<svg'),
+        usesDataSvg: html.includes('data:image/svg'),
       }
     })
 
     expect(cursorPresent.apiPresent).toBe(true)
     expect(cursorPresent.elementPresent).toBe(true)
+    expect(cursorPresent.hasInlineSvg).toBe(true)
+    expect(cursorPresent.usesDataSvg).toBe(false)
   }, 30000)
 })

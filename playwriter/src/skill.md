@@ -259,6 +259,29 @@ playwriter -s 1 -f script.js
 
 The file is read from disk and executed in the same sandbox as `-e`. All context variables (`state`, `page`, `context`, etc.) are available. `-e` and `-f` cannot be used together.
 
+### Recording user actions for skill generation
+
+Before any recorder work, run `playwriter skill` once and read the full output (never truncate).
+
+The user can start recording from the **in-page toolbar** (Record) or ask you to run `playwriter recorder start`. Both write the same event file. The toolbar does not pick a session; the relay attaches to any free extension session (or creates one). Session choice does not matter: extension sessions share the same Chrome tabs. You identify the recording later at **stop** time.
+
+`playwriter recorder start` records everything the user does in the browser (clicks, typing, navigations, mutating xhr/fetch) as events with generated locator strings. It also saves a jpeg of each visual change into a frames folder (`~/.playwriter/recordings/<id>/frames`, files named `<ms>.jpg`). User clicks flash a ripple in those frames. To see the screen at an event, read the jpeg whose filename is closest to that event's `ms`. When the user asks you to "start recording", run it and let them perform their workflow. You may run playwriter commands on that session if they ask (snapshot, inspect, click something). If they did not ask, ask first. Do not drive the workflow yourself.
+
+```bash
+playwriter recorder start            # reuse the only session, or create one
+playwriter recorder start -s 1       # attach to an existing session
+playwriter recorder status           # active recordings + current page urls
+playwriter recorder stop             # stop the only active recording
+playwriter recorder stop 3           # stop recording 3 when several are active
+playwriter recorder events           # thin timeline of the latest recording
+playwriter recorder events -r 3      # events of recording 3
+playwriter recorder events 4 7       # full details of events 4 and 7
+```
+
+Run `playwriter recorder stop` when they say done, then `playwriter recorder events -r <id>` to read the events. If stop fails because **more than one recording is active**, the error lists each recording id, session, and current or last page URL. Pick the one that matches the workflow (or ask the user), then `playwriter recorder stop <id>`. Replay the flow with **playwriter** commands only (`playwriter -s <id> -e '...'`), never raw Playwright. The `recorder start` output prints full instructions for turning a recording into a reusable skill: a SKILL.md of markdown instructions with example playwriter commands, plus an importable helper script (`submit.js`, `sdk.js`) for cheap replay. Recording runs inside the relay daemon, so it survives CLI exits. Pass `-s <id>` to record an existing session; the recorder attaches to all Playwriter-enabled tabs and does not open a new tab. A recording auto-stops after 20 minutes.
+
+If the user started from the toolbar and then says "done", still run `playwriter recorder stop` (or `stop <id>` if several are listed). The toolbar Stop button also works; it stops the recording it started.
+
 ### Live streaming to RTMP (X Live, Twitch, YouTube)
 
 Niche use case: `playwriter stream start|stop|status` streams a tab live to RTMP endpoints via ffmpeg, surviving navigation and running 24/7 after the CLI exits. Docs: https://playwriter.dev/docs/streaming
@@ -344,10 +367,48 @@ You can collaborate with the user - they can help with captchas, difficult eleme
 - `state` - object persisted between calls **within your session**. Each session has its own isolated state. Use to store pages, data, listeners (e.g., `state.page = await context.newPage()`)
 - `page` - a default page (may be shared with other agents). Prefer creating your own page and storing it in `state` (see "working with pages")
 - `context` - browser context, access all pages via `context.pages()`
-- `require` - load Node.js modules (e.g., `const fs = require('node:fs')`). ESM `import` is not available in the sandbox
+- `require` - load Node.js modules (e.g., `const fs = require('node:fs')`)
+- `import()` - use Node.js ESM to load local scripts, packages, and built-ins (e.g., `const helpers = await import('./scripts/helpers.js')`). Relative paths resolve from the session cwd
+- `importModule` - restricted async import for allowlisted Node.js built-ins (e.g., `const fs = await importModule('node:fs')`)
 - Node.js globals: `setTimeout`, `setInterval`, `fetch`, `URL`, `Buffer`, `crypto`, `process`, etc.
 
-**Not available in the sandbox:** `__dirname`, `__filename`, `import`.
+**Not available in the sandbox:** `__dirname`, `__filename`.
+
+### importing local scripts
+
+Local modules use normal Node.js ESM. Export helper functions from a `.js` or `.mjs` file and pass Playwriter values such as `page` explicitly:
+
+```js
+// scripts/page-helpers.mjs
+export async function getPageInfo({ page }) {
+  return {
+    title: await page.title(),
+    url: page.url(),
+  }
+}
+```
+
+Load the module from the directory where the Playwriter session was created:
+
+```js
+const { getPageInfo } = await import('./scripts/page-helpers.mjs')
+console.log(await getPageInfo({ page }))
+```
+
+Local modules can use static imports and package imports normally:
+
+```js
+// scripts/save-title.mjs
+import fs from 'node:fs/promises'
+import path from 'node:path'
+
+export async function saveTitle({ page, outputPath }) {
+  await fs.mkdir(path.dirname(outputPath), { recursive: true })
+  await fs.writeFile(outputPath, await page.title())
+}
+```
+
+**Security:** Modules loaded with `import()` run with normal Node.js permissions. Only import code you trust. Use sandboxed `require` or `importModule` when you need restricted built-ins and scoped filesystem writes.
 
 **Important:** `state` is **session-isolated** but pages are **shared** across all sessions. See "working with pages" for how to avoid interference.
 
@@ -366,7 +427,8 @@ Writing to any other path (e.g. `~/Downloads`, `~/Desktop`) throws `EPERM: opera
 - **No bringToFront**: never call unless user asks - it's disruptive and unnecessary, you can interact with background pages
 - **Click before keyboard input in extension mode.** Call `click()` on the target field immediately before `fill()` or `keyboard` methods. CDP sends keyboard input to the browser's OS-focused surface, so DOM focus and `bringToFront()` can still leave text in Chrome's omnibox.
 - **Check state after actions**: always verify page state after clicking/submitting (see next section)
-- **Clean up listeners**: call `state.page.removeAllListeners()` at end of message to prevent leaks
+- **Clean up only your listeners**: remove listeners you added by event name or handler reference. Never call `removeAllListeners()` because it also removes Playwriter's page error and console listeners.
+- **Tracked page errors are automatic**: uncaught errors from pages assigned directly to `state` keys appear in the current or next execute output as `[PAGE ERROR]`. Errors from pages tracked by other sessions are excluded.
 - **Always print page logs after every action**: call `getLatestLogs({ page: state.page, sinceLastCall: true })` after every goto, click, or submit to catch console errors and warnings. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors.
 - **CDP sessions**: use `getCDPSession({ page: state.page })` not `state.page.context().newCDPSession()` - NEVER use `newCDPSession()` method, it doesn't work through playwriter relay
 - **Wait for load**: use `state.page.waitForLoadState('domcontentloaded')` not `state.page.waitForEvent('load')` - waitForEvent times out if already loaded
@@ -854,6 +916,8 @@ For carousels or lazy-loaded galleries, you may need to click navigation arrows 
 **getLatestLogs** - retrieve captured browser console logs and page errors (up to 5000 per page):
 
 Always use this helper when inspecting browser logs. Do not attach new `page.on('console')` listeners for debugging because they only see future events and can miss logs emitted during page startup or hydration.
+
+Uncaught errors from pages assigned directly to `state` keys also appear automatically in execute output. `getLatestLogs()` keeps the full page log history for filtering and deeper diagnosis.
 
 Use `sinceLastCall: true` after every action to get only new logs since the previous call. The first call returns all buffered logs including pre-existing ones. Logs persist across navigations so you never miss errors from page transitions.
 

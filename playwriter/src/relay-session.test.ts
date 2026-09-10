@@ -6,6 +6,10 @@ import { getCDPSessionForPage } from './cdp-session.js'
 import { Debugger } from './debugger.js'
 import { Editor } from './editor.js'
 import { PlaywrightExecutor } from './executor.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import dedent from 'string-dedent'
 import {
   setupTestContext,
   cleanupTestContext,
@@ -147,6 +151,38 @@ describe('CDP Session Tests', () => {
     expect(result.text).toContain('[return value] 4')
 
     await page.close()
+  }, 60000)
+
+  it('should import local ESM modules from the session cwd', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'playwriter-local-import-'))
+    fs.writeFileSync(
+      path.join(cwd, 'page-info.mjs'),
+      dedent`
+        import path from 'node:path'
+
+        export async function getPageInfo({ page }) {
+          return { titleType: typeof await page.title(), file: path.basename('/tmp/helper.mjs') }
+        }
+      `,
+    )
+    const executor = new PlaywrightExecutor({
+      cdpConfig: { port: TEST_PORT },
+      cwd,
+      logger: {
+        log: () => {},
+        error: () => {},
+      },
+    })
+
+    const result = await executor.execute(js`
+      const { getPageInfo } = await import('./page-info.mjs')
+      return await getPageInfo({ page })
+    `)
+
+    expect(result).toMatchObject({
+      isError: false,
+      text: "[return value] { titleType: 'string', file: 'helper.mjs' }",
+    })
   }, 60000)
 
   it('should list scripts with Debugger class', async () => {

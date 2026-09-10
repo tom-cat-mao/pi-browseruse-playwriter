@@ -16,8 +16,12 @@
   },
   "license": "Apache-2.0",
   "scripts": {
-    "build": "tsc --project . && vite build --config vite.config.mts && tsx scripts/download-prism.ts",
-    "reload": "bun run build && open -a 'Google Chrome' 'chrome://extensions/?id=pebbngnfojnignonigcnkdilknapkgid'",
+    "build": "node scripts/build-extension.mjs --fork",
+    "build:fork": "node scripts/build-extension.mjs --fork",
+    "build:legacy": "node scripts/build-extension.mjs --legacy",
+    "reload:fork": "pnpm build:fork && echo Reload the fork extension at chrome://extensions/?id=eeklahpecooapnailfaebkjjembkjhhg",
+    "reload:legacy": "pnpm build:legacy && echo Reload the legacy extension at chrome://extensions/?id=pebbngnfojnignonigcnkdilknapkgid",
+    "test": "vitest run --passWithNoTests",
     "watch": "vite build --watch --config vite.config.mts",
     "clean": "rm -rf dist"
   },
@@ -26,10 +30,11 @@
     "concurrently": "^8.2.2",
     "typescript": "^5.8.2",
     "vite": "^8.0.13",
-    "vite-plugin-static-copy": "^3.1.1"
+    "vite-plugin-static-copy": "^3.1.1",
+    "vitest": "^4.0.8"
   },
   "dependencies": {
-    "playwriter": "workspace:^",
+    "playwriter": "workspace:@tom-cat/pi-browser-runtime@*",
     "string-dedent": "^3.0.2",
     "zustand": "^5.0.8"
   }

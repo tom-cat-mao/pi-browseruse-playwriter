@@ -17,6 +17,7 @@
     "dark": "#FF9500"
   },
   "knownPaths": ["/README", "/api/*", "/login", "/dashboard", "/device"],
+  "decorativeLines": "none",
   "navigation": {
     "tabs": [
       {
@@ -74,15 +75,14 @@
         ]
       },
       {
+        "tab": "Skill Recorder",
+        "icon": "lucide:circle-dot",
+        "pages": ["docs/skill-recorder"]
+      },
+      {
         "tab": "Cloud Browsers",
         "icon": "lucide:dollar-sign",
         "pages": ["docs/cloud-browsers"]
-      },
-      {
-        "tab": "Changelog",
-        "icon": "lucide:newspaper",
-        "changelog": "https://github.com/remorses/playwriter",
-        "initialContent": "changelog/intro"
       }
     ],
     "global": {
@@ -108,6 +108,7 @@
         "header": "platform",
         "items": [
           { "label": "Rent Cloud Browsers", "href": "/dashboard" },
+          { "label": "Changelog", "href": "/changelog/intro" },
           { "label": "GitHub", "href": "https://github.com/remorses/playwriter" },
           {
             "label": "Chrome Extension",

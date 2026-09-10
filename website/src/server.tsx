@@ -1,7 +1,9 @@
 // Custom entry: mounts holocron as a child of a Spiceflow app.
 // Auth middleware (better-auth) runs first, then auth/dashboard pages,
-// then holocron docs. Cloudflare Workers fetch handler is provided
-// by spiceflow/cloudflare-entrypoint.
+// then holocron docs. Also serves /.well-known/agent-skills/* so
+// `npx skills add https://playwriter.dev` installs the skill from this
+// domain instead of the GitHub repo. Cloudflare Workers fetch handler
+// is provided by spiceflow/cloudflare-entrypoint.
 
 import './globals.css'
 
@@ -15,6 +17,23 @@ import { cloudApp } from './cloud-api.ts'
 import { stripeWebhookApp } from './stripe-webhook.ts'
 import { approveDevice, denyDevice, createApiKey, revokeApiKey } from './actions.tsx'
 import { enforceProxyBudgets } from './scheduled.ts'
+import playwriterSkillMd from '../../skills/playwriter/SKILL.md?raw'
+
+const PLAYWRITER_SKILL_DESCRIPTION =
+  "Control the user own Chrome browser via Playwriter extension with Playwright code snippets in a stateful local js sandbox. Use this over other Playwright MCPs to automate the browser — it connects to the user's existing Chrome instead of launching a new one. Use this cli for navigating JS-heavy websites (Instagram, Twitter, cookie/login walls, lazy-loaded UIs) instead of webfetch/curl. ALWAYS load this skill before using any playwriter commands"
+
+// skills.sh validates the artifact against this sha256 digest, so it must
+// match the exact bytes served at /.well-known/agent-skills/playwriter/SKILL.md.
+let skillDigestPromise: Promise<string> | undefined
+function getSkillDigest(): Promise<string> {
+  skillDigestPromise ??= (async () => {
+    const bytes = new TextEncoder().encode(playwriterSkillMd)
+    const hash = await crypto.subtle.digest('SHA-256', bytes)
+    const hex = Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, '0')).join('')
+    return `sha256:${hex}`
+  })()
+  return skillDigestPromise
+}
 
 const loginQuerySchema = z.object({ callbackURL: z.string().optional() })
 
@@ -263,6 +282,36 @@ export const app = new Spiceflow()
   .page('/live', async () => {
     const { default: LivePage } = await import('./pages/live.tsx')
     return <LivePage />
+  })
+
+  // Skill discovery for `npx skills add https://playwriter.dev` (skills.sh).
+  // The url is relative to this index file per the discovery schema.
+  .route({
+    method: 'GET',
+    path: '/.well-known/agent-skills/index.json',
+    detail: { hide: true },
+    handler: async () =>
+      Response.json({
+        $schema: 'https://schemas.agentskills.io/discovery/0.2.0/schema.json',
+        skills: [
+          {
+            name: 'playwriter',
+            type: 'skill-md',
+            description: PLAYWRITER_SKILL_DESCRIPTION,
+            url: './playwriter/SKILL.md',
+            digest: await getSkillDigest(),
+          },
+        ],
+      }),
+  })
+  .route({
+    method: 'GET',
+    path: '/.well-known/agent-skills/playwriter/SKILL.md',
+    detail: { hide: true },
+    handler: () =>
+      new Response(playwriterSkillMd, {
+        headers: { 'content-type': 'text/markdown; charset=utf-8' },
+      }),
   })
 
   // Cloud browser API routes (/api/cloud/*)

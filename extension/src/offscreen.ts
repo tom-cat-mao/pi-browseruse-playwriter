@@ -68,7 +68,7 @@ type OffscreenResult =
   | OffscreenCancelRecordingResult
 
 chrome.runtime.onMessage.addListener((message: OffscreenMessage, _sender, sendResponse) => {
-  handleMessage(message).then(sendResponse)
+  void handleMessage(message).then(sendResponse)
   return true // Keep channel open for async response
 })
 
@@ -143,7 +143,7 @@ async function handleStartRecording(params: OffscreenStartRecordingMessage): Pro
         // Convert blob to array buffer and send to service worker
         const arrayBuffer = await event.data.arrayBuffer()
         const uint8Array = new Uint8Array(arrayBuffer)
-        chrome.runtime.sendMessage({
+        void chrome.runtime.sendMessage({
           action: 'recordingChunk',
           tabId,
           data: Array.from(uint8Array), // Convert to regular array for message passing
@@ -212,14 +212,14 @@ async function handleStopRecording(params: OffscreenStopRecordingMessage): Promi
     })
 
     // Stop all tracks
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
+    stream.getTracks().forEach((track) => {
       track.stop()
     })
 
     const duration = Date.now() - startedAt
 
     // Send final marker
-    chrome.runtime.sendMessage({
+    void chrome.runtime.sendMessage({
       action: 'recordingChunk',
       tabId,
       final: true,
@@ -268,11 +268,11 @@ function handleCancelRecordingForTab(tabId: number): OffscreenCancelRecordingRes
     if (recorder.state !== 'inactive') {
       recorder.stop()
     }
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
+    stream.getTracks().forEach((track) => {
       track.stop()
     })
 
-    chrome.runtime.sendMessage({
+    void chrome.runtime.sendMessage({
       action: 'recordingCancelled',
       tabId,
     })

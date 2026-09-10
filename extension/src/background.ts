@@ -13,6 +13,8 @@ import type { ExtensionState, ConnectionState, TabState, TabInfo } from './types
 import { initPlaywriterToolbar } from './toolbar/toolbar'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
+import type { BrowserRequest } from 'playwriter/src/browser-protocol'
+import { ManagedGroups } from './managed-groups'
 import { handleGhostBrowserCommand, type GhostBrowserCommandParams } from 'playwriter/src/ghost-browser'
 // Inlined at build time via vite ?raw. Source: playwriter/src/ghost-cursor-client.ts
 import ghostCursorBundleCode from '../../playwriter/dist/ghost-cursor-client.js?raw'
@@ -27,6 +29,10 @@ import {
   handleCancelRecording,
   cleanupRecordingForTab,
 } from './recording'
+
+function isTruthy<T>(value: T): value is NonNullable<T> {
+  return Boolean(value)
+}
 
 const RELAY_HOST = '127.0.0.1'
 const RELAY_PORT = Number(process.env.PLAYWRITER_PORT) || 19988
@@ -410,13 +416,22 @@ class ConnectionManager {
         message = JSON.parse(event.data)
       } catch (error: any) {
         logger.debug('Error parsing message:', error)
-        sendMessage({ error: { code: -32700, message: `Error parsing message: ${error.message}` } })
+        // Every reply in this handler goes back on the socket the request arrived
+        // on (or is dropped); never on this.ws, which may already be a new socket.
+        sendMessageToSocket(socket, { error: { code: -32700, message: `Error parsing message: ${error.message}` } })
         return
       }
 
       // Handle ping from server - respond with pong to keep service worker alive
       if (message.method === 'ping') {
-        sendMessage({ method: 'pong' })
+        sendMessageToSocket(socket, { method: 'pong' })
+        return
+      }
+
+      // Relay notifies us when action recording starts/stops — update toolbar in all connected tabs
+      if (message.method === 'setRecorderState') {
+        const recording = !!(message.params as { recording?: boolean })?.recording
+        setRecorderStateInAllTabs(recording)
         return
       }
 
@@ -439,7 +454,7 @@ class ConnectionManager {
             setTabConnecting(tab.id)
             const { targetInfo, sessionId } = await attachTab(tab.id, { skipAttachedEvent: true })
             logger.debug('Initial tab created and connected:', tab.id, 'sessionId:', sessionId)
-            sendMessage({
+            sendMessageToSocket(socket, {
               id: message.id,
               result: {
                 success: true,
@@ -453,7 +468,7 @@ class ConnectionManager {
           }
         } catch (error: any) {
           logger.debug('Failed to create initial tab:', error)
-          sendMessage({ id: message.id, error: error.message })
+          sendMessageToSocket(socket, { id: message.id, error: error.message })
         }
         return
       }
@@ -462,10 +477,10 @@ class ConnectionManager {
       if (message.method === 'startRecording') {
         try {
           const result = await handleStartRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to start recording:', error)
-          sendMessage({ id: message.id, result: { success: false, error: error.message } })
+          sendMessageToSocket(socket, { id: message.id, result: { success: false, error: error.message } })
         }
         return
       }
@@ -473,10 +488,10 @@ class ConnectionManager {
       if (message.method === 'stopRecording') {
         try {
           const result = await handleStopRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to stop recording:', error)
-          sendMessage({ id: message.id, result: { success: false, error: error.message } })
+          sendMessageToSocket(socket, { id: message.id, result: { success: false, error: error.message } })
         }
         return
       }
@@ -484,10 +499,10 @@ class ConnectionManager {
       if (message.method === 'isRecording') {
         try {
           const result = await handleIsRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to check recording status:', error)
-          sendMessage({ id: message.id, result: { isRecording: false } })
+          sendMessageToSocket(socket, { id: message.id, result: { isRecording: false } })
         }
         return
       }
@@ -495,10 +510,10 @@ class ConnectionManager {
       if (message.method === 'cancelRecording') {
         try {
           const result = await handleCancelRecording(message.params)
-          sendMessage({ id: message.id, result })
+          sendMessageToSocket(socket, { id: message.id, result })
         } catch (error: any) {
           logger.error('Failed to cancel recording:', error)
-          sendMessage({ id: message.id, result: { success: false, error: error.message } })
+          sendMessageToSocket(socket, { id: message.id, result: { success: false, error: error.message } })
         }
         return
       }
@@ -522,7 +537,18 @@ class ConnectionManager {
             await attachTab(tabId)
           }
         }
-        sendMessage({ id: message.id, result })
+        sendMessageToSocket(socket, { id: message.id, result })
+        return
+      }
+
+      // Handle managed (Pi) group/tab control requests. The relay forwards the
+      // request envelope and expects the legacy response envelope back.
+      if (message.method === 'browserRequest') {
+        const params: BrowserRequest = message.params
+        const result = await managedGroups.handleBrowserRequest(params)
+        // Answer on the socket this request arrived on (or drop it): a response
+        // must never be sent on a newer connection with the same message id.
+        sendMessageToSocket(socket, { id: message.id, result })
         return
       }
 
@@ -534,19 +560,25 @@ class ConnectionManager {
         response.error = error.message
       }
       // logger.debug('Sending response:', response)
-      sendMessage(response)
+      sendMessageToSocket(socket, response)
     }
 
-    this.ws.onclose = (event: CloseEvent) => {
+    socket.onclose = (event: CloseEvent) => {
+      // A stale socket's close must never tear down the current connection.
+      if (this.ws !== socket) {
+        logger.debug('Ignoring close event from a replaced websocket:', event.reason, event.code)
+        return
+      }
       this.handleClose(event.reason, event.code)
     }
 
-    this.ws.onerror = (event: Event) => {
+    socket.onerror = (event: Event) => {
       logger.debug('WebSocket error:', event)
     }
 
-    chrome.debugger.onEvent.addListener(onDebuggerEvent)
-    chrome.debugger.onDetach.addListener(onDebuggerDetach)
+    // Restore managed ownership bindings and re-attach debuggers before any
+    // CDP routing starts; this never replays page actions, only connections.
+    void managedGroups.handleWsConnected()
 
     logger.debug('Connection established')
   }
@@ -565,8 +597,9 @@ class ConnectionManager {
     } catch {}
     logger.warn(`DISCONNECT: WS closed code=${code} reason=${reason || 'none'} stack=${getCallStack()}`)
 
-    chrome.debugger.onEvent.removeListener(onDebuggerEvent)
-    chrome.debugger.onDetach.removeListener(onDebuggerDetach)
+    // Invalidate the dropped connection: its in-flight control requests must not
+    // write to Chrome or send responses on a new socket.
+    managedGroups.handleWsDisconnected()
 
     const isExtensionReplaced = reason === 'Extension Replaced' || code === 4001
     const isExtensionInUse = reason === 'Extension Already In Use' || code === 4002
@@ -575,9 +608,7 @@ class ConnectionManager {
     const { tabs } = store.getState()
 
     for (const [tabId] of tabs) {
-      chrome.debugger.detach({ tabId }).catch((err) => {
-        logger.debug('Error detaching from tab:', tabId, err.message)
-      })
+      detachDebuggerProgrammatically(tabId)
     }
 
     childSessions.clear()
@@ -676,9 +707,10 @@ class ConnectionManager {
         await this.ensureConnection()
         store.setState({ connectionState: 'connected' })
 
-        // Re-attach any tabs that were in 'connecting' state (from a previous disconnect)
+        // Re-attach any tabs that were in 'connecting' state (from a previous disconnect).
+        // Managed tabs are restored by managedGroups.handleWsConnected with registry checks.
         const tabsToReattach = Array.from(store.getState().tabs.entries())
-          .filter(([_, tab]) => tab.state === 'connecting')
+          .filter(([tabId, tab]) => tab.state === 'connecting' && !managedGroups.isManagedChromeTabId(tabId))
           .map(([tabId]) => tabId)
 
         for (const tabId of tabsToReattach) {
@@ -842,6 +874,19 @@ export function sendMessage(message: any): void {
   }
 }
 
+/** Sends a response on the socket a request arrived on; drops it when closed. */
+function sendMessageToSocket(socket: WebSocket | null, message: unknown): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    logger.debug('Dropping response: the request websocket is no longer open')
+    return
+  }
+  try {
+    socket.send(JSON.stringify(message))
+  } catch (error: unknown) {
+    logger.debug('Error sending response on the request socket:', error)
+  }
+}
+
 async function getPreferredWindowId(): Promise<number | undefined> {
   const { preferredWindowId, currentTabId } = store.getState()
   if (preferredWindowId !== undefined) {
@@ -888,25 +933,36 @@ async function createTabInPreferredWindow(options: { url: string; active: boolea
 
 async function syncTabGroup(): Promise<void> {
   try {
+    // Wait for the managed registry so managed tabs are never mistaken for legacy ones.
+    await managedGroups.initialize()
     // Include 'connecting' tabs in the group only when the relay is alive, so that
     // tabs the user drags into the group stay visible while attaching. When the relay
     // is dead all tabs are 'connecting' (waiting for reconnect) and the group should
     // be cleaned up. The onUpdated handler (line ~1601) already guards against the
     // ungroup→disconnect loop for 'connecting' tabs, so excluding them here is safe.
+    // Managed (Pi) tabs and groups are owned by the resource registry and must never
+    // be dissolved by this legacy sync.
     const { connectionState } = store.getState()
     const isRelayConnected = connectionState === 'connected'
+    const managedChromeGroupIds = new Set(managedGroups.getManagedChromeGroupIds())
     const connectedTabIds = Array.from(store.getState().tabs.entries())
-      .filter(([_, info]) => info.state === 'connected' || (info.state === 'connecting' && isRelayConnected))
+      .filter(([tabId, info]) => {
+        if (managedGroups.isManagedChromeTabId(tabId)) return false
+        return info.state === 'connected' || (info.state === 'connecting' && isRelayConnected)
+      })
       .map(([tabId]) => tabId)
 
-    // Always query by title - no cached ID that can go stale
-    const existingGroups = await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })
+    // Always query by title - no cached ID that can go stale. Managed groups may
+    // legitimately be named "playwriter"; they are excluded by id, never by title.
+    const existingGroups = (await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })).filter((group) => {
+      return !managedChromeGroupIds.has(group.id)
+    })
 
     // If no connected tabs, clear any existing playwriter groups
     if (connectedTabIds.length === 0) {
       for (const group of existingGroups) {
         const tabsInGroup = await chrome.tabs.query({ groupId: group.id })
-        const tabIdsToUngroup = tabsInGroup.map((t) => t.id).filter((id): id is number => id !== undefined)
+        const tabIdsToUngroup = tabsInGroup.map((t) => t.id).filter(isTruthy)
         if (tabIdsToUngroup.length > 0) {
           await chrome.tabs.ungroup(tabIdsToUngroup)
         }
@@ -922,7 +978,7 @@ async function syncTabGroup(): Promise<void> {
       groupId = keep.id
       for (const group of duplicates) {
         const tabsInDupe = await chrome.tabs.query({ groupId: group.id })
-        const tabIdsToUngroup = tabsInDupe.map((t) => t.id).filter((id): id is number => id !== undefined)
+        const tabIdsToUngroup = tabsInDupe.map((t) => t.id).filter(isTruthy)
         if (tabIdsToUngroup.length > 0) {
           await chrome.tabs.ungroup(tabIdsToUngroup)
         }
@@ -1064,7 +1120,7 @@ async function handleCommand(msg: ExtensionCommandMessage): Promise<any> {
   // Root-level Target.setAutoAttach must apply to all connected tabs since
   // CDP auto-attach is per-debugger-session. Without this, OOPIF targets never attach.
   if (msg.params.method === 'Target.setAutoAttach' && !msg.params.sessionId) {
-    const params = msg.params.params as Protocol.Target.SetAutoAttachRequest | undefined
+    const params = msg.params.params
     if (!params) {
       return {}
     }
@@ -1248,19 +1304,31 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
   })
 }
 
+// Chrome fires chrome.debugger.onDetach for API-initiated detaches too. Track the
+// detaches we request so our own teardown is never mistaken for a user action;
+// the user-control listener itself stays registered for the worker's lifetime.
+const programmaticDetachUntil = new Map<number, number>()
+
+function detachDebuggerProgrammatically(tabId: number): void {
+  programmaticDetachUntil.set(tabId, Date.now() + 3000)
+  chrome.debugger.detach({ tabId }).catch((err: Error) => {
+    logger.debug('Error detaching from tab:', tabId, err.message)
+  })
+}
+
+function consumeProgrammaticDetach(tabId: number): boolean {
+  const until = programmaticDetachUntil.get(tabId)
+  if (until === undefined) return false
+  programmaticDetachUntil.delete(tabId)
+  return until > Date.now()
+}
+
 function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.debugger.DetachReason}`): void {
   const tabId = source.tabId
-  if (!tabId || !store.getState().tabs.has(tabId)) {
-    logger.debug('Ignoring debugger detach event for untracked tab:', tabId)
+  if (!tabId) {
+    logger.debug('Ignoring debugger detach event without a tab id:', reason)
     return
   }
-
-  if (connectionManager.preserveTabsOnDetach) {
-    logger.debug('Ignoring debugger detach during relay reconnect:', tabId, reason)
-    return
-  }
-
-  logger.warn(`DISCONNECT: onDebuggerDetach tabId=${tabId} reason=${reason}`)
 
   const detachTabFromPlaywright = (detachedTabId: number, tab: TabInfo) => {
     sendMessage({
@@ -1274,16 +1342,41 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
   }
 
   if (reason === chrome.debugger.DetachReason.CANCELED_BY_USER) {
-    // Chrome's debugger info bar cancellation detaches every debugger session
-    // in this extension process. Clear every tracked tab so Playwright does not
-    // keep sending commands to tabs Chrome already detached from.
+    // A Chrome infobar cancel detaches every debugger session at once and is a
+    // global user stop. It must be handled before the programmatic-detach
+    // suppression and before any reconnect early-return, so a TTL window or a
+    // transport drop can never swallow a real user cancel.
+    programmaticDetachUntil.delete(tabId)
+    logger.warn(`DISCONNECT: user canceled automation in Chrome (tabId=${tabId})`)
+    void managedGroups.handleDebuggerDetached(tabId, reason, { userCanceledAll: true })
     for (const [detachedTabId, tab] of store.getState().tabs.entries()) {
       detachTabFromPlaywright(detachedTabId, tab)
     }
-
     store.setState({ tabs: new Map(), connectionState: 'idle', errorText: undefined })
     return
   }
+
+  // Suppression only applies to non-user reasons: a detach we requested ourselves
+  // must not be mistaken for a user action, but it can never hide a real cancel.
+  if (consumeProgrammaticDetach(tabId)) {
+    logger.debug('Ignoring debugger detach we requested ourselves:', tabId, reason)
+    return
+  }
+
+  if (connectionManager.preserveTabsOnDetach) {
+    logger.debug('Ignoring debugger detach during relay reconnect:', tabId, reason)
+    return
+  }
+
+  if (!store.getState().tabs.has(tabId)) {
+    logger.debug('Ignoring debugger detach event for untracked tab:', tabId)
+    return
+  }
+
+  // Transient detaches keep managed ownership; a later reconnect re-attaches.
+  void managedGroups.handleDebuggerDetached(tabId, reason)
+
+  logger.warn(`DISCONNECT: onDebuggerDetach tabId=${tabId} reason=${reason}`)
 
   const tab = store.getState().tabs.get(tabId)
   if (tab) {
@@ -1490,6 +1583,9 @@ async function attachTab(
         world: 'MAIN',
         func: initPlaywriterToolbar,
       })
+      .then(() => {
+        injectRecorderCallbacks(tabId)
+      })
       .catch((err: Error) => {
         logger.debug('Could not inject toolbar (restricted page):', err.message)
       })
@@ -1499,7 +1595,7 @@ async function attachTab(
     // Clean up debugger if we attached but failed later
     if (debuggerAttached) {
       logger.debug('Cleaning up debugger after partial attach failure:', tabId)
-      chrome.debugger.detach(debuggee).catch(() => {})
+      detachDebuggerProgrammatically(tabId)
     }
     throw error
   }
@@ -1513,7 +1609,7 @@ function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   }
 
   // Clean up any active recording for this tab
-  cleanupRecordingForTab(tabId)
+  void cleanupRecordingForTab(tabId)
 
   // Destroy the in-page toolbar (best-effort: tab may already be closing or navigating)
   void chrome.scripting
@@ -1559,9 +1655,86 @@ function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   emitChildDetachesForTab(tabId)
 
   if (shouldDetachDebugger) {
-    chrome.debugger.detach({ tabId }).catch((err) => {
-      logger.debug('Error detaching debugger from tab:', tabId, err.message)
+    detachDebuggerProgrammatically(tabId)
+  }
+}
+
+// Recording started from the toolbar. Passed back on stop so the Stop button
+// is never ambiguous when another recording is also active.
+let toolbarRecordingId: string | null = null
+let toolbarStartInFlight = false
+
+// Inject start/stop recording callbacks into a single tab's toolbar.
+// Called on tab attach and whenever the relay notifies a state change.
+//
+// Routed through extension messaging (MAIN → ISOLATED → service worker → relay)
+// instead of direct fetch to avoid CORS failures on cross-origin pages.
+// The service worker can fetch localhost freely from the extension context.
+// Uses window.postMessage (the Chrome-documented cross-world communication
+// pattern) because CustomEvent does not reliably cross MAIN↔ISOLATED worlds.
+function injectRecorderCallbacks(tabId: number): void {
+  // 1. ISOLATED world bridge: catches postMessage from MAIN world, forwards
+  //    to service worker via chrome.runtime.sendMessage
+  chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: false },
+      world: 'ISOLATED',
+      func: () => {
+        if ((window as any).__playwriterRecorderBridge) return
+        ;(window as any).__playwriterRecorderBridge = true
+        window.addEventListener('message', (event: MessageEvent) => {
+          if (event.source !== window) return
+          if (event.data?.__playwriter === 'recorder_start') {
+            void chrome.runtime.sendMessage({ action: 'actionRecorderStart' })
+          }
+          if (event.data?.__playwriter === 'recorder_stop') {
+            void chrome.runtime.sendMessage({ action: 'actionRecorderStop' })
+          }
+        })
+      },
     })
+    .then(() => {
+      // 2. MAIN world callbacks: the toolbar calls these on button click.
+      //    Posts structured messages instead of fetching directly.
+      return chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        world: 'MAIN',
+        func: (recording: boolean) => {
+          ;(window as any).__playwriterToolbarStartRecording = () => {
+            window.postMessage({ __playwriter: 'recorder_start' }, '*')
+          }
+          ;(window as any).__playwriterToolbarStopRecording = () => {
+            window.postMessage({ __playwriter: 'recorder_stop' }, '*')
+          }
+          ;(window as any).__playwriterToolbarSetRecording?.(recording)
+        },
+        args: [toolbarRecordingId !== null],
+      })
+    })
+    .catch(() => {})
+}
+
+function setRecorderStateInTab(tabId: number, recording: boolean): void {
+  chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: false },
+      world: 'MAIN',
+      func: (rec: boolean) => {
+        ;(window as any).__playwriterToolbarSetRecording?.(rec)
+      },
+      args: [recording],
+    })
+    .catch(() => {})
+}
+
+// Notify all connected tabs when recording starts/stops.
+function setRecorderStateInAllTabs(recording: boolean): void {
+  const { tabs } = store.getState()
+  for (const [tabId, tab] of tabs) {
+    if (tab.state !== 'connected') {
+      continue
+    }
+    setRecorderStateInTab(tabId, recording)
   }
 }
 
@@ -1692,6 +1865,9 @@ async function disconnectEverything(): Promise<void> {
     }
   })
   await tabGroupQueue
+  // Managed tabs keep their registry ownership on transport disconnects, but an
+  // explicit disconnect-everything is a user release.
+  await managedGroups.releaseAllChromeTabs('disconnect-everything')
   // WS connection is maintained - maintainConnection handles it
 }
 
@@ -1700,7 +1876,10 @@ async function resetDebugger(): Promise<void> {
   targets = targets.filter((x) => x.tabId && x.attached)
   logger.log(`found ${targets.length} existing debugger targets. detaching them before background script starts`)
   for (const target of targets) {
-    await chrome.debugger.detach({ tabId: target.tabId })
+    const tabId = target.tabId
+    if (tabId === undefined) continue
+    programmaticDetachUntil.set(tabId, Date.now() + 3000)
+    await chrome.debugger.detach({ tabId })
   }
 }
 
@@ -1708,6 +1887,7 @@ async function resetDebugger(): Promise<void> {
 const OUR_EXTENSION_IDS = [
   'jfeammnjpkecdekppnclgkkffahnhfhe', // Production extension (Chrome Web Store)
   'pebbngnfojnignonigcnkdilknapkgid', // Dev extension (stable ID from manifest key)
+  'eeklahpecooapnailfaebkjjembkjhhg', // Fork dev extension (built with PLAYWRITER_FORK_DEV_KEY=1)
 ]
 
 // undefined URL is for about:blank pages (not restricted) and chrome:// URLs (restricted).
@@ -1730,6 +1910,21 @@ function isRestrictedUrl(url: string | undefined): boolean {
   ]
   return restrictedPrefixes.some((prefix) => url.startsWith(prefix))
 }
+
+// Managed (Pi) ownership runtime. The registry in chrome.storage.local is the
+// authority for named groups and their tabs; this wiring only connects it to
+// the Chrome APIs and the legacy store.
+export const managedGroups = new ManagedGroups({
+  getProfileId: getInstallId,
+  attachTab,
+  detachManagedTab: (tabId: number) => {
+    detachTab(tabId, true)
+  },
+  sendMessage,
+  logger,
+  getPreferredWindowId,
+  isRestrictedUrl,
+})
 
 const icons = {
   connected: {
@@ -1808,7 +2003,7 @@ async function updateIcons(): Promise<void> {
 
   const allTabs = await chrome.tabs.query({})
   const tabUrlMap = new Map(allTabs.map((tab) => [tab.id, tab.url]))
-  const allTabIds = [undefined, ...allTabs.map((tab) => tab.id).filter((id): id is number => id !== undefined)]
+  const allTabIds = [undefined, ...allTabs.map((tab) => tab.id).filter(isTruthy)]
 
   for (const tabId of allTabIds) {
     const tabInfo = tabId !== undefined ? tabs.get(tabId) : undefined
@@ -1845,6 +2040,7 @@ async function updateIcons(): Promise<void> {
 
 async function onTabRemoved(tabId: number): Promise<void> {
   popupSourceTabMap.delete(tabId)
+  void managedGroups.handleChromeTabRemoved(tabId)
   const { tabs } = store.getState()
   if (!tabs.has(tabId)) return
   logger.debug(`Connected tab ${tabId} was closed, disconnecting`)
@@ -1855,7 +2051,38 @@ async function onTabActivated(activeInfo: chrome.tabs.TabActiveInfo): Promise<vo
   store.setState({ currentTabId: activeInfo.tabId, preferredWindowId: activeInfo.windowId })
 }
 
+const TUTORIAL_PAGE_PATH = 'src/tutorial.html'
+
+// Icon only attaches a tab. Daemon starts on the first playwriter command.
+function shouldOpenTutorialPage(): boolean {
+  if (import.meta.env.TESTING) return false
+  if (!__PLAYWRITER_OPEN_WELCOME_PAGE__) return false
+  return store.getState().connectionState === 'idle'
+}
+
+async function openTutorialPage(): Promise<void> {
+  try {
+    const baseUrl = chrome.runtime.getURL(TUTORIAL_PAGE_PATH)
+    const tabs = await chrome.tabs.query({})
+    const existing = tabs.find((t) => t.url?.startsWith(baseUrl))
+    if (existing?.id) {
+      await chrome.tabs.update(existing.id, { active: true })
+      if (existing.windowId !== undefined) {
+        await chrome.windows.update(existing.windowId, { focused: true })
+      }
+      return
+    }
+    await chrome.tabs.create({ url: `${TUTORIAL_PAGE_PATH}?port=${RELAY_PORT}` })
+  } catch (e) {
+    logger.debug('Failed to open tutorial page:', e)
+  }
+}
+
 async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
+  if (shouldOpenTutorialPage()) {
+    void openTutorialPage()
+  }
+
   if (!tab.id) {
     logger.debug('No tab ID available')
     return
@@ -1863,6 +2090,24 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 
   if (tab.windowId !== undefined) {
     store.setState({ currentTabId: tab.id, preferredWindowId: tab.windowId })
+  }
+
+  // Managed (Pi) tabs: an icon click is "cancel control" and releases the tab;
+  // clicking a disconnected managed tab restores its attachment instead.
+  await managedGroups.initialize()
+  const managedTab = managedGroups.findManagedTabByChromeTabId(tab.id)
+  if (managedTab) {
+    if (managedTab.state === 'ready') {
+      logger.debug('Icon click on managed tab, releasing control:', tab.id)
+      await managedGroups.releaseChromeTab(tab.id, 'icon-click-cancel-control')
+      return
+    }
+    if (managedTab.state === 'disconnected') {
+      logger.debug('Icon click on disconnected managed tab, restoring attachment:', tab.id)
+      await managedGroups.restoreChromeTab(tab.id)
+      return
+    }
+    return
   }
 
   if (isRestrictedUrl(tab.url)) {
@@ -1899,8 +2144,20 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
   }
 }
 
-resetDebugger()
-connectionManager.maintainLoop()
+// Register the debugger listeners exactly once for the whole worker lifetime.
+// They must NOT be removed on connection close: user actions (debugger infobar
+// cancel, tab moves) still have to be recorded while the relay is offline.
+chrome.debugger.onEvent.addListener(onDebuggerEvent)
+chrome.debugger.onDetach.addListener(onDebuggerDetach)
+
+void (async () => {
+  // Startup order: clear stale debugger sessions from a previous worker first,
+  // then load the ownership registry, and only then start connecting (which
+  // attaches managed tabs) so teardown can never race a fresh attach.
+  await resetDebugger()
+  await managedGroups.initialize()
+  void connectionManager.maintainLoop()
+})()
 
 chrome.contextMenus
   .remove('playwriter-pin-element')
@@ -1929,8 +2186,8 @@ chrome.contextMenus
 function updateContextMenuVisibility(): void {
   const { currentTabId, tabs } = store.getState()
   const isConnected = currentTabId !== undefined && tabs.get(currentTabId)?.state === 'connected'
-  chrome.contextMenus?.update('playwriter-pin-element', { visible: isConnected })
-  chrome.contextMenus?.update('playwriter-copy-react-source', { visible: isConnected })
+  void chrome.contextMenus?.update('playwriter-pin-element', { visible: isConnected })
+  void chrome.contextMenus?.update('playwriter-copy-react-source', { visible: isConnected })
 }
 
 function buildPinnedElementInspectionCode(options: { pinName: string; url: string }): string {
@@ -2020,14 +2277,47 @@ checkMemory()
 chrome.tabs.onRemoved.addListener(onTabRemoved)
 chrome.tabs.onActivated.addListener(onTabActivated)
 chrome.action.onClicked.addListener(onActionClicked)
+// Chrome removes a tab group as soon as its last tab leaves. Managed logical
+// groups are session-owned, so this only drops the stale physical binding.
+chrome.tabGroups.onRemoved.addListener((group) => {
+  void managedGroups.handleChromeGroupRemoved(group.id)
+})
+// Manual renames / window moves of a managed group are identified by Chrome
+// group id (never by title) and synced back into the registry.
+chrome.tabGroups.onUpdated.addListener((group) => {
+  void managedGroups.handleChromeGroupUpdated({
+    chromeGroupId: group.id,
+    title: group.title,
+    windowId: group.windowId,
+  })
+})
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void updateIcons()
+  if (changeInfo.groupId !== undefined) {
+    void managedGroups.handleChromeTabUpdatedGroup({
+      chromeTabId: tabId,
+      chromeGroupId: changeInfo.groupId,
+      url: tab.url ?? '',
+      title: tab.title ?? '',
+    })
+  }
+  if ((changeInfo.url !== undefined || changeInfo.title !== undefined) && managedGroups.isManagedChromeTabId(tabId)) {
+    managedGroups.noteChromeTabPageInfo(tabId, tab.url ?? '', tab.title ?? '')
+  }
   if (changeInfo.groupId !== undefined) {
     // Queue tab group operations to serialize with syncTabGroup and disconnectEverything
     tabGroupQueue = tabGroupQueue
       .then(async () => {
-        // Query for playwriter group by title - no stale cached ID
-        const existingGroups = await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })
+        // Managed tabs are owned by the resource registry, never by this legacy path
+        await managedGroups.initialize()
+        if (managedGroups.isManagedChromeTabId(tabId)) return
+
+        // Query for playwriter group by title - no stale cached ID. Managed groups
+        // are excluded by id so a managed group named "playwriter" is never touched.
+        const managedGroupIds = new Set(managedGroups.getManagedChromeGroupIds())
+        const existingGroups = (await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })).filter((group) => {
+          return !managedGroupIds.has(group.id)
+        })
         const groupId = existingGroups[0]?.id
         if (groupId === undefined) {
           return
@@ -2067,7 +2357,32 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
   setTimeout(() => {
     popupSourceTabMap.delete(details.tabId)
   }, 10000)
+  void adoptInheritedTabIfInNormalWindow({ chromeTabId: details.tabId, sourceChromeTabId: details.sourceTabId })
 })
+
+// target=_blank links and cmd+click open as regular tabs (no popup window), so the
+// popup-window relocation path below never sees them. Tabs that are still inside a
+// popup window are skipped here: windows.onCreated moves them into the source window
+// first and adopts them after the move, avoiding a double-adoption race.
+async function adoptInheritedTabIfInNormalWindow(options: {
+  chromeTabId: number
+  sourceChromeTabId: number
+}): Promise<void> {
+  try {
+    if (managedGroups.isManagedChromeTabId(options.chromeTabId)) return
+    const tab = await chrome.tabs.get(options.chromeTabId).catch(() => {
+      return null
+    })
+    if (!tab) return
+    const parentWindow = await chrome.windows.get(tab.windowId).catch(() => {
+      return null
+    })
+    if (parentWindow?.type !== 'normal') return
+    await managedGroups.adoptInheritedTab(options)
+  } catch (error) {
+    logger.debug('Inherited tab adoption check failed (ignored):', error)
+  }
+}
 
 // Relocate popup windows opened by a Playwriter-connected tab into the
 // source tab's window as a regular tab, since Playwriter cannot attach
@@ -2080,6 +2395,7 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
     return
   }
   try {
+    await managedGroups.initialize()
     // Retry tab discovery — windows.onCreated can fire before
     // chrome.tabs.query({ windowId }) sees the new popup tab.
     let popupTabs: chrome.tabs.Tab[] = []
@@ -2088,11 +2404,7 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
       if (popupTabs.length > 0) break
       await sleep(20)
     }
-    const tabIds = popupTabs
-      .map((t) => t.id)
-      .filter((id): id is number => {
-        return id !== undefined
-      })
+    const tabIds = popupTabs.map((t) => t.id).filter(isTruthy)
     if (tabIds.length === 0) {
       logger.debug(`Popup window ${popupWindow.id} has no tabs after retry, skipping`)
       return
@@ -2143,7 +2455,14 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
     } catch {
       // Chrome may have already closed the empty popup window.
     }
+    const managedSourceTab = managedGroups.findManagedTabByChromeTabId(sourceTabId)
     for (const tabId of tabIds) {
+      if (managedSourceTab) {
+        // Task popup inherits its source tab's managed group; unrelated popups are
+        // never moved because only managed source tabs lead here.
+        await managedGroups.adoptInheritedTab({ chromeTabId: tabId, sourceChromeTabId: sourceTabId })
+        continue
+      }
       if (connectedTabs.has(tabId)) continue
       try {
         await connectTab(tabId)
@@ -2376,8 +2695,125 @@ chrome.contextMenus?.onClicked.addListener(async (info, tab) => {
 // Sync icons on first load
 void updateIcons()
 
-// Handle messages from offscreen document (recording chunks)
-chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
+function toastToolbar(tabId: number, msg: string): void {
+  chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: false },
+      world: 'MAIN',
+      func: (text: string) => {
+        ;(window as any).__playwriterToolbarShowToast?.(text)
+      },
+      args: [msg],
+    })
+    .catch(() => {})
+}
+
+// Handle messages from content scripts (recorder commands) and offscreen document (recording chunks)
+chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
+  // Action recorder start/stop: routed through extension messaging to avoid CORS.
+  // MAIN world toolbar → ISOLATED content script → here → relay HTTP endpoint.
+  if (message.action === 'actionRecorderStart') {
+    const senderTabId = sender.tab?.id
+    if (toolbarRecordingId || toolbarStartInFlight) {
+      return false
+    }
+    toolbarStartInFlight = true
+    fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+      .then(async (response) => {
+        const result = (await response.json().catch(() => {
+          return {}
+        })) as { error?: string; recordingId?: string }
+        if (response.ok && result.recordingId) {
+          toolbarRecordingId = result.recordingId
+          if (senderTabId) {
+            setRecorderStateInTab(senderTabId, true)
+          }
+          return
+        }
+        logger.error('Action recorder start failed:', result.error || response.status)
+        if (!senderTabId) {
+          return
+        }
+        setRecorderStateInTab(senderTabId, false)
+        toastToolbar(senderTabId, result.error || 'Failed to start recording')
+      })
+      .catch((err) => {
+        logger.error('Action recorder start failed:', err)
+        if (!senderTabId) {
+          return
+        }
+        setRecorderStateInTab(senderTabId, false)
+        toastToolbar(senderTabId, 'Failed to start recording')
+      })
+      .finally(() => {
+        toolbarStartInFlight = false
+      })
+    return false
+  }
+
+  if (message.action === 'actionRecorderStop') {
+    const senderTabId = sender.tab?.id
+    fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(toolbarRecordingId ? { recordingId: toolbarRecordingId } : {}),
+    })
+      .then((r) => r.json())
+      .then((result: { recordingId?: string; error?: string }) => {
+        if (!result.recordingId) {
+          logger.error('Action recorder stop failed:', result.error || 'unknown')
+          if (senderTabId) {
+            toastToolbar(senderTabId, result.error || 'Failed to stop recording')
+          }
+          return
+        }
+        toolbarRecordingId = null
+        if (!senderTabId) return
+        const prompt = [
+          'I just recorded a browser workflow (recording ' + result.recordingId + ').',
+          'Analyze it and create a reusable skill from it.',
+          '',
+          'First read how Playwriter works (do not skip):',
+          'https://playwriter.dev/SKILL.md',
+          '',
+          'Then run:',
+          'playwriter recorder events -r ' + result.recordingId,
+        ].join('\n')
+        chrome.scripting
+          .executeScript({
+            target: { tabId: senderTabId, allFrames: false },
+            world: 'MAIN',
+            func: (text: string) => {
+              navigator.clipboard.writeText(text).catch(() => {
+                try {
+                  const ta = document.createElement('textarea')
+                  ta.value = text
+                  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none;'
+                  document.body.appendChild(ta)
+                  ta.focus()
+                  ta.select()
+                  document.execCommand('copy')
+                  ta.remove()
+                } catch {}
+              })
+              ;(window as any).__playwriterToolbarSetRecording?.(false)
+              ;(window as any).__playwriterToolbarShowToast?.('Prompt copied to clipboard')
+              ;(window as any).__playwriterToolbarPlaySound?.('success')
+            },
+            args: [prompt],
+          })
+          .catch(() => {})
+      })
+      .catch((err) => {
+        logger.error('Action recorder stop failed:', err)
+      })
+    return false
+  }
+
   if (message.action === 'recordingChunk') {
     const { tabId, data, final } = message
 
@@ -2447,6 +2883,9 @@ chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
       target: { tabId: details.tabId, allFrames: false },
       world: 'MAIN',
       func: initPlaywriterToolbar,
+    })
+    .then(() => {
+      injectRecorderCallbacks(details.tabId)
     })
     .catch((err: Error) => {
       logger.debug('Could not re-inject toolbar after navigation:', err.message)
