@@ -22,14 +22,14 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | 工作流 | agent / task | 分支 | 状态 |
 | --- | --- | --- | --- |
 | E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 2346d18 已集成，CI待重跑 |
-| A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 35fe197 已集成，socket/写队列收尾中 |
-| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 3909817 已集成，待实际worker联调 |
-| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | 运行中 |
-| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 运行中 |
+| A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 42eb198 已集成 |
+| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 3909817 已集成，静态worker接线/CI flaky修订 |
+| C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | f37b70b 已集成 |
+| D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 6dcde8e 已集成 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
 | 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 仅编写/dry-run，不启动Chrome |
-| 最终独立验收 | 另一全新 agent，实施后启动 | 待创建 | 未开始 |
+| 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | 无Chrome验收中，候选23c3ebd |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
 executor、pi-tools、integration。主目录 main 未修改。
@@ -81,10 +81,19 @@ executor、pi-tools、integration。主目录 main 未修改。
   协调者已向用户更正；未访问日常Chrome或重启19988。不能将此前执行
   统称为纯无浏览器。后续逐项检查套件并按授权门槛运行。
 - Linux另一个IPC崩溃原因仍为端口/进程并行竞态推断，串行分离后待CI验证。
+- 纠正测试分类后，协调者重跑实际无浏览器套件：runtime unit210/210、
+  process integration34/34、extension33/33通过；typechecks通过。
+  e979d37已push PR，Linux CI待结果。
 - A35fe197已合入：请求取消跟踪、pending ledger、revision fence。
   最后read-back要求覆盖所有CDP reply（不只browserRequest）、取消优先于
   programmatic抑制、旧storage写drain、权威tab.resolve核验实际分组。
-- 以上不能代替最后的全新agent独立验收与用户Chrome验收。
+- C f37b70b与D6dcde8e已集成；协调者重跑候选：runtime217unit+34
+  process integration、Pi48+12工具loadcheck、extension34全部通过。
+- e979d37 Linux CI一条success一条failure，剩余失败是managed-relay
+  queue-a测试30s超时，B正在检查handshake/flaky根因，不以重跑绿掩盖。
+- 全新最终reviewer CodeBuddy14在review/browser-rebuild独立树，
+  候选23c3ebd；Chrome仍未授权，结果最多是非浏览器验收。
+- 以上不能代替用户Chrome验收，不提前merge main。
 
 # 待完成门槛
 

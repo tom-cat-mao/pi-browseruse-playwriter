@@ -1,5 +1,5 @@
 ---
-'playwriter': minor
+'@tom-cat/pi-browser-runtime': minor
 ---
 
 Add an isolated managed executor pool for Pi browser sessions. Managed page
