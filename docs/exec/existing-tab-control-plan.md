@@ -50,7 +50,13 @@ Pi64项及12工具加载检查通过；修订后build/smoke及目标回归亦通
 attached事件。Codex22已以a6cc285只修relay的inventory/target通知协调，
 保留owner范围与去重；协调者重跑类型检查和38项managed-relay测试通过。
 原始验收报告见existing-tab-control-live-acceptance.md，不以修复代替真机通过。
-下一步用户仅重启19991测试runtime后，继续原地接入与外链往返验收。
+第二轮真机已通过原地attach、外链新tab/独立popup读取与返回、普通history
+back、非视觉AX路径与跨session拒绝；原页草稿与scroll在往返后保持。
+剩余：release后重新attach的首动作早于Playwright Page初始化，c37a0ba已
+增加明确target的有界事件等待；协调者typecheck及46项目标回归通过。
+hash点击被浮动toolbar遮挡，不是后退实现失败；报告已纠正，复测先正常隐藏
+工具栏或避让fixture布局，不强制点击，不把cancelled视为未执行后盲重试。
+下一步用户只需重启19991 runtime，定向复测重接与hash back，不重跑整套。
 扩展仍为0.0.129（本树extension/dist-acceptance），无须重载；不替换现有
 19989/19990进程或全局Pi配置。
 共享契约见下文“共享契约（本轮新增，唯一写入处）”。
