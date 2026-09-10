@@ -106,6 +106,81 @@ describe('CDP log rotation', () => {
     fs.rmSync(tmpDir, { recursive: true })
   })
 
+  it('marks dropped lines when the buffer cap is exceeded', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'cdp.jsonl')
+    const logger = createCdpLogger({ logFilePath: logFile, maxBufferedLines: 5 })
+
+    for (let i = 0; i < 8; i++) {
+      logger.log(makeEntry(i))
+    }
+    await logger.flush()
+
+    const lines = fs
+      .readFileSync(logFile, 'utf-8')
+      .trim()
+      .split('\n')
+      .map((line) => {
+        const parsed = JSON.parse(line)
+        if (parsed.message.method === 'cdpLogOverflow') {
+          return { droppedLines: parsed.message.droppedLines, source: parsed.source }
+        }
+        return parsed.message.id
+      })
+    expect(lines).toMatchInlineSnapshot(`
+      [
+        {
+          "droppedLines": 3,
+          "source": "server",
+        },
+        3,
+        4,
+        5,
+        6,
+        7,
+      ]
+    `)
+
+    fs.rmSync(tmpDir, { recursive: true })
+  })
+
+  it('disables itself without throwing when the log path cannot be written', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'used-as-dir')
+    fs.mkdirSync(logFile)
+    const logger = createCdpLogger({ logFilePath: logFile })
+
+    expect(() => {
+      logger.log(makeEntry(1))
+    }).not.toThrow()
+    await expect(logger.flush()).resolves.toBeUndefined()
+
+    expect(fs.readdirSync(logFile)).toEqual([])
+
+    fs.rmSync(tmpDir, { recursive: true })
+  })
+
+  it('keeps logging after an append failure without rejecting the queue', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'cdp.jsonl')
+    const logger = createCdpLogger({ logFilePath: logFile })
+
+    logger.log(makeEntry(1))
+    await logger.flush()
+    expect(readIds(logFile)).toEqual([1])
+
+    // Replace the file with a directory so every append fails with EISDIR.
+    fs.rmSync(logFile)
+    fs.mkdirSync(logFile)
+
+    logger.log(makeEntry(2))
+    await expect(logger.flush()).resolves.toBeUndefined()
+    logger.log(makeEntry(3))
+    await expect(logger.flush()).resolves.toBeUndefined()
+
+    fs.rmSync(tmpDir, { recursive: true })
+  })
+
   it('uses atomic rename for rotation', async () => {
     const tmpDir = makeTmpDir()
     const logFile = path.join(tmpDir, 'cdp.jsonl')

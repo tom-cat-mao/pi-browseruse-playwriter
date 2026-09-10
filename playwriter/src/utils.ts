@@ -9,6 +9,58 @@ export const EXTENSION_IDS = [
   'pebbngnfojnignonigcnkdilknapkgid', // Dev extension (stable ID from manifest key)
 ]
 
+// Fork dev extension identity, built with PLAYWRITER_FORK_DEV_KEY=1 from the
+// public key in extension/vite.config.mts. Keeping it separate from the legacy
+// dev ID lets the fork be installed side by side with upstream and stops the
+// two dev builds from answering for each other.
+export const FORK_EXTENSION_IDS = [
+  'eeklahpecooapnailfaebkjjembkjhhg', // Fork dev extension (stable ID from fork manifest key)
+]
+
+// Legacy IDs stay accepted so a browser with the upstream extension can still
+// talk to this runtime, but only these exact origins are allowed.
+export const ALLOWED_EXTENSION_IDS = [...EXTENSION_IDS, ...FORK_EXTENSION_IDS]
+
+export const DEFAULT_BROWSER_RUNTIME_PORT = 19989
+export const DEFAULT_BROWSER_DATA_DIR = path.join(os.homedir(), '.pi-browser-use')
+
+export type BrowserRuntimeConfig = {
+  host: string
+  port: number
+  token?: string
+  dataDir: string
+  logFilePath: string
+  cdpLogFilePath: string
+}
+
+function resolvePositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0 || Math.floor(parsed) !== parsed) {
+    return fallback
+  }
+  return parsed
+}
+
+/**
+ * Resolve the managed runtime startup config from PI_BROWSER_* env vars.
+ * The managed runtime never shares the legacy 19988 port or ~/.playwriter
+ * data dir, so both can run side by side without cross-talk.
+ */
+export function resolveBrowserRuntimeConfig({
+  env = process.env,
+}: { env?: Record<string, string | undefined> } = {}): BrowserRuntimeConfig {
+  const dataDir = env.PI_BROWSER_DATA_DIR || DEFAULT_BROWSER_DATA_DIR
+  const token = env.PI_BROWSER_TOKEN || undefined
+  return {
+    host: env.PI_BROWSER_HOST || '127.0.0.1',
+    port: resolvePositiveInt(env.PI_BROWSER_PORT, DEFAULT_BROWSER_RUNTIME_PORT),
+    token,
+    dataDir,
+    logFilePath: env.PI_BROWSER_LOG_FILE_PATH || path.join(dataDir, 'relay-server.log'),
+    cdpLogFilePath: env.PI_BROWSER_CDP_LOG_FILE_PATH || path.join(dataDir, 'cdp.jsonl'),
+  }
+}
+
 /**
  * Parse a relay host string into HTTP and WebSocket base URLs.
  * Supports both plain hostnames (appends port) and full URLs (uses as-is).

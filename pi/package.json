@@ -18,7 +18,7 @@
   ],
   "pi": {
     "extensions": [
-      "extensions"
+      "extensions/index.ts"
     ],
     "skills": [
       "skills"
@@ -52,5 +52,8 @@
     "test:watch": "vitest",
     "load-check": "jiti test/load-check.ts",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tom-cat/pi-browser-runtime": "workspace:*"
   }
 }
