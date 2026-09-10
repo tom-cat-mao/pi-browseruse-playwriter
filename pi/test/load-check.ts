@@ -34,7 +34,6 @@ const mockPi = {
   on: (event: string) => {
     events.push(event);
   },
-  exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
 };
 
 factory(mockPi);
@@ -48,12 +47,22 @@ console.log(`commands (${commands.length}): ${commands.join(", ")}`);
 console.log(`events: ${events.join(", ")}`);
 
 const expected = [
-  "browser_navigate", "browser_snapshot", "browser_click", "browser_fill", "browser_evaluate",
-  "browser_screenshot", "browser_tabs", "browser_network", "browser_save_as_pdf", "browser_execute",
+  "browser_profiles", "browser_groups", "browser_tabs", "browser_navigate", "browser_snapshot",
+  "browser_click", "browser_fill", "browser_evaluate", "browser_screenshot", "browser_network",
+  "browser_logs", "browser_execute",
 ];
 const missing = expected.filter((n) => !tools.some((t) => t.name === n));
-if (missing.length > 0 || !commands.includes("browser-status") || tools.some((t) => !t.hasExecute)) {
-  console.error(`MISMATCH — missing: ${missing.join(", ")}; browser-status: ${commands.includes("browser-status")}`);
+const forbidden = tools.filter((t) => t.name === "browser_save_as_pdf").map((t) => t.name);
+if (
+  missing.length > 0 ||
+  forbidden.length > 0 ||
+  !commands.includes("browser-status") ||
+  !events.includes("session_shutdown") ||
+  tools.some((t) => !t.hasExecute)
+) {
+  console.error(
+    `MISMATCH — missing: ${missing.join(", ")}; forbidden: ${forbidden.join(", ")}; browser-status: ${commands.includes("browser-status")}; session_shutdown: ${events.includes("session_shutdown")}`,
+  );
   process.exit(1);
 }
-console.log("all 10 tools + /browser-status command registered OK");
+console.log(`all ${expected.length} tools + /browser-status command + session_shutdown hook registered OK`);

@@ -1,52 +1,69 @@
 /**
- * pi browser-use extension for the Playwriter relay.
+ * Pi Browser Use tools — managed runtime edition.
  *
- * Drives the user's real Chrome (their login sessions) through the Playwriter
- * browser extension + relay server on 127.0.0.1:19988. State (current page,
- * network capture) lives on the relay session (`state` in the sandbox), which
- * is bound 1:1 to the pi session as `pi-<id8>`.
+ * These tools drive the user's real Chrome through the paired managed browser
+ * runtime (`@tom-cat/pi-browser-runtime`, default 127.0.0.1:19989) over the
+ * frozen HTTP v1 contract (playwriter/src/browser-protocol.ts). They only
+ * execute and report facts — the Pi LLM owns every decision. There is NO agent
+ * loop, HITL, captcha, danger-confirmation, or retry/replay logic here.
  *
- * Design rules (see docs/exec/A-pi-package.md):
- *   - zero runtime dependencies (fetch + node built-ins; pi packages are peers)
- *   - all tool calls serialized through a promise chain (browser state is global)
- *   - capability probe degrades silently: stock relay has no /cli/capabilities
- *   - collapsed tool rows = title + one dim line + expand hint (webbridge-style)
+ * Contract rules baked into this file (docs/exec/browser-runtime-contract.md):
+ *   - Identity: sessionId is the full Pi session UUID, read fresh per request
+ *     from ctx.sessionManager.getSessionId() (never an LLM parameter, never a
+ *     module-global). requestId is the Pi toolCallId, so a retried/duplicate
+ *     create with the same id returns the original resource (dedup by A/B).
+ *   - Resources: one Pi session : N named groups; each group is bound to one
+ *     fixed profileId. groups.create needs name+profileId; tabs.create needs
+ *     groupId+url. All page ops take an explicit tabId. There is no implicit
+ *     "current page" and no URL/name matching to reach other sessions' groups.
+ *   - groups.list / tabs.list are filtered by the runtime strictly by session.
+ *   - Selectors: plain CSS/role selectors are matched strictly (the runtime
+ *     never falls back to .first()). aria refs (aria-ref=eN / @eN) require the
+ *     snapshotId they came from.
+ *   - Cancellation: on abort we fire a separate best-effort request.cancel with
+ *     a fresh signal; page actions are never replayed. An already-started action
+ *     that is cancelled/timed out is reported with its runtime outcome.
+ *   - session_shutdown calls session.release only (frees workers/CDP clients);
+ *     it never deletes groups/tabs or changes persistent ownership.
+ *   - /browser-status only inspects; it never creates a session/group/tab.
+ *   - Output is bounded: text is truncated and only a small number of images
+ *     are inlined. No console-marker parsing — results come as structured
+ *     BrowserResultData.
+ *
+ * The headless-only `browser_save_as_pdf` tool is intentionally gone: it always
+ * errored on headed extension sessions, so it is not registered.
  */
 
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import * as relay from "./relay-client.ts";
-import * as bootstrap from "./bootstrap.ts";
-import {
-  clickSnippet,
-  evaluateSnippet,
-  fillSnippet,
-  navigateSnippet,
-  networkListSnippet,
-  networkStartSnippet,
-  networkStopSnippet,
-  pdfSnippet,
-  rawSnippet,
-  screenshotSnippet,
-  snapshotSnippet,
-  tabsCloseSessionSnippet,
-  tabsCloseTabSnippet,
-  tabsFindSnippet,
-  tabsListSnippet,
-} from "./snippets.ts";
+import type {
+  BrowserGroup,
+  BrowserOperation,
+  BrowserProfile,
+  BrowserResultData,
+  BrowserTab,
+} from "@tom-cat/pi-browser-runtime/browser-protocol";
+import * as runtime from "./bootstrap.ts";
+import { RuntimeRequestError } from "./runtime-client.ts";
 
 type Json = Record<string, unknown>;
-type Theme = Parameters<NonNullable<Parameters<ExtensionAPI["registerTool"]>[0]["renderCall"]>>[1];
+type RenderCallParams = Parameters<NonNullable<Parameters<ExtensionAPI["registerTool"]>[0]["renderCall"]>>;
+type RenderResultParams = Parameters<NonNullable<Parameters<ExtensionAPI["registerTool"]>[0]["renderResult"]>>;
+type Theme = RenderCallParams[1];
+type RenderResultContext = RenderResultParams[3];
 type ContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
+// Output caps so a huge page never overflows the LLM context.
 const MAX_INLINE_IMAGES = 2;
-const MAX_INLINE_IMAGE_BASE64 = 16 * 1024 * 1024; // ~12MB raw
+const MAX_INLINE_IMAGE_BASE64 = 16 * 1024 * 1024; // ~12MB raw per image
+const MAX_TEXT_CHARS = 48_000; // ~12k tokens
+const MAX_STRUCTURED_CHARS = 24_000; // budget for the structured-ids JSON block
 
-// --- rendering helpers (webbridge-style) -----------------------------------
+// --- rendering helpers -------------------------------------------------------
 
 const preview = (v: unknown, limit = 96): string => {
   const s = typeof v === "string" ? v : JSON.stringify(v);
@@ -54,25 +71,11 @@ const preview = (v: unknown, limit = 96): string => {
   return one.length > limit ? `${one.slice(0, limit)}…` : one;
 };
 
-/** First `MARKER:` line value in execute text, or null. */
-function marker(text: string | undefined, m: string): string | null {
-  if (!text) return null;
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (t.startsWith(`${m}:`)) return t.slice(m.length + 1);
-  }
-  return null;
-}
-
-const okSummary = (d: Json | undefined): string => {
-  const s = JSON.stringify(d ?? {});
-  return s === "{}" ? "✓ OK" : `✓ ${preview(d)}`;
-};
-
-function makeRenderCall(label: string, summarize: (args: any) => string) {
-  return (args: any, theme: Theme, _context: any) => {
+function makeRenderCall(label: string, summarize: (args: Json) => string) {
+  return (rawArgs: object, theme: Theme, context: { expanded: boolean }) => {
+    const args = rawArgs as Json;
     const title = theme.fg("toolTitle", theme.bold(label));
-    if (!_context.expanded) {
+    if (!context.expanded) {
       const s = summarize(args);
       return new Text(s ? `${title}\n${theme.fg("dim", s)}` : title, 0, 0);
     }
@@ -81,381 +84,646 @@ function makeRenderCall(label: string, summarize: (args: any) => string) {
 }
 
 function makeRenderResult(summarize: (details: Json) => string) {
-  return (result: any, options: { expanded: boolean }, theme: Theme) => {
+  return (result: { details?: unknown; content?: ContentBlock[] }, options: { expanded: boolean }, theme: Theme, context?: RenderResultContext) => {
     const details = (result?.details ?? {}) as Json;
+    // On error the framework marks the row; summarize the error text from
+    // content instead of printing a misleading "✓".
+    if (context?.isError) {
+      const errText = (result.content ?? []).find((c): c is { type: "text"; text: string } => c.type === "text")?.text;
+      return new Text(theme.fg("error", `✗ ${preview(errText ?? "failed", 160)}`), 0, 0);
+    }
     if (!options.expanded) {
-      return new Text(theme.fg("dim", `${summarize(details)}\n${keyHint("app.tools.expand", "to inspect output")}`), 0, 0);
+      return new Text(
+        theme.fg("dim", `${summarize(details)}\n${keyHint("app.tools.expand", "to inspect output")}`),
+        0,
+        0,
+      );
     }
     return new Text(theme.fg("toolOutput", JSON.stringify(details, null, 2)), 0, 0);
   };
 }
 
-const kb = (bytes?: number) => (bytes == null ? "" : `${(bytes / 1024).toFixed(1)} KB`);
+/** Compact one-line description of a runtime error for the LLM. */
+function describeError(e: unknown): string {
+  if (e instanceof RuntimeRequestError) {
+    const parts = [e.message];
+    if (e.code) parts.push(`code=${e.code}`);
+    if (e.outcome) parts.push(`outcome=${e.outcome}`);
+    return parts.join(" · ");
+  }
+  return e instanceof Error ? e.message : String(e);
+}
 
 // --- extension factory -------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // Browser state is global to the relay session, so serialize every call to
-  // avoid races from pi's parallel tool execution.
-  let queue: Promise<unknown> = Promise.resolve();
-  const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
-    const p = queue.then(fn, fn);
-    queue = p.catch(() => {});
-    return p;
-  };
+  const text = (t: string): ContentBlock => ({ type: "text", text: t });
 
-  const text = (t: string): ContentBlock => ({ type: "text" as const, text: t });
+  /**
+   * Run one runtime operation and shape its result into tool content. This is
+   * the single choke point: it launches the runtime on first use, injects the
+   * per-request sessionId + toolCallId, and on cancellation fires a separate
+   * best-effort cancel (never replaying the action).
+   */
+  async function run(options: {
+    ctx: ExtensionContext;
+    toolCallId: string;
+    signal: AbortSignal | undefined;
+    operation: BrowserOperation;
+    timeoutMs?: number;
+  }): Promise<{ content: ContentBlock[]; details: Json }> {
+    // If the caller already cancelled, do not even launch the runtime.
+    if (options.signal?.aborted) {
+      throw new Error("request cancelled before it started");
+    }
+    await runtime.ensureRuntime();
+    const client = runtime.getClient();
+    const sessionId = runtime.sessionId(options.ctx);
+    const requestId = options.toolCallId;
 
-  async function run(
-    ctx: ExtensionContext,
-    signal: AbortSignal | undefined,
-    snippet: string,
-    opts: { timeoutMs?: number; groupTitle?: string } = {},
-  ): Promise<{ content: ContentBlock[]; details: Json }> {
-    return serialize(async () => {
-      const s = await bootstrap.ensureSession(pi, ctx, { groupTitle: opts.groupTitle });
-      let result: relay.ExecuteResult;
-      try {
-        result = await relay.execute({
-          sessionId: s.id,
-          code: snippet,
-          timeoutMs: opts.timeoutMs,
-          signal,
-        });
-      } catch (e) {
-        if (e instanceof relay.RelayError && e.category === "session-invalid") {
-          // Session died server-side: rebuild once and retry.
-          bootstrap.invalidateSession();
-          const s2 = await bootstrap.ensureSession(pi, ctx);
-          result = await relay.execute({ sessionId: s2.id, code: snippet, timeoutMs: opts.timeoutMs, signal });
-        } else {
-          throw e;
-        }
+    let data: BrowserResultData;
+    try {
+      data = await client.request({
+        requestId,
+        sessionId,
+        operation: options.operation,
+        cwd: options.ctx.cwd,
+        timeoutMs: options.timeoutMs,
+        signal: options.signal,
+      });
+    } catch (e) {
+      // On caller cancellation, ask the runtime to cancel this request with a
+      // fresh (non-aborted) signal. Best-effort; the action is never replayed.
+      if (options.signal?.aborted && e instanceof RuntimeRequestError && e.category === "timeout") {
+        await client.cancel({ sessionId, requestId: `${requestId}:cancel`, targetRequestId: requestId });
       }
+      // If the daemon went away, drop cached process state so a later tool call
+      // re-probes/relaunches instead of failing forever against a dead runtime.
+      if (e instanceof RuntimeRequestError && e.category === "runtime-unreachable") {
+        runtime.reset();
+      }
+      throw new Error(describeError(e), { cause: e });
+    }
 
-      const caps = bootstrap.boundCapabilities();
-      const screenshots = result.screenshots.map((sc) => ({ path: sc.path, labelCount: sc.labelCount }));
-      const canSee = ctx.model?.input?.includes("image") ?? false;
-      const content: ContentBlock[] = [text(result.text || "(no output)")];
-      if (screenshots.length > 0) {
-        content.push(text(`\nscreenshots: ${screenshots.map((s) => `${s.path} (${s.labelCount} labels)`).join(", ")}`));
-      }
-      if (canSee && result.images.length > 0) {
-        for (const img of result.images.slice(0, MAX_INLINE_IMAGES)) {
-          if (img.data.length <= MAX_INLINE_IMAGE_BASE64) {
-            content.push({ type: "image" as const, data: img.data, mimeType: img.mimeType });
-          }
-        }
-      }
-      const details: Json = {
-        sessionId: s.id,
-        sessionName: s.name,
-        capabilities: caps,
-        text: result.text,
-        url: relay.extractUrlLine(result.text),
-        screenshots,
-        imagesInlined: canSee ? Math.min(result.images.length, MAX_INLINE_IMAGES) : 0,
-        imageCount: result.images.length,
-      };
-      return { content, details };
-    });
+    return shapeResult(options.ctx, data);
   }
 
-  // --- tools ----------------------------------------------------------------
+  /**
+   * Turn BrowserResultData into content blocks + details, applying output caps.
+   *
+   * CRITICAL: Pi only feeds tool `content` back to the LLM — `details` is UI-only
+   * and never enters the model context. So every structured resource the model
+   * needs to continue (groupId/tabId from create, snapshotId + refs, evaluate
+   * value, listing ids) MUST be serialized into a compact text block here, not
+   * left in details. details carries the same data (plus counts) for the TUI.
+   */
+  function shapeResult(ctx: ExtensionContext, data: BrowserResultData): { content: ContentBlock[]; details: Json } {
+    const content: ContentBlock[] = [];
+    const textOut = data.text != null ? data.text.slice(0, MAX_TEXT_CHARS) : "";
+    const truncated = data.text != null && data.text.length > MAX_TEXT_CHARS;
+    if (textOut) content.push(text(truncated ? `${textOut}\n…[truncated]` : textOut));
 
-  pi.registerTool({
-    name: "browser_navigate",
-    label: "Browser Navigate",
-    description:
-      "Open a URL in the user's real Chrome (with their login sessions) via the Playwriter extension. " +
-      "Reuses the session's current tab by default; pass newTab to open a separate tab. Returns the final URL.",
-    promptSnippet: "Open URLs in the user's real browser",
-    promptGuidelines: [
-      "Use browser_navigate to open pages in the user's real Chrome. On the first browser_navigate of a task pass newTab so the task gets its own tab, and group_title (in the user's language) to label the tab group when the relay supports session groups. Always verify with browser_snapshot afterwards — pages redirect unexpectedly.",
-    ],
-    parameters: Type.Object({
-      url: Type.String({ description: "URL to open" }),
-      newTab: Type.Optional(Type.Boolean({ description: "Open in a new tab (default: reuse the session's current tab)" })),
-      group_title: Type.Optional(Type.String({ description: "Human-readable label for the session's tab group; used at session creation" })),
-    }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, navigateSnippet({ url: params.url, newTab: params.newTab }), {
-        groupTitle: params.group_title,
-      });
-    },
-    renderCall: makeRenderCall("browser navigate", (a) =>
-      `${a.url}${a.newTab ? " (new tab)" : ""}${a.group_title ? ` · group: ${a.group_title}` : ""}`,
-    ),
-    renderResult: makeRenderResult((d) => `✓ ${preview(d.url ?? "")}${d.sessionId ? ` · session ${d.sessionId}` : ""}`),
+    // Structured resources → compact JSON text so the LLM actually receives the
+    // ids/values. De-duplicated (single vs list) and byte-budgeted below.
+    const structured = buildStructuredText(data);
+    if (structured) content.push(text(structured));
+
+    if (data.logs && data.logs.length > 0) {
+      content.push(text(`\nPage logs:\n${data.logs.slice(-50).join("\n")}`));
+    }
+    if (data.artifacts && data.artifacts.length > 0) {
+      content.push(text(`\nartifacts: ${data.artifacts.map((a) => `${a.path} (${a.mimeType})`).join(", ")}`));
+    }
+
+    const canSee = ctx.model?.input?.includes("image") ?? false;
+    let inlined = 0;
+    if (canSee && data.images) {
+      for (const img of data.images.slice(0, MAX_INLINE_IMAGES)) {
+        if (img.data.length <= MAX_INLINE_IMAGE_BASE64) {
+          content.push({ type: "image", data: img.data, mimeType: img.mimeType });
+          inlined++;
+        }
+      }
+    }
+    if (content.length === 0) content.push(text("(no output)"));
+
+    const details: Json = {
+      text: data.text,
+      value: data.value,
+      profiles: data.profiles,
+      groups: data.groups,
+      tabs: data.tabs,
+      group: data.group,
+      tab: data.tab,
+      snapshotId: data.snapshotId,
+      artifacts: data.artifacts,
+      logs: data.logs,
+      imageCount: data.images?.length ?? 0,
+      imagesInlined: inlined,
+      textTruncated: truncated,
+    };
+    return { content, details };
+  }
+
+  /**
+   * Serialize the structured fields the LLM must see (ids, snapshotId, evaluate
+   * value) as compact JSON, bounded by MAX_STRUCTURED_CHARS. Only present fields
+   * are emitted; list fields collapse to their essential columns so a large
+   * listing stays within budget. Returns "" when there is nothing structured.
+   */
+  function buildStructuredText(data: BrowserResultData): string {
+    const out: Json = {};
+    if (data.snapshotId) out.snapshotId = data.snapshotId;
+    if (data.value !== undefined) out.value = data.value;
+    if (data.group) out.group = compactGroup(data.group);
+    if (data.tab) out.tab = compactTab(data.tab);
+    if (data.profiles) out.profiles = data.profiles.map(compactProfile);
+    if (data.groups) out.groups = data.groups.map(compactGroup);
+    if (data.tabs) out.tabs = data.tabs.map(compactTab);
+    if (Object.keys(out).length === 0) return "";
+    const json = JSON.stringify(out);
+    if (json.length <= MAX_STRUCTURED_CHARS) return json;
+    return `${json.slice(0, MAX_STRUCTURED_CHARS)}\n…[structured output truncated; narrow the query]`;
+  }
+
+  const groupLine = (g: BrowserGroup): string => `${g.name} [${g.groupId}] profile=${g.profileId} ${g.state}`;
+  const tabLine = (t: BrowserTab): string => `${t.title || "(untitled)"} [${t.tabId}] ${t.url} ${t.state}`;
+  const profileLine = (p: BrowserProfile): string =>
+    `${p.label} [${p.profileId}] ${p.browser} ${p.connected ? "connected" : "disconnected"}`;
+
+  // Compact projections keep only the fields the LLM needs to act, so listings
+  // stay within the structured-text byte budget.
+  const compactGroup = (g: BrowserGroup): Json => ({
+    groupId: g.groupId,
+    name: g.name,
+    profileId: g.profileId,
+    state: g.state,
+  });
+  const compactTab = (t: BrowserTab): Json => ({
+    tabId: t.tabId,
+    groupId: t.groupId,
+    url: t.url,
+    title: t.title,
+    state: t.state,
+  });
+  const compactProfile = (p: BrowserProfile): Json => ({
+    profileId: p.profileId,
+    label: p.label,
+    browser: p.browser,
+    connected: p.connected,
   });
 
+  // --- profiles -------------------------------------------------------------
+
   pi.registerTool({
-    name: "browser_snapshot",
-    label: "Browser Snapshot",
+    name: "browser_profiles",
+    label: "Browser Profiles",
     description:
-      "Read the current page as an accessibility tree with element refs. Primary way to read page content and get selectors for browser_click/browser_fill.",
-    promptSnippet: "Read current page content as an accessibility tree",
+      "List the browser profiles (installed Chrome identities) the managed runtime knows about, with their connection state. " +
+      "A profileId is required to create a group. This is connection metadata, not filtered by session.",
+    promptSnippet: "List available browser profiles",
     promptGuidelines: [
-      "Use browser_snapshot to read page content and obtain element refs; prefer refs from the snapshot over hand-written CSS selectors with browser_click/browser_fill.",
+      "Use browser_profiles to discover a profileId before browser_groups create. A profile must be connected to open groups/tabs in it.",
     ],
     parameters: Type.Object({}),
-    async execute(_id, _params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, snapshotSnippet());
+    async execute(toolCallId, _params, signal, _onUpdate, ctx) {
+      return run({ ctx, toolCallId, signal, operation: { kind: "profiles.list" } });
     },
-    renderCall: makeRenderCall("browser snapshot", () => ""),
-    renderResult: makeRenderResult((d) => `✓ snapshot · ${(d.text as string)?.split("\n").length ?? 0} lines`),
-  });
-
-  pi.registerTool({
-    name: "browser_click",
-    label: "Browser Click",
-    description:
-      "Click an element on the current page by snapshot ref (aria-ref=eN or @eN) or CSS selector. " +
-      "Uses .first() to tolerate duplicate matches.",
-    promptSnippet: "Click an element by ref or CSS selector",
-    promptGuidelines: [
-      "Use browser_click with a ref from the most recent browser_snapshot (aria-ref=eN); refs are only valid against the latest snapshot, take a fresh one if the page changed.",
-    ],
-    parameters: Type.Object({
-      selector: Type.String({ description: "aria-ref=eN, @eN or CSS selector" }),
-    }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, clickSnippet({ selector: params.selector }));
-    },
-    renderCall: makeRenderCall("browser click", (a) => a.selector ?? ""),
-    renderResult: makeRenderResult((d) => `✓ clicked · ${preview(d.url ?? "")}`),
-  });
-
-  pi.registerTool({
-    name: "browser_fill",
-    label: "Browser Fill",
-    description:
-      "Set text into an input/textarea/contenteditable on the current page by snapshot ref or CSS selector. " +
-      "Clear-and-insert: existing content is replaced.",
-    promptSnippet: "Fill inputs and rich text editors",
-    promptGuidelines: [
-      "Use browser_fill to type into inputs; it is clear-and-insert (existing content replaced). To append, read the current value with browser_evaluate, concatenate, then browser_fill.",
-    ],
-    parameters: Type.Object({
-      selector: Type.String({ description: "aria-ref=eN, @eN or CSS selector" }),
-      value: Type.String({ description: "Text to insert (replaces existing content)" }),
-    }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, fillSnippet({ selector: params.selector, value: params.value }));
-    },
-    renderCall: makeRenderCall("browser fill", (a) => `${a.selector ?? ""} ← "${preview(a.value, 48)}"`),
-    renderResult: makeRenderResult((d) => `✓ filled · ${preview(d.url ?? "")}`),
-  });
-
-  pi.registerTool({
-    name: "browser_evaluate",
-    label: "Browser Evaluate",
-    description:
-      "Run JavaScript inside the current page (DOM available, async/await supported). Wrapped in page.evaluate so const/let stay scoped. Returns the JSON-serializable result (RESULT: line). Sandbox scope (state/context) is not visible here — use browser_execute for that.",
-    promptSnippet: "Run JavaScript in the current page",
-    promptGuidelines: [
-      "Use browser_evaluate only when browser_snapshot lacks the target or you need attributes/scrolling/complex events; prefer browser_snapshot for reading page state. browser_evaluate runs in the page (document/window available); end your code with `return <value>` — a bare expression like `document.title` returns undefined. Multi-statement code stays scoped in an async arrow. Results are compact JSON (RESULT: line). Use browser_execute when you need sandbox helpers (state/context/require).",
-    ],
-    parameters: Type.Object({
-      code: Type.String({ description: "JS code, async/await supported" }),
-    }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, evaluateSnippet({ code: params.code }));
-    },
-    renderCall: makeRenderCall("browser evaluate", (a) => preview(a.code, 96)),
+    renderCall: makeRenderCall("browser profiles", () => ""),
     renderResult: makeRenderResult((d) => {
-      const res = marker(d.text as string | undefined, "RESULT");
-      return res != null ? `✓ → ${preview(res, 96)}` : okSummary(d);
+      const profiles = (d.profiles as BrowserProfile[] | undefined) ?? [];
+      if (profiles.length === 1) return `✓ ${profileLine(profiles[0])}`;
+      return `✓ ${profiles.length} profile(s)`;
     }),
   });
 
+  // --- groups ---------------------------------------------------------------
+
   pi.registerTool({
-    name: "browser_screenshot",
-    label: "Browser Screenshot",
+    name: "browser_groups",
+    label: "Browser Groups",
     description:
-      "Screenshot the current page. Returns a labeled image inline (when the model can see images) plus the saved file path and an aria snapshot.",
-    promptSnippet: "Screenshot the current page",
+      "Manage this session's tab groups. Each group is owned by this Pi session and bound to one fixed profile. " +
+      "Actions: list (this session's groups only), create (needs a name and a profileId), rename, close. " +
+      "Same-name groups are allowed — each has its own groupId; there is no merging by title.",
+    promptSnippet: "List/create/rename/close this session's tab groups",
     promptGuidelines: [
-      "Use browser_screenshot when you need visual/spatial state; browser_snapshot is cheaper for reading text. Pass an absolute path to save the file (allowed dirs: relay session cwd, /tmp).",
+      "Use browser_groups create with an explicit name and a profileId from browser_profiles before opening tabs; a group is bound to one profile for its lifetime. Use its groupId with browser_tabs create.",
     ],
     parameters: Type.Object({
-      path: Type.Optional(Type.String({ description: "Absolute output path (allowed: session cwd, /tmp)" })),
-      fullPage: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page" })),
+      action: StringEnum(["list", "create", "rename", "close"] as const),
+      profileId: Type.Optional(Type.String({ description: "For create (required) or to filter list" })),
+      name: Type.Optional(Type.String({ description: "For create/rename (required): the group name" })),
+      groupId: Type.Optional(Type.String({ description: "For rename/close (required)" })),
     }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, screenshotSnippet({ path: params.path, fullPage: params.fullPage }));
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      const op = ((): BrowserOperation => {
+        if (params.action === "create") {
+          if (!params.profileId || !params.name) {
+            throw new Error("browser_groups create requires both profileId and name");
+          }
+          return { kind: "groups.create", profileId: params.profileId, name: params.name };
+        }
+        if (params.action === "rename") {
+          if (!params.groupId || !params.name) {
+            throw new Error("browser_groups rename requires both groupId and name");
+          }
+          return { kind: "groups.rename", groupId: params.groupId, name: params.name };
+        }
+        if (params.action === "close") {
+          if (!params.groupId) throw new Error("browser_groups close requires groupId");
+          return { kind: "groups.close", groupId: params.groupId };
+        }
+        return { kind: "groups.list", ...(params.profileId ? { profileId: params.profileId } : {}) };
+      })();
+      return run({ ctx, toolCallId, signal, operation: op });
     },
-    renderCall: makeRenderCall("browser screenshot", (a) => [a.path ? `→ ${a.path}` : "", a.fullPage ? "full page" : ""].filter(Boolean).join(" · ")),
+    renderCall: makeRenderCall("browser groups", (a) =>
+      `${a.action}${a.name ? ` "${a.name}"` : ""}${a.groupId ? ` [${a.groupId}]` : ""}${a.profileId ? ` profile=${a.profileId}` : ""}`,
+    ),
     renderResult: makeRenderResult((d) => {
-      const shot = Array.isArray(d.screenshots) ? (d.screenshots[0] as { path?: string; labelCount?: number } | undefined) : undefined;
-      return shot ? `✓ ${shot.path ?? "screenshot"} (${shot.labelCount ?? 0} labels)` : `✓ ${(d.imageCount ?? 0)} image(s)`;
+      if (d.group) return `✓ ${groupLine(d.group as BrowserGroup)}`;
+      const groups = (d.groups as BrowserGroup[] | undefined) ?? [];
+      return `✓ ${groups.length} group(s)`;
     }),
   });
+
+  // --- tabs -----------------------------------------------------------------
 
   pi.registerTool({
     name: "browser_tabs",
     label: "Browser Tabs",
     description:
-      "Manage tabs of the relay session: list tabs, find (switch the session's current page to a tab by url or the most recent one), close current tab, close the session's opened tabs.",
-    promptSnippet: "List/find/close browser tabs",
+      "Manage tabs within this session's groups. Actions: list (this session's tabs, optionally filtered by groupId), " +
+      "create (needs groupId and url — the tab opens inside that group), close (a tab), release (mark a tab released so " +
+      "reconnects won't pull it back). All actions take explicit ids; there is no implicit current tab.",
+    promptSnippet: "List/create/close/release tabs in this session's groups",
     promptGuidelines: [
-      "Use browser_tabs list to enumerate the session's tabs, then find with the full url to switch back. Only use close_session when the user explicitly asks to close the tabs (it closes exactly the tabs this session opened, never other sessions' or the user's tabs).",
+      "Use browser_tabs create with a groupId (from browser_groups) and a url to open a managed tab; use the returned tabId for all page tools. Use release only when the user is done with a tab so a browser restart won't reopen it.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["list", "find", "close_tab", "close_session"] as const),
-      url: Type.Optional(Type.String({ description: "For find: full or prefix URL of the tab (from list or navigate result)" })),
-      active: Type.Optional(Type.Boolean({ description: "For find without url: switch to the most recently attached tab" })),
+      action: StringEnum(["list", "create", "close", "release"] as const),
+      groupId: Type.Optional(Type.String({ description: "For create (required) or to filter list" })),
+      url: Type.Optional(Type.String({ description: "For create (required): initial URL" })),
+      tabId: Type.Optional(Type.String({ description: "For close/release (required)" })),
     }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      if (params.action === "close_session") {
-        // NOTE: do not re-wrap in serialize() here — run() already serializes;
-        // nesting would deadlock the promise queue.
-        return (async () => {
-          const s = await bootstrap.ensureSession(pi, ctx);
-          const caps = bootstrap.boundCapabilities();
-          if (caps?.closeTabs) {
-            const ok = await relay.closeSessionTabs(s.id);
-            if (ok) {
-              return { content: [text("✓ session tabs closed")], details: { sessionId: s.id, closed: "all tabs" } };
-            }
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      const op = ((): BrowserOperation => {
+        if (params.action === "create") {
+          if (!params.groupId || !params.url) {
+            throw new Error("browser_tabs create requires both groupId and url");
           }
-          // Degraded path: close every page from inside the sandbox.
-          return run(ctx, signal, tabsCloseSessionSnippet());
-        })();
-      }
-      if (params.action === "list") {
-        return run(ctx, signal, tabsListSnippet({}));
-      }
-      if (params.action === "close_tab") {
-        return run(ctx, signal, tabsCloseTabSnippet());
-      }
-      return run(ctx, signal, tabsFindSnippet({ url: params.url, active: params.active }));
+          return { kind: "tabs.create", groupId: params.groupId, url: params.url };
+        }
+        if (params.action === "close") {
+          if (!params.tabId) throw new Error("browser_tabs close requires tabId");
+          return { kind: "tabs.close", tabId: params.tabId };
+        }
+        if (params.action === "release") {
+          if (!params.tabId) throw new Error("browser_tabs release requires tabId");
+          return { kind: "tabs.release", tabId: params.tabId };
+        }
+        return { kind: "tabs.list", ...(params.groupId ? { groupId: params.groupId } : {}) };
+      })();
+      return run({ ctx, toolCallId, signal, operation: op });
     },
     renderCall: makeRenderCall("browser tabs", (a) =>
-      `${a.action}${a.url ? ` ${preview(a.url, 64)}` : ""}${a.active ? " (most recent tab)" : ""}`,
+      `${a.action}${a.groupId ? ` group=${a.groupId}` : ""}${a.tabId ? ` [${a.tabId}]` : ""}${a.url ? ` ${preview(a.url, 64)}` : ""}`,
     ),
     renderResult: makeRenderResult((d) => {
-      const t = marker(d.text as string | undefined, "TABS");
-      if (t != null) {
-        try {
-          const arr = JSON.parse(t);
-          return `✓ ${arr.length} tab(s)`;
-        } catch {
-          return `✓ ${preview(t, 48)}`;
-        }
-      }
-      for (const m of ["SWITCHED", "CLOSED", "CLOSED_SESSION"]) {
-        const v = marker(d.text as string | undefined, m);
-        if (v != null) return `✓ ${m.toLowerCase()}: ${preview(v, 64)}`;
-      }
-      if (d.closed) return `✓ closed ${d.closed} tab(s)`;
-      return okSummary(d);
+      if (d.tab) return `✓ ${tabLine(d.tab as BrowserTab)}`;
+      const tabs = (d.tabs as BrowserTab[] | undefined) ?? [];
+      return `✓ ${tabs.length} tab(s)`;
     }),
   });
+
+  // --- page: navigate -------------------------------------------------------
+
+  pi.registerTool({
+    name: "browser_navigate",
+    label: "Browser Navigate",
+    description: "Navigate an existing managed tab (by tabId) to a URL. Returns the final URL after any redirects.",
+    promptSnippet: "Navigate a managed tab to a URL",
+    promptGuidelines: [
+      "Use browser_navigate with a tabId from browser_tabs to load a URL, then browser_snapshot to read the page — pages redirect, so always re-check.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      url: Type.String({ description: "URL to open" }),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({ ctx, toolCallId, signal, operation: { kind: "page.navigate", tabId: params.tabId, url: params.url } });
+    },
+    renderCall: makeRenderCall("browser navigate", (a) => `[${a.tabId}] ${preview(a.url, 80)}`),
+    renderResult: makeRenderResult((d) => `✓ ${preview((d.tab as BrowserTab | undefined)?.url ?? d.text ?? "ok", 96)}`),
+  });
+
+  // --- page: snapshot -------------------------------------------------------
+
+  pi.registerTool({
+    name: "browser_snapshot",
+    label: "Browser Snapshot",
+    description:
+      "Read a managed tab as an accessibility tree with element refs (aria-ref=eN). Primary way to read page content and " +
+      "get refs for browser_click/browser_fill. Optionally narrow with a CSS selector, a text search, or request the full tree.",
+    promptSnippet: "Read a managed tab as an accessibility tree",
+    promptGuidelines: [
+      "Use browser_snapshot to read a tab's content and obtain aria-ref=eN refs; pass those refs (with the returned snapshotId) to browser_click/browser_fill. Refs are only valid against the snapshot that produced them.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      search: Type.Optional(Type.String({ description: "Only include nodes matching this text" })),
+      selector: Type.Optional(Type.String({ description: "Scope the snapshot to a CSS selector" })),
+      full: Type.Optional(Type.Boolean({ description: "Include the full tree (not just interactive nodes)" })),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: {
+          kind: "page.snapshot",
+          tabId: params.tabId,
+          ...(params.search ? { search: params.search } : {}),
+          ...(params.selector ? { selector: params.selector } : {}),
+          ...(params.full ? { full: params.full } : {}),
+        },
+      });
+    },
+    renderCall: makeRenderCall("browser snapshot", (a) =>
+      `[${a.tabId}]${a.selector ? ` selector=${a.selector}` : ""}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.full ? " full" : ""}`,
+    ),
+    renderResult: makeRenderResult((d) => {
+      const lines = (d.text as string | undefined)?.split("\n").length ?? 0;
+      return `✓ snapshot ${d.snapshotId ? `${d.snapshotId} · ` : ""}${lines} lines`;
+    }),
+  });
+
+  // --- page: click ----------------------------------------------------------
+
+  pi.registerTool({
+    name: "browser_click",
+    label: "Browser Click",
+    description:
+      "Click an element in a managed tab. Pass either a snapshot ref (aria-ref=eN or @eN) together with the snapshotId it " +
+      "came from, or a plain CSS/role selector. Selectors are matched strictly — an ambiguous selector is an error, not a guess.",
+    promptSnippet: "Click an element by ref or CSS selector",
+    promptGuidelines: [
+      "Use browser_click with an aria-ref=eN from the latest browser_snapshot plus its snapshotId; if the page changed, re-snapshot first. A plain CSS selector must match exactly one element.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      selector: Type.String({ description: "aria-ref=eN, @eN, or a strict CSS/role selector" }),
+      snapshotId: Type.Optional(Type.String({ description: "Required when selector is an aria ref" })),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: {
+          kind: "page.click",
+          tabId: params.tabId,
+          selector: params.selector,
+          ...(params.snapshotId ? { snapshotId: params.snapshotId } : {}),
+        },
+      });
+    },
+    renderCall: makeRenderCall("browser click", (a) => `[${a.tabId}] ${a.selector}`),
+    renderResult: makeRenderResult((d) => `✓ clicked${d.text ? ` · ${preview(d.text, 80)}` : ""}`),
+  });
+
+  // --- page: fill -----------------------------------------------------------
+
+  pi.registerTool({
+    name: "browser_fill",
+    label: "Browser Fill",
+    description:
+      "Set text into an input/textarea/contenteditable in a managed tab (clear-and-insert: existing content is replaced). " +
+      "Target by snapshot ref (aria-ref=eN / @eN with its snapshotId) or a strict CSS selector.",
+    promptSnippet: "Fill inputs and rich-text editors",
+    promptGuidelines: [
+      "Use browser_fill to replace an input's value; to append, read the current value with browser_evaluate, concatenate, then fill. Use an aria ref + snapshotId, or a strict CSS selector.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      selector: Type.String({ description: "aria-ref=eN, @eN, or a strict CSS selector" }),
+      value: Type.String({ description: "Text to insert (replaces existing content)" }),
+      snapshotId: Type.Optional(Type.String({ description: "Required when selector is an aria ref" })),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: {
+          kind: "page.fill",
+          tabId: params.tabId,
+          selector: params.selector,
+          value: params.value,
+          ...(params.snapshotId ? { snapshotId: params.snapshotId } : {}),
+        },
+      });
+    },
+    renderCall: makeRenderCall("browser fill", (a) => `[${a.tabId}] ${a.selector} ← "${preview(a.value, 40)}"`),
+    renderResult: makeRenderResult((d) => `✓ filled${d.text ? ` · ${preview(d.text, 80)}` : ""}`),
+  });
+
+  // --- page: evaluate -------------------------------------------------------
+
+  pi.registerTool({
+    name: "browser_evaluate",
+    label: "Browser Evaluate",
+    description:
+      "Run JavaScript inside a managed tab's page (document/window available, async/await supported). Returns the " +
+      "JSON-serializable result value. Use browser_execute for the Node/Playwright sandbox instead.",
+    promptSnippet: "Run JavaScript in a managed tab's page",
+    promptGuidelines: [
+      "Use browser_evaluate for attributes/scrolling/complex reads a snapshot can't give; it runs in the page (document/window). End with `return <value>` — a bare expression returns undefined. Use browser_execute for Playwright-level control.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      code: Type.String({ description: "JS code, async/await supported" }),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({ ctx, toolCallId, signal, operation: { kind: "page.evaluate", tabId: params.tabId, code: params.code } });
+    },
+    renderCall: makeRenderCall("browser evaluate", (a) => `[${a.tabId}] ${preview(a.code, 80)}`),
+    renderResult: makeRenderResult((d) => (d.value !== undefined ? `✓ → ${preview(d.value, 96)}` : `✓ ${preview(d.text ?? "ok", 96)}`)),
+  });
+
+  // --- page: screenshot -----------------------------------------------------
+
+  pi.registerTool({
+    name: "browser_screenshot",
+    label: "Browser Screenshot",
+    description:
+      "Screenshot a managed tab. Returns the image inline (when the model can see images) and, if a path is given, saves it. " +
+      "Optionally capture the full scrollable page or overlay interactive-element labels.",
+    promptSnippet: "Screenshot a managed tab",
+    promptGuidelines: [
+      "Use browser_screenshot when you need visual/spatial state; browser_snapshot is cheaper for text. Pass a path to save the file, fullPage for the whole page, or labels to overlay element markers.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      path: Type.Optional(Type.String({ description: "Absolute output path" })),
+      fullPage: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page" })),
+      labels: Type.Optional(Type.Boolean({ description: "Overlay interactive-element labels" })),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: {
+          kind: "page.screenshot",
+          tabId: params.tabId,
+          ...(params.path ? { path: params.path } : {}),
+          ...(params.fullPage ? { fullPage: params.fullPage } : {}),
+          ...(params.labels ? { labels: params.labels } : {}),
+        },
+      });
+    },
+    renderCall: makeRenderCall("browser screenshot", (a) =>
+      `[${a.tabId}]${a.path ? ` → ${a.path}` : ""}${a.fullPage ? " full" : ""}${a.labels ? " labels" : ""}`,
+    ),
+    renderResult: makeRenderResult((d) => {
+      const artifacts = (d.artifacts as Array<{ path: string }> | undefined) ?? [];
+      if (artifacts[0]) return `✓ ${artifacts[0].path}`;
+      return `✓ ${d.imageCount ?? 0} image(s)`;
+    }),
+  });
+
+  // --- page: network --------------------------------------------------------
 
   pi.registerTool({
     name: "browser_network",
     label: "Browser Network",
     description:
-      "Capture network responses of the session's current page: start/stop capture, list requests with an optional url substring filter. Captured data persists across calls in session state.",
-    promptSnippet: "Capture and inspect page network requests",
+      "Capture network responses of a managed tab: start capture, list requests (optional url substring filter), or stop " +
+      "(which clears the capture). Capture is bound to the tab and cleaned up on stop.",
+    promptSnippet: "Capture and inspect a tab's network requests",
     promptGuidelines: [
-      "Use browser_network start before the action that triggers requests, then list to inspect API calls of the current page.",
+      "Use browser_network start before the action that triggers requests, then list with a url filter to inspect API calls of that tab.",
     ],
     parameters: Type.Object({
-      cmd: StringEnum(["start", "list", "stop"] as const),
+      tabId: Type.String({ description: "Target managed tab" }),
+      action: StringEnum(["start", "list", "stop"] as const),
       filter: Type.Optional(Type.String({ description: "URL substring filter for list" })),
     }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      if (params.cmd === "start") return run(ctx, signal, networkStartSnippet());
-      if (params.cmd === "stop") return run(ctx, signal, networkStopSnippet());
-      return run(ctx, signal, networkListSnippet({ filter: params.filter }));
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: {
+          kind: "page.network",
+          tabId: params.tabId,
+          action: params.action,
+          ...(params.filter ? { filter: params.filter } : {}),
+        },
+      });
     },
-    renderCall: makeRenderCall("browser network", (a) =>
-      `${a.cmd}${a.filter ? ` filter:${a.filter}` : ""}`,
-    ),
+    renderCall: makeRenderCall("browser network", (a) => `[${a.tabId}] ${a.action}${a.filter ? ` filter:${a.filter}` : ""}`),
     renderResult: makeRenderResult((d) => {
-      const net = marker(d.text as string | undefined, "NET");
-      if (net != null) {
-        try {
-          const arr = JSON.parse(net) as unknown[];
-          return `✓ ${arr.length} request(s)`;
-        } catch {
-          return `✓ ${preview(net, 64)}`;
-        }
-      }
-      if (marker(d.text as string | undefined, "NET_START")) return "✓ capture started";
-      if (marker(d.text as string | undefined, "NET_STOP")) return "✓ capture stopped";
-      return okSummary(d);
+      if (Array.isArray(d.value)) return `✓ ${(d.value as unknown[]).length} request(s)`;
+      return `✓ ${preview(d.text ?? "ok", 64)}`;
     }),
   });
 
+  // --- page: logs -----------------------------------------------------------
+
   pi.registerTool({
-    name: "browser_save_as_pdf",
-    label: "Browser Save as PDF",
+    name: "browser_logs",
+    label: "Browser Logs",
     description:
-      "Render the current page to PDF via Playwright page.pdf. Note: page.pdf only works in headless Chromium; on a headed extension session it errors — prefer browser_screenshot in that case.",
-    promptSnippet: "Save current page as PDF",
+      "Return buffered console/log output for a managed tab (most recent first-capped). Use it after an action to surface " +
+      "hydration errors, failed requests, and runtime exceptions without attaching listeners.",
+    promptSnippet: "Read a managed tab's buffered console logs",
     promptGuidelines: [
-      "Use browser_save_as_pdf only for headless/direct-CDP sessions; in extension mode (headed Chrome) page.pdf is unsupported and will error.",
+      "Use browser_logs after a navigate/click/submit to check for page errors; pass limit to bound how many lines you get back.",
     ],
     parameters: Type.Object({
-      path: Type.Optional(Type.String({ description: "Absolute output path (allowed: session cwd, /tmp)" })),
-      format: Type.Optional(StringEnum(["letter", "a4", "legal", "a3", "tabloid"] as const)),
-      landscape: Type.Optional(Type.Boolean()),
+      tabId: Type.String({ description: "Target managed tab" }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, description: "Max log lines to return" })),
     }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, pdfSnippet({ path: params.path, format: params.format, landscape: params.landscape }));
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: { kind: "page.logs", tabId: params.tabId, ...(params.limit ? { limit: params.limit } : {}) },
+      });
     },
-    renderCall: makeRenderCall("browser save as PDF", (a) => a.path ?? a.format ?? ""),
-    renderResult: makeRenderResult((d) => `✓ PDF → ${preview(marker(d.text as string | undefined, "PDF_PATH") ?? "saved", 64)}`),
+    renderCall: makeRenderCall("browser logs", (a) => `[${a.tabId}]${a.limit ? ` limit=${a.limit}` : ""}`),
+    renderResult: makeRenderResult((d) => `✓ ${((d.logs as string[] | undefined) ?? []).length} log line(s)`),
   });
+
+  // --- page: execute (escape hatch) ----------------------------------------
 
   pi.registerTool({
     name: "browser_execute",
     label: "Browser Execute",
     description:
-      "Escape hatch: run an arbitrary Playwright code snippet in the relay session's sandbox. Scope has page, context, state (persistent), snapshot, getLatestLogs, refToLocator. Errors and console output are returned verbatim.",
-    promptSnippet: "Run an arbitrary Playwright snippet (escape hatch)",
+      "Escape hatch: run a Playwright snippet against a managed tab in the runtime's Node sandbox. Scope is fixed to the " +
+      "requested tab (its `page`); there is no newPage/close/context escape. Errors and output are returned verbatim. " +
+      "Optional timeout in ms (runtime caps it at 120s).",
+    promptSnippet: "Run a Playwright snippet against a managed tab (escape hatch)",
     promptGuidelines: [
-      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows). The sandbox keeps `state` across calls; console.log output is returned. Never call browser.close()/context.close(); close tabs via browser_tabs.",
+      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Never call browser.close()/context.close(); close tabs via browser_tabs.",
     ],
     parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
       code: Type.String({ description: "Playwright JS code, async/await supported" }),
-      timeout: Type.Optional(Type.Integer({ minimum: 1000, description: "Timeout in ms (default 120000)" })),
+      timeout: Type.Optional(Type.Integer({ minimum: 1000, description: "Timeout in ms (runtime caps at 120000)" })),
     }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      return run(ctx, signal, rawSnippet(params.code), { timeoutMs: params.timeout });
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: { kind: "page.execute", tabId: params.tabId, code: params.code },
+        timeoutMs: params.timeout,
+      });
     },
-    renderCall: makeRenderCall("browser execute", (a) => preview(a.code, 96)),
-    renderResult: makeRenderResult((d) => `✓ ${preview((d.text as string)?.split("\n")[0] ?? "ok", 96)}`),
+    renderCall: makeRenderCall("browser execute", (a) => `[${a.tabId}] ${preview(a.code, 80)}`),
+    renderResult: makeRenderResult((d) => `✓ ${preview((d.text as string | undefined)?.split("\n")[0] ?? "ok", 96)}`),
   });
 
-  // --- command ----------------------------------------------------------------
+  // --- command: /browser-status (inspect only) ------------------------------
 
   pi.registerCommand("browser-status", {
-    description: "Show Playwriter relay status, extension connection and the bound session",
+    description: "Inspect the managed browser runtime: reachability, capabilities, and connected profiles",
     handler: async (_args, ctx) => {
+      // Inspect only — never launch the runtime, never create a session/group/tab.
+      const client = runtime.getClient();
       try {
-        const url = relay.baseUrl();
-        const version = await relay.getVersion(url);
-        const status = await relay.getExtensionStatus(url);
-        const s = await bootstrap.ensureSession(pi, ctx).catch(() => null);
-        const caps = bootstrap.boundCapabilities();
+        const caps = await runtime.probeCapabilities(client);
+        if (!caps) {
+          ctx.ui.notify(
+            `browser runtime: not reachable at ${client.config.baseUrl} (start it with pi-browser-runtime or set PI_BROWSER_RUNTIME_PATH)`,
+            "warning",
+          );
+          return;
+        }
+        const profiles = await client.listProfiles().catch(() => []);
+        const connected = profiles.filter((p) => p.connected).length;
         const lines = [
-          `relay: ${version ?? "not reachable"} (${url})`,
-          `browser extension: ${status?.connected ? `connected (${status.browser ?? "Chrome"})` : "NOT connected — open Chrome and click the Playwriter extension icon"}`,
-          `session: ${s ? `${s.id} (${s.name})` : "not bound yet"}`,
-          `capabilities: ${caps ? `groups=${caps.sessionGroups} consent=${caps.consent} audit=${caps.audit} closeTabs=${caps.closeTabs}` : "unknown"}`,
+          `browser runtime: reachable (${client.config.baseUrl})`,
+          `protocol v${caps.protocolVersion} · managedGroups=${caps.managedGroups} explicitTabs=${caps.explicitTabs} isolatedExecution=${caps.isolatedExecution}`,
+          `profiles: ${profiles.length} (${connected} connected)`,
         ];
-        ctx.ui.notify(lines.join("\n"), status?.connected ? "info" : "warning");
+        ctx.ui.notify(lines.join("\n"), connected > 0 ? "info" : "warning");
       } catch (e) {
-        ctx.ui.notify(`browser-status unavailable: ${String(e)}`, "error");
+        ctx.ui.notify(`browser-status unavailable: ${describeError(e)}`, "error");
       }
     },
   });
 
-  pi.on("session_shutdown", async () => {
-    await bootstrap.closeSession();
+  // session.release only: frees this session's workers/CDP clients. Never
+  // deletes groups/tabs or changes persistent ownership; never stops the runtime.
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await runtime.releaseSession(ctx, `shutdown:${runtime.sessionId(ctx)}`).catch(() => {});
+    runtime.reset();
   });
 }

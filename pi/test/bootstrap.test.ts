@@ -1,165 +1,144 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { RelayError } from "../extensions/relay-client.ts";
+/**
+ * Lifecycle tests for bootstrap.ts against a real local HTTP server. We exercise
+ * identity resolution, probe semantics (free vs timeout vs unauthorized vs
+ * foreign), reset(), local-vs-remote launch guard, and session.release wiring —
+ * WITHOUT ever spawning a real runtime or Chrome. Launch is verified only via
+ * resolveRuntimeEntry (pure) and the remote guard.
+ */
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as bootstrap from "../extensions/bootstrap.ts";
-import { parseSessionId } from "../extensions/bootstrap.ts";
+import { BrowserRuntimeClient } from "../extensions/runtime-client.ts";
+import { startTestServer, validCapabilities, type TestServer } from "./test-server.ts";
 
-const mocks = vi.hoisted(() => ({
-  getVersion: vi.fn(),
-  getExtensionStatus: vi.fn(),
-  createSession: vi.fn(),
-  getCapabilities: vi.fn(),
-  deleteSession: vi.fn(),
-}));
+let server: TestServer;
+const savedEnv = { ...process.env };
 
-vi.mock("../extensions/relay-client.ts", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../extensions/relay-client.ts")>();
-  return {
-    ...actual,
-    getVersion: mocks.getVersion,
-    getExtensionStatus: mocks.getExtensionStatus,
-    createSession: mocks.createSession,
-    getCapabilities: mocks.getCapabilities,
-    deleteSession: mocks.deleteSession,
-  };
-});
-
-function makePi(execImpl?: ReturnType<typeof vi.fn>) {
-  const fn = execImpl ?? vi.fn();
-  return {
-    exec: fn as (command: string, args: string[], options?: unknown) => Promise<{ stdout: string; stderr: string; code: number; killed: boolean }>,
-  };
-}
-
-function makeCtx(sessionId = "abcdef123456") {
-  return { sessionManager: { getSessionId: () => sessionId } } as never;
-}
-
-const caps404 = { sessionGroups: false, consent: false, audit: false, closeTabs: false };
-
-beforeEach(() => {
-  vi.clearAllMocks();
+beforeEach(async () => {
+  server = await startTestServer();
   bootstrap.reset();
-  mocks.getCapabilities.mockResolvedValue(caps404);
-  mocks.deleteSession.mockResolvedValue(true);
+});
+afterEach(async () => {
+  await server.close();
+  process.env = { ...savedEnv };
+  bootstrap.reset();
 });
 
-describe("ensureSession", () => {
-  it("creates a session over HTTP named pi-<id8> when the relay is reachable", async () => {
-    mocks.getVersion.mockResolvedValue("0.4.0");
-    mocks.getExtensionStatus.mockResolvedValue({ connected: true, activeTargets: 1, browser: "Chrome", playwriterVersion: "0.4.0" });
-    mocks.createSession.mockResolvedValue({ id: "42", mode: "extension" });
+function makeCtx(sessionId: string | undefined = "11111111-2222-3333-4444-555555555555") {
+  return { sessionManager: { getSessionId: () => sessionId }, cwd: "/tmp" } as never;
+}
 
-    const s = await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"));
-    expect(s).toEqual({ id: "42", name: "pi-abcdef12" });
-    expect(mocks.createSession).toHaveBeenCalledWith(expect.any(String), {
-      name: "pi-abcdef12",
-      groupTitle: undefined,
-    });
-    expect(bootstrap.boundCapabilities()).toEqual(caps404);
-    expect(mocks.getCapabilities).toHaveBeenCalledTimes(1);
+function clientFor(s: TestServer): BrowserRuntimeClient {
+  return new BrowserRuntimeClient({ baseUrl: s.baseUrl });
+}
+
+describe("sessionId", () => {
+  it("returns the full session UUID read fresh each call", () => {
+    expect(bootstrap.sessionId(makeCtx("uuid-abc"))).toBe("uuid-abc");
   });
-
-  it("passes the remembered group title into session creation", async () => {
-    mocks.getVersion.mockResolvedValue("0.4.0");
-    mocks.getExtensionStatus.mockResolvedValue({ connected: true, activeTargets: 0, browser: "Chrome", playwriterVersion: null });
-    mocks.createSession.mockResolvedValue({ id: "1", mode: "extension" });
-
-    await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"), { groupTitle: "TikTok ads task" });
-    expect(mocks.createSession).toHaveBeenCalledWith(expect.any(String), {
-      name: "pi-abcdef12",
-      groupTitle: "TikTok ads task",
-    });
-  });
-
-  it("auto-starts the relay via global CLI and parses the session id when unreachable", async () => {
-    mocks.getVersion.mockResolvedValue(null);
-    const exec = vi.fn().mockResolvedValue({ stdout: "1\n", stderr: "", code: 0, killed: false });
-
-    const s = await bootstrap.ensureSession(makePi(exec), makeCtx("abcdef123456"));
-    expect(exec).toHaveBeenCalledWith("playwriter", ["session", "new"], expect.objectContaining({ timeout: 90_000 }));
-    expect(s.id).toBe("1");
-    expect(bootstrap.boundCapabilities()).toEqual(caps404);
-  });
-
-  it("falls back to npx -y playwriter@latest when the global CLI is missing", async () => {
-    mocks.getVersion.mockResolvedValue(null);
-    const exec = vi
-      .fn()
-      .mockResolvedValueOnce({ stdout: "", stderr: "command not found", code: 127, killed: false })
-      .mockResolvedValueOnce({ stdout: "Session 7 created\n", stderr: "", code: 0, killed: false });
-
-    const s = await bootstrap.ensureSession(makePi(exec), makeCtx("abcdef123456"));
-    expect(exec).toHaveBeenNthCalledWith(2, "npx", ["-y", "playwriter@latest", "session", "new"], expect.anything());
-    expect(s.id).toBe("7");
-  });
-
-  it("throws extension-disconnected when the relay is up but no extension is attached", async () => {
-    mocks.getVersion.mockResolvedValue("0.4.0");
-    mocks.getExtensionStatus.mockResolvedValue({ connected: false, activeTargets: 0, browser: null, playwriterVersion: null });
-
-    await expect(bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"))).rejects.toMatchObject({
-      category: "extension-disconnected",
-    });
-    expect(mocks.createSession).not.toHaveBeenCalled();
-  });
-
-  it("recreates the session after invalidateSession (session-invalid recovery)", async () => {
-    mocks.getVersion.mockResolvedValue("0.4.0");
-    mocks.getExtensionStatus.mockResolvedValue({ connected: true, activeTargets: 0, browser: "Chrome", playwriterVersion: null });
-    mocks.createSession.mockResolvedValue({ id: "1", mode: "extension" });
-
-    await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"));
-    expect(bootstrap.boundSessionId()).toBe("1");
-
-    bootstrap.invalidateSession();
-    mocks.createSession.mockResolvedValue({ id: "2", mode: "extension" });
-    const s = await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"));
-    expect(s.id).toBe("2");
-    expect(mocks.createSession).toHaveBeenCalledTimes(2);
-  });
-
-  it("reuses the bound session on subsequent calls without recreating", async () => {
-    mocks.getVersion.mockResolvedValue("0.4.0");
-    mocks.getExtensionStatus.mockResolvedValue({ connected: true, activeTargets: 0, browser: "Chrome", playwriterVersion: null });
-    mocks.createSession.mockResolvedValue({ id: "1", mode: "extension" });
-
-    await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"));
-    await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"));
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-  });
-
-  it("raises a RelayError with a helpful message when both CLI paths fail", async () => {
-    mocks.getVersion.mockResolvedValue(null);
-    const exec = vi.fn().mockResolvedValue({ stdout: "", stderr: "not found", code: 127, killed: false });
-
-    await expect(bootstrap.ensureSession(makePi(exec), makeCtx("abcdef123456"))).rejects.toMatchObject({
-      category: "relay-unreachable",
-    });
+  it("throws loudly when there is no active session", () => {
+    const ctx = { sessionManager: { getSessionId: () => undefined }, cwd: "/tmp" } as never;
+    expect(() => bootstrap.sessionId(ctx)).toThrow(/no active Pi session/);
   });
 });
 
-describe("closeSession", () => {
-  it("deletes the relay session and resets module state", async () => {
-    mocks.getVersion.mockResolvedValue("0.4.0");
-    mocks.getExtensionStatus.mockResolvedValue({ connected: true, activeTargets: 0, browser: "Chrome", playwriterVersion: null });
-    mocks.createSession.mockResolvedValue({ id: "9", mode: "extension" });
-
-    await bootstrap.ensureSession(makePi(), makeCtx("abcdef123456"));
-    await bootstrap.closeSession();
-
-    expect(mocks.deleteSession).toHaveBeenCalledWith("9");
-    expect(bootstrap.boundSessionId()).toBeUndefined();
+describe("probeCapabilities", () => {
+  it("returns capabilities when a managed runtime answers", async () => {
+    server.setHandler(() => ({ json: validCapabilities }));
+    await expect(bootstrap.probeCapabilities(clientFor(server))).resolves.toEqual(validCapabilities);
+  });
+  it("returns null only when the port is genuinely free (connection refused)", async () => {
+    const dead = new BrowserRuntimeClient({ baseUrl: "http://127.0.0.1:1" });
+    await expect(bootstrap.probeCapabilities(dead)).resolves.toBeNull();
+  });
+  it("treats a 401 as a hard error (never replace a token-protected process)", async () => {
+    server.setHandler(() => ({ status: 401, json: {} }));
+    await expect(bootstrap.probeCapabilities(clientFor(server))).rejects.toThrow(/rejected auth/);
+  });
+  it("treats a non-managed listener as a hard error", async () => {
+    server.setHandler(() => ({ json: { hello: "not a runtime" } }));
+    await expect(bootstrap.probeCapabilities(clientFor(server))).rejects.toThrow(/not a managed browser runtime/);
   });
 });
 
-describe("parseSessionId", () => {
-  it("parses a bare number line", () => {
-    expect(parseSessionId("1\n")).toBe("1");
+describe("resolveRuntimeEntry", () => {
+  it("runs a .ts PI_BROWSER_RUNTIME_PATH through tsx", () => {
+    const entry = bootstrap.resolveRuntimeEntry({ PI_BROWSER_RUNTIME_PATH: "/abs/runtime-cli.ts" });
+    expect(entry).toEqual({ command: "tsx", args: ["/abs/runtime-cli.ts"] });
   });
-  it("parses 'Session N created' style output", () => {
-    expect(parseSessionId("Session 7 created\n")).toBe("7");
+  it("runs a .js PI_BROWSER_RUNTIME_PATH through node", () => {
+    const entry = bootstrap.resolveRuntimeEntry({ PI_BROWSER_RUNTIME_PATH: "/abs/runtime-cli.js" });
+    expect(entry.command).toBe(process.execPath);
+    expect(entry.args).toEqual(["/abs/runtime-cli.js"]);
   });
-  it("returns null on garbage", () => {
-    expect(parseSessionId("error\n")).toBeNull();
+  it("never falls back to npx (uses packaged bin or the pi-browser-runtime executable)", () => {
+    const entry = bootstrap.resolveRuntimeEntry({});
+    expect(entry.command).not.toBe("npx");
+    // Either the packaged bin resolved (node + a path) or the PATH executable.
+    if (entry.command === "pi-browser-runtime") {
+      expect(entry.args).toEqual([]);
+    } else {
+      expect(entry.command).toBe(process.execPath);
+      expect(entry.args[0]).toMatch(/pi-browser-runtime|bin-runtime/);
+    }
+  });
+});
+
+describe("ensureRuntime", () => {
+  it("returns capabilities from an already-listening runtime without launching", async () => {
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    server.setHandler(() => ({ json: validCapabilities }));
+    await expect(bootstrap.ensureRuntime()).resolves.toEqual(validCapabilities);
+    expect(bootstrap.boundCapabilities()).toEqual(validCapabilities);
+  });
+
+  it("memoizes capabilities and dedupes concurrent first-use launches", async () => {
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    server.setHandler(() => ({ json: validCapabilities }));
+    const [a, b] = await Promise.all([bootstrap.ensureRuntime(), bootstrap.ensureRuntime()]);
+    expect(a).toEqual(b);
+    // One extra ensureRuntime after memoization does not re-probe.
+    const before = server.requests.length;
+    await bootstrap.ensureRuntime();
+    expect(server.requests.length).toBe(before);
+  });
+
+  it("refuses to spawn a local daemon when PI_BROWSER_HOST points at a remote host", async () => {
+    // A .invalid TLD fails DNS immediately → probe returns null (unreachable),
+    // and the hostname is not loopback, so the remote guard fires instead of a
+    // launch. (Using a dead IP would time out rather than refuse.)
+    process.env.PI_BROWSER_HOST = "http://runtime.invalid:19989";
+    await expect(bootstrap.ensureRuntime()).rejects.toThrow(/remote host/);
+  });
+});
+
+describe("reset", () => {
+  it("drops memoized capabilities and re-resolves the client", async () => {
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    server.setHandler(() => ({ json: validCapabilities }));
+    await bootstrap.ensureRuntime();
+    expect(bootstrap.boundCapabilities()).not.toBeNull();
+    bootstrap.reset();
+    expect(bootstrap.boundCapabilities()).toBeNull();
+  });
+});
+
+describe("releaseSession", () => {
+  it("does nothing when the runtime never started for this session", async () => {
+    // No ensureRuntime call → no capabilities → release is a no-op (no request).
+    await bootstrap.releaseSession(makeCtx(), "shutdown:x");
+    expect(server.requests.length).toBe(0);
+  });
+
+  it("sends session.release scoped to this session once the runtime is up", async () => {
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    server.setHandler((req) => {
+      const body = req.body as { requestId?: string; operation?: { kind?: string } };
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      return { json: { requestId: body.requestId, ok: true, data: {} } };
+    });
+    await bootstrap.ensureRuntime();
+    await bootstrap.releaseSession(makeCtx("sess-1"), "shutdown:sess-1");
+    const post = server.requests.find((r) => r.url === "/browser/v1/request");
+    expect(post?.body).toMatchObject({ sessionId: "sess-1", operation: { kind: "session.release" } });
   });
 });

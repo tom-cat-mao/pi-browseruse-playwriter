@@ -1,13 +1,29 @@
-import { describe, expect, it, vi } from "vitest";
+/**
+ * Registration + end-to-end shaping tests for the extension factory. The
+ * factory is invoked with a mock ExtensionAPI to capture tools/commands/hooks.
+ * A real local HTTP server stands in for the runtime (via PI_BROWSER_HOST) so we
+ * can assert that structured resources (groupId/tabId/snapshotId/evaluate value)
+ * actually land in the tool `content` the LLM sees — not just in `details`.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import factory from "../extensions/index.ts";
+import * as bootstrap from "../extensions/bootstrap.ts";
+import { startTestServer, validCapabilities, validProfile, type TestServer } from "./test-server.ts";
 
+type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 type RegisteredTool = {
   name: string;
   description: string;
   promptSnippet?: string;
   promptGuidelines?: string[];
-  parameters: unknown;
-  execute: (...args: unknown[]) => unknown;
+  parameters: { properties?: Record<string, unknown> };
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    onUpdate: undefined,
+    ctx: unknown,
+  ) => Promise<{ content: ContentBlock[]; details: Record<string, unknown> }>;
   renderCall?: (...args: unknown[]) => unknown;
   renderResult?: (...args: unknown[]) => unknown;
 };
@@ -26,40 +42,51 @@ function makeMockPi() {
     on: vi.fn((event: string) => {
       events.push(event);
     }),
-    exec: vi.fn(),
   };
   return { pi, tools, commands, events };
 }
 
+function makeCtx(sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") {
+  return { sessionManager: { getSessionId: () => sessionId }, cwd: "/tmp", model: { input: ["text"] } };
+}
+
+function textOf(content: ContentBlock[]): string {
+  return content
+    .filter((c): c is { type: "text"; text: string } => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+}
+
 describe("extension factory registration", () => {
-  it("registers 9 typed tools + browser_execute escape hatch", () => {
+  it("registers the 12 managed tools and no browser_save_as_pdf", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
-
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
+        "browser_profiles",
+        "browser_groups",
+        "browser_tabs",
         "browser_navigate",
         "browser_snapshot",
         "browser_click",
         "browser_fill",
         "browser_evaluate",
         "browser_screenshot",
-        "browser_tabs",
         "browser_network",
-        "browser_save_as_pdf",
+        "browser_logs",
         "browser_execute",
       ].sort(),
     );
+    expect(tools.some((t) => t.name === "browser_save_as_pdf")).toBe(false);
   });
 
-  it("gives every tool a promptSnippet and self-naming promptGuidelines", () => {
+  it("gives every tool a promptSnippet, self-naming guidelines, and renderers", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
-
     for (const tool of tools) {
       expect(tool.promptSnippet, tool.name).toBeTruthy();
       for (const guideline of tool.promptGuidelines ?? []) {
-        expect(guideline, `${tool.name} guideline must name its tool`).toContain(tool.name);
+        expect(guideline, `${tool.name} guideline names its tool`).toContain(tool.name);
       }
       expect(typeof tool.execute).toBe("function");
       expect(typeof tool.renderCall).toBe("function");
@@ -67,19 +94,151 @@ describe("extension factory registration", () => {
     }
   });
 
-  it("exposes a /browser-status command and session_shutdown hook", () => {
+  it("exposes a /browser-status command and a session_shutdown hook", () => {
     const { pi, commands, events } = makeMockPi();
     factory(pi as never);
-
     expect(commands).toContain("browser-status");
     expect(events).toContain("session_shutdown");
   });
 
-  it("defines browser_click parameters with selector only", () => {
+  it("declares browser_click with selector + optional snapshotId (no auto .first ref)", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     const click = tools.find((t) => t.name === "browser_click")!;
-    const params = click.parameters as { properties?: Record<string, unknown> };
-    expect(Object.keys(params.properties ?? {})).toEqual(["selector"]);
+    expect(Object.keys(click.parameters.properties ?? {}).sort()).toEqual(["selector", "snapshotId", "tabId"].sort());
+  });
+});
+
+describe("tool execution shaping (real HTTP runtime)", () => {
+  let server: TestServer;
+  const savedEnv = { ...process.env };
+
+  beforeEach(async () => {
+    server = await startTestServer();
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    bootstrap.reset();
+  });
+  afterEach(async () => {
+    await server.close();
+    process.env = { ...savedEnv };
+    bootstrap.reset();
+  });
+
+  function toolByName(name: string): RegisteredTool {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    return tools.find((t) => t.name === name)!;
+  }
+
+  function runtimeHandler(dataFor: (op: { kind: string }) => Record<string, unknown>) {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [validProfile] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      return { json: { requestId: body.requestId, ok: true, data: dataFor(body.operation) } };
+    });
+  }
+
+  it("puts a created group's id into content so the LLM can use it", async () => {
+    runtimeHandler(() => ({
+      group: {
+        groupId: "grp-42",
+        sessionId: "s",
+        profileId: "profile-1",
+        name: "work",
+        state: "ready",
+        browserEpoch: "e",
+        revision: 1,
+      },
+    }));
+    const groups = toolByName("browser_groups");
+    const res = await groups.execute(
+      "call-1",
+      { action: "create", profileId: "profile-1", name: "work" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(textOf(res.content)).toContain("grp-42");
+    expect(res.details.group).toBeTruthy();
+  });
+
+  it("puts a created tab's id into content", async () => {
+    runtimeHandler(() => ({
+      tab: {
+        tabId: "tab-7",
+        groupId: "grp-42",
+        sessionId: "s",
+        profileId: "profile-1",
+        url: "https://example.com",
+        title: "Example",
+        state: "ready",
+        browserEpoch: "e",
+        revision: 1,
+        chromeTabId: 99,
+      },
+    }));
+    const tabs = toolByName("browser_tabs");
+    const res = await tabs.execute(
+      "call-2",
+      { action: "create", groupId: "grp-42", url: "https://example.com" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(textOf(res.content)).toContain("tab-7");
+  });
+
+  it("surfaces snapshotId and the tree text from a snapshot", async () => {
+    runtimeHandler(() => ({ text: "- button \"Login\" [aria-ref=e5]", snapshotId: "snap-1" }));
+    const snap = toolByName("browser_snapshot");
+    const res = await snap.execute("call-3", { tabId: "tab-7" }, undefined, undefined, makeCtx());
+    const t = textOf(res.content);
+    expect(t).toContain("snap-1");
+    expect(t).toContain("aria-ref=e5");
+  });
+
+  it("surfaces an evaluate value into content", async () => {
+    runtimeHandler(() => ({ value: { count: 3 } }));
+    const evaluate = toolByName("browser_evaluate");
+    const res = await evaluate.execute("call-4", { tabId: "tab-7", code: "return 3" }, undefined, undefined, makeCtx());
+    expect(textOf(res.content)).toContain("\"count\":3");
+  });
+
+  it("injects the full session UUID and toolCallId into the wire request", async () => {
+    runtimeHandler(() => ({ profiles: [validProfile] }));
+    const profiles = toolByName("browser_profiles");
+    await profiles.execute("call-5", {}, undefined, undefined, makeCtx("full-uuid-123"));
+    const post = server.requests.find((r) => r.url === "/browser/v1/request");
+    expect(post?.body).toMatchObject({ requestId: "call-5", sessionId: "full-uuid-123" });
+  });
+
+  it("does not launch the runtime when the caller signal is already aborted", async () => {
+    runtimeHandler(() => ({}));
+    const nav = toolByName("browser_navigate");
+    const ac = new AbortController();
+    ac.abort(new Error("cancelled"));
+    await expect(
+      nav.execute("call-6", { tabId: "tab-7", url: "https://x.com" }, ac.signal, undefined, makeCtx()),
+    ).rejects.toThrow(/cancelled before it started/);
+    expect(server.requests.length).toBe(0);
+  });
+
+  it("preserves runtime error code/outcome in the thrown message", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string };
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: false,
+          error: { code: "resource-not-found", message: "no such tab", outcome: "not-started" },
+        },
+      };
+    });
+    const nav = toolByName("browser_navigate");
+    await expect(
+      nav.execute("call-7", { tabId: "missing", url: "https://x.com" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/resource-not-found/);
   });
 });
