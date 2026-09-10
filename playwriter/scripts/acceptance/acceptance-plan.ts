@@ -24,6 +24,7 @@ import {
   type BrowserRequest,
   type BrowserTab,
 } from '../../src/browser-protocol.ts'
+import { runSnapshotRefSelfChecks } from './snapshot-refs.ts'
 
 export const ACCEPTANCE_ENV = {
   runGate: 'PI_BROWSER_ACCEPTANCE',
@@ -343,30 +344,45 @@ export function mainChecklist(): ChecklistItem[] {
       detail: 'runs only with --chrome-cdp <devtools ws/http endpoint of the isolated Chrome>',
     },
     {
-      id: 'snapshot-click',
-      title: 'page.snapshot -> page.click on a snapshot locator',
+      id: 'page-navigate',
+      title: 'page.navigate loads a fixture page and is observable',
       how: 'auto',
       detail:
-        'click the fixture submit button using the locator printed by page.snapshot, passing the fresh snapshotId; plain locators accept it without requiring it',
+        'reload the recorded A1 tab through page.navigate with the same fixture marker URL used by tabs.create; the response URL/title and a page-marker check must confirm the navigation',
+    },
+    {
+      id: 'page-screenshot',
+      title: 'page.screenshot returns a non-empty PNG and writes an artifact',
+      how: 'auto',
+      detail: 'a screenshot of the recorded A1 tab must return PNG bytes in images and save a non-empty artifact under the repo tmp report dir; no PDF and no extra business page',
+    },
+    {
+      id: 'snapshot-click',
+      title: 'page.snapshot -> page.click on a runtime ref',
+      how: 'auto',
+      detail:
+        'resolve the Submit button ref from the refs array in the page.snapshot response value (never a hardcoded eN or a CSS-derived ref), then click that aria-ref with the fresh snapshotId',
     },
     {
       id: 'snapshot-fill',
-      title: 'page.fill with the snapshot locator and visible value check',
+      title: 'page.fill with the runtime ref and visible value check',
       how: 'auto',
-      detail: 'fill the fixture input, verify the typed value and the echo text was produced by a real click',
+      detail:
+        'resolve the Name textbox ref from the page.snapshot response refs, fill it, verify the typed value and the echo text produced by a click on the Submit ref from a second fresh snapshot',
     },
     {
       id: 'stale-snapshot',
       title: 'stale snapshotId is rejected for snapshot refs, not silently first()',
       how: 'auto',
       detail:
-        'a snapshot ref (@eN / aria-ref=eN) with an older snapshotId must fail stale-snapshot, and a ref without any snapshotId must fail the same way; neither may click anything',
+        'the runtime Submit aria-ref with an older snapshotId must fail stale-snapshot, and the same ref without any snapshotId must fail the same way; neither may click anything',
     },
     {
       id: 'unknown-ref',
       title: 'unknown snapshot ref fails without clicking anything',
       how: 'auto',
-      detail: 'a ref that is not present in the current snapshot must fail stale-snapshot and the counter must not move',
+      detail:
+        'with a fresh snapshot still valid, a ref that is not present in it must fail stale-snapshot with a not-present-in-snapshot message and the counter must not move; the error must be about the ref, not a stale snapshot',
     },
     {
       id: 'logs',
@@ -681,6 +697,10 @@ export function runAcceptanceSelfChecks(): SelfCheck[] {
     } catch (error) {
       checks.push({ name, ok: false, detail: error instanceof Error ? error.message : String(error) })
     }
+  }
+
+  for (const check of runSnapshotRefSelfChecks()) {
+    checks.push(check)
   }
 
   run({
