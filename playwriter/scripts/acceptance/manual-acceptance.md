@@ -110,24 +110,30 @@ launch command instead of using Load unpacked.
 Check the runtime directly:
 
 ```bash
-curl -s http://127.0.0.1:19990/browser/v1/capabilities
+curl -s -H 'authorization: Bearer acceptance-local-token' \
+  http://127.0.0.1:19990/browser/v1/capabilities
 curl -s -H 'authorization: Bearer acceptance-local-token' \
   http://127.0.0.1:19990/browser/v1/profiles
 ```
+
+Both routes are token-protected when the runtime was started with
+`PI_BROWSER_TOKEN`, so every curl needs the header above; without it
+you get HTTP 401, not a connection problem.
 
 `profiles` must contain one connected entry. If it is empty, use the
 extension service worker console:
 
 1. `chrome://extensions` -> fork card -> click "service worker".
-2. In the DevTools console run `getExtensionState()` to see the
-   connection state of the tabs you enabled.
+2. In the DevTools console run `getExtensionState()` to see whether the
+   relay websocket is connected.
 3. Run `await chrome.storage.local.get(null)` to inspect the persisted
    managed registry (owned groups/tabs, browser epoch) that the
    acceptance run relies on.
-4. The extension only controls tabs you explicitly enable: click the
-   extension icon on the tab where you want managed groups to appear.
-   The harness creates its own tabs through the API, so one enabled tab
-   is enough to bootstrap the connection.
+4. No per-tab click is needed in managed mode: the extension keeps its
+   own websocket connection, and `tabs.create` attaches the debugger to
+   the new tab itself. Clicking the toolbar icon only wakes the service
+   worker and toggles legacy control for the active tab; it is not
+   required and it does not affect managed groups or tabs.
 
 # Step 5 — run the main acceptance pass
 
@@ -141,9 +147,26 @@ node playwriter/scripts/acceptance/acceptance-harness.ts \
   --chrome-cdp http://127.0.0.1:9333
 ```
 
-If you started the standalone fixture server from Step 6, replace
-`--fixture-server` with `--fixture-url http://127.0.0.1:8790` so the
-same server keeps the counters across every phase.
+If fault phases will follow, the main run must keep its resources and
+share one fixture server with them:
+
+```bash
+node playwriter/scripts/acceptance/acceptance-harness.ts \
+  --fixture-only --fixture-port 8790   # separate terminal, keep running
+
+PI_BROWSER_ACCEPTANCE=1 \
+node playwriter/scripts/acceptance/acceptance-harness.ts \
+  --run \
+  --base-url http://127.0.0.1:19990 \
+  --token acceptance-local-token \
+  --fixture-url http://127.0.0.1:8790 \
+  --cleanup never
+```
+
+`--cleanup never` is required for the fault workflow: with the default
+`--cleanup=on-success` the main run closes its groups and tabs, and the
+fault phases then have nothing to verify (the harness reports that as
+not-verifiable instead of blaming the implementation).
 
 Dry-run first if you want to see the plan without any request:
 
@@ -179,10 +202,13 @@ whole session and reuse its URL everywhere:
 
 ```bash
 node playwriter/scripts/acceptance/acceptance-harness.ts \
-  --fixture-server --fixture-port 8790
-# then use --fixture-url http://127.0.0.1:8790 instead of
-# --fixture-server in the Step 5 main run
+  --fixture-only --fixture-port 8790
+# then use --fixture-url http://127.0.0.1:8790 in the Step 5 main run
 ```
+
+`--fixture-only` is not a live mode: it starts a local HTTP stub and
+touches no browser, relay or product API. `--dry-run` starts nothing at
+all.
 
 ```bash
 PI_BROWSER_ACCEPTANCE=1 PI_BROWSER_ACCEPTANCE_FAULTS=1 \
@@ -196,22 +222,39 @@ node playwriter/scripts/acceptance/acceptance-harness.ts \
   --confirm-test-ownership
 ```
 
-Repeat for `--fault-phase ws-drop`, `--fault-phase sw-restart`,
-`--fault-phase drag-out`, `--fault-phase worker-kill`. Each phase
-prompts before and after your manual action:
+Each phase needs its own invocation: `--fault-phase ws-drop`,
+`--fault-phase relay-restart`, `--fault-phase sw-restart`,
+`--fault-phase extension-reload`, `--fault-phase drag-out`,
+`--fault-phase worker-kill`. `extension-reload` must run alone because
+it changes the browser epoch. Each phase first proves the recorded
+resources are still alive and then prompts before and after your manual
+action:
 
 - `ws-drop` / `relay-restart`: stop the Step 2 runtime (Ctrl+C), press
   Enter, restart it with the same env, press Enter again. The harness
-  checks the same groupIds/tabIds come back without duplicates and that
-  page actions work again.
-- `sw-restart`: reload the extension card at `chrome://extensions`,
-  then press Enter. The persisted registry must restore the same
-  resources.
+  checks the same groupIds/tabIds come back with the same states
+  (released stays released, ready becomes ready again) and that a page
+  action works.
+- `sw-restart` stops only the extension service worker inside the same
+  browser run. Open the fork card service worker, then DevTools ->
+  Application -> Service Workers -> Stop, press Enter, wake the worker
+  again (open a new tab or click the extension icon once), press Enter.
+  `storage.session` survives this, so the same resources must come back
+  ready. If your Chrome build does not offer Stop for the extension
+  service worker, the harness reports the phase as not-verifiable
+  instead of failing it.
+- `extension-reload` uses the card reload button. That clears
+  `storage.session`, so the browser epoch changes on purpose: the
+  contract says old Chrome mappings are unverifiable, and every
+  non-released record must degrade to `needs-rebind` (logical ownership
+  kept, nothing auto-adopted, no duplicates, tabs stay where they are in
+  Chrome). The harness verifies exactly that; recovery back to ready
+  is not part of this round and is reported as not-verifiable.
 - `drag-out`: drag the tab whose page shows
   `acceptance:A2-<runId>` out of its group (and, for the optional
-  second step, the last B1 tab). The extension must record a user
-  release; the harness verifies the tab becomes `released` and that
-  page actions are refused with `resource-released`.
+  second step, the single last B1 tab). The extension must record a
+  user release; the harness verifies the tab becomes `released` and
+  that page actions are refused with `resource-released`.
 - `worker-kill`: the harness starts a long `page.execute`, waits, then
   asks you to kill only the executor worker child process of the test
   runtime (`lsof -ti tcp:19990`, then `pgrep -P <runtime pid>`). The
@@ -235,11 +278,37 @@ node playwriter/scripts/acceptance/acceptance-harness.ts \
   --state tmp/acceptance/ledger-<runId>.json
 ```
 
+Cleanup rules the harness follows:
+
+- only groupIds/tabIds from its own ledger are touched, and only while
+  the live inventory still attributes them to this run's sessions;
+- a tab that is already `released`, or answers `resource-not-found` /
+  `needs-rebind`, is left alone instead of counted as a failure;
+- after an `extension-reload` the harness can only release the logical
+  records: the physical Chrome tabs and groups stay open for you to
+  close by hand (the extension must not guess identities across epochs);
+- a group is never force-closed while recorded ready tabs remain in it;
+  the extension itself only closes tabs listed in its registry, so an
+  unrecorded user tab in the same Chrome group is never closed by the
+  harness.
+
 - Close the isolated Chrome yourself when done.
 - Remove `~/.pi-browser-acceptance/chrome-profile` and
   `tmp/acceptance-runtime` manually if you want a clean slate. The
   harness never deletes profile or runtime directories.
 - Stop the Step 2 runtime with Ctrl+C, or leave it for the next phase.
+
+# Evidence levels
+
+The harness labels every mode and report with what it actually touched:
+
+- `--self-test` / `--dry-run` / `--list`: pure. No HTTP, no browser, no
+  relay; they only validate gates and print the plan.
+- `--fixture-only`: a local HTTP fixture stub. It proves the fixtures
+  serve real pages and count requests, nothing about the product.
+- `--run`, `--fault-mode`, `--cleanup-only`: live. They drive the real
+  `/browser/v1` API of the test runtime against the isolated Chrome you
+  opened. Only this level counts as browser acceptance.
 
 # Expected results
 
@@ -261,7 +330,12 @@ A SKIP is not a pass; the report keeps the distinction.
 
 - `no connected managed profile`: the extension websocket is not up.
   Check the Step 4 console; make sure the extension was built with
-  `PLAYWRITER_PORT=19990` and the runtime listens on 19990.
+  `PLAYWRITER_PORT=19990` and the runtime listens on 19990. If the
+  service worker was stopped or idle, wake it by opening a new tab or
+  clicking the extension icon once.
+- `needs-rebind` after an extension reload is the expected safe
+  degradation, not a bug: the browser epoch changed and the contract
+  deliberately refuses to re-adopt old Chrome mappings.
 - HTTP 401: pass the same `PI_BROWSER_TOKEN` value you started the
   runtime with via `--token`.
 - `port 19988` refused: that is intentional. Pick a test port.

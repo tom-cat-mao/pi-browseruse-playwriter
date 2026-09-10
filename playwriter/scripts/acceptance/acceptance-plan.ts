@@ -37,9 +37,35 @@ export const DAILY_RELAY_PORT = 19988
 export const FORK_DEFAULT_PORT = 19989
 export const EXPECTED_PROTOCOL_VERSION = BROWSER_PROTOCOL_VERSION
 
-export type HarnessMode = 'dry-run' | 'list' | 'self-test' | 'run' | 'faults' | 'cleanup-only'
+export type HarnessMode = 'dry-run' | 'list' | 'self-test' | 'fixture-only' | 'run' | 'faults' | 'cleanup-only'
 
-export type FaultPhase = 'ws-drop' | 'relay-restart' | 'sw-restart' | 'drag-out' | 'worker-kill'
+/**
+ * sw-restart stops/restarts the extension service worker inside the same
+ * browser run: storage.session (browserEpoch) survives, so persisted ownership
+ * must come back ready.
+ *
+ * extension-reload reloads the extension from chrome://extensions, which clears
+ * storage.session: the browserEpoch changes and the contract says old physical
+ * mappings are unverifiable, so records must degrade to needs-rebind (logical
+ * ownership kept, no auto-adoption). It is a separate phase on purpose.
+ */
+export type FaultPhase = 'ws-drop' | 'relay-restart' | 'sw-restart' | 'extension-reload' | 'drag-out' | 'worker-kill'
+
+export const EVIDENCE_LEVELS = {
+  pure: 'pure (no HTTP, no browser)',
+  httpStub: 'local HTTP fixture stub (no browser, no relay)',
+  live: 'live test runtime + user-opened isolated Chrome',
+} as const
+
+export function describeEvidenceLevel({ mode }: { mode: HarnessMode }): string {
+  if (mode === 'run' || mode === 'faults' || mode === 'cleanup-only') {
+    return EVIDENCE_LEVELS.live
+  }
+  if (mode === 'fixture-only') {
+    return EVIDENCE_LEVELS.httpStub
+  }
+  return EVIDENCE_LEVELS.pure
+}
 
 export type CleanupPolicy = 'on-success' | 'always' | 'never'
 
@@ -217,6 +243,15 @@ export function validateAcceptanceConfig({
     }
   }
 
+  if (config.faultPhases.includes('extension-reload') && config.faultPhases.length > 1) {
+    issues.push({
+      level: 'error',
+      code: 'extension-reload-alone',
+      message:
+        'extension-reload changes the browserEpoch (storage.session is cleared), so it must run as its own fault-mode invocation; same-epoch phases would be invalid afterwards',
+    })
+  }
+
   if (config.mode === 'faults' && config.faultPhases.length === 0) {
     issues.push({ level: 'error', code: 'fault-phase-required', message: '--fault-mode requires at least one --fault-phase' })
   }
@@ -309,27 +344,29 @@ export function mainChecklist(): ChecklistItem[] {
     },
     {
       id: 'snapshot-click',
-      title: 'page.snapshot -> page.click with snapshotId',
+      title: 'page.snapshot -> page.click on a snapshot locator',
       how: 'auto',
-      detail: 'click the fixture submit button with the fresh snapshotId and observe the fixture log/counter',
+      detail:
+        'click the fixture submit button using the locator printed by page.snapshot, passing the fresh snapshotId; plain locators accept it without requiring it',
     },
     {
       id: 'snapshot-fill',
-      title: 'page.fill with snapshotId and visible value check',
+      title: 'page.fill with the snapshot locator and visible value check',
       how: 'auto',
       detail: 'fill the fixture input, verify the typed value and the echo text was produced by a real click',
     },
     {
       id: 'stale-snapshot',
-      title: 'stale snapshotId is rejected, not silently first()',
+      title: 'stale snapshotId is rejected for snapshot refs, not silently first()',
       how: 'auto',
-      detail: 'reuse an old snapshotId after a DOM mutation: must fail with stale-snapshot and produce no side effect',
+      detail:
+        'a snapshot ref (@eN / aria-ref=eN) with an older snapshotId must fail stale-snapshot, and a ref without any snapshotId must fail the same way; neither may click anything',
     },
     {
       id: 'unknown-ref',
-      title: 'unknown aria-ref fails without clicking anything',
+      title: 'unknown snapshot ref fails without clicking anything',
       how: 'auto',
-      detail: 'fill aria-ref=e<nonexistent> with a valid snapshotId; counter must not move',
+      detail: 'a ref that is not present in the current snapshot must fail stale-snapshot and the counter must not move',
     },
     {
       id: 'logs',
@@ -389,7 +426,8 @@ export function mainChecklist(): ChecklistItem[] {
       id: 'cleanup-own-only',
       title: 'cleanup closes only recorded resources of this run',
       how: 'auto',
-      detail: 'tabs.close/groups.close only for recorded ids that the inventory still attributes to our sessions',
+      detail:
+        'tabs.close/groups.close only for recorded ids that the inventory still attributes to our sessions. Released/not-found/needs-rebind tabs are left alone, and a group is never closed while it still contains a ready tab this run did not record (a user-borrowed tab).',
     },
   ]
 }
@@ -401,6 +439,13 @@ export function faultChecklist({ phase }: { phase: FaultPhase }): ChecklistItem[
       title: 'fault gates and ownership confirmation',
       how: 'auto',
       detail: `requires ${ACCEPTANCE_ENV.faultGate}=1 and --confirm-test-ownership`,
+    },
+    {
+      id: `${phase}-resources`,
+      title: 'recorded resources are still alive before any manual action',
+      how: 'auto',
+      detail:
+        'fault phases act on the ledger from a main run, so that run must use --cleanup never and the same fixture server. If the recorded resources were already cleaned up, the phase is reported as not-verifiable instead of failed.',
     },
   ]
   if (phase === 'ws-drop' || phase === 'relay-restart') {
@@ -430,16 +475,44 @@ export function faultChecklist({ phase }: { phase: FaultPhase }): ChecklistItem[
     return [
       ...common,
       {
-        id: 'sw-reload',
-        title: 'user reloads the fork extension service worker',
+        id: 'sw-stop',
+        title: 'user stops the extension service worker in the same browser run',
         how: 'manual-user',
-        detail: 'chrome://extensions -> fork card -> reload button; the harness polls for the re-published inventory',
+        detail:
+          'fork card -> service worker -> DevTools -> Application -> Service Workers -> Stop, then wake it (open a new tab or click the extension icon once). Stopping the worker must not clear storage.session, so the browserEpoch stays the same.',
       },
       {
         id: 'resources-restored',
-        title: 'the persisted registry restores the same resources',
+        title: 'same-epoch restore brings the recorded resources back ready',
         how: 'auto',
-        detail: 'same groupIds/tabIds, revision increases, recorded tabs become ready again',
+        detail:
+          'same groupIds/tabIds are listed ready again and a page snapshot works. If your Chrome build does not expose Stop for the extension service worker, this phase is not-verifiable, never a product failure.',
+      },
+    ]
+  }
+  if (phase === 'extension-reload') {
+    return [
+      ...common,
+      {
+        id: 'extension-reload-user',
+        title: 'user reloads the extension card (clears storage.session)',
+        how: 'manual-user',
+        detail:
+          'chrome://extensions -> fork card -> reload. Reloading clears storage.session, so the browserEpoch changes; this is the cold-restart boundary, not a same-epoch worker restart.',
+      },
+      {
+        id: 'needs-rebind-degradation',
+        title: 'records degrade to needs-rebind without auto-adoption',
+        how: 'auto',
+        detail:
+          'every recorded group/tab that was not released before the reload comes back as needs-rebind with its logical id, nothing becomes ready, no duplicate resources appear, page actions fail with needs-rebind, and Chrome tabs/groups the user sees are not moved or closed by the extension.',
+      },
+      {
+        id: 'rebind-not-claimed',
+        title: 'explicit rebind is not claimed by this round',
+        how: 'auto-or-skip',
+        detail:
+          'the contract keeps logical resources but provides no rebind entry yet; recovery back to ready after an extension reload is NOT verified and must not be reported as passed.',
       },
     ]
   }
@@ -450,7 +523,8 @@ export function faultChecklist({ phase }: { phase: FaultPhase }): ChecklistItem[
         id: 'drag-out-user',
         title: 'user drags the instructed tab out of its Chrome group',
         how: 'manual-user',
-        detail: 'the user picks the tab whose marker the harness prints; the extension must record a user release',
+        detail:
+          'the harness first proves the recorded tab is still alive and ready, then prints its marker; the user drags that tab out and the extension must record a user release. If no recorded tab is alive (for example the main run used cleanup=on-success), this phase is not-verifiable instead of failed.',
       },
       {
         id: 'release-recorded',
@@ -481,11 +555,6 @@ export function faultChecklist({ phase }: { phase: FaultPhase }): ChecklistItem[
       detail: 'the request must not report success; the fixture counter must stay at most one and never grow afterwards',
     },
   ]
-}
-
-export function extractAriaRefs({ snapshotText }: { snapshotText: string }): string[] {
-  const matches = snapshotText.match(/aria-ref=[A-Za-z0-9_-]+/g) || []
-  return Array.from(new Set(matches))
 }
 
 export function counterDelta({
@@ -738,16 +807,6 @@ export function runAcceptanceSelfChecks(): SelfCheck[] {
   })
 
   run({
-    name: 'aria-ref extraction finds refs once',
-    fn: () => {
-      const refs = extractAriaRefs({ snapshotText: 'button "Save" aria-ref=e12\nlink aria-ref=e12\ninput aria-ref=e3' })
-      return refs.length === 2 && refs.includes('aria-ref=e12') && refs.includes('aria-ref=e3')
-        ? null
-        : `unexpected refs ${JSON.stringify(refs)}`
-    },
-  })
-
-  run({
     name: 'counter delta uses tag counters only',
     fn: () => {
       const delta = counterDelta({ before: { a: 1 }, after: { a: 3, b: 9 }, tag: 'a' })
@@ -790,6 +849,66 @@ export function runAcceptanceSelfChecks(): SelfCheck[] {
     name: 'expected protocol version is the shared contract value',
     fn: () => {
       return EXPECTED_PROTOCOL_VERSION === 1 ? null : `unexpected protocol version ${EXPECTED_PROTOCOL_VERSION}`
+    },
+  })
+
+  run({
+    name: 'every fault phase has its own checklist',
+    fn: () => {
+      const phases: FaultPhase[] = ['ws-drop', 'relay-restart', 'sw-restart', 'extension-reload', 'drag-out', 'worker-kill']
+      for (const phase of phases) {
+        const items = faultChecklist({ phase })
+        if (items.length < 3) {
+          return `phase ${phase} has only ${items.length} checklist items`
+        }
+        if (!items.some((item) => item.id === `${phase}-gate`)) {
+          return `phase ${phase} is missing its gate item`
+        }
+      }
+      return null
+    },
+  })
+
+  run({
+    name: 'evidence levels distinguish pure, http stub and live Chrome',
+    fn: () => {
+      const pure = describeEvidenceLevel({ mode: 'self-test' })
+      const stub = describeEvidenceLevel({ mode: 'fixture-only' })
+      const live = describeEvidenceLevel({ mode: 'run' })
+      if (pure !== EVIDENCE_LEVELS.pure || stub !== EVIDENCE_LEVELS.httpStub || live !== EVIDENCE_LEVELS.live) {
+        return `unexpected levels: ${pure} / ${stub} / ${live}`
+      }
+      return null
+    },
+  })
+
+  run({
+    name: 'extension-reload must run alone',
+    fn: () => {
+      const issues = errorCodes({
+        issues: validateAcceptanceConfig({
+          config: baseConfig({
+            mode: 'faults',
+            faultPhases: ['extension-reload', 'relay-restart'],
+            statePath: 'tmp/ledger.json',
+            confirmTestOwnership: true,
+          }),
+          env: { [ACCEPTANCE_ENV.runGate]: '1', [ACCEPTANCE_ENV.faultGate]: '1' },
+        }),
+      })
+      return issues.includes('extension-reload-alone') ? null : `expected extension-reload-alone, got ${JSON.stringify(issues)}`
+    },
+  })
+
+  run({
+    name: 'sw-restart and extension-reload are distinct phases',
+    fn: () => {
+      const workerRestart = faultChecklist({ phase: 'sw-restart' }).map((item) => item.id)
+      const reload = faultChecklist({ phase: 'extension-reload' }).map((item) => item.id)
+      if (workerRestart.includes('extension-reload-user') || reload.includes('resources-restored')) {
+        return 'same-epoch worker restart and extension reload checklists are conflated'
+      }
+      return null
     },
   })
 

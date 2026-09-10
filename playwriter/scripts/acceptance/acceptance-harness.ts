@@ -32,8 +32,9 @@ import type { BrowserGroup, BrowserOperation, BrowserProfile, BrowserResponse, B
 import {
   ACCEPTANCE_ENV,
   DAILY_RELAY_PORT,
+  EVIDENCE_LEVELS,
   EXPECTED_PROTOCOL_VERSION,
-  extractAriaRefs,
+  describeEvidenceLevel,
   counterDelta,
   faultChecklist,
   mainChecklist,
@@ -130,13 +131,14 @@ usage:
   node playwriter/scripts/acceptance/acceptance-harness.ts [mode] [options]
 
 modes (default: --dry-run):
-  --dry-run                  validate gates and print the checklist + planned requests; connects nothing
+  --dry-run                  validate gates and print the checklist + planned requests; starts and connects nothing
   --list                     print the acceptance checklist only
   --self-test                run the pure gate/plan checks and exit
+  --fixture-only             start the local fixture HTTP server and keep it running (no browser, no relay)
   --run                      execute the live acceptance run (requires the hard gates below)
   --fault-mode               run --fault-phase steps against a ledger from a finished --run
   --cleanup-only             close only the resources recorded in --state, nothing else
-  --fixture-server           start the local fixture HTTP server and keep it running
+  --fixture-server           with --run: start fixture pages inside the run process
 
 live options:
   --base-url <url>           test runtime base URL, e.g. http://127.0.0.1:19990
@@ -190,6 +192,9 @@ function parseMode({ values }: { values: Record<string, unknown> }): HarnessMode
   if (values['cleanup-only']) {
     selected.push('cleanup-only')
   }
+  if (values['fixture-only']) {
+    selected.push('fixture-only')
+  }
   if (selected.length > 1) {
     return { error: `choose exactly one mode, got: ${selected.join(', ')}` }
   }
@@ -210,6 +215,7 @@ function readCliConfig({ argv }: { argv: string[] }): AcceptanceConfig | { error
         run: { type: 'boolean' },
         'fault-mode': { type: 'boolean' },
         'cleanup-only': { type: 'boolean' },
+        'fixture-only': { type: 'boolean' },
         'fixture-server': { type: 'boolean' },
         'base-url': { type: 'string' },
         token: { type: 'string' },
@@ -248,7 +254,7 @@ function readCliConfig({ argv }: { argv: string[] }): AcceptanceConfig | { error
   }
 
   const faultPhases = (parsed.values['fault-phase'] || []) as string[]
-  const allowedPhases: FaultPhase[] = ['ws-drop', 'relay-restart', 'sw-restart', 'drag-out', 'worker-kill']
+  const allowedPhases: FaultPhase[] = ['ws-drop', 'relay-restart', 'sw-restart', 'extension-reload', 'drag-out', 'worker-kill']
   const badPhase = faultPhases.find((phase) => !allowedPhases.includes(phase as FaultPhase))
   if (badPhase) {
     return { error: `unknown fault phase "${badPhase}", allowed: ${allowedPhases.join(', ')}` }
@@ -527,6 +533,9 @@ function writeReport({ state, extra, nameSuffix }: { state: RunState; extra?: Re
     value: {
       runId: state.runId,
       createdAt: new Date().toISOString(),
+      evidenceLevel: describeEvidenceLevel({ mode: state.config.mode }),
+      evidenceNote:
+        'pure and local-HTTP-stub checks are never browser acceptance; only a live run against the user-opened isolated Chrome counts as acceptance',
       config: redactAcceptanceConfig({ config: state.config }),
       summary: { passed, failed, skipped, total: state.results.length },
       steps: state.results,
@@ -910,14 +919,16 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
   await runStep({
     state,
     id: 'snapshot-click',
-    title: 'page.snapshot -> page.click with snapshotId',
+    title: 'page.snapshot -> page.click on a snapshot locator',
     fn: async () => {
       const { snapshotId, text } = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
       const marker = `acceptance:A1-${state.runId}`
       if (!text.includes(marker)) {
         throw new Error(`snapshot text does not contain the fixture marker ${marker}`)
       }
-      const refs = extractAriaRefs({ snapshotText: text })
+      if (!text.includes('submit-fill')) {
+        throw new Error('snapshot text does not expose the fixture submit locator; cannot click from the snapshot')
+      }
       state.countersBefore = await readCounters({ state })
       const { response } = await apiCall({
         state,
@@ -939,14 +950,8 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
           return { done: false as const, detail: `delta=${delta}` }
         },
       })
-      if (refs.length === 0) {
-        return {
-          evidence: `clicked [data-testid=submit-fill] with snapshotId=${snapshotId}; counter delta 1. snapshot text exposes no aria-ref= token, positive ref click not exercised`,
-          details: { after },
-        }
-      }
       return {
-        evidence: `clicked with snapshotId=${snapshotId}; snapshot exposes ${refs.length} aria-ref tokens (${refs.slice(0, 3).join(', ')}); counter delta 1`,
+        evidence: `snapshot returned snapshotId=${snapshotId} and the fixture locator; click accepted it and the counter delta is 1 (plain locators may omit snapshotId per contract, the ref binding is checked by the stale/unknown ref steps)`,
         details: { after },
       }
     },
@@ -955,7 +960,7 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
   await runStep({
     state,
     id: 'fill-and-verify',
-    title: 'page.fill with snapshotId and visible value check',
+    title: 'page.fill on the snapshot locator with visible value check',
     fn: async () => {
       const value = `acceptance-value-${state.runId}`
       const fresh = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
@@ -1026,54 +1031,83 @@ async function runMainPhase({ state }: { state: RunState }): Promise<void> {
   await runStep({
     state,
     id: 'stale-snapshot',
-    title: 'stale snapshotId is rejected without side effects',
+    title: 'stale snapshotId is rejected for snapshot refs without side effects',
     fn: async () => {
       const staleSnapshotId = state.lastSnapshotId
       if (!staleSnapshotId) {
         throw new Error('no earlier snapshotId was recorded')
       }
+      // Ref selectors are the ones the contract binds to a snapshotId: taking a
+      // newer snapshot makes the previous id stale, and a ref without any id must
+      // be refused. Plain CSS locators intentionally accept an optional id, so
+      // they cannot be used to prove the binding.
       const fresh = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
       if (fresh.snapshotId === staleSnapshotId) {
-        throw new Error('snapshotId did not change after a DOM mutation; stale detection cannot be exercised')
+        throw new Error('snapshotId did not change between two snapshots; stale detection cannot be exercised')
       }
       const before = await readCounters({ state })
-      const { response } = await apiCall({
+      const { response: staleResponse } = await apiCall({
         state,
         sessionId: state.config.sessionA,
-        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: '[data-testid="submit-fill"]', snapshotId: staleSnapshotId },
+        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: '@e1', snapshotId: staleSnapshotId },
       })
-      const failure = requireFailure({ response, what: 'stale snapshot click', allowedCodes: ['stale-snapshot'] })
+      const staleFailure = requireFailure({ response: staleResponse, what: 'click with stale snapshotId', allowedCodes: ['stale-snapshot'] })
+      const { response: missingIdResponse } = await apiCall({
+        state,
+        sessionId: state.config.sessionA,
+        operation: { kind: 'page.click', tabId: state.ids.tabA1, selector: 'aria-ref=e1' },
+      })
+      const missingIdFailure = requireFailure({ response: missingIdResponse, what: 'click with a ref but no snapshotId', allowedCodes: ['stale-snapshot'] })
       await new Promise((resolve) => {
         setTimeout(resolve, 1500)
       })
       const after = await readCounters({ state })
       const delta = counterDelta({ before, after, tag: `submit-fill-A1-${state.runId}` })
       if (delta !== 0) {
-        throw new Error(`stale snapshot click produced a side effect (counter delta ${delta})`)
+        throw new Error(`stale snapshot refs produced a side effect (counter delta ${delta})`)
       }
-      return { evidence: `rejected with ${failure.code} (${failure.outcome}); fixture counter delta 0` }
+      return {
+        evidence: `old snapshotId rejected with ${staleFailure.code}, ref without snapshotId rejected with ${missingIdFailure.code}; fixture counter delta 0`,
+      }
     },
   })
 
   await runStep({
     state,
     id: 'unknown-ref',
-    title: 'unknown aria-ref fails without clicking anything',
+    title: 'unknown snapshot ref fails without clicking anything',
     fn: async () => {
       const fresh = await snapshotTab({ state, sessionId: state.config.sessionA, tabId: state.ids.tabA1 })
+      const valueBefore = await evaluateInTab({
+        state,
+        sessionId: state.config.sessionA,
+        tabId: state.ids.tabA1,
+        code: `document.querySelector('[data-testid="name-input"]').value`,
+      })
+      const beforeData = requireSuccess({ response: valueBefore, what: 'page.evaluate input value' })
       const before = await readCounters({ state })
       const { response } = await apiCall({
         state,
         sessionId: state.config.sessionA,
         operation: { kind: 'page.fill', tabId: state.ids.tabA1, selector: 'aria-ref=e99999', value: 'should-not-apply', snapshotId: fresh.snapshotId },
       })
-      const failure = requireFailure({ response, what: 'fill with unknown aria-ref' })
+      const failure = requireFailure({ response, what: 'fill with unknown aria-ref', allowedCodes: ['stale-snapshot'] })
+      const valueAfter = await evaluateInTab({
+        state,
+        sessionId: state.config.sessionA,
+        tabId: state.ids.tabA1,
+        code: `document.querySelector('[data-testid="name-input"]').value`,
+      })
+      const afterData = requireSuccess({ response: valueAfter, what: 'page.evaluate input value' })
+      if (String(afterData.value ?? afterData.text ?? '') !== String(beforeData.value ?? beforeData.text ?? '')) {
+        throw new Error('unknown snapshot ref changed the input value')
+      }
       const after = await readCounters({ state })
       const delta = counterDelta({ before, after, tag: `submit-fill-A1-${state.runId}` })
       if (delta !== 0) {
-        throw new Error(`unknown aria-ref produced a side effect (counter delta ${delta})`)
+        throw new Error(`unknown snapshot ref produced a side effect (counter delta ${delta})`)
       }
-      return { evidence: `rejected with ${failure.code} (${failure.outcome}); no fixture side effect` }
+      return { evidence: `rejected with ${failure.code} (${failure.outcome}); input unchanged, no fixture side effect` }
     },
   })
 
@@ -1377,21 +1411,26 @@ async function cleanupOwnResources({ state, ledger }: { state: RunState; ledger:
         tabs,
       })
       const closedTabs: string[] = []
-      const leftReleased: string[] = []
+      const leftAlone: string[] = []
+      const benignCloseCodes = ['resource-released', 'resource-not-found', 'needs-rebind']
       for (const tab of selection.tabs) {
-        if (tab.state !== 'ready') {
-          leftReleased.push(`${tab.tabId}:${tab.state}`)
+        if (tab.state === 'released') {
+          leftAlone.push(`${tab.tabId}: already released, nothing to close`)
           continue
         }
         const { response } = await apiCall({ state, sessionId: tab.sessionId, operation: { kind: 'tabs.close', tabId: tab.tabId } })
         if (!response.ok) {
-          if (response.error.code === 'resource-released') {
-            leftReleased.push(`${tab.tabId}:released`)
+          if (benignCloseCodes.includes(response.error.code)) {
+            leftAlone.push(`${tab.tabId}: ${response.error.code} (left alone)`)
             continue
           }
           throw new Error(`tabs.close ${tab.tabId} failed: ${response.error.code}: ${response.error.message}`)
         }
-        closedTabs.push(tab.tabId)
+        if (tab.state === 'needs-rebind' || tab.state === 'disconnected') {
+          leftAlone.push(`${tab.tabId}: logical record released; the physical Chrome tab was not touched and stays for manual close`)
+        } else {
+          closedTabs.push(tab.tabId)
+        }
       }
       await pollUntil({
         description: 'recorded ready tabs disappear from the inventory',
@@ -1402,7 +1441,7 @@ async function cleanupOwnResources({ state, ledger }: { state: RunState; ledger:
           for (const sessionId of [ledger.sessions.a, ledger.sessions.b]) {
             remaining.push(...(await listTabs({ state, sessionId })))
           }
-          const stillReady = remaining.filter((tab) => selection.tabs.some((owned) => owned.tabId === tab.tabId) && tab.state === 'ready')
+          const stillReady = remaining.filter((tab) => closedTabs.includes(tab.tabId) && tab.state === 'ready')
           if (stillReady.length === 0) {
             return { done: true as const, value: remaining }
           }
@@ -1411,11 +1450,28 @@ async function cleanupOwnResources({ state, ledger }: { state: RunState; ledger:
       })
       const closedGroups: string[] = []
       for (const group of selection.groups) {
-        if (group.state !== 'ready') {
+        if (group.state === 'released') {
+          leftAlone.push(`group ${group.groupId}: already released`)
+          continue
+        }
+        const tabsInGroup = await listTabs({ state, sessionId: group.sessionId, groupId: group.groupId })
+        const stillReady = tabsInGroup.filter((tab) => tab.state === 'ready')
+        if (stillReady.length > 0) {
+          // The extension itself only closes tabs that are in its registry, so
+          // an unrecorded user tab is never touched by groups.close. This guard
+          // is about our own failed closes: never force a group closed while
+          // recorded ready tabs are still in it.
+          leftAlone.push(
+            `group ${group.groupId}: still has ${stillReady.length} ready recorded tab(s) (${stillReady.map((tab) => tab.tabId).join(', ')}); leaving the group untouched`,
+          )
           continue
         }
         const { response } = await apiCall({ state, sessionId: group.sessionId, operation: { kind: 'groups.close', groupId: group.groupId } })
-        if (!response.ok && response.error.code !== 'resource-released') {
+        if (!response.ok) {
+          if (benignCloseCodes.includes(response.error.code)) {
+            leftAlone.push(`group ${group.groupId}: ${response.error.code} (left alone)`)
+            continue
+          }
           throw new Error(`groups.close ${group.groupId} failed: ${response.error.code}: ${response.error.message}`)
         }
         closedGroups.push(group.groupId)
@@ -1429,7 +1485,7 @@ async function cleanupOwnResources({ state, ledger }: { state: RunState; ledger:
           for (const sessionId of [ledger.sessions.a, ledger.sessions.b]) {
             remaining.push(...(await listGroups({ state, sessionId })))
           }
-          const stillReady = remaining.filter((group) => selection.groups.some((owned) => owned.groupId === group.groupId) && group.state === 'ready')
+          const stillReady = remaining.filter((group) => closedGroups.includes(group.groupId) && group.state === 'ready')
           if (stillReady.length === 0) {
             return { done: true as const, value: remaining }
           }
@@ -1437,8 +1493,8 @@ async function cleanupOwnResources({ state, ledger }: { state: RunState; ledger:
         },
       })
       return {
-        evidence: `closed ${closedTabs.length} tabs and ${closedGroups.length} groups; left released/user-owned tabs untouched (${leftReleased.join(', ') || 'none'}); rejected ${selection.rejected.length} foreign records`,
-        details: { closedTabs, closedGroups, leftReleased, rejected: selection.rejected },
+        evidence: `closed ${closedTabs.length} tabs and ${closedGroups.length} groups; left alone ${leftAlone.length} (${leftAlone.join('; ') || 'none'}); rejected ${selection.rejected.length} foreign records`,
+        details: { closedTabs, closedGroups, leftAlone, rejected: selection.rejected },
       }
     },
   })
@@ -1469,9 +1525,119 @@ async function runFaultPhases({ config, ledger }: { config: AcceptanceConfig; le
   const recordedGroupIds = ledger.groups.map((group) => group.groupId)
   const recordedTabIds = ledger.tabs.map((tab) => tab.tabId)
 
+  type InventoryState = { groups: BrowserGroup[]; tabs: BrowserTab[] }
+
+  const recordedStates = (snapshot: InventoryState) => {
+    const groups = new Map<string, string>()
+    const tabs = new Map<string, string>()
+    for (const group of snapshot.groups) {
+      if (recordedGroupIds.includes(group.groupId)) {
+        groups.set(group.groupId, group.state)
+      }
+    }
+    for (const tab of snapshot.tabs) {
+      if (recordedTabIds.includes(tab.tabId)) {
+        tabs.set(tab.tabId, tab.state)
+      }
+    }
+    return { groups, tabs }
+  }
+
+  /** Polls until every recorded id is present again with its pre-fault state. */
+  const waitForStableRecordedStates = async ({
+    description,
+    expected,
+    readyRequired,
+  }: {
+    description: string
+    expected: { groups: Map<string, string>; tabs: Map<string, string> }
+    readyRequired: boolean
+  }): Promise<InventoryState> => {
+    return await pollUntil({
+      description,
+      timeoutMs: 90000,
+      intervalMs: 2000,
+      check: async () => {
+        const snapshot = await inventorySnapshot()
+        const current = recordedStates(snapshot)
+        const missing = [
+          ...Array.from(expected.groups.keys()).filter((id) => !current.groups.has(id)),
+          ...Array.from(expected.tabs.keys()).filter((id) => !current.tabs.has(id)),
+        ]
+        if (missing.length > 0) {
+          return { done: false as const, detail: `recorded ids not back yet: ${missing.join(', ')}` }
+        }
+        const mismatched = Array.from(expected.tabs.entries())
+          .filter(([id, state]) => current.tabs.get(id) !== state)
+          .map(([id, state]) => `${id}:${current.tabs.get(id)}!=${state}`)
+        if (mismatched.length > 0) {
+          return { done: false as const, detail: `tab states not restored: ${mismatched.join(', ')}` }
+        }
+        if (readyRequired) {
+          const disconnected = snapshot.tabs.filter((tab) => recordedTabIds.includes(tab.tabId) && tab.state === 'disconnected')
+          if (disconnected.length > 0) {
+            return { done: false as const, detail: `still disconnected: ${disconnected.map((tab) => tab.tabId).join(', ')}` }
+          }
+        }
+        return { done: true as const, value: snapshot }
+      },
+    })
+  }
+
+  const pickReadyRecordedTab = async ({ purposes, sessionId }: { purposes: string[]; sessionId: string }): Promise<BrowserTab | null> => {
+    const { tabs } = await inventorySnapshot()
+    for (const purpose of purposes) {
+      const candidate = ledger.tabs.find((tab) => tab.purpose === purpose && tab.sessionId === sessionId)
+      if (!candidate) {
+        continue
+      }
+      const live = tabs.find((tab) => tab.tabId === candidate.tabId)
+      if (live && live.state === 'ready') {
+        return live
+      }
+    }
+    return null
+  }
+
+  const inventoryPreflight = await runStep({
+    state,
+    id: 'fault-preflight',
+    title: 'ledger resources are still alive for fault verification',
+    fn: async () => {
+      const snapshot = await inventorySnapshot()
+      const live = recordedStates(snapshot)
+      if (live.groups.size === 0 && live.tabs.size === 0) {
+        return {
+          status: 'skipped',
+          skipReason:
+            'no recorded resources are present. If the main run used --cleanup=on-success they were already closed: rerun the main phase with --cleanup never and the same fixture server. This is a setup issue, not a product failure',
+          evidence: '',
+        }
+      }
+      return {
+        evidence: `${live.groups.size}/${recordedGroupIds.length} recorded groups and ${live.tabs.size}/${recordedTabIds.length} recorded tabs are still present`,
+      }
+    },
+  })
+
+  if (inventoryPreflight.status !== 'pass') {
+    for (const phase of config.faultPhases) {
+      state.results.push({
+        id: `${phase}-not-verifiable`,
+        title: `fault phase ${phase} was not verified`,
+        status: 'skipped',
+        evidence: 'fault preflight found no live recorded resources; not a product failure, see manual-acceptance.md for the --cleanup never workflow',
+      })
+    }
+    return state
+  }
+
   for (const phase of config.faultPhases) {
     if (phase === 'ws-drop' || phase === 'relay-restart') {
-      await runStep({
+      const before = await inventorySnapshot()
+      const expected = recordedStates(before)
+      const readyBefore = Array.from(expected.tabs.values()).filter((state) => state === 'ready').length
+      const downResult = await runStep({
         state,
         id: `${phase}-relay-down`,
         title: 'user stops the test runtime and the endpoint goes unreachable',
@@ -1503,9 +1669,16 @@ async function runFaultPhases({ config, ledger }: { config: AcceptanceConfig; le
         id: `${phase}-relay-up`,
         title: 'user restarts the runtime and resources come back',
         fn: async () => {
+          if (downResult.status !== 'pass') {
+            return {
+              status: 'skipped',
+              skipReason: 'the runtime was not observed as stopped first, so the restart check would be vacuous; not-verifiable',
+              evidence: '',
+            }
+          }
           const started = await waitForUser({
             state,
-            message: `Start the TEST runtime again with the same PI_BROWSER_PORT/DATA_DIR/token. Press Enter once it prints it is listening.`,
+            message: 'Start the TEST runtime again with the same PI_BROWSER_PORT/DATA_DIR/token. Press Enter once it prints it is listening.',
           })
           if (!started) {
             return { status: 'skipped', skipReason: 'non-interactive session; fault step is user-driven', evidence: '' }
@@ -1522,85 +1695,237 @@ async function runFaultPhases({ config, ledger }: { config: AcceptanceConfig; le
               return { done: false as const, detail: `${result.state}: ${result.detail}` }
             },
           })
-          const { groups, tabs } = await pollUntil({
-            description: 'recorded resources reappear after reconnect',
-            timeoutMs: 60000,
-            intervalMs: 2000,
-            check: async () => {
-              const snapshot = await inventorySnapshot()
-              const groupIds = snapshot.groups.map((group) => group.groupId).filter((id) => recordedGroupIds.includes(id))
-              const tabIds = snapshot.tabs.map((tab) => tab.tabId).filter((id) => recordedTabIds.includes(id))
-              if (sameIdSet({ left: groupIds, right: recordedGroupIds }) && sameIdSet({ left: tabIds, right: recordedTabIds })) {
-                return { done: true as const, value: snapshot }
-              }
-              return { done: false as const, detail: `groups=${groupIds.length}/${recordedGroupIds.length} tabs=${tabIds.length}/${recordedTabIds.length}` }
-            },
+          const restored = await waitForStableRecordedStates({
+            description: 'recorded resources return with their pre-outage states',
+            expected,
+            readyRequired: true,
           })
-          const readyTabs = tabs.filter((tab) => recordedTabIds.includes(tab.tabId) && tab.state === 'ready')
-          const expectedReady = ledger.tabs.filter((tab) => tab.purpose !== 'B2-release-candidate').length
-          if (readyTabs.length < Math.min(expectedReady, recordedTabIds.length)) {
-            throw new Error(`only ${readyTabs.length} recorded tabs are ready after reconnect, expected at least ${expectedReady}`)
+          const readyTab = await pickReadyRecordedTab({ purposes: ['A1-main'], sessionId: ledger.sessions.a })
+          if (!readyTab) {
+            return {
+              evidence: `${restored.groups.length} groups and ${restored.tabs.length} tabs preserved; no ready A-session tab existed before the outage, page action not exercised`,
+            }
           }
-          const snapshotState = await snapshotTab({ state, sessionId: ledger.sessions.a, tabId: ledger.tabs.find((tab) => tab.purpose === 'A1-main')?.tabId || recordedTabIds[0] })
+          const snapshotState = await snapshotTab({ state, sessionId: ledger.sessions.a, tabId: readyTab.tabId })
           if (!snapshotState.text.includes('acceptance:')) {
             throw new Error('post-restart snapshot did not return fixture content')
           }
-          state.ledger.finalRevisionByProfile = Object.fromEntries(groups.map((group) => [group.profileId, group.revision]))
           return {
-            evidence: `same ${groups.length} groups and ${tabs.length} tabs after restart, ${readyTabs.length} ready, page snapshot works again`,
+            evidence: `${restored.groups.length} groups and ${restored.tabs.length} tabs kept their ids and states (${readyBefore} ready before), page snapshot works again`,
           }
         },
       })
     }
 
     if (phase === 'sw-restart') {
-      await runStep({
+      const before = await inventorySnapshot()
+      const expected = recordedStates(before)
+      const stopResult = await runStep({
         state,
-        id: 'sw-restart-reload',
-        title: 'user reloads the fork extension service worker',
+        id: 'sw-restart-stop',
+        title: 'user stops the extension service worker in the same browser run',
         fn: async () => {
           const started = await waitForUser({
             state,
             message:
-              'Open chrome://extensions in the isolated Chrome, find the fork extension card (eeklahpecooapnailfaebkjjembkjhhg), click its reload button. Press Enter after it reconnects.',
+              'In chrome://extensions open the fork card service worker, then DevTools -> Application -> Service Workers -> Stop. Do NOT use the card reload button: a reload clears storage.session and is the separate extension-reload phase. Press Enter after stopping it.',
           })
           if (!started) {
             return { status: 'skipped', skipReason: 'non-interactive session; fault step is user-driven', evidence: '' }
           }
-          const { groups, tabs } = await pollUntil({
-            description: 'inventory republished with the same resources',
+          let disconnected: BrowserProfile[] | null = null
+          try {
+            disconnected = await pollUntil({
+              description: 'managed profile goes disconnected after the worker stopped',
+              timeoutMs: 25000,
+              intervalMs: 1000,
+              check: async () => {
+                const profiles = await listProfiles({ endpoint: state.endpoint, timeoutMs: 3000 })
+                const offline = profiles.filter((profile) => !profile.connected)
+                if (offline.length > 0) {
+                  return { done: true as const, value: offline }
+                }
+                return { done: false as const, detail: `still connected: ${profiles.map((profile) => profile.profileId).join(', ') || 'no profiles'}` }
+              },
+            })
+          } catch (error) {
+            if (!(error instanceof AcceptanceTimeoutError)) {
+              throw error
+            }
+          }
+          if (!disconnected) {
+            return {
+              status: 'skipped',
+              skipReason:
+                'the profile never went disconnected, so the worker was probably not stopped (Chrome builds without Stop for the extension service worker cannot run this phase). Not-verifiable, not a product failure',
+              evidence: '',
+            }
+          }
+          return { evidence: `profile disconnected after the worker stop (${disconnected.map((profile) => profile.profileId).join(', ')})` }
+        },
+      })
+      await runStep({
+        state,
+        id: 'sw-restart-restore',
+        title: 'same-epoch restore brings the recorded resources back ready',
+        fn: async () => {
+          if (stopResult.status !== 'pass') {
+            return { status: 'skipped', skipReason: 'the worker stop was not observed; restore cannot be verified', evidence: '' }
+          }
+          const started = await waitForUser({
+            state,
+            message: 'Wake the service worker again (open a new tab or click the extension icon once). Press Enter after it reconnects.',
+          })
+          if (!started) {
+            return { status: 'skipped', skipReason: 'non-interactive session; fault step is user-driven', evidence: '' }
+          }
+          const restored = await waitForStableRecordedStates({
+            description: 'recorded resources come back with the same states',
+            expected,
+            readyRequired: true,
+          })
+          const readyTab = await pickReadyRecordedTab({ purposes: ['A1-main'], sessionId: ledger.sessions.a })
+          if (!readyTab) {
+            return { evidence: `${restored.groups.length} groups and ${restored.tabs.length} tabs restored; no ready A-session tab existed before the stop, page action not exercised` }
+          }
+          const snapshotState = await snapshotTab({ state, sessionId: ledger.sessions.a, tabId: readyTab.tabId })
+          if (!snapshotState.text.includes('acceptance:')) {
+            throw new Error('post-worker-restart snapshot did not return fixture content')
+          }
+          return { evidence: `${restored.groups.length} groups and ${restored.tabs.length} tabs restored ready with the same ids; page snapshot works` }
+        },
+      })
+    }
+
+    if (phase === 'extension-reload') {
+      const before = await inventorySnapshot()
+      const expected = recordedStates(before)
+      const mustRebindGroups = Array.from(expected.groups.entries())
+        .filter(([, state]) => state !== 'released')
+        .map(([id]) => id)
+      const mustRebindTabs = Array.from(expected.tabs.entries())
+        .filter(([, state]) => state !== 'released')
+        .map(([id]) => id)
+      const reloadResult = await runStep({
+        state,
+        id: 'extension-reload-user',
+        title: 'user reloads the extension card (clears storage.session)',
+        fn: async () => {
+          const started = await waitForUser({
+            state,
+            message:
+              'Click the reload icon on the fork extension card in chrome://extensions. Press Enter after the card finished reloading.',
+          })
+          if (!started) {
+            return { status: 'skipped', skipReason: 'non-interactive session; fault step is user-driven', evidence: '' }
+          }
+          await pollUntil({
+            description: 'runtime sees the profile connected again after the extension reload',
             timeoutMs: 90000,
             intervalMs: 2000,
             check: async () => {
-              const snapshot = await inventorySnapshot()
-              const groupIds = snapshot.groups.map((group) => group.groupId).filter((id) => recordedGroupIds.includes(id))
-              const tabIds = snapshot.tabs.map((tab) => tab.tabId).filter((id) => recordedTabIds.includes(id))
-              const profilesReady = snapshot.groups.length === 0 || snapshot.groups.every((group) => group.state !== 'disconnected')
-              if (sameIdSet({ left: groupIds, right: recordedGroupIds }) && sameIdSet({ left: tabIds, right: recordedTabIds }) && profilesReady) {
-                return { done: true as const, value: snapshot }
+              const profiles = await listProfiles({ endpoint: state.endpoint, timeoutMs: 3000 })
+              const connected = profiles.filter((profile) => profile.connected)
+              if (connected.length > 0) {
+                return { done: true as const, value: connected }
               }
-              return { done: false as const, detail: `groups=${groupIds.length}/${recordedGroupIds.length} tabs=${tabIds.length}/${recordedTabIds.length} connected=${profilesReady}` }
+              return { done: false as const, detail: `profiles: ${profiles.map((profile) => `${profile.profileId}:${profile.connected}`).join(', ') || 'none'}` }
             },
           })
-          const mainTabId = ledger.tabs.find((tab) => tab.purpose === 'A1-main')?.tabId || recordedTabIds[0]
-          const snapshotState = await snapshotTab({ state, sessionId: ledger.sessions.a, tabId: mainTabId })
-          if (!snapshotState.text.includes('acceptance:')) {
-            throw new Error('post-SW-reload snapshot did not return fixture content')
+          return { evidence: 'extension reconnected after the card reload' }
+        },
+      })
+      await runStep({
+        state,
+        id: 'needs-rebind-degradation',
+        title: 'records degrade to needs-rebind without auto-adoption',
+        fn: async () => {
+          if (reloadResult.status !== 'pass') {
+            return { status: 'skipped', skipReason: 'the extension reload was not observed; degradation cannot be verified', evidence: '' }
           }
-          return { evidence: `same ${groups.length} groups and ${tabs.length} tabs after SW reload; page snapshot works`, details: { mainTabId } }
+          if (mustRebindGroups.length === 0 && mustRebindTabs.length === 0) {
+            return { status: 'skipped', skipReason: 'only released records existed before the reload; the degradation check would be vacuous', evidence: '' }
+          }
+          const snapshot = await pollUntil({
+            description: 'recorded resources degrade to needs-rebind and none becomes ready',
+            timeoutMs: 60000,
+            intervalMs: 2000,
+            check: async () => {
+              const current = await inventorySnapshot()
+              const groupStates = new Map(
+                current.groups.filter((group) => recordedGroupIds.includes(group.groupId)).map((group) => [group.groupId, group.state]),
+              )
+              const tabStates = new Map(current.tabs.filter((tab) => recordedTabIds.includes(tab.tabId)).map((tab) => [tab.tabId, tab.state]))
+              const missing = [...mustRebindGroups, ...mustRebindTabs].filter((id) => !groupStates.has(id) && !tabStates.has(id))
+              if (missing.length > 0) {
+                return { done: false as const, detail: `logical records missing: ${missing.join(', ')}` }
+              }
+              const wrong = [
+                ...mustRebindGroups.filter((id) => groupStates.get(id) !== 'needs-rebind').map((id) => `group ${id}:${groupStates.get(id)}`),
+                ...mustRebindTabs.filter((id) => tabStates.get(id) !== 'needs-rebind').map((id) => `tab ${id}:${tabStates.get(id)}`),
+              ]
+              if (wrong.length > 0) {
+                return { done: false as const, detail: `not needs-rebind yet: ${wrong.join(', ')}` }
+              }
+              const readyCount =
+                Array.from(groupStates.values()).filter((state) => state === 'ready').length +
+                Array.from(tabStates.values()).filter((state) => state === 'ready').length
+              if (readyCount > 0) {
+                return { done: false as const, detail: `${readyCount} recorded resources are still ready; a new browserEpoch must not auto-adopt them` }
+              }
+              return { done: true as const, value: current }
+            },
+          })
+          const groupIds = snapshot.groups.filter((group) => recordedGroupIds.includes(group.groupId)).map((group) => group.groupId)
+          const tabIds = snapshot.tabs.filter((tab) => recordedTabIds.includes(tab.tabId)).map((tab) => tab.tabId)
+          const duplicateGroups = groupIds.filter((id, index) => groupIds.indexOf(id) !== index)
+          const duplicateTabs = tabIds.filter((id, index) => tabIds.indexOf(id) !== index)
+          if (duplicateGroups.length > 0 || duplicateTabs.length > 0) {
+            throw new Error(`duplicate records after the reload: groups ${duplicateGroups.join(', ')} tabs ${duplicateTabs.join(', ')}`)
+          }
+          const needsRebindTabId = mustRebindTabs[0]
+          if (needsRebindTabId) {
+            const operationResponse = await apiCall({
+              state,
+              sessionId: ledger.tabs.find((tab) => tab.tabId === needsRebindTabId)?.sessionId || ledger.sessions.a,
+              operation: { kind: 'page.snapshot', tabId: needsRebindTabId },
+            })
+            const failure = requireFailure({ response: operationResponse.response, what: 'page action on needs-rebind tab', allowedCodes: ['needs-rebind'] })
+            return {
+              evidence: `${mustRebindGroups.length} groups and ${mustRebindTabs.length} tabs kept as needs-rebind, none ready, no duplicates; page action rejected ${failure.code}`,
+            }
+          }
+          return { evidence: `${mustRebindGroups.length} groups kept as needs-rebind, none ready, no duplicates` }
+        },
+      })
+      await runStep({
+        state,
+        id: 'rebind-not-claimed',
+        title: 'explicit rebind is not claimed by this round',
+        fn: async () => {
+          return {
+            status: 'skipped',
+            skipReason:
+              'the contract keeps logical resources but has no rebind entry yet: recovery back to ready after an extension reload is NOT verified by this acceptance and must not be reported as passed',
+            evidence: '',
+          }
         },
       })
     }
 
     if (phase === 'drag-out') {
+      const candidate = await pickReadyRecordedTab({ purposes: ['A2-drag-candidate'], sessionId: ledger.sessions.a })
       await runStep({
         state,
         id: 'drag-out-user',
         title: 'user drags the A2 tab out of its Chrome group',
         fn: async () => {
-          const candidate = ledger.tabs.find((tab) => tab.purpose === 'A2-drag-candidate')
           if (!candidate) {
-            return { status: 'skipped', skipReason: 'ledger has no A2-drag-candidate tab', evidence: '' }
+            return {
+              status: 'skipped',
+              skipReason: 'no live ready recorded A2 tab: the resource was released or cleaned up, so this phase is not-verifiable',
+              evidence: '',
+            }
           }
           const started = await waitForUser({
             state,
@@ -1609,7 +1934,7 @@ async function runFaultPhases({ config, ledger }: { config: AcceptanceConfig; le
           if (!started) {
             return { status: 'skipped', skipReason: 'non-interactive session; fault step is user-driven', evidence: '' }
           }
-          const released = await pollUntil({
+          await pollUntil({
             description: 'dragged tab is recorded as released',
             timeoutMs: 60000,
             intervalMs: 1000,
@@ -1635,14 +1960,28 @@ async function runFaultPhases({ config, ledger }: { config: AcceptanceConfig; le
           return { evidence: `tab ${candidate.tabId} recorded released after user drag-out; page action rejected ${failure.code}; group still listed` }
         },
       })
+      const lastCandidate = await pickReadyRecordedTab({ purposes: ['B1-last-tab'], sessionId: ledger.sessions.b })
       await runStep({
         state,
         id: 'drag-out-last-tab',
         title: 'optional: dragging out the last tab keeps the empty group',
         fn: async () => {
-          const candidate = ledger.tabs.find((tab) => tab.purpose === 'B1-last-tab')
-          if (!candidate) {
-            return { status: 'skipped', skipReason: 'ledger has no B1-last-tab', evidence: '' }
+          if (!lastCandidate) {
+            return {
+              status: 'skipped',
+              skipReason: 'no live ready recorded B1 tab: the resource was released or cleaned up, so this phase is not-verifiable',
+              evidence: '',
+            }
+          }
+          const readyInGroup = (await listTabs({ state, sessionId: ledger.sessions.b, groupId: lastCandidate.groupId })).filter(
+            (tab) => tab.state === 'ready',
+          )
+          if (readyInGroup.length !== 1 || readyInGroup[0].tabId !== lastCandidate.tabId) {
+            return {
+              status: 'skipped',
+              skipReason: `group B1 has ${readyInGroup.length} ready tabs instead of exactly the recorded last tab (state drift); last-tab drag-out is not-verifiable`,
+              evidence: '',
+            }
           }
           const started = await waitForUser({
             state,
@@ -1657,40 +1996,44 @@ async function runFaultPhases({ config, ledger }: { config: AcceptanceConfig; le
             intervalMs: 1000,
             check: async () => {
               const tabs = await listTabs({ state, sessionId: ledger.sessions.b })
-              const tab = tabs.find((candidateTab) => candidateTab.tabId === candidate.tabId)
+              const tab = tabs.find((candidateTab) => candidateTab.tabId === lastCandidate.tabId)
               if (tab && tab.state === 'released') {
                 return { done: true as const, value: tab }
               }
               return { done: false as const, detail: `state=${tab?.state || 'missing'}` }
             },
           })
-          const tabs = await listTabs({ state, sessionId: ledger.sessions.b, groupId: candidate.groupId })
-          const ready = tabs.filter((tab) => tab.state === 'ready')
+          const tabsInGroup = await listTabs({ state, sessionId: ledger.sessions.b, groupId: lastCandidate.groupId })
+          const ready = tabsInGroup.filter((tab) => tab.state === 'ready')
           if (ready.length !== 0) {
             throw new Error(`group still has ${ready.length} ready tabs after the last tab was dragged out`)
           }
           const groups = await listGroups({ state, sessionId: ledger.sessions.b })
-          if (!groups.some((group) => group.groupId === candidate.groupId)) {
+          if (!groups.some((group) => group.groupId === lastCandidate.groupId)) {
             throw new Error('empty group disappeared after the last tab was dragged out')
           }
-          return { evidence: `group ${candidate.groupId} kept with 0 ready tabs after the last tab was dragged out` }
+          return { evidence: `group ${lastCandidate.groupId} kept with 0 ready tabs after the last tab was dragged out` }
         },
       })
     }
 
     if (phase === 'worker-kill') {
+      const mainTab = await pickReadyRecordedTab({ purposes: ['A1-main'], sessionId: ledger.sessions.a })
       await runStep({
         state,
         id: 'worker-kill-inflight',
         title: 'user kills the executor worker during a long page.execute',
         fn: async () => {
-          const mainTab = ledger.tabs.find((tab) => tab.purpose === 'A1-main') || ledger.tabs[0]
           if (!mainTab) {
-            return { status: 'skipped', skipReason: 'ledger has no tabs', evidence: '' }
+            return {
+              status: 'skipped',
+              skipReason: 'no live ready recorded A-session tab: the resource was released or cleaned up, so this phase is not-verifiable',
+              evidence: '',
+            }
           }
           if (!state.fixtureBaseUrl) {
             throw new Error(
-              'no reachable fixture server for the counter check: start one with --fixture-server in another terminal and pass --fixture-url to this fault run',
+              'no reachable fixture server for the counter check: start one with --fixture-only in another terminal and pass --fixture-url to this fault run',
             )
           }
           const tag = `worker-kill-${ledger.runId}-${state.requestNonce}`
@@ -1758,6 +2101,7 @@ async function runCleanupOnly({ config }: { config: AcceptanceConfig }): Promise
 
 async function runLive({ config }: { config: AcceptanceConfig }): Promise<void> {
   const state = createState({ config, fixtureBaseUrl: config.fixtureUrl || '' })
+  console.log(`evidence level: ${EVIDENCE_LEVELS.live}`)
   let fixture: FixtureServer | null = null
   const onSigint = () => {
     console.log('\ninterrupted; writing ledger and report before exit')
@@ -1834,7 +2178,7 @@ async function main(): Promise<void> {
       console.log(`${item.how.padEnd(14)} ${item.id.padEnd(28)} ${item.title}`)
       console.log(`${''.padEnd(15)}${item.detail}`)
     }
-    for (const phase of ['ws-drop', 'relay-restart', 'sw-restart', 'drag-out', 'worker-kill'] as FaultPhase[]) {
+    for (const phase of ['ws-drop', 'relay-restart', 'sw-restart', 'extension-reload', 'drag-out', 'worker-kill'] as FaultPhase[]) {
       console.log(`\n[fault phase ${phase}]`)
       for (const item of faultChecklist({ phase })) {
         console.log(`${item.how.padEnd(14)} ${item.id.padEnd(28)} ${item.title}`)
@@ -1857,17 +2201,14 @@ async function main(): Promise<void> {
     return
   }
 
-  const issues = validateAcceptanceConfig({ config, env: process.env })
-  const errors = issues.filter((issue) => issue.level === 'error')
-  for (const issue of issues) {
-    console.log(`${issue.level === 'error' ? 'ERROR' : 'WARN '} [${issue.code}] ${issue.message}`)
-  }
-
-  if (config.mode === 'dry-run' && config.fixtureServer) {
+  if (config.mode === 'fixture-only') {
     const fixture = await startFixtureServer({ port: config.fixturePort })
-    console.log(`fixture server only (explicit --fixture-server): ${fixture.baseUrl}`)
+    console.log('fixture-only mode: local HTTP fixture stub')
+    console.log(`evidence level: ${EVIDENCE_LEVELS.httpStub}`)
+    console.log(`fixture server: ${fixture.baseUrl}`)
     console.log(`fixture pages: ${path.join(scriptDir, 'fixtures')}`)
-    console.log('Ctrl+C to stop. No browser and no relay are started by this mode.')
+    console.log('No browser, no relay and no product API are started or contacted by this mode.')
+    console.log('Ctrl+C to stop.')
     await new Promise<void>((resolve) => {
       process.once('SIGINT', () => {
         resolve()
@@ -1880,8 +2221,18 @@ async function main(): Promise<void> {
     return
   }
 
+  const issues = validateAcceptanceConfig({ config, env: process.env })
+  const errors = issues.filter((issue) => issue.level === 'error')
+  for (const issue of issues) {
+    console.log(`${issue.level === 'error' ? 'ERROR' : 'WARN '} [${issue.code}] ${issue.message}`)
+  }
+
   if (config.mode === 'dry-run') {
     console.log(`\nmode: dry-run (nothing is started or connected)`)
+    console.log(`evidence level if you run live: ${describeEvidenceLevel({ mode: 'run' })}`)
+    if (config.fixtureServer) {
+      console.log('note: --fixture-server only applies to --run; use --fixture-only to keep a standalone fixture server')
+    }
     console.log(`base URL: ${config.baseUrl || '(not set; required for live modes)'}`)
     const portLabel = (() => {
       if (!config.baseUrl) {
@@ -1896,7 +2247,9 @@ async function main(): Promise<void> {
     console.log(`port check: ${portLabel} — port ${DAILY_RELAY_PORT} is always refused`)
     console.log(`sessions: A=${config.sessionA} B=${config.sessionB}`)
     console.log(`profiles: ${config.profiles.length > 0 ? config.profiles.join(', ') : '(auto only when exactly one profile is connected)'}`)
-    console.log(`fixture: ${config.fixtureServer ? 'start local fixture server' : config.fixtureUrl || '(none)'}`)
+    console.log(
+      `fixture: ${config.fixtureServer ? 'with --run: start local fixture server' : config.fixtureUrl ? `with --run: ${config.fixtureUrl}` : '(none; dry-run starts nothing)'}`,
+    )
     console.log(`fault phases: ${config.faultPhases.join(', ') || '(none)'}`)
     console.log(`cleanup: ${config.cleanup}`)
     console.log(`report dir: ${config.reportDir}`)
