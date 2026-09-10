@@ -23,12 +23,12 @@ codebuddy-11 接续同一工作树，保留未提交修改。其余四个执行 
 | --- | --- | --- | --- |
 | E 工具链/发行/日志 | CodeBuddy / codebuddy-11 | feat/browser-runtime-foundation | 2346d18 已集成，CI待重跑 |
 | A 扩展归属/分组 | CodeBuddy / codebuddy-7 | feat/browser-owned-groups | 42eb198 已集成 |
-| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 3909817 已集成，静态worker接线/CI flaky修订 |
+| B Managed relay | CodeBuddy / codebuddy-8 | feat/browser-managed-relay | 107d274 已集成，worker静态接线完成 |
 | C 独立执行器 | Codex / codex-9 | feat/browser-isolated-executor | f37b70b 已集成 |
 | D Pi 工具 | TRAEX / traex-10 | feat/browser-pi-tools | 6dcde8e 已集成 |
 | 集成/共享契约 | 协调者 | feat/pi-browser-rebuild | 进行中 |
 | 中期独立审查 | 全新 CodeBuddy / codebuddy-12，只读 | 集成分支 | 已完成，见browser-midpoint-review.md |
-| 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 仅编写/dry-run，不启动Chrome |
+| 验收脚本准备 | 新 CodeBuddy / codebuddy-13 | feat/browser-acceptance-harness | 54c1f07已集成，说明/严格类型修订中 |
 | 最终独立验收 | 全新CodeBuddy / codebuddy-14 | review/browser-rebuild | 无Chrome验收中，候选23c3ebd |
 
 各 worktree 位于主仓库 tmp/swarm-rebuild/：foundation、extension、relay、
@@ -89,8 +89,15 @@ executor、pi-tools、integration。主目录 main 未修改。
   programmatic抑制、旧storage写drain、权威tab.resolve核验实际分组。
 - C f37b70b与D6dcde8e已集成；协调者重跑候选：runtime217unit+34
   process integration、Pi48+12工具loadcheck、extension34全部通过。
-- e979d37 Linux CI一条success一条failure，剩余失败是managed-relay
-  queue-a测试30s超时，B正在检查handshake/flaky根因，不以重跑绿掩盖。
+- e979d37 Linux CI一条success一条failure，B已查明是测试两个并发fetch
+  到达顺序不定；先确认queue-a握手再发queue-b后，Node22目标case10次、
+  整套unit218项3次通过。107d274静态worker接线和确定性测试已合入。
+- d37ea7a两次Linux CI均通过，最新107d274集成尚待重跑。
+- 验收脚本54c1f07已集成，尚未对真实browser API执行。
+  协调者修订要求：token示例、SW restart与extension reload区分、
+  fault流程资源不提前cleanup、去掉noImplicitAny=false假严格检查。
+- fork签名私钥已复制到主目录ignored tmp/swarm-rebuild-artifacts，
+  权限600，内容校验一致，不公开不提交，避免清理worktree丢失。
 - 全新最终reviewer CodeBuddy14在review/browser-rebuild独立树，
   候选23c3ebd；Chrome仍未授权，结果最多是非浏览器验收。
 - 以上不能代替用户Chrome验收，不提前merge main。
