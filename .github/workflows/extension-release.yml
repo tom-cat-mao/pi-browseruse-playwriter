@@ -1,0 +1,73 @@
+name: Extension release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: true
+        type: string
+      tag:
+        description: Release tag, for example extension@0.0.130
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          submodules: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare the local Playwright fork
+        run: |
+          node playwright/utils/generate_injected.js
+          node playwright/packages/playwright-core/build.mjs
+
+      - name: Build runtime assets
+        run: pnpm --filter @tom-cat/pi-browser-runtime build
+
+      - name: Create extension ZIP and checksum
+        run: pnpm package:extension
+
+      - name: Create Draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="$(node --input-type=module -e "import fs from 'node:fs'; console.log(JSON.parse(fs.readFileSync('extension/manifest.json', 'utf8')).version)")"
+          EXPECTED_TAG="extension@$VERSION"
+          test "$RELEASE_TAG" = "$EXPECTED_TAG"
+          ZIP="dist-release/pi-browser-use-extension-$VERSION.zip"
+          gh release create "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" \
+            --repo tom-cat-mao/pi-browseruse-playwriter \
+            --target "$RELEASE_REF" \
+            --title "Extension $VERSION" \
+            --draft \
+            --latest=false \
+            --notes "Draft Pi Browser Use extension package for maintainer review."
