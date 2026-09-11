@@ -77,12 +77,7 @@ const INTERNAL_MOVE_TTL_MS = 3000
 const MAX_LEDGER_ENTRIES = 200
 const LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const TAB_ID_NONE = -1
-/**
- * How long a burst of URL/title updates may wait before the authoritative
- * inventory is published once. This is a fixed window, not a sliding debounce:
- * later updates join the current window instead of moving the deadline, so the
- * publish latency stays bounded and continuous title changes cannot starve it.
- */
+/** Fixed coalescing interval (not a sliding debounce) for tab page-info publishes. */
 const PAGE_INFO_PUBLISH_COALESCE_MS = 250
 
 export interface ManagedGroupsDeps {
@@ -195,18 +190,15 @@ export interface DiscoverySortableTab {
 }
 
 /**
- * Discovery ordering. Active tabs come first because every window has its own
- * active tab - there is no globally unique "current tab" - and Chrome may have
- * no focused window at all while the user types in the terminal. The focused
- * window is only a supplementary key: it orders otherwise equal tabs, and the
- * stable windowId/index tie-breaks keep the listing deterministic so pagination
- * never reshuffles entries.
+ * Active tab of every window first; focus only breaks ties; windowId/index keep
+ * the order stable for pagination. No globally unique current tab is assumed.
  */
-export function compareDiscoveredTabs(
-  a: DiscoverySortableTab,
-  b: DiscoverySortableTab,
-  focusedWindowIds: ReadonlySet<number>,
-): number {
+export function compareDiscoveredTabs(options: {
+  a: DiscoverySortableTab
+  b: DiscoverySortableTab
+  focusedWindowIds: ReadonlySet<number>
+}): number {
+  const { a, b, focusedWindowIds } = options
   if (a.active !== b.active) return a.active ? -1 : 1
   const aFocused = focusedWindowIds.has(a.windowId)
   const bFocused = focusedWindowIds.has(b.windowId)
@@ -216,9 +208,8 @@ export function compareDiscoveredTabs(
 }
 
 /**
- * Fixed-window trailing coalescer for small metadata updates. The first
- * `schedule()` opens one window and later calls join it, so a burst produces a
- * single flush while a continuous stream still flushes on a bounded interval.
+ * Fixed-window trailing coalescer: the first schedule opens a window, later
+ * calls join it, so bursts collapse without moving the deadline.
  */
 export class CoalescedPublisher {
   private timer: ReturnType<typeof setTimeout> | null = null
@@ -1054,7 +1045,7 @@ export class ManagedGroups {
         return true
       })
       .sort((a, b) => {
-        return compareDiscoveredTabs(a, b, focusedWindowIds)
+        return compareDiscoveredTabs({ a, b, focusedWindowIds })
       })
       .map((tab) => {
         return this.buildCandidate({
@@ -2050,13 +2041,10 @@ export class ManagedGroups {
   }
 
   /**
-   * Best-effort url/title refresh for a managed tab. The update is merged into
-   * the in-memory authoritative registry (which bumps its revision) and one
-   * coalesced inventory publish follows, so `tabs.list` stops showing stale
-   * url/title. Display metadata is never written to disk per title change:
-   * reconnect reconciliation re-reads it from Chrome. Released tabs and records
-   * from another browser epoch are never revived - the active lookup skips them -
-   * so this can neither change ownership nor resurrect a tombstone.
+   * Merge a managed tab's URL/title into the authoritative registry (revision
+   * bump) and coalesce one inventory publish, so `tabs.list` stops serving stale
+   * metadata. No per-title disk write; released tabs and other epochs never
+   * revive because the active lookup skips them.
    */
   noteChromeTabPageInfo(chromeTabId: number, url: string, title: string): void {
     if (!this.registry) return
@@ -2071,12 +2059,7 @@ export class ManagedGroups {
     this.pageInfoPublisher.schedule()
   }
 
-  /**
-   * A reconnect/disconnect changed the connection generation while the metadata
-   * publish was coalescing. The pending snapshot could race the restore that
-   * publishes freshly observed Chrome state, so it is dropped instead of being
-   * allowed to re-advertise pre-reconnect ownership.
-   */
+  /** Drop the publish when the connection generation changed: restore publishes freshly observed state. */
   private flushPageInfoPublish(): void {
     if (this.pageInfoPublishGeneration !== this.generation) {
       this.deps.logger.debug('Dropping coalesced page-info publish: connection generation changed')
