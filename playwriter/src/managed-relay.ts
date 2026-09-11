@@ -1505,6 +1505,8 @@ export class ManagedRelay {
   private readonly slots = new Map<string, ManagedExecutionSlot>()
   private readonly managedClients = new Map<string, ManagedClientEntry>()
   private readonly networkCaptures = new RuntimeNetworkCaptureStore()
+  private readonly pendingNetworkStarts = new Map<string, number>()
+  private nextNetworkStartToken = 0
   private pool: ManagedExecutorPoolContract | null = null
   private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
   private disposed = false
@@ -1939,6 +1941,7 @@ export class ManagedRelay {
         return resultCheck.response
       }
       if (request.operation.kind === 'tabs.release' || request.operation.kind === 'tabs.close') {
+        this.pendingNetworkStarts.delete(networkStartKey(request.sessionId, request.operation.tabId))
         this.networkCaptures.deleteTab({ sessionId: request.sessionId, tabId: request.operation.tabId })
       }
       return parsed.value
@@ -2133,12 +2136,19 @@ export class ManagedRelay {
       return tabResult.response
     }
     if (operation.action === 'list' || operation.action === 'stop') {
+      if (operation.action === 'stop') {
+        this.pendingNetworkStarts.delete(networkStartKey(request.sessionId, operation.tabId))
+      }
       const capture = operation.action === 'list'
         ? this.networkCaptures.list({ sessionId: request.sessionId, tabId: operation.tabId, filter: operation.filter })
         : this.networkCaptures.stop({ sessionId: request.sessionId, tabId: operation.tabId, filter: operation.filter })
       return successResponse(request.requestId, {
         ...(operation.action === 'stop'
-          ? { text: `Network capture stopped with ${capture.entries.length} retained entries` }
+          ? {
+              text: operation.filter
+                ? `Network capture stopped with ${capture.metadata.retainedCount} retained entries (${capture.entries.length} filter matches)`
+                : `Network capture stopped with ${capture.metadata.retainedCount} retained entries`,
+            }
           : {}),
         value: operation.action === 'list'
           ? capture.entries
@@ -2162,6 +2172,10 @@ export class ManagedRelay {
       return routable.response
     }
     const profileId = routable.profile.profileId
+    const startKey = networkStartKey(request.sessionId, operation.tabId)
+    const startToken = this.nextNetworkStartToken + 1
+    this.nextNetworkStartToken = startToken
+    this.pendingNetworkStarts.set(startKey, startToken)
     const pending = this.createPending({
       sessionId: request.sessionId,
       requestId: request.requestId,
@@ -2177,6 +2191,7 @@ export class ManagedRelay {
         key: profileId,
         controller: pending.controller,
         task: async (signal) => {
+          this.assertNetworkStartCurrent({ startKey, startToken, outcome: 'not-started' })
           if (!this.networkCaptures.canStart({ sessionId: request.sessionId, tabId: operation.tabId })) {
             throw new ManagedTransportError({
               code: 'execution-failed',
@@ -2198,6 +2213,7 @@ export class ManagedRelay {
           if (!authoritative.ok) {
             throw new ManagedTransportError(authoritative.failure)
           }
+          this.assertNetworkStartCurrent({ startKey, startToken, outcome: 'not-started' })
           const tab = authoritative.tab
           if (!freshProfile.profile.connectionId || !tab.targetId || !tab.cdpSessionId) {
             throw new ManagedTransportError({
@@ -2214,7 +2230,6 @@ export class ManagedRelay {
             })
           }
           const commandTimeoutMs = this.remainingTimeout({ deadlineAt, pending })
-          this.networkCaptures.deleteTab({ sessionId: request.sessionId, tabId: tab.tabId })
           pending.started = true
           const commandPromise = this.options.transport.sendCdpCommand({
             profileId,
@@ -2228,6 +2243,7 @@ export class ManagedRelay {
           commandPromise.catch(() => {})
           await this.awaitWithAbort({ promise: commandPromise, signal })
           this.remainingTimeout({ deadlineAt, pending })
+          this.assertNetworkStartCurrent({ startKey, startToken, outcome: 'unknown' })
           const currentProfile = this.state.profiles.get(profileId)
           const currentTab = currentProfile?.tabs.get(tab.tabId)
           if (
@@ -2263,9 +2279,31 @@ export class ManagedRelay {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
     } finally {
       clearTimeout(timer)
+      if (this.pendingNetworkStarts.get(startKey) === startToken) {
+        this.pendingNetworkStarts.delete(startKey)
+      }
       pending.detachClientSignal?.()
       this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
     }
+  }
+
+  private assertNetworkStartCurrent({
+    startKey,
+    startToken,
+    outcome,
+  }: {
+    startKey: string
+    startToken: number
+    outcome: 'not-started' | 'unknown'
+  }): void {
+    if (this.pendingNetworkStarts.get(startKey) === startToken) {
+      return
+    }
+    throw new ManagedTransportError({
+      code: 'cancelled',
+      message: 'network capture start was superseded or stopped before activation',
+      outcome,
+    })
   }
 
   handleCdpEvent({
@@ -2450,6 +2488,13 @@ export class ManagedRelay {
 
   private async releaseSession({ requestId, sessionId }: { requestId: string; sessionId: string }): Promise<BrowserResponse> {
     this.networkCaptures.deleteSession(sessionId)
+    Array.from(this.pendingNetworkStarts.keys())
+      .filter((key) => {
+        return key.startsWith(`${sessionId}\u0000`)
+      })
+      .map((key) => {
+        this.pendingNetworkStarts.delete(key)
+      })
     this.abortPendingForSession(sessionId, 'session-released')
     this.invalidateSessionExecutions({ sessionId, reason: 'session released' })
     try {
@@ -3032,6 +3077,7 @@ export class ManagedRelay {
   async dispose(): Promise<void> {
     this.disposed = true
     this.networkCaptures.clear()
+    this.pendingNetworkStarts.clear()
     for (const pending of this.pending.values()) {
       pending.controller.abort(new Error('relay shutting down'))
     }
@@ -3444,6 +3490,10 @@ function describeTransportFailure(error: unknown): ManagedFailure {
 
 function slotKey(sessionId: string, profileId: string): string {
   return `${sessionId}\u0000${profileId}`
+}
+
+function networkStartKey(sessionId: string, tabId: string): string {
+  return `${sessionId}\u0000${tabId}`
 }
 
 /**

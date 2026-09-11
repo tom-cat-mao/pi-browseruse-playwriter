@@ -15,7 +15,12 @@ import { afterEach, describe, expect, test } from 'vitest'
 import net from 'node:net'
 import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
-import { RUNTIME_NETWORK_MAX_CAPTURES } from './runtime-network-capture.js'
+import {
+  RUNTIME_NETWORK_MAX_BYTES,
+  RUNTIME_NETWORK_MAX_CAPTURES,
+  RuntimeNetworkCaptureLimitError,
+  RuntimeNetworkCaptureStore,
+} from './runtime-network-capture.js'
 import {
   MANAGED_REQUEST_BODY_LIMIT_BYTES,
   ManagedRelay,
@@ -175,6 +180,37 @@ function makeTab(
     cdpSessionId: `pw-${overrides.tabId}`,
     ...overrides,
   }
+}
+
+function captureStoreResponse({
+  store,
+  requestId,
+  url,
+}: {
+  store: RuntimeNetworkCaptureStore
+  requestId: string
+  url: string
+}): void {
+  const eventBase = {
+    connectionId: 'connection-1',
+    rootCdpSessionId: 'pw-pure-tab',
+    sourceCdpSessionId: 'pw-pure-tab',
+  }
+  store.handleEvent({
+    ...eventBase,
+    method: 'Network.requestWillBeSent',
+    params: { requestId, type: 'XHR', request: { url, method: 'GET' } },
+  })
+  store.handleEvent({
+    ...eventBase,
+    method: 'Network.responseReceived',
+    params: { requestId, type: 'XHR', response: { url, status: 200 } },
+  })
+  store.handleEvent({
+    ...eventBase,
+    method: 'Network.loadingFinished',
+    params: { requestId },
+  })
 }
 
 function makeInventory({
@@ -2393,6 +2429,7 @@ describe('runtime network capture', () => {
     expect(stopped.body).toMatchObject({
       ok: true,
       data: {
+        text: 'Network capture stopped with 2 retained entries (1 filter matches)',
         value: {
           active: false,
           entries: [{ url: 'https://example.com/api/one', method: 'POST', resourceType: 'xhr', status: 201 }],
@@ -2433,6 +2470,243 @@ describe('runtime network capture', () => {
     expect(listedAfterRelease.body).toMatchObject({
       ok: true,
       data: { value: [], networkCapture: { status: 'not-started', retainedCount: 0 } },
+    })
+  })
+
+  test('failed replacement start preserves the prior capture id and POST response evidence', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'replacement preservation inventory accepted' },
+    )
+    await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'preserved-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'preserved-post',
+        type: 'XHR',
+        request: { url: 'https://example.com/posts', method: 'POST' },
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'preserved-post',
+        type: 'XHR',
+        response: { url: 'https://example.com/posts', status: 200 },
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    const before = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'preserved-before',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    const beforeData = (before.body as { data: BrowserResultData }).data
+    const captureId = beforeData.networkCapture?.captureId
+    expect(captureId).toBeTruthy()
+
+    extension.holdForwardCommands = true
+    const replacementPromise = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'preserved-replacement',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    await waitForCondition(
+      () => {
+        return extension.forwardCommands.length === 2
+      },
+      { message: 'replacement Network.enable held' },
+    )
+    const cancelled = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'cancel-preserved-replacement',
+        sessionId: 's1',
+        operation: { kind: 'request.cancel', targetRequestId: 'preserved-replacement' },
+      },
+    })
+    expect(cancelled.body).toMatchObject({ ok: true })
+    const replacement = await replacementPromise
+    expect(replacement.body).toMatchObject({ ok: false, error: { code: 'cancelled', outcome: 'unknown' } })
+    extension.releaseHeldForwardCommands()
+
+    const after = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'preserved-after',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(after.body).toMatchObject({
+      ok: true,
+      data: {
+        value: [{ url: 'https://example.com/posts', method: 'POST', resourceType: 'xhr', status: 200 }],
+        networkCapture: { status: 'active', captureId, retainedCount: 1, droppedCount: 0 },
+      },
+    })
+  })
+
+  test('stop fences out an earlier start both in the profile queue and during Network.enable', async () => {
+    const pool = createTestPool()
+    const relay = await startTrackedRelay({ poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 's1' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'stop fence inventory accepted' },
+    )
+    await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-initial-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+
+    pool.hold = true
+    const blocker = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-blocker',
+        sessionId: 's1',
+        operation: { kind: 'page.logs', tabId: 't2' },
+      },
+    })
+    await waitForCondition(
+      () => {
+        return pool.executions.length === 1 && pool.held() === 1
+      },
+      { message: 'stop fence page operation holds profile queue' },
+    )
+    const queuedStart = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-queued-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    const stopWhileQueued = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-queued-stop',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'stop' },
+      },
+    })
+    expect(stopWhileQueued.body).toMatchObject({
+      ok: true,
+      data: { value: { active: false }, networkCapture: { status: 'stopped' } },
+    })
+    expect(pool.held()).toBe(1)
+    pool.releaseAll()
+    expect((await blocker).body).toMatchObject({ ok: true })
+    expect((await queuedStart).body).toMatchObject({
+      ok: false,
+      error: { code: 'cancelled', outcome: 'not-started' },
+    })
+    expect(extension.forwardCommands).toHaveLength(1)
+
+    pool.hold = false
+    const reactivated = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-reactivate',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    expect(reactivated.body).toMatchObject({ ok: true, data: { networkCapture: { status: 'active' } } })
+
+    extension.holdForwardCommands = true
+    const enablingStart = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-enabling-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    await waitForCondition(
+      () => {
+        return extension.forwardCommands.length === 3
+      },
+      { message: 'stop fence Network.enable in flight' },
+    )
+    const stopWhileEnabling = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-enabling-stop',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'stop' },
+      },
+    })
+    expect(stopWhileEnabling.body).toMatchObject({
+      ok: true,
+      data: { value: { active: false }, networkCapture: { status: 'stopped' } },
+    })
+    extension.releaseHeldForwardCommands()
+    expect((await enablingStart).body).toMatchObject({
+      ok: false,
+      error: { code: 'cancelled', outcome: 'unknown' },
+    })
+    const finalList = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'stop-fence-final-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(finalList.body).toMatchObject({
+      ok: true,
+      data: { networkCapture: { status: 'stopped' } },
     })
   })
 
@@ -2950,6 +3224,63 @@ describe('runtime network capture', () => {
       ok: true,
       data: { value: [], networkCapture: { status: 'not-started', retainedCount: 0 } },
     })
+  })
+
+  test('bounds retained metadata by serialized bytes', () => {
+    const store = new RuntimeNetworkCaptureStore()
+    const tab = makeTab({
+      tabId: 'pure-tab',
+      groupId: 'pure-group',
+      sessionId: 'pure-session',
+      cdpSessionId: 'pw-pure-tab',
+    })
+    store.start({
+      sessionId: 'pure-session',
+      profileId: 'profile-1',
+      tab,
+      connectionId: 'connection-1',
+    })
+    const largeUrl = `https://example.com/${'x'.repeat(Math.floor(RUNTIME_NETWORK_MAX_BYTES / 3))}`
+    captureStoreResponse({ store, requestId: 'request-1', url: `${largeUrl}1` })
+    captureStoreResponse({ store, requestId: 'request-2', url: `${largeUrl}2` })
+    captureStoreResponse({ store, requestId: 'request-3', url: `${largeUrl}3` })
+    captureStoreResponse({ store, requestId: 'request-4', url: `${largeUrl}4` })
+
+    const result = store.list({ sessionId: 'pure-session', tabId: 'pure-tab' })
+    expect(result.entries).toHaveLength(2)
+    expect(result.entries[0].url.endsWith('3')).toBe(true)
+    expect(result.metadata).toMatchObject({ status: 'active', retainedCount: 2, droppedCount: 2 })
+  })
+
+  test('pure store rejects a new capture at the cap without deleting retained evidence', () => {
+    const store = new RuntimeNetworkCaptureStore()
+    Array.from({ length: RUNTIME_NETWORK_MAX_CAPTURES }).map((_, index) => {
+      const tab = makeTab({
+        tabId: `pure-cap-tab-${index}`,
+        groupId: 'pure-group',
+        sessionId: 'pure-session',
+        chromeTabId: index,
+      })
+      return store.start({
+        sessionId: 'pure-session',
+        profileId: 'profile-1',
+        tab,
+        connectionId: 'connection-1',
+      })
+    })
+    expect(() => {
+      store.start({
+        sessionId: 'pure-session',
+        profileId: 'profile-1',
+        tab: makeTab({
+          tabId: 'pure-over-cap',
+          groupId: 'pure-group',
+          sessionId: 'pure-session',
+        }),
+        connectionId: 'connection-1',
+      })
+    }).toThrow(RuntimeNetworkCaptureLimitError)
+    expect(store.list({ sessionId: 'pure-session', tabId: 'pure-cap-tab-0' }).metadata.status).toBe('active')
   })
 })
 
