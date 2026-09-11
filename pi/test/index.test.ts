@@ -60,6 +60,7 @@ function makeMockPi() {
   const tools: RegisteredTool[] = [];
   const commands: string[] = [];
   const events: string[] = [];
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
   const pi = {
     registerTool: vi.fn((tool: RegisteredTool) => {
       tools.push(tool);
@@ -67,11 +68,12 @@ function makeMockPi() {
     registerCommand: vi.fn((name: string) => {
       commands.push(name);
     }),
-    on: vi.fn((event: string) => {
+    on: vi.fn((event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
       events.push(event);
+      handlers.set(event, handler);
     }),
   };
-  return { pi, tools, commands, events };
+  return { pi, tools, commands, events, handlers };
 }
 
 function makeCtx(sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") {
@@ -1030,6 +1032,136 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     });
     expect(foldedB).not.toContain("Invoice draft");
     expect(foldedB).not.toContain("billing.example.com");
+  });
+
+  it("session_shutdown drops only the shutting-down session's page context", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string; sessionId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.create") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              tab: {
+                tabId: "tab-shared",
+                groupId: "g",
+                sessionId: body.sessionId,
+                profileId: "p",
+                url: `https://${body.sessionId}.example/`,
+                title: body.sessionId === "session-a" ? "A title" : "B title",
+                state: "ready",
+                browserEpoch: "e",
+                revision: 1,
+                chromeTabId: 7,
+              },
+            },
+          },
+        };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: {} } };
+    });
+    const { pi, tools, handlers } = makeMockPi();
+    factory(pi as never);
+    const tabs = tools.find((t) => t.name === "browser_tabs")!;
+    const click = tools.find((t) => t.name === "browser_click")!;
+    for (const sessionId of ["session-a", "session-b"]) {
+      await tabs.execute(
+        `call-create-${sessionId}`,
+        { action: "create", groupId: "g", url: `https://${sessionId}.example/` },
+        undefined,
+        undefined,
+        makeCtx(sessionId),
+      );
+    }
+    const clickArgs = { tabId: "tab-shared", selector: "#go" };
+    const clickA = await click.execute("call-click-a", clickArgs, undefined, undefined, makeCtx("session-a"));
+    const clickB = await click.execute("call-click-b", clickArgs, undefined, undefined, makeCtx("session-b"));
+    expect(renderResultText(click, clickA, { expanded: false, args: clickArgs })).toContain("A title");
+    expect(renderResultText(click, clickB, { expanded: false, args: clickArgs })).toContain("B title");
+
+    const shutdown = handlers.get("session_shutdown");
+    expect(shutdown).toBeTruthy();
+    await shutdown!({}, makeCtx("session-a"));
+
+    // A's context is gone; B's title is retained.
+    const afterA = renderResultText(click, clickA, { expanded: false, args: clickArgs });
+    expect(afterA).not.toContain("A title");
+    expect(afterA).not.toContain("session-a.example");
+    expect(renderResultText(click, clickB, { expanded: false, args: clickArgs })).toContain("B title");
+  });
+
+  it("prefers the row's own page facts over cached context and updates the cache", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.create") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              tab: {
+                tabId: "tab-p",
+                groupId: "g",
+                sessionId: "s",
+                profileId: "p",
+                url: "https://old.example/",
+                title: "Old title",
+                state: "ready",
+                browserEpoch: "e",
+                revision: 1,
+                chromeTabId: 1,
+              },
+            },
+          },
+        };
+      }
+      if (body.operation.kind === "page.snapshot") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              text: "tree",
+              snapshotId: "snap-p",
+              pageInfo: { tabId: "tab-p", url: "https://new.example/", title: "New title" },
+            },
+          },
+        };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: {} } };
+    });
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const tabs = tools.find((t) => t.name === "browser_tabs")!;
+    const snapshot = tools.find((t) => t.name === "browser_snapshot")!;
+    const click = tools.find((t) => t.name === "browser_click")!;
+    await tabs.execute(
+      "call-create-p",
+      { action: "create", groupId: "g", url: "https://old.example/" },
+      undefined,
+      undefined,
+      makeCtx("session-p"),
+    );
+    const snap = await snapshot.execute("call-snap-p", { tabId: "tab-p" }, undefined, undefined, makeCtx("session-p"));
+    const snapRow = renderResultText(snapshot, snap, { expanded: false, args: { tabId: "tab-p" } });
+    expect(snapRow).toContain("New title");
+    expect(snapRow).not.toContain("Old title");
+    // The observation also refreshed the cache for later rows without page facts.
+    const clickResult = await click.execute(
+      "call-click-p",
+      { tabId: "tab-p", selector: "#go" },
+      undefined,
+      undefined,
+      makeCtx("session-p"),
+    );
+    const clickRow = renderResultText(click, clickResult, {
+      expanded: false,
+      args: { tabId: "tab-p", selector: "#go" },
+    });
+    expect(clickRow).toContain("New title");
   });
 
   it("uses pageInfo for later rows without any extra browser request", async () => {

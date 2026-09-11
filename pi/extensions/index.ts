@@ -1465,10 +1465,11 @@ export default function (pi: ExtensionAPI) {
 
   // session.release only: frees this session's workers/CDP clients. Never
   // deletes groups/tabs or changes persistent ownership; never stops the runtime.
-  // Page context is dropped too, so no title can outlive its session.
+  // Only THIS session's page context is dropped — other sessions keep theirs.
   pi.on("session_shutdown", async (_event, ctx) => {
-    pageContext.clear();
-    await runtime.releaseSession(ctx, `shutdown:${runtime.sessionId(ctx)}`).catch(() => {});
+    const sessionId = runtime.sessionId(ctx);
+    pageContext.clear(sessionId);
+    await runtime.releaseSession(ctx, `shutdown:${sessionId}`).catch(() => {});
     runtime.reset();
   });
 }
