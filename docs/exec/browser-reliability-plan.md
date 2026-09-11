@@ -9,6 +9,8 @@ prompt: |
   需要开chrome的时候告诉我就可以额
   用户补充合并边界：
   这次最后合并的时候应该不会直接合并到main上边吧，应该是会合并到一个开发的分支上面吧
+  用户追加仓库指南任务：
+  然后我看现在agents md还是旧的playwriter的agents md啊，能不能写成符合我们仓库开发环境以及要求的啊。这个也让一个agent去干一下呗
   上文确认：抓包必须在执行强制中止后保留已有记录；局部修复，不重构架构，
   不增加网站专用逻辑，不自动重放不确定动作。分工独立 worktree，功能分支
   提交和 PR，全新 agent 独立验收，Chrome 阶段先通知用户，验收后合并清理。
@@ -73,6 +75,7 @@ back 25ms 成功：不能声称该特定等待问题已复现。旧 CDP JSONL �
 | B / executor | TRAEX | managed-executor-worker.ts、aria-snapshot.ts、对应测试及局部辅助模块 |
 | C / extension | CodeBuddy | extension/src、extension/tests、manifest.json |
 | D / Pi | CodeBuddy | pi/extensions、pi/test、pi/README.md、pi/skills |
+| E / guidance | CodeBuddy | AGENTS.md、旧指南来源、root agents.md script；必要的本地生成脚本 |
 | 协调与验收 | 协调者/全新 agent | 本计划、进度、集成接线、最终验收报告与 PR |
 
 各 owner 可新增自己的 changeset。跨所有权改动先说明接口缺口，由协调者
@@ -160,6 +163,15 @@ back 25ms 成功：不能声称该特定等待问题已复现。旧 CDP JSONL �
    协调通知后适配，不能通过 any 绕过。主动核对 model-visible content。
 7. 读完整 Pi docs/extensions.md、docs/tui.md 和相关交叉文档，核对真实
    renderer API；增加纯 renderer 测试，不能只断言函数存在。
+
+# E：仓库开发指南
+
+将旧上游 AGENTS.md 改为本仓库的真实开发指南，同时修正其来源。当前
+agentsdotmd 依赖未安装且引用不存在的本地模板；优先单一维护源，若保留
+生成则输入全部入库、确定性生成可校验。删除旧单窗口/19988 默认杀进程/
+上游包名与发布指令等误导内容，保留协议兼容、隔离、工作树、授权与测试
+纪律。文档写当前已实现事实，不把 swarm 尚未验收的功能描述为已交付。
+独立 worktree `guidance`，文档任务不修改运行代码或依赖，不需要 Chrome。
 
 # 验收与收尾
 
