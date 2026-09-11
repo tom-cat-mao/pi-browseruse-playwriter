@@ -15,6 +15,7 @@ import { afterEach, describe, expect, test } from 'vitest'
 import net from 'node:net'
 import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
+import { RUNTIME_NETWORK_MAX_CAPTURES } from './runtime-network-capture.js'
 import {
   MANAGED_REQUEST_BODY_LIMIT_BYTES,
   ManagedRelay,
@@ -314,9 +315,11 @@ class FakeExtension {
   readonly inventoryByGroup = new Map<string, BrowserGroup>()
   readonly inventoryByTab = new Map<string, BrowserTab>()
   holdResponses = false
+  holdForwardCommands = false
   onRequest?: (request: BrowserRequest) => BrowserResponse | Promise<BrowserResponse>
   private readonly ws: WebSocket
   private readonly held: Array<() => void> = []
+  private readonly heldForwardCommands: Array<() => void> = []
   private readonly closeResolvers: Array<(value: { code: number; reason: string }) => void> = []
   private closedState: { code: number; reason: string } | null = null
 
@@ -390,7 +393,14 @@ class FakeExtension {
     }
     if (message.method === 'forwardCDPCommand') {
       this.forwardCommands.push(message.params as { method: string; params?: unknown; sessionId?: string })
-      this.ws.send(JSON.stringify({ id: message.id, result: {} }))
+      const respond = () => {
+        this.ws.send(JSON.stringify({ id: message.id, result: {} }))
+      }
+      if (this.holdForwardCommands) {
+        this.heldForwardCommands.push(respond)
+        return
+      }
+      respond()
       return
     }
     this.ws.send(JSON.stringify({ id: message.id, result: {} }))
@@ -401,6 +411,13 @@ class FakeExtension {
     for (const release of held) {
       release()
     }
+  }
+
+  releaseHeldForwardCommands(): void {
+    const held = this.heldForwardCommands.splice(0)
+    held.map((release) => {
+      release()
+    })
   }
 
   sendInventory(inventory: BrowserInventory): void {
@@ -2247,6 +2264,758 @@ describe('managed page execution', () => {
       error: { code: 'ownership-mismatch', outcome: 'not-started' },
     })
     expect(pool.executions).toHaveLength(0)
+  })
+})
+
+describe('runtime network capture', () => {
+  test('captures real extension CDP events without a worker and retains them after worker timeout', async () => {
+    const pool = createTestPool()
+    const relay = await startTrackedRelay({ poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'network test inventory accepted' },
+    )
+
+    const started = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    expect(started.body).toMatchObject({
+      ok: true,
+      data: {
+        value: { active: true, filter: null, entries: [] },
+        networkCapture: { status: 'active', retainedCount: 0, droppedCount: 0 },
+      },
+    })
+    expect(extension.forwardCommands).toContainEqual({
+      sessionId: 'pw-t1',
+      method: 'Network.enable',
+      params: {},
+      source: 'server',
+    })
+    expect(pool.executions).toHaveLength(0)
+
+    extension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'request-1',
+        type: 'XHR',
+        request: { url: 'https://example.com/api/one', method: 'POST' },
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'request-1',
+        type: 'XHR',
+        response: { url: 'https://example.com/api/one', status: 201 },
+      },
+    })
+
+    pool.hold = true
+    const timedOut = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'worker-timeout-during-capture',
+        sessionId: 's1',
+        operation: { kind: 'page.click', tabId: 't1', selector: 'button' },
+        timeoutMs: 40,
+      },
+    })
+    expect(timedOut.body).toMatchObject({ ok: false, error: { code: 'timeout', outcome: 'unknown' } })
+
+    extension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'request-2',
+        type: 'Document',
+        request: { url: 'https://example.com/two', method: 'GET' },
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'request-2',
+        type: 'Document',
+        response: { url: 'https://example.com/two', status: 200 },
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+
+    const listed = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-list-after-timeout',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(listed.body).toMatchObject({
+      ok: true,
+      data: {
+        value: [
+          { url: 'https://example.com/api/one', method: 'POST', resourceType: 'xhr', status: 201 },
+          { url: 'https://example.com/two', method: 'GET', resourceType: 'document', status: 200 },
+        ],
+        networkCapture: { status: 'active', retainedCount: 2, droppedCount: 0 },
+      },
+    })
+
+    const stopped = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-stop',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'stop', filter: '/api/' },
+      },
+    })
+    expect(stopped.body).toMatchObject({
+      ok: true,
+      data: {
+        value: {
+          active: false,
+          entries: [{ url: 'https://example.com/api/one', method: 'POST', resourceType: 'xhr', status: 201 }],
+        },
+        networkCapture: { status: 'stopped', retainedCount: 2, droppedCount: 0 },
+      },
+    })
+    const listedAfterStop = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-list-after-stop',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(listedAfterStop.body).toMatchObject({
+      ok: true,
+      data: { networkCapture: { status: 'stopped', retainedCount: 2 }, value: expect.any(Array) },
+    })
+
+    const released = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-tab-release',
+        sessionId: 's1',
+        operation: { kind: 'tabs.release', tabId: 't1' },
+      },
+    })
+    expect(released.body).toMatchObject({ ok: true })
+    const listedAfterRelease = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-list-after-release',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(listedAfterRelease.body).toMatchObject({
+      ok: true,
+      data: { value: [], networkCapture: { status: 'not-started', retainedCount: 0 } },
+    })
+  })
+
+  test('routes OOPIF events to the owning page and rejects stale connection events after restart', async () => {
+    const relay = await startTrackedRelay()
+    const firstExtension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    const inventory = makeInventory({
+      groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+      tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+    })
+    firstExtension.sendInventory(inventory)
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'iframe network inventory accepted' },
+    )
+    await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'iframe-capture-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      params: {
+        sessionId: 'pw-t1',
+        targetInfo: {
+          targetId: 'target-t1',
+          type: 'page',
+          title: 'Example',
+          url: 'https://example.com/',
+          attached: true,
+          canAccessOpener: false,
+        },
+        waitingForDebugger: false,
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Page.frameAttached',
+      sessionId: 'pw-t1',
+      params: { frameId: 'parent-frame', parentFrameId: 'root-frame' },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Target.attachedToTarget',
+      sessionId: 'pw-t1',
+      params: {
+        sessionId: 'oopif-session',
+        targetInfo: {
+          targetId: 'oopif-target',
+          type: 'iframe',
+          title: '',
+          url: 'https://frame.example/',
+          attached: true,
+          canAccessOpener: false,
+          parentFrameId: 'parent-frame',
+        },
+        waitingForDebugger: false,
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'shared-request-id',
+        type: 'XHR',
+        request: { url: 'https://example.com/root-data', method: 'POST' },
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'oopif-session',
+      params: {
+        requestId: 'shared-request-id',
+        type: 'Fetch',
+        request: { url: 'https://frame.example/data', method: 'GET' },
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'shared-request-id',
+        type: 'XHR',
+        response: { url: 'https://example.com/root-data', status: 202 },
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'oopif-session',
+      params: {
+        requestId: 'shared-request-id',
+        type: 'Fetch',
+        response: { url: 'https://frame.example/data', status: 204 },
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    const iframeList = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'iframe-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(iframeList.body).toMatchObject({
+      ok: true,
+      data: {
+        value: [
+          { url: 'https://example.com/root-data', method: 'POST', resourceType: 'xhr', status: 202 },
+          { url: 'https://frame.example/data', method: 'GET', resourceType: 'fetch', status: 204 },
+        ],
+      },
+    })
+
+    const secondExtension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    secondExtension.sendInventory(makeInventory({ ...inventory, revision: 2 }))
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=2')
+        })
+      },
+      { message: 'replacement connection inventory accepted' },
+    )
+    const interrupted = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'interrupted-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(interrupted.body).toMatchObject({
+      ok: true,
+      data: { networkCapture: { status: 'interrupted', retainedCount: 2, reason: expect.any(String) } },
+    })
+
+    await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'replacement-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'stale-request',
+        type: 'XHR',
+        request: { url: 'https://stale.example/', method: 'GET' },
+      },
+    })
+    firstExtension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'stale-request',
+        type: 'XHR',
+        response: { url: 'https://stale.example/', status: 200 },
+      },
+    })
+    secondExtension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'current-request',
+        type: 'XHR',
+        request: { url: 'https://current.example/', method: 'GET' },
+      },
+    })
+    secondExtension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'current-request',
+        type: 'XHR',
+        response: { url: 'https://current.example/', status: 200 },
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    const replacementList = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'replacement-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(replacementList.body).toMatchObject({
+      ok: true,
+      data: {
+        value: [{ url: 'https://current.example/', method: 'GET', resourceType: 'xhr', status: 200 }],
+        networkCapture: { status: 'active', retainedCount: 1, droppedCount: 0 },
+      },
+    })
+  })
+
+  test('bounds retained entries and reports not-started separately from an empty active capture', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'bounded network inventory accepted' },
+    )
+    const notStarted = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'network-never-started',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(notStarted.body).toMatchObject({
+      ok: true,
+      data: { value: [], networkCapture: { status: 'not-started', retainedCount: 0, droppedCount: 0 } },
+    })
+    await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'bounded-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    Array.from({ length: 501 }).map((_, index) => {
+      extension.sendForwardCdpEvent({
+        method: 'Network.requestWillBeSent',
+        sessionId: 'pw-t1',
+        params: {
+          requestId: `bounded-${index}`,
+          type: 'XHR',
+          request: { url: `https://example.com/${index}`, method: 'GET' },
+        },
+      })
+      extension.sendForwardCdpEvent({
+        method: 'Network.responseReceived',
+        sessionId: 'pw-t1',
+        params: {
+          requestId: `bounded-${index}`,
+          type: 'XHR',
+          response: { url: `https://example.com/${index}`, status: 200 },
+        },
+      })
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50)
+    })
+    const bounded = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'bounded-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(bounded.body).toMatchObject({
+      ok: true,
+      data: {
+        networkCapture: { status: 'active', retainedCount: 500, droppedCount: 1 },
+      },
+    })
+    const boundedValue = (bounded.body as { data: { value: unknown[] } }).data.value
+    expect(boundedValue).toHaveLength(500)
+    expect(boundedValue[0]).toMatchObject({ url: 'https://example.com/1' })
+  })
+
+  test('keeps interrupted metadata queryable after the extension connection goes offline', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'offline network inventory accepted' },
+    )
+    await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'offline-network-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Network.requestWillBeSent',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'offline-request',
+        type: 'XHR',
+        request: { url: 'https://example.com/offline', method: 'GET' },
+      },
+    })
+    extension.sendForwardCdpEvent({
+      method: 'Network.responseReceived',
+      sessionId: 'pw-t1',
+      params: {
+        requestId: 'offline-request',
+        type: 'XHR',
+        response: { url: 'https://example.com/offline', status: 200 },
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    extension.close()
+    await extension.closed
+
+    const listed = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'offline-network-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(listed.body).toMatchObject({
+      ok: true,
+      data: {
+        value: [{ url: 'https://example.com/offline', method: 'GET', resourceType: 'xhr', status: 200 }],
+        networkCapture: {
+          status: 'interrupted',
+          retainedCount: 1,
+          droppedCount: 0,
+          reason: 'extension disconnected',
+        },
+      },
+    })
+  })
+
+  test('rejects a capture above the process cap without evicting existing evidence', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    const tabs: BrowserTab[] = Array.from({ length: RUNTIME_NETWORK_MAX_CAPTURES + 1 }, (_, index) => {
+      return makeTab({
+        tabId: `cap-tab-${index}`,
+        groupId: 'g1',
+        sessionId: 's1',
+        chromeTabId: index + 1,
+      })
+    })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs,
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes(`tabs=${tabs.length}`)
+        })
+      },
+      { message: 'capture cap inventory accepted' },
+    )
+    const starts = await Promise.all(
+      tabs.slice(0, RUNTIME_NETWORK_MAX_CAPTURES).map(async (tab, index) => {
+        return await browserRequest({
+          port: relay.port,
+          request: {
+            requestId: `cap-start-${index}`,
+            sessionId: 's1',
+            operation: { kind: 'page.network', tabId: tab.tabId, action: 'start' },
+          },
+        })
+      }),
+    )
+    expect(starts.every((result) => {
+      return (result.body as { ok?: boolean }).ok === true
+    })).toBe(true)
+
+    const rejected = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'cap-rejected-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: tabs[RUNTIME_NETWORK_MAX_CAPTURES].tabId, action: 'start' },
+      },
+    })
+    expect(rejected.body).toMatchObject({
+      ok: false,
+      error: { code: 'execution-failed', outcome: 'not-started', message: expect.stringContaining('limit reached') },
+    })
+    const firstCapture = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'cap-first-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: tabs[0].tabId, action: 'list' },
+      },
+    })
+    expect(firstCapture.body).toMatchObject({
+      ok: true,
+      data: { networkCapture: { status: 'active', retainedCount: 0 } },
+    })
+  })
+
+  test('does not activate a capture when ownership changes while Network.enable is in flight', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    const firstInventory = makeInventory({
+      groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+      tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+    })
+    extension.sendInventory(firstInventory)
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'in-flight enable inventory accepted' },
+    )
+    extension.holdForwardCommands = true
+    const startPromise = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'in-flight-enable-start',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'start' },
+      },
+    })
+    await waitForCondition(
+      () => {
+        return extension.forwardCommands.length === 1
+      },
+      { message: 'Network.enable held by extension harness' },
+    )
+    extension.sendInventory(
+      makeInventory({
+        browserEpoch: 'epoch-2',
+        revision: 2,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1', browserEpoch: 'epoch-2', state: 'needs-rebind' })],
+        tabs: [
+          makeTab({
+            tabId: 't1',
+            groupId: 'g1',
+            sessionId: 's1',
+            browserEpoch: 'epoch-2',
+            state: 'needs-rebind',
+            targetId: undefined,
+            cdpSessionId: undefined,
+          }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=2')
+        })
+      },
+      { message: 'browser epoch changed during Network.enable' },
+    )
+    extension.releaseHeldForwardCommands()
+    const start = await startPromise
+    expect(start.body).toMatchObject({
+      ok: false,
+      error: { code: 'profile-disconnected', outcome: 'unknown', message: expect.stringContaining('changed ownership') },
+    })
+
+    extension.sendInventory(
+      makeInventory({
+        browserEpoch: 'epoch-2',
+        revision: 3,
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1', browserEpoch: 'epoch-2' })],
+        tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1', browserEpoch: 'epoch-2' })],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('revision=3')
+        })
+      },
+      { message: 'tab rebound after failed capture start' },
+    )
+    const listed = await browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'in-flight-enable-list',
+        sessionId: 's1',
+        operation: { kind: 'page.network', tabId: 't1', action: 'list' },
+      },
+    })
+    expect(listed.body).toMatchObject({
+      ok: true,
+      data: { value: [], networkCapture: { status: 'not-started', retainedCount: 0 } },
+    })
+  })
+})
+
+describe('managed request deadline budget', () => {
+  test('passes only the budget remaining after profile queue wait to the worker', async () => {
+    const pool = createTestPool()
+    pool.hold = true
+    const relay = await startTrackedRelay({ poolFactory: async () => pool })
+    const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+    extension.sendInventory(
+      makeInventory({
+        groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+        tabs: [
+          makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' }),
+          makeTab({ tabId: 't2', groupId: 'g1', sessionId: 's1' }),
+        ],
+      }),
+    )
+    await waitForCondition(
+      () => {
+        return relay.logs.some((line) => {
+          return line.includes('inventory profile=profile-1')
+        })
+      },
+      { message: 'deadline inventory accepted' },
+    )
+    const first = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'deadline-first',
+        sessionId: 's1',
+        operation: { kind: 'page.logs', tabId: 't1' },
+        timeoutMs: 1_000,
+      },
+    })
+    await waitForCondition(
+      () => {
+        return pool.executions.length === 1 && pool.held() === 1
+      },
+      { message: 'first deadline request occupies queue' },
+    )
+    const second = browserRequest({
+      port: relay.port,
+      request: {
+        requestId: 'deadline-second',
+        sessionId: 's1',
+        operation: { kind: 'page.logs', tabId: 't2' },
+        timeoutMs: 500,
+      },
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 80)
+    })
+    pool.releaseAll()
+    await waitForCondition(
+      () => {
+        return pool.executions.length === 2 && pool.held() === 1
+      },
+      { message: 'second deadline request reaches worker' },
+    )
+    expect(pool.executions[1].request.timeoutMs).toBeGreaterThan(0)
+    expect(pool.executions[1].request.timeoutMs).toBeLessThan(450)
+    pool.releaseAll()
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult.body).toMatchObject({ ok: true })
+    expect(secondResult.body).toMatchObject({ ok: true })
   })
 })
 

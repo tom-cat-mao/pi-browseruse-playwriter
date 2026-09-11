@@ -245,6 +245,43 @@ export async function startPlayWriterCDPRelayServer({
     })
   }
 
+  const getRootPageSessionId = ({
+    extensionState,
+    sessionId,
+  }: {
+    extensionState: relayState.ExtensionEntry
+    sessionId?: string
+  }): string | undefined => {
+    if (!sessionId) {
+      return undefined
+    }
+    const resolveTarget = ({
+      target,
+      visited,
+    }: {
+      target: relayState.ConnectedTarget
+      visited: Set<string>
+    }): string | undefined => {
+      if (visited.has(target.sessionId)) {
+        return undefined
+      }
+      visited.add(target.sessionId)
+      if (target.targetInfo.type === 'page') {
+        return target.sessionId
+      }
+      const parentFrameId = target.targetInfo.parentFrameId
+      if (!parentFrameId) {
+        return undefined
+      }
+      const parentTarget = Array.from(extensionState.connectedTargets.values()).find((candidate) => {
+        return candidate.frameIds.has(parentFrameId)
+      })
+      return parentTarget ? resolveTarget({ target: parentTarget, visited }) : undefined
+    }
+    const target = extensionState.connectedTargets.get(sessionId)
+    return target ? resolveTarget({ target, visited: new Set() }) : undefined
+  }
+
   const startExtensionPing = (extensionId: string): void => {
     const ext = store.getState().extensions.get(extensionId)
     if (!ext) {
@@ -587,6 +624,34 @@ export async function startPlayWriterCDPRelayServer({
           const code = message.includes('timeout') ? 'timeout' : 'profile-disconnected'
           throw new ManagedTransportError(
             { code, message: `browserRequest failed: ${message}`, outcome: neverSent ? 'not-started' : 'unknown' },
+            { cause: error },
+          )
+        }
+      },
+      sendCdpCommand: async ({ profileId, stableKey, connectionId, sessionId, method, params, timeoutMs }) => {
+        const conn = getExtensionConnection(stableKey)
+        if (!conn || conn.id !== connectionId || conn.stableKey !== stableKey) {
+          throw new ManagedTransportError({
+            code: 'profile-disconnected',
+            message: `current extension connection for profile ${profileId} changed before the CDP command`,
+            outcome: 'not-started',
+          })
+        }
+        try {
+          return await sendToExtension({
+            extensionId: connectionId,
+            method: 'forwardCDPCommand',
+            params: { sessionId, method, params, source: 'server' },
+            timeout: timeoutMs,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new ManagedTransportError(
+            {
+              code: message.includes('timeout') ? 'timeout' : 'profile-disconnected',
+              message: `CDP command failed: ${message}`,
+              outcome: 'unknown',
+            },
             { cause: error },
           )
         }
@@ -2055,6 +2120,18 @@ export async function startPlayWriterCDPRelayServer({
 
             const cdpEvent: CDPEventBase = { method, sessionId, params }
             emitter.emit('cdp:event', { event: cdpEvent, sessionId })
+
+            const extensionState = store.getState().extensions.get(connectionId)
+            const attributedSessionId = getTargetSessionId({ event: cdpEvent }) ?? sessionId
+            managedRelay.handleCdpEvent({
+              connectionId,
+              rootCdpSessionId: extensionState
+                ? getRootPageSessionId({ extensionState, sessionId: attributedSessionId }) ?? attributedSessionId
+                : undefined,
+              sourceCdpSessionId: sessionId,
+              method,
+              params,
+            })
 
             maybeEmitBrowserDownloadCompatEvent({ method, params, extensionId: connectionId })
 
