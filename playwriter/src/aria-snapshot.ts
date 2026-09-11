@@ -195,6 +195,10 @@ export async function resizeImageForAgent(options: ResizeImageOptions): Promise<
 
 export interface AriaSnapshotResult {
   snapshot: string
+  // Per-line rendered output paired with the shortRef (if any) of the interactive
+  // element on that line. Lets callers restrict returned refs to the same
+  // search/offset/limit window applied to the text.
+  snapshotLines: SnapshotOutputLine[]
   tree: AriaSnapshotNode[]
   refs: AriaRef[]
   refToElement: Map<string, { role: string; name: string; shortRef: string }>
@@ -231,7 +235,12 @@ export function buildShortRefMap({ refs }: { refs: Array<{ ref: string }> }): Ma
   return map
 }
 
-// Roles that represent interactive elements
+// disclosuretriangle is Chrome's AX role for a native <summary>. It is NOT a
+// Playwright ARIA role, so `role=disclosuretriangle` is invalid: it must always
+// resolve to a DOM-backed selector (stable id/testid, else the element tag with
+// a DOM-order nth so it identifies the exact node, not a visible-subtree guess).
+const DISCLOSURE_TRIANGLE_ROLE = 'disclosuretriangle'
+
 const INTERACTIVE_ROLES = new Set([
   'button',
   'link',
@@ -252,12 +261,36 @@ const INTERACTIVE_ROLES = new Set([
   'img',
   'video',
   'audio',
+  DISCLOSURE_TRIANGLE_ROLE,
 ])
 
 const LABEL_ROLES = new Set(['labeltext'])
 
 const MAX_LABEL_POSITION_CONCURRENCY = 24
 const BOX_MODEL_TIMEOUT_MS = 5000
+
+// Scope selector resolution must be short-bounded so a missing (0) or ambiguous
+// (>1) selector reports a clear error long before the server request timeout
+// aborts the worker. No locator check may exceed this budget; the count() call
+// is non-retrying and the scope-marking evaluate carries a native {timeout}.
+const SCOPE_RESOLUTION_TIMEOUT_MS = 5000
+
+export function describeScopeResolution({ matchCount }: { matchCount: number }): { ok: true } | { ok: false; error: string } {
+  if (matchCount === 0) {
+    return {
+      ok: false,
+      error:
+        'snapshot scope selector matched no elements; verify the selector or take a full-page snapshot without a locator',
+    }
+  }
+  if (matchCount > 1) {
+    return {
+      ok: false,
+      error: `snapshot scope selector matched ${matchCount} elements; pass a selector that resolves to exactly one element`,
+    }
+  }
+  return { ok: true }
+}
 
 const CONTEXT_ROLES = new Set([
   'navigation',
@@ -294,6 +327,11 @@ type DomNodeInfo = {
   backendNodeId: Protocol.DOM.BackendNodeId
   nodeName: string
   attributes: Map<string, string>
+  // Document-order index among DOM nodes sharing this (lowercased) tag. Used to
+  // build a unique `tag >> nth=` selector for disclosuretriangle summaries that
+  // have no stable id, so the selector identifies the exact DOM node rather than
+  // a visible-subtree guess.
+  sameTagIndex?: number
 }
 
 function toAttributeMap(attributes?: string[]): Map<string, string> {
@@ -341,11 +379,13 @@ function buildBaseLocator({
   name,
   stable,
   isPromotedContentEditable,
+  domInfo,
 }: {
   role: string
   name: string
   stable: { value: string; attr: string } | null
   isPromotedContentEditable?: boolean
+  domInfo?: DomNodeInfo
 }): string {
   if (stable) {
     return buildLocatorFromStable(stable)
@@ -358,12 +398,31 @@ function buildBaseLocator({
   if (isPromotedContentEditable) {
     return `[contenteditable="true"]`
   }
+  // disclosuretriangle (native <summary>) has no Playwright ARIA role; emit a
+  // unique DOM tag selector, never role=disclosuretriangle.
+  if (role === DISCLOSURE_TRIANGLE_ROLE) {
+    return domTagSelector({ nodeName: domInfo?.nodeName, sameTagIndex: domInfo?.sameTagIndex })
+  }
   const trimmedName = name.trim()
   if (trimmedName.length > 0) {
     const escapedName = escapeLocatorValue(trimmedName)
     return `role=${role}[name="${escapedName}"]`
   }
   return `role=${role}`
+}
+
+function domTagSelector({ nodeName, sameTagIndex }: { nodeName?: string; sameTagIndex?: number }): string {
+  const tag = (nodeName ?? '').toLowerCase()
+  // Only bare tag names are safe as CSS selectors; anything else (namespaced
+  // nodes, missing name) falls back to the native summary element which is the
+  // only element Chrome maps to disclosuretriangle. When the tag is not unique in
+  // the document we append a document-order `>> nth=` so the selector resolves to
+  // the exact DOM node rather than a visible-subtree guess.
+  const safeTag = /^[a-z][a-z0-9-]*$/.test(tag) ? tag : 'summary'
+  if (sameTagIndex !== undefined && sameTagIndex > 0) {
+    return `${safeTag} >> nth=${sameTagIndex}`
+  }
+  return safeTag
 }
 
 function getAxValueString(value?: Protocol.Accessibility.AXValue): string {
@@ -392,6 +451,9 @@ export type SnapshotLine = {
   role?: string
   name?: string
   indent?: number
+  // shortRef of the interactive node this line renders, so the worker can
+  // restrict returned refs to the same search/offset/limit window as the text.
+  ref?: string
 }
 
 export type SnapshotNode = {
@@ -411,12 +473,14 @@ function buildSnapshotLine({
   baseLocator,
   indent,
   hasChildren,
+  ref,
 }: {
   role: string
   name: string
   baseLocator?: string
   indent: number
   hasChildren: boolean
+  ref?: string
 }): SnapshotLine {
   const prefix = '  '.repeat(indent)
   let text = `${prefix}- ${role}`
@@ -424,7 +488,7 @@ function buildSnapshotLine({
     const escapedName = name.replace(/"/g, '\\"')
     text += ` "${escapedName}"`
   }
-  return { text, baseLocator, hasChildren, role, name, indent }
+  return { text, baseLocator, hasChildren, role, name, indent, ref }
 }
 
 function buildTextLine(text: string, indent: number): SnapshotLine {
@@ -445,6 +509,7 @@ export function buildSnapshotLines(nodes: SnapshotNode[], indent = 0): SnapshotL
             baseLocator: node.baseLocator,
             indent: nodeIndent,
             hasChildren: node.children.length > 0,
+            ref: node.ref,
           })
     return [line, ...buildSnapshotLines(node.children, nodeIndent + 1)]
   })
@@ -590,7 +655,7 @@ export function filterInteractiveSnapshotTree(options: {
     const domInfo = options.node.backendNodeId ? options.domByBackendId.get(options.node.backendNodeId) : undefined
     const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
     const isPromoted = options.node.backendNodeId != null && (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
-    baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted })
+    baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted, domInfo })
     ref = options.createRefForNode({ backendNodeId: options.node.backendNodeId, role, name })
   }
 
@@ -691,7 +756,7 @@ export function filterFullSnapshotTree(options: {
     const domInfo = options.node.backendNodeId ? options.domByBackendId.get(options.node.backendNodeId) : undefined
     const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
     const isPromoted = options.node.backendNodeId != null && (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
-    baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted })
+    baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted, domInfo })
     ref = options.createRefForNode({ backendNodeId: options.node.backendNodeId, role, name })
   }
 
@@ -731,11 +796,18 @@ function buildLocatorLineText({ line, locator }: { line: SnapshotLine; locator: 
   return `${base} ${locator}`
 }
 
+export type SnapshotOutputLine = {
+  text: string
+  // shortRef of the interactive element rendered on this line, if any. Lets the
+  // worker restrict returned refs to the same search/offset/limit window as text.
+  shortRef?: string
+}
+
 export function finalizeSnapshotOutput(
   lines: SnapshotLine[],
   nodes: SnapshotNode[],
   shortRefMap: Map<string, string>,
-): { snapshot: string; tree: AriaSnapshotNode[] } {
+): { snapshot: string; snapshotLines: SnapshotOutputLine[]; tree: AriaSnapshotNode[] } {
   const locatorCounts = lines.reduce<Map<string, number>>((acc, line) => {
     if (!line.baseLocator) {
       return acc
@@ -758,20 +830,19 @@ export function finalizeSnapshotOutput(
   }, [])
 
   let lineLocatorIndex = 0
-  const snapshot = lines
-    .map((line) => {
-      let text = line.text
-      if (line.baseLocator) {
-        const locator = locatorSequence[lineLocatorIndex]
-        lineLocatorIndex += 1
-        text = buildLocatorLineText({ line, locator })
-      }
-      if (line.hasChildren) {
-        text += ':'
-      }
-      return text
-    })
-    .join('\n')
+  const snapshotLines = lines.map((line) => {
+    let text = line.text
+    if (line.baseLocator) {
+      const locator = locatorSequence[lineLocatorIndex]
+      lineLocatorIndex += 1
+      text = buildLocatorLineText({ line, locator })
+    }
+    if (line.hasChildren) {
+      text += ':'
+    }
+    return { text, shortRef: line.ref ? (shortRefMap.get(line.ref) ?? line.ref) : undefined }
+  })
+  const snapshot = snapshotLines.map((line) => line.text).join('\n')
 
   let nodeLocatorIndex = 0
   const applyLocators = (items: SnapshotNode[]): AriaSnapshotNode[] => {
@@ -790,7 +861,7 @@ export function finalizeSnapshotOutput(
     })
   }
 
-  return { snapshot, tree: applyLocators(nodes) }
+  return { snapshot, snapshotLines, tree: applyLocators(nodes) }
 }
 
 function buildDomIndex(nodes: Protocol.DOM.Node[]): {
@@ -801,14 +872,21 @@ function buildDomIndex(nodes: Protocol.DOM.Node[]): {
   const domById = new Map<Protocol.DOM.NodeId, DomNodeInfo>()
   const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomNodeInfo>()
   const childrenByParent = new Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>()
+  // Document-order counter per lowercased tag so disclosuretriangle summaries
+  // without a stable id get a unique `tag >> nth=` selector.
+  const tagCounts = new Map<string, number>()
 
   for (const node of nodes) {
+    const tag = node.nodeName.toLowerCase()
+    const sameTagIndex = tagCounts.get(tag) ?? 0
+    tagCounts.set(tag, sameTagIndex + 1)
     const info: DomNodeInfo = {
       nodeId: node.nodeId,
       parentId: node.parentId,
       backendNodeId: node.backendNodeId,
       nodeName: node.nodeName,
       attributes: toAttributeMap(node.attributes),
+      sameTagIndex,
     }
     domById.set(node.nodeId, info)
     domByBackendId.set(node.backendNodeId, info)
@@ -1026,11 +1104,21 @@ export async function getAriaSnapshot({
 
   try {
     if (scopeLocator) {
+      // count() does not auto-wait, so a missing (0) or ambiguous (>1) selector
+      // reports a precise error immediately. The scope-marking evaluate carries a
+      // native {timeout} so locator resolution is bounded without an uncancelled
+      // Promise.race that could leave data-pw-scope set after we report failure.
+      const matchCount = await scopeLocator.count()
+      const decision = describeScopeResolution({ matchCount })
+      if (!decision.ok) {
+        throw new Error(decision.error)
+      }
       await scopeLocator.evaluate(
         (element, data) => {
           element.setAttribute(data.attr, data.value)
         },
         { attr: scopeAttr, value: scopeValue },
+        { timeout: SCOPE_RESOLUTION_TIMEOUT_MS },
       )
       scopeApplied = true
     }
@@ -1162,6 +1250,12 @@ export async function getAriaSnapshot({
       if (!selector && options.backendNodeId != null && promotedContentEditableIds.has(options.backendNodeId)) {
         selector = '[contenteditable="true"]'
       }
+      // disclosuretriangle has no valid Playwright ARIA role. Without a stable
+      // selector, store a unique DOM tag selector so getSelectorForRef never
+      // emits role=disclosuretriangle.
+      if (!selector && options.role === DISCLOSURE_TRIANGLE_ROLE) {
+        selector = domTagSelector({ nodeName: domInfo?.nodeName, sameTagIndex: domInfo?.sameTagIndex })
+      }
 
       refs.push({ ref, role: options.role, name: options.name, selector, backendNodeId: options.backendNodeId })
       return ref
@@ -1224,7 +1318,7 @@ export async function getAriaSnapshot({
         shortRef: shortRefMap.get(entry.ref) ?? entry.ref,
       }
     })
-    const result = { snapshot: finalized.snapshot, tree: finalized.tree, refs: refsWithShortRef }
+    const result = { snapshot: finalized.snapshot, snapshotLines: finalized.snapshotLines, tree: finalized.tree, refs: refsWithShortRef }
 
     // Build refToElement map
     const refToElement = new Map<string, { role: string; name: string; shortRef: string }>()
@@ -1333,6 +1427,7 @@ export async function getAriaSnapshot({
 
     return {
       snapshot,
+      snapshotLines: result.snapshotLines,
       tree: result.tree,
       refs: result.refs,
       refToElement,
@@ -1344,9 +1439,19 @@ export async function getAriaSnapshot({
     }
   } finally {
     if (scopeApplied && scopeLocator) {
-      await scopeLocator.evaluate((element, attr) => {
-        element.removeAttribute(attr)
-      }, scopeAttr)
+      // Teardown is best-effort and bounded: the scoped element may have been
+      // removed by the page, so never let removeAttribute block the response.
+      await scopeLocator
+        .evaluate(
+          (element, attr) => {
+            element.removeAttribute(attr)
+          },
+          scopeAttr,
+          { timeout: SCOPE_RESOLUTION_TIMEOUT_MS },
+        )
+        .catch((e) => {
+          console.error('[aria-snapshot] Failed to remove scope attribute:', e)
+        })
     }
     if (oopifSessionId) {
       await session.send('Target.detachFromTarget', { sessionId: oopifSessionId }).catch((e) => {

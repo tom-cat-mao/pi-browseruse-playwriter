@@ -3,6 +3,7 @@ import type { Protocol } from 'devtools-protocol'
 import {
   buildRawSnapshotTree,
   buildSnapshotLines,
+  describeScopeResolution,
   filterFullSnapshotTree,
   filterInteractiveSnapshotTree,
   finalizeSnapshotOutput,
@@ -15,6 +16,15 @@ const roleValue = (value: string): Protocol.Accessibility.AXValue => {
 
 const nameValue = (value: string): Protocol.Accessibility.AXValue => {
   return { type: 'string', value }
+}
+
+type DomInfoEntry = {
+  nodeId: Protocol.DOM.NodeId
+  parentId?: Protocol.DOM.NodeId
+  backendNodeId: Protocol.DOM.BackendNodeId
+  nodeName: string
+  attributes: Map<string, string>
+  sameTagIndex?: number
 }
 
 describe('aria-snapshot tree filters', () => {
@@ -417,6 +427,24 @@ describe('aria-snapshot tree filters', () => {
         - textbox "Email" [data-testid="email-input"]
         - button "Save" [id="save-primary"]
         - button "Save" [id="save-secondary"]",
+        "snapshotLines": [
+          {
+            "shortRef": undefined,
+            "text": "- form "Account":",
+          },
+          {
+            "shortRef": "e1",
+            "text": "  - textbox "Email" [data-testid="email-input"]",
+          },
+          {
+            "shortRef": "e2",
+            "text": "  - button "Save" [id="save-primary"]",
+          },
+          {
+            "shortRef": "e3",
+            "text": "  - button "Save" [id="save-secondary"]",
+          },
+        ],
         "tree": [
           {
             "backendNodeId": undefined,
@@ -611,5 +639,148 @@ describe('aria-snapshot tree filters', () => {
         ],
       }
     `)
+  })
+
+  it('reports a clear error for missing and ambiguous scope selectors', () => {
+    expect(describeScopeResolution({ matchCount: 1 })).toEqual({ ok: true })
+    expect(describeScopeResolution({ matchCount: 0 })).toEqual({
+      ok: false,
+      error:
+        'snapshot scope selector matched no elements; verify the selector or take a full-page snapshot without a locator',
+    })
+    expect(describeScopeResolution({ matchCount: 3 })).toEqual({
+      ok: false,
+      error: 'snapshot scope selector matched 3 elements; pass a selector that resolves to exactly one element',
+    })
+  })
+
+  it('exposes per-line shortRefs so callers can window refs with the text', () => {
+    const rawTree: SnapshotNode = {
+      role: 'main',
+      name: '',
+      ignored: false,
+      children: [
+        { role: 'button', name: 'Alpha', backendNodeId: 10 as Protocol.DOM.BackendNodeId, children: [] },
+        { role: 'button', name: 'Beta', backendNodeId: 11 as Protocol.DOM.BackendNodeId, children: [] },
+      ],
+    }
+    const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomInfoEntry>([
+      [
+        10 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 40 as Protocol.DOM.NodeId,
+          backendNodeId: 10 as Protocol.DOM.BackendNodeId,
+          nodeName: 'BUTTON',
+          attributes: new Map([['id', 'alpha']]),
+        },
+      ],
+      [
+        11 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 41 as Protocol.DOM.NodeId,
+          backendNodeId: 11 as Protocol.DOM.BackendNodeId,
+          nodeName: 'BUTTON',
+          attributes: new Map([['id', 'beta']]),
+        },
+      ],
+    ])
+    let counter = 0
+    const filtered = filterInteractiveSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      labelContext: false,
+      domByBackendId,
+      createRefForNode: () => `alpha-beta-${(counter += 1)}`,
+    })
+    const lines = buildSnapshotLines(filtered.nodes)
+    const shortRefMap = new Map([
+      ['alpha-beta-1', 'e1'],
+      ['alpha-beta-2', 'e2'],
+    ])
+    const result = finalizeSnapshotOutput(lines, filtered.nodes, shortRefMap)
+    expect(result.snapshotLines).toEqual([
+      { text: '- main:', shortRef: undefined },
+      { text: '  - button "Alpha" [id="alpha"]', shortRef: 'e1' },
+      { text: '  - button "Beta" [id="beta"]', shortRef: 'e2' },
+    ])
+  })
+
+  it('gives native summaries a DOM-backed selector, never role=disclosuretriangle', () => {
+    const rawTree: SnapshotNode = {
+      role: 'main',
+      name: '',
+      ignored: false,
+      children: [
+        { role: 'disclosuretriangle', name: 'Details', backendNodeId: 50 as Protocol.DOM.BackendNodeId, children: [] },
+      ],
+    }
+    const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomInfoEntry>([
+      [
+        50 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 60 as Protocol.DOM.NodeId,
+          backendNodeId: 50 as Protocol.DOM.BackendNodeId,
+          nodeName: 'SUMMARY',
+          attributes: new Map(),
+          sameTagIndex: 0,
+        },
+      ],
+    ])
+    const filtered = filterInteractiveSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      labelContext: false,
+      domByBackendId,
+      createRefForNode: () => 'summary-ref',
+    })
+    const summary = filtered.nodes[0].children[0]
+    expect(summary.baseLocator).toBe('summary')
+    expect(summary.baseLocator).not.toContain('disclosuretriangle')
+  })
+
+  it('disambiguates multiple summaries by DOM order, not visible-subtree nth', () => {
+    const rawTree: SnapshotNode = {
+      role: 'main',
+      name: '',
+      ignored: false,
+      children: [
+        { role: 'disclosuretriangle', name: 'First', backendNodeId: 70 as Protocol.DOM.BackendNodeId, children: [] },
+        { role: 'disclosuretriangle', name: 'Second', backendNodeId: 71 as Protocol.DOM.BackendNodeId, children: [] },
+      ],
+    }
+    // The scoped subtree only sees two summaries but they are the 2nd and 4th
+    // <summary> in document order; the selector must carry the real DOM index.
+    const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomInfoEntry>([
+      [
+        70 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 80 as Protocol.DOM.NodeId,
+          backendNodeId: 70 as Protocol.DOM.BackendNodeId,
+          nodeName: 'SUMMARY',
+          attributes: new Map(),
+          sameTagIndex: 1,
+        },
+      ],
+      [
+        71 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 81 as Protocol.DOM.NodeId,
+          backendNodeId: 71 as Protocol.DOM.BackendNodeId,
+          nodeName: 'SUMMARY',
+          attributes: new Map(),
+          sameTagIndex: 3,
+        },
+      ],
+    ])
+    const filtered = filterInteractiveSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      labelContext: false,
+      domByBackendId,
+      createRefForNode: () => 'ref',
+    })
+    const [first, second] = filtered.nodes[0].children
+    expect(first.baseLocator).toBe('summary >> nth=1')
+    expect(second.baseLocator).toBe('summary >> nth=3')
   })
 })

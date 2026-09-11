@@ -26,6 +26,10 @@ class FakePage extends EventEmitter {
     return this.id
   }
 
+  url(): string {
+    return 'https://example.com/'
+  }
+
   isClosed(): boolean {
     return false
   }
@@ -121,7 +125,7 @@ describe('managed executor target initialization', () => {
     expect(response).toMatchObject({
       requestId: 'request-1',
       ok: true,
-      data: { logs: [] },
+      data: { logs: [], pageInfo: { tabId: 'tab-1', url: 'https://example.com/' } },
     })
     expect(context.listenerCount('page')).toBe(1)
 

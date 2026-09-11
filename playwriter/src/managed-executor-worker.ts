@@ -14,7 +14,7 @@ import type {
   BrowserResultData,
   ManagedExecution,
 } from './browser-protocol.js'
-import { getAriaSnapshot, hideAriaRefLabels, screenshotWithAccessibilityLabels, type ScreenshotResult } from './aria-snapshot.js'
+import { getAriaSnapshot, hideAriaRefLabels, screenshotWithAccessibilityLabels, type ScreenshotResult, type SnapshotOutputLine } from './aria-snapshot.js'
 import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
 import { getChromium } from './playwright-import.js'
 import { waitForPageLoad } from './wait-for-page-load.js'
@@ -541,6 +541,48 @@ export class ManagedExecutorWorkerRuntime {
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const operation = request.operation
+    const data = await this.dispatchOperation({ operation, page, markSideEffectsStarted })
+    // B7: attach observed page context from data we already hold. page.url() is a
+    // synchronous cached read; title is only surfaced when the operation already
+    // computed one (navigate/back), never an added unbounded page.title() query.
+    return this.attachPageInfo({ data, page, tabId: operation.tabId })
+  }
+
+  private attachPageInfo({
+    data,
+    page,
+    tabId,
+  }: {
+    data: BrowserResultData
+    page: Page
+    tabId: string
+  }): BrowserResultData {
+    if (data.pageInfo) {
+      return data
+    }
+    const observedTitle =
+      data.value && typeof data.value === 'object' && !Array.isArray(data.value) && typeof data.value.title === 'string'
+        ? data.value.title
+        : undefined
+    return {
+      ...data,
+      pageInfo: {
+        tabId,
+        url: page.url(),
+        ...(observedTitle !== undefined ? { title: observedTitle } : {}),
+      },
+    }
+  }
+
+  private async dispatchOperation({
+    operation,
+    page,
+    markSideEffectsStarted,
+  }: {
+    operation: Extract<BrowserRequest['operation'], { kind: `page.${string}` }>
+    page: Page
+    markSideEffectsStarted: () => void
+  }): Promise<BrowserResultData> {
     switch (operation.kind) {
       case 'page.navigate':
         return await this.navigate({ page, url: operation.url, markSideEffectsStarted })
@@ -664,8 +706,11 @@ export class ManagedExecutorWorkerRuntime {
     markSideEffectsStarted()
     await locator.click()
     this.invalidateSnapshot({ page })
+    // The URL is the tab's state observed right after the click returns — not a
+    // promise that any navigation the click triggered has finished. We never sleep
+    // or auto-goto; take a fresh snapshot to confirm the resulting page.
     return {
-      text: 'Clicked the selected element',
+      text: 'Clicked the selected element; url below is the immediate post-click observation, not a settled navigation',
       value: { url: page.url() },
     }
   }
@@ -709,17 +754,27 @@ export class ManagedExecutorWorkerRuntime {
     }
     const state = this.requirePageState({ page })
     const snapshot = state.latestSnapshot
-    if (!snapshot || snapshot.id !== snapshotId || snapshot.pageGeneration !== state.pageGeneration) {
+    // A snapshot is invalidated after any navigation, click, fill, evaluate, or
+    // execute on this page, because those may mutate the DOM in ways we cannot
+    // introspect (JS side effects are opaque). We keep this conservative rather
+    // than guessing a ref still points at the same element.
+    if (!snapshot) {
       throw new ManagedExecutorOperationError({
         code: 'stale-snapshot',
-        message: `Snapshot ${snapshotId} is stale for target ${state.targetId}; take a fresh page.snapshot`,
+        message: `Selector ${selector} needs a snapshot ref, but no snapshot is current for target ${state.targetId} (a prior navigate/click/fill/evaluate/execute invalidated it); take a fresh page.snapshot and reuse its refs`,
+      })
+    }
+    if (snapshot.id !== snapshotId || snapshot.pageGeneration !== state.pageGeneration) {
+      throw new ManagedExecutorOperationError({
+        code: 'stale-snapshot',
+        message: `Snapshot ${snapshotId} is stale for target ${state.targetId}: the page changed or a later action replaced it (current snapshot ${snapshot.id}). Take a fresh page.snapshot and use the refs it returns`,
       })
     }
     const locator = snapshot.refs.get(ref)
     if (!locator) {
       throw new ManagedExecutorOperationError({
         code: 'stale-snapshot',
-        message: `Snapshot ref ${ref} is not present in snapshot ${snapshotId}`,
+        message: `Snapshot ref ${ref} is not present in snapshot ${snapshotId}; it may have been filtered out by search/offset/limit. Take a full page.snapshot (or widen the window) and reuse a ref it lists`,
       })
     }
     // Deliberately do not call first()/nth() here. Playwright strictness must
@@ -1097,13 +1152,35 @@ export class ManagedExecutorWorkerRuntime {
   }: SnapshotOptions & { page: Page }): Promise<BrowserResultData> {
     const pageState = this.requirePageState({ page })
     markSideEffectsStarted?.()
+    // The default snapshot is the full readable tree (labels, contexts, text).
+    // `interactiveOnly` narrows it to interactive elements; `full: true` forces the
+    // complete readable tree regardless. Both outputs stay subject to the same
+    // search/offset/limit windowing and MAX_SNAPSHOT_LINES/CHARS caps below.
+    const useInteractiveOnly = full ? false : (interactiveOnly ?? false)
     const result = await getAriaSnapshot({
       page,
       locator,
-      interactiveOnly: interactiveOnly ?? false,
+      interactiveOnly: useInteractiveOnly,
+    })
+    const selectorByShortRef = new Map(
+      result.refs.flatMap((entry) => {
+        const selector = result.getSelectorForRef(entry.ref)
+        return selector ? [[entry.shortRef, selector] as const] : []
+      }),
+    )
+    // Restrict the returned refs to the same search/offset/limit window applied to
+    // the text. No match means empty refs; shortRef identities are preserved.
+    const { text, visibleRefs } = formatSnapshotText({
+      snapshotLines: result.snapshotLines,
+      search,
+      offset,
+      limit,
     })
     const snapshotRefs = result.refs.flatMap((entry) => {
-      const selector = result.getSelectorForRef(entry.ref)
+      if (!visibleRefs.has(entry.shortRef)) {
+        return [] as Array<{ ref: string; role: string; name: string; selector: string }>
+      }
+      const selector = selectorByShortRef.get(entry.shortRef)
       if (!selector) {
         return [] as Array<{ ref: string; role: string; name: string; selector: string }>
       }
@@ -1123,12 +1200,6 @@ export class ManagedExecutorWorkerRuntime {
       pageGeneration: pageState.pageGeneration,
       refs,
     }
-    const text = formatSnapshotText({
-      snapshot: result.snapshot,
-      search,
-      offset,
-      limit,
-    })
     return {
       text,
       snapshotId,
@@ -1184,37 +1255,39 @@ export function resolveManagedOperationOutcome({
 }
 
 function formatSnapshotText({
-  snapshot,
+  snapshotLines,
   search,
   offset,
   limit,
 }: {
-  snapshot: string
+  snapshotLines: SnapshotOutputLine[]
   search?: string
   offset: number
   limit?: number
-}): string {
-  const lines = snapshot.split('\n')
-  const searchedLines = search
-    ? selectSearchLines({ lines, search })
-    : lines
+}): { text: string; visibleRefs: Set<string> } {
+  const searchedLines = search ? selectSearchLines({ lines: snapshotLines, search }) : snapshotLines
   const boundedOffset = Number.isInteger(offset) && offset >= 0 ? offset : 0
   const boundedLimit = limit === undefined ? MAX_SNAPSHOT_LINES : Math.max(0, Math.floor(limit))
   const visibleLines = searchedLines.slice(boundedOffset, boundedOffset + Math.min(boundedLimit, MAX_SNAPSHOT_LINES))
-  let text = visibleLines.join('\n')
+  const visibleRefs = new Set(visibleLines.flatMap((line) => (line.shortRef ? [line.shortRef] : [])))
+  let text = visibleLines.map((line) => line.text).join('\n')
   if (visibleLines.length < searchedLines.length - boundedOffset) {
     text += `\n[truncated; use search or offset/limit in execute snapshot helper]`
   }
-  return truncateString({ value: text, maxLength: MAX_SNAPSHOT_CHARS })
+  return { text: truncateString({ value: text, maxLength: MAX_SNAPSHOT_CHARS }), visibleRefs }
 }
 
-function selectSearchLines({ lines, search }: { lines: string[]; search: string }): string[] {
+// A synthetic "No matches found" line carries no ref, so refs collapse to empty
+// when the search matches nothing.
+const NO_SEARCH_MATCHES_LINE: SnapshotOutputLine = { text: 'No matches found' }
+
+function selectSearchLines({ lines, search }: { lines: SnapshotOutputLine[]; search: string }): SnapshotOutputLine[] {
   const matches = lines
     .map((line, index) => ({ line, index }))
-    .filter((entry) => entry.line.includes(search))
+    .filter((entry) => entry.line.text.includes(search))
     .slice(0, 10)
   if (matches.length === 0) {
-    return ['No matches found']
+    return [NO_SEARCH_MATCHES_LINE]
   }
   const included = new Set<number>()
   matches.forEach(({ index }) => {
@@ -1225,9 +1298,9 @@ function selectSearchLines({ lines, search }: { lines: string[]; search: string 
     }
   })
   const indices = [...included].sort((left, right) => left - right)
-  return indices.reduce<string[]>((result, index, position) => {
+  return indices.reduce<SnapshotOutputLine[]>((result, index, position) => {
     if (position > 0 && indices[position - 1] !== index - 1) {
-      result.push('---')
+      result.push({ text: '---' })
     }
     result.push(lines[index])
     return result
