@@ -37,19 +37,11 @@ export const DEFAULT_RUNTIME_PORT = 19989;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const MAX_REQUEST_TIMEOUT_MS = 120_000;
 /**
- * Extra transport time granted AFTER the operation deadline so the runtime can
- * answer with its own typed `timeout` response before the socket is aborted.
- *
- * The operation deadline itself is unchanged: it is still sent to the runtime
- * as `timeoutMs` (capped at MAX_REQUEST_TIMEOUT_MS) and the runtime enforces it.
- * Without this grace the two deadlines fire in the same tick, so the client
- * aborts the body read and reports a raw transport timeout, hiding the
- * runtime's typed `code:"timeout"`/`outcome:"unknown"` result.
+ * Transport time granted past the operation deadline so the runtime can return
+ * its typed `timeout` instead of the client aborting in the same tick. The
+ * operation deadline itself is still `timeoutMs` (capped at 120s).
  */
 export const TRANSPORT_RESPONSE_GRACE_MS = 5_000;
-// The grace is only a transport allowance for a typed server timeout; it stays
-// bounded even if a config asks for more.
-export const MAX_TRANSPORT_RESPONSE_GRACE_MS = 30_000;
 // The largest response body we will read into memory. Generous enough for a
 // couple of full-page screenshots (base64), but bounded so a runaway runtime
 // cannot exhaust memory.
@@ -106,11 +98,6 @@ export class RuntimeRequestError extends Error {
 export type RuntimeClientConfig = {
   baseUrl: string;
   token?: string;
-  /**
-   * Transport grace after the operation deadline (tests / advanced tuning).
-   * Omitted configs use TRANSPORT_RESPONSE_GRACE_MS.
-   */
-  transportGraceMs?: number;
 };
 
 /** Resolve runtime config from PI_BROWSER_HOST / PI_BROWSER_PORT / PI_BROWSER_TOKEN. */
@@ -510,10 +497,9 @@ export class BrowserRuntimeClient {
     const timeoutMs = clampTimeout(opts.timeoutMs);
     // The operation deadline the runtime enforces and the transport deadline
     // this client enforces are deliberately different: the transport waits one
-    // finite grace past the operation deadline so a typed server timeout can
+    // bounded grace past the operation deadline so a typed server timeout can
     // arrive. A user abort is independent of both (see withTimeout).
-    const operationTimeoutMs = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-    const abortBudgetMs = operationTimeoutMs + transportGraceMs(this.config);
+    const abortBudgetMs = (timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) + TRANSPORT_RESPONSE_GRACE_MS;
     const body: BrowserRequest = {
       requestId: opts.requestId,
       sessionId: opts.sessionId,
@@ -565,13 +551,6 @@ export function clampTimeout(timeoutMs?: number): number | undefined {
   if (timeoutMs == null) return undefined;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return undefined;
   return Math.min(Math.floor(timeoutMs), MAX_REQUEST_TIMEOUT_MS);
-}
-
-/** Finite transport grace for a client config; invalid values use the default. */
-function transportGraceMs(config: RuntimeClientConfig): number {
-  const raw = config.transportGraceMs;
-  if (raw == null || !Number.isFinite(raw) || raw < 0) return TRANSPORT_RESPONSE_GRACE_MS;
-  return Math.min(Math.floor(raw), MAX_TRANSPORT_RESPONSE_GRACE_MS);
 }
 
 /** Combine a local timeout with an optional caller signal. */

@@ -30,18 +30,6 @@
  *     are inlined. No console-marker parsing — results come as structured
  *     BrowserResultData.
  *
- * Human-facing rows: the folded view shows the observed page (title/domain)
- * plus the action, counts and verifiable outcome; opaque ids stay complete in
- * model-visible content and in the expanded detail (the folded fallback is a
- * short id tail). Raw terminal control sequences are stripped before any
- * shortening. Page context is cached per Pi session, bounded, from runtime
- * observations only — never an extra browser call.
- *
- * browser_tabs discover paginates LOCALLY (offset/limit are Pi-only schema
- * fields): the full tabs.discover response is sorted active-first and paged
- * after the response, so no unknown field is ever sent to the runtime, and
- * nextOffset always counts the candidates actually returned.
- *
  * The headless-only `browser_save_as_pdf` tool is intentionally gone: it always
  * errored on headed extension sessions, so it is not registered.
  */
@@ -68,6 +56,7 @@ import {
   pageLabel,
   preview,
   safeStringify,
+  sanitizeValue,
   shortId,
   sliceToBytes,
   stripTerminalControls,
@@ -144,11 +133,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Bounded copy of an optional `data.pageInfo` observation (frozen protocol).
- * Strings are control-stripped and clamped so a hostile/huge value cannot
- * bloat UI state; the full value still reaches the model through content.
- */
+/** Bounded copy of an optional `data.pageInfo` observation. */
 function readPageInfo(value: unknown): BrowserPageInfo | undefined {
   if (!isRecord(value)) return undefined;
   if (typeof value.tabId !== "string" || typeof value.url !== "string") return undefined;
@@ -163,11 +148,7 @@ function readPageInfo(value: unknown): BrowserPageInfo | undefined {
   };
 }
 
-/**
- * Bounded copy of an optional `data.networkCapture` metadata object (frozen
- * protocol). `status`/counts were validated by the client; this re-guards the
- * UI-only copies and clamps display strings.
- */
+/** Bounded copy of an optional `data.networkCapture` metadata object. */
 function readNetworkCapture(value: unknown): BrowserNetworkCaptureMetadata | undefined {
   if (!isRecord(value)) return undefined;
   const status = value.status;
@@ -243,16 +224,22 @@ const MAX_DISCOVER_LIMIT = 200;
 // MAX_STRUCTURED_BYTES so the structured block never has to truncate the page
 // again (which would make nextOffset lie about what was returned).
 const DISCOVER_PAGE_BYTES = 16_000;
+const MAX_SUMMARY_BYTES = 600;
 
-/** Pretty JSON clamped to a byte budget, stripped of terminal controls. */
-function boundedJson(value: unknown, maxBytes: number): string {
+/** One bounded, control-free line for folded rows. */
+function sanitizeSummary(summary: string): string {
+  return clampBytes(stripTerminalControls(summary).replace(/\s+/g, " ").trim(), MAX_SUMMARY_BYTES);
+}
+
+/** Pretty JSON of a sanitized copy, clamped to a byte budget. */
+function boundedJson({ value, maxBytes }: { value: unknown; maxBytes: number }): string {
   let json: string;
   try {
-    json = JSON.stringify(value, null, 2) ?? String(value);
+    json = JSON.stringify(sanitizeValue(value), null, 2) ?? String(value);
   } catch {
     json = String(value);
   }
-  return clampBytes(stripTerminalControls(json), maxBytes);
+  return clampBytes(json, maxBytes);
 }
 
 /** Expand affordance; a renderer must never throw just because no theme is up. */
@@ -268,9 +255,9 @@ function makeRenderCall(label: string, summarize: (args: Json) => string) {
   return (rawArgs: object, theme: Theme, context: { expanded: boolean }) => {
     const args = (rawArgs ?? {}) as Json;
     const title = theme.fg("toolTitle", theme.bold(label));
-    // Expanded shows the bounded call arguments (ids, selectors, values) —
-    // never an unbounded code/value dump, and never raw control sequences.
-    const body = context.expanded ? boundedJson(args, MAX_RENDER_ARG_BYTES) : summarize(args);
+    const body = context.expanded
+      ? boundedJson({ value: args, maxBytes: MAX_RENDER_ARG_BYTES })
+      : sanitizeSummary(summarize(args));
     if (!body) return new Text(title, 0, 0);
     return new Text(`${title}\n${theme.fg(context.expanded ? "muted" : "dim", body)}`, 0, 0);
   };
@@ -380,9 +367,13 @@ export default function (pi: ExtensionAPI) {
     // Remember every page fact the runtime already gave us so later rows can
     // show a title/domain without issuing any extra browser call. Keyed by the
     // Pi session; bounded per session.
-    observePage(sessionId, pageInfo);
-    if (data.tab) observePage(sessionId, { tabId: data.tab.tabId, url: data.tab.url, title: data.tab.title });
-    if (data.tabs) for (const tab of data.tabs) observePage(sessionId, { tabId: tab.tabId, url: tab.url, title: tab.title });
+    observePage({ sessionId, page: pageInfo });
+    if (data.tab) observePage({ sessionId, page: { tabId: data.tab.tabId, url: data.tab.url, title: data.tab.title } });
+    if (data.tabs) {
+      for (const tab of data.tabs) {
+        observePage({ sessionId, page: { tabId: tab.tabId, url: tab.url, title: tab.title } });
+      }
+    }
     // Track the running text budget in UTF-8 BYTES so the total content never
     // blows past MAX_TOTAL_TEXT_BYTES regardless of multibyte content. Structured
     // ids are laid down FIRST and always fit (bounded by MAX_STRUCTURED_BYTES) so
@@ -411,7 +402,7 @@ export default function (pi: ExtensionAPI) {
 
     // 1) Structured resources (ids/value) — highest priority, compact JSON.
     // Optional capture metadata rides along in the same always-kept block.
-    const structured = buildStructuredText(data, networkCapture);
+    const structured = buildStructuredText({ data, networkCapture, pageInfo });
     if (structured) pushText(structured);
 
     // 2) Primary text (snapshot/navigate/etc.), truncated to its own cap first.
@@ -500,15 +491,30 @@ export default function (pi: ExtensionAPI) {
    *     emitted separately as an explicitly-truncated string (never sliced JSON).
    * Returns "" when there is nothing structured.
    */
-  function buildStructuredText(data: BrowserResultData, networkCapture?: BrowserNetworkCaptureMetadata): string {
-    // Small ids that must always survive intact.
+  function buildStructuredText({
+    data,
+    networkCapture,
+    pageInfo,
+  }: {
+    data: BrowserResultData;
+    networkCapture?: BrowserNetworkCaptureMetadata;
+    pageInfo?: BrowserPageInfo;
+  }): string {
+    // Small facts that must always survive intact.
     const base: Json = {};
     if (data.snapshotId) base.snapshotId = data.snapshotId;
     if (data.group) base.group = compactGroup(data.group);
     if (data.tab) base.tab = compactTab(data.tab);
-    // Capture metadata is a few bytes and must never be dropped: it is the
-    // difference between "0 requests" and "capture was interrupted".
     if (networkCapture) base.networkCapture = compactNetworkCapture(networkCapture);
+    // Observed page url/title are useful to the agent when no tab object was
+    // returned; tabId stays exact, display fields are clamped.
+    if (pageInfo) {
+      base.pageInfo = {
+        tabId: pageInfo.tabId,
+        url: clampField(pageInfo.url),
+        ...(pageInfo.title ? { title: clampField(pageInfo.title) } : {}),
+      };
+    }
 
     // Lists are budgeted: keep as many items as fit, record how many dropped.
     const lists: Array<{ key: "profiles" | "groups" | "tabs" | "candidates"; items: Json[] }> = [];
@@ -620,19 +626,22 @@ export default function (pi: ExtensionAPI) {
   });
 
   // --- human-facing result rows ---------------------------------------------
-  //
-  // The folded view shows page/domain + action + verifiable counts. Opaque ids
-  // stay complete in model-visible content and in the expanded detail; folded
-  // falls back to a short id tail only when nothing human is known. The page
-  // context comes exclusively from data the runtime already returned.
+  // Folded: page/domain + action + counts, short-id fallback. Full ids stay in
+  // model content and expanded detail; context comes only from runtime results.
 
   const pageContext = new PageContextStore();
 
-  const observePage = (sessionId: string | undefined, page: ObservedPage | undefined): void => {
+  function observePage({
+    sessionId,
+    page,
+  }: {
+    sessionId: string | undefined;
+    page: ObservedPage | undefined;
+  }): void {
     if (page) pageContext.observe(sessionId, page);
-  };
+  }
 
-  function makeResultView(args: Json, details: Json): ResultView {
+  function makeResultView({ args, details }: { args: Json; details: Json }): ResultView {
     const sessionId = boundResultSession(details);
     const pageInfo = readPageInfo(details.pageInfo);
     const tab = isRecord(details.tab) ? details.tab : undefined;
@@ -655,24 +664,20 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  const listCount = (view: ResultView, key: string): number => {
+  function countList({ view, key }: { view: ResultView; key: string }): number {
     const value = view.details[key];
     return Array.isArray(value) ? value.length : 0;
-  };
+  }
 
-  /**
-   * Human page suffix for summaries. Falls back to a short id tail when no
-   * observed page is known, so a row never loses track of which tab it refers
-   * to (the full id stays in content and expanded detail).
-   */
-  const pageSuffix = (view: ResultView): string => {
+  /** Page suffix with a short-id fallback so a row keeps its tab identity. */
+  function pageSuffix(view: ResultView): string {
     const label = pageLabel(view.page);
     if (label) return ` · ${label}`;
     const id = shortId(view.args.tabId);
     return id ? ` · ${id}` : "";
-  };
+  }
 
-  /** Number of captured entries in either legacy value shape (array | entries). */
+  /** Captured entry count for either legacy value shape (array | entries). */
   function capturedEntryCount(value: unknown): number {
     if (Array.isArray(value)) return value.length;
     if (isRecord(value) && Array.isArray(value.entries)) return value.entries.length;
@@ -681,14 +686,16 @@ export default function (pi: ExtensionAPI) {
 
   const isTextBlock = (c: ContentBlock): c is { type: "text"; text: string } => c.type === "text";
 
-  function renderErrorResult(
-    result: { content?: ContentBlock[] },
-    options: { expanded: boolean },
-    theme: Theme,
-  ) {
+  function renderErrorResult({
+    result,
+    options,
+    theme,
+  }: {
+    result: { content?: ContentBlock[] };
+    options: { expanded: boolean };
+    theme: Theme;
+  }) {
     const raw = (result.content ?? []).filter(isTextBlock).map((c) => c.text).join("\n");
-    // Real control bytes are stripped before any shortening, so the error text
-    // can never inject terminal state — even in the expanded branch.
     const full = stripTerminalControls(raw || "failed");
     if (options.expanded) {
       const marker = "\n…[error truncated]";
@@ -702,11 +709,7 @@ export default function (pi: ExtensionAPI) {
     return new Text(`${theme.fg("error", `✗ ${preview(first, 160)}`)}\n${expandHint()}`, 0, 0);
   }
 
-  /**
-   * Bounded expanded detail. Stable opaque ids come first and are never
-   * dropped; text/value/logs are byte- and line-capped instead of dumping
-   * unbounded raw details.
-   */
+  /** Bounded expanded detail: full ids first, display fields byte-capped. */
   function renderResultDetails(view: ResultView): string {
     const lines: string[] = [];
     if (view.page) {
@@ -730,14 +733,19 @@ export default function (pi: ExtensionAPI) {
     }
     for (const key of ["groups", "tabs", "profiles", "candidates"]) {
       const value = view.details[key];
-      if (Array.isArray(value) && value.length > 0) lines.push(...detailListLines(key, value));
+      if (Array.isArray(value) && value.length > 0) lines.push(...detailListLines({ key, items: value }));
     }
     if (typeof view.details.text === "string" && view.details.text) {
       lines.push("text:", clampBytes(stripTerminalControls(view.details.text), MAX_DETAIL_TEXT_BYTES));
     }
     if (view.value !== undefined) {
-      const raw = typeof view.value === "string" ? view.value : safeStringify(view.value);
-      lines.push("value:", clampBytes(stripTerminalControls(raw), MAX_DETAIL_TEXT_BYTES));
+      // String leaves are sanitized before serialization, so a raw ESC in a
+      // nested value cannot turn into visible `\u001b` JSON junk.
+      const raw =
+        typeof view.value === "string"
+          ? stripTerminalControls(view.value)
+          : safeStringify(sanitizeValue(view.value));
+      lines.push("value:", clampBytes(raw, MAX_DETAIL_TEXT_BYTES));
     }
     if (Array.isArray(view.details.logs) && view.details.logs.length > 0) {
       const tail = view.details.logs.slice(-MAX_DETAIL_LOG_LINES).join("\n");
@@ -759,7 +767,7 @@ export default function (pi: ExtensionAPI) {
   const str = (value: unknown): string => (typeof value === "string" ? value : "");
 
   /** One line per list entry with its FULL id, bounded by item count. */
-  function detailListLines(key: string, items: unknown[]): string[] {
+  function detailListLines({ key, items }: { key: string; items: unknown[] }): string[] {
     const out = [`${key}: ${items.length}`];
     for (const item of items.slice(0, MAX_DETAIL_ITEMS)) {
       if (!isRecord(item)) {
@@ -781,16 +789,14 @@ export default function (pi: ExtensionAPI) {
       theme: Theme,
       context?: RenderResultContext,
     ) => {
-      // On error the framework marks the row; show the real bounded error
-      // instead of a misleading "✓". Expanded shows the complete bounded
-      // multiline message (code/outcome included), collapsed keeps the first
-      // line plus an expand affordance.
-      if (context?.isError) return renderErrorResult(result, options, theme);
+      if (context?.isError) return renderErrorResult({ result, options, theme });
       const rawDetails = isRecord(result?.details) ? result.details : {};
       const args = isRecord(context?.args) ? context.args : {};
-      const view = makeResultView(args, rawDetails);
+      const view = makeResultView({ args, details: rawDetails });
       if (!options.expanded) {
-        const line = summarize(view) || "done";
+        // Single sanitize choke point: every folded summary is bounded to one
+        // control-free line, whatever raw values a tool interpolated.
+        const line = sanitizeSummary(summarize(view)) || "done";
         return new Text(`${theme.fg("dim", line)}\n${expandHint()}`, 0, 0);
       }
       return new Text(theme.fg("toolOutput", renderResultDetails(view)), 0, 0);
@@ -805,22 +811,25 @@ export default function (pi: ExtensionAPI) {
     );
 
   /**
-   * Sort + page a full tabs.discover response locally. `offset`/`limit` are
-   * never sent to the runtime. nextOffset always counts the candidates that
-   * were actually returned (including a byte-budget cut), so paging cannot
-   * skip an unseen entry.
+   * Page a full tabs.discover response locally (offset/limit never reach the
+   * runtime). nextOffset counts the candidates actually returned, so a
+   * byte-budget cut cannot skip an unseen entry.
    */
-  function paginateDiscover(
-    data: BrowserResultData,
-    offsetRaw: number | undefined,
-    limitRaw: number | undefined,
-  ): { data: BrowserResultData; extraDetails: Json } {
+  function paginateDiscover({
+    data,
+    offset,
+    limit,
+  }: {
+    data: BrowserResultData;
+    offset: number | undefined;
+    limit: number | undefined;
+  }): { data: BrowserResultData; extraDetails: Json } {
     const total = data.candidates?.length ?? 0;
     const sorted = sortCandidates(data.candidates ?? []);
-    const offset = Math.max(0, Math.floor(offsetRaw ?? 0));
-    const limit = Math.min(Math.max(Math.floor(limitRaw ?? DISCOVER_DEFAULT_LIMIT), 1), MAX_DISCOVER_LIMIT);
-    const start = Math.min(offset, total);
-    const requested = sorted.slice(start, start + limit);
+    const startOffset = Math.max(0, Math.floor(offset ?? 0));
+    const pageSize = Math.min(Math.max(Math.floor(limit ?? DISCOVER_DEFAULT_LIMIT), 1), MAX_DISCOVER_LIMIT);
+    const start = Math.min(startOffset, total);
+    const requested = sorted.slice(start, start + pageSize);
     const accepted: BrowserTabCandidate[] = [];
     let usedBytes = 0;
     for (const candidate of requested) {
@@ -987,7 +996,7 @@ export default function (pi: ExtensionAPI) {
             ...(params.query ? { query: params.query } : {}),
             ...(params.includeManaged !== undefined ? { includeManaged: params.includeManaged } : {}),
           },
-          refine: (data) => paginateDiscover(data, params.offset, params.limit),
+          refine: (data) => paginateDiscover({ data, offset: params.offset, limit: params.limit }),
         });
       }
       const op = ((): BrowserOperation => {
@@ -1109,20 +1118,20 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Snapshot",
     description:
       "Read a managed tab as an accessibility tree with element refs (aria-ref=eN). Primary way to read page content and " +
-      "get refs for browser_click/browser_fill. The default tree is the readable page content (text, headings, controls) — " +
-      "not interactive-only — so it can be large; narrow it with a text search or a strict CSS selector that matches exactly " +
-      "one scope element. full requests the complete unfiltered tree.",
+      "get refs for browser_click/browser_fill. The default result is the readable tree (text, headings, controls) — not " +
+      "interactive-only — so it can be large; narrow it with a text search or a strict CSS selector that matches exactly one " +
+      "scope element. Output stays bounded; full requests the complete tree within the same output caps.",
     promptSnippet: "Read a managed tab as an accessibility tree",
     promptGuidelines: [
       "Use browser_snapshot to read a tab's content and obtain aria-ref=eN refs; pass those refs (with the returned snapshotId) to browser_click/browser_fill. Refs are only valid against the snapshot that produced them.",
-      "browser_snapshot selector must match exactly one element: zero or multiple matches is an error (there is no implicit .first()) — narrow the selector or use search instead. The default result is the readable whole tree, not only interactive nodes; use search to keep large pages compact.",
+      "browser_snapshot selector must match exactly one element: zero or multiple matches is an error (there is no implicit .first()) — narrow the selector or use search instead. The default result is the readable tree, not only interactive nodes; use search to keep large pages compact (all snapshot output is bounded).",
       "Any browser_evaluate or browser_execute call conservatively invalidates the latest snapshot, even a read-only one: take a fresh browser_snapshot before using refs again, or the action throws stale-snapshot.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       search: Type.Optional(Type.String({ description: "Only include nodes matching this text" })),
       selector: Type.Optional(Type.String({ description: "Scope the snapshot to a single matching CSS selector" })),
-      full: Type.Optional(Type.Boolean({ description: "Return the complete unfiltered tree" })),
+      full: Type.Optional(Type.Boolean({ description: "Request the complete tree (output stays bounded)" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1335,16 +1344,20 @@ export default function (pi: ExtensionAPI) {
       const action = typeof view.args.action === "string" ? view.args.action : "list";
       const meta = view.network;
       const entries = capturedEntryCount(view.value);
-      const retained = meta?.retainedCount ?? entries;
       const status = meta?.status;
       const dropped = meta?.droppedCount ? ` · ${meta.droppedCount} dropped` : "";
       if (action === "start") {
-        return `✓ capture ${status ?? "active"}${meta?.retainedCount !== undefined ? ` · ${meta.retainedCount} retained` : ""}${pageSuffix(view)}`;
+        return `✓ capture ${status ?? "active"}${meta ? ` · ${meta.retainedCount} retained` : ""}${pageSuffix(view)}`;
       }
       if (action === "stop") {
-        return `✓ capture ${status ?? "stopped"} · ${retained} retained${dropped}${pageSuffix(view)}`;
+        return `✓ capture ${status ?? "stopped"} · ${meta?.retainedCount ?? entries} retained${dropped}${pageSuffix(view)}`;
       }
-      return `✓ ${retained} request(s)${status ? ` · ${status}` : ""}${dropped}${pageSuffix(view)}`;
+      // A filtered list returns matching entries, while retainedCount is the
+      // whole capture: label both so matches are not mistaken for the total.
+      const retainedTotal = meta?.retainedCount;
+      const totalSuffix =
+        retainedTotal !== undefined && retainedTotal !== entries ? ` of ${retainedTotal} retained` : "";
+      return `✓ ${entries} request(s)${totalSuffix}${status ? ` · ${status}` : ""}${dropped}${pageSuffix(view)}`;
     }),
   });
 
@@ -1373,7 +1386,7 @@ export default function (pi: ExtensionAPI) {
       });
     },
     renderCall: makeRenderCall("browser logs", (a) => `[${shortId(a.tabId)}]${a.limit ? ` limit=${a.limit}` : ""}`),
-    renderResult: makeRenderResult((view) => `✓ ${listCount(view, "logs")} log line(s)${pageSuffix(view)}`),
+    renderResult: makeRenderResult((view) => `✓ ${countList({ view, key: "logs" })} log line(s)${pageSuffix(view)}`),
   });
 
   // --- page: execute (escape hatch) ----------------------------------------
@@ -1408,7 +1421,7 @@ export default function (pi: ExtensionAPI) {
     },
     renderCall: makeRenderCall("browser execute", (a) => `[${shortId(a.tabId)}] ${preview(a.code, 72)}`),
     renderResult: makeRenderResult((view) => {
-      const logs = listCount(view, "logs");
+      const logs = countList({ view, key: "logs" });
       const logSuffix = logs ? ` · ${logs} log line(s)` : "";
       if (view.value !== undefined) {
         return `✓ value: ${preview(view.value, 72)}${logSuffix}${pageSuffix(view)}`;

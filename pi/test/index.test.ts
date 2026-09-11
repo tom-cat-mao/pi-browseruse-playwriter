@@ -8,9 +8,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import factory from "../extensions/index.ts";
 import * as bootstrap from "../extensions/bootstrap.ts";
+import { PageContextStore } from "../extensions/page-context.ts";
 import { startTestServer, validCapabilities, validProfile, type TestServer } from "./test-server.ts";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+type Rendered = { render(width: number): string[] };
 type RegisteredTool = {
   name: string;
   description: string;
@@ -24,9 +26,35 @@ type RegisteredTool = {
     onUpdate: undefined,
     ctx: unknown,
   ) => Promise<{ content: ContentBlock[]; details: Record<string, unknown> }>;
-  renderCall?: (...args: unknown[]) => unknown;
-  renderResult?: (...args: unknown[]) => unknown;
+  renderCall?: (args: Record<string, unknown>, theme: unknown, context: { expanded: boolean }) => Rendered;
+  renderResult?: (
+    result: { content: ContentBlock[]; details: Record<string, unknown> },
+    options: { expanded: boolean },
+    theme: unknown,
+    context: unknown,
+  ) => Rendered;
 };
+
+// A theme that returns text unchanged, so renderer assertions read real content.
+const renderTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+function renderCallText(tool: RegisteredTool, args: Record<string, unknown>, expanded: boolean): string {
+  return tool.renderCall!(args, renderTheme, { expanded }).render(220).join("\n");
+}
+
+function renderResultText(
+  tool: RegisteredTool,
+  result: { content: ContentBlock[]; details: Record<string, unknown> },
+  options: { expanded: boolean; isError?: boolean; args?: Record<string, unknown> },
+): string {
+  return tool
+    .renderResult!(result, { expanded: options.expanded }, renderTheme, {
+      isError: options.isError === true,
+      args: options.args ?? {},
+    })
+    .render(220)
+    .join("\n");
+}
 
 function makeMockPi() {
   const tools: RegisteredTool[] = [];
@@ -640,5 +668,518 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     );
     const nextParsed = structuredLine(textOf(next.content)) as { candidates: Array<{ candidateId: string }> };
     expect(nextParsed.candidates[0].candidateId).toBe(candidates[page.nextOffset].candidateId);
+  });
+
+  // --- human-facing renderers (invoked, not just present) -------------------
+
+  function allTools(): RegisteredTool[] {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    return tools;
+  }
+
+  function toolOf(tools: RegisteredTool[], name: string): RegisteredTool {
+    const tool = tools.find((t) => t.name === name);
+    expect(tool, name).toBeTruthy();
+    return tool!;
+  }
+
+  it("renders a compact call line and bounds expanded call arguments", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const nav = tools.find((t) => t.name === "browser_navigate")!;
+    const folded = renderCallText(nav, { tabId: "ptab-mtwn3svh-5illhh1cdkl18", action: "back" }, false);
+    expect(folded).toContain("back");
+    expect(folded).not.toContain("ptab-mtwn3svh-5illhh1cdkl18");
+    const expanded = renderCallText(
+      nav,
+      { tabId: "tab-1", action: "goto", url: `https://example.com/${"x".repeat(20_000)}` },
+      true,
+    );
+    expect(Buffer.byteLength(expanded, "utf8")).toBeLessThan(6_000);
+
+    // Raw values interpolated by a call summary are sanitized too.
+    const groups = tools.find((t) => t.name === "browser_groups")!;
+    const groupCall = renderCallText(
+      groups,
+      { action: "create", name: "\u001b[31mwork\u001b[0m\nsecond line" },
+      false,
+    );
+    expect(groupCall).not.toContain("\u001b");
+    expect(groupCall).toContain("work second line");
+    const groupCallExpanded = renderCallText(groups, { action: "create", name: "\u001b[31mwork" }, true);
+    expect(groupCallExpanded).not.toContain("\u001b");
+    expect(groupCallExpanded).toContain("work");
+  });
+
+  it("sanitizes raw group/profile values at the folded-summary choke point", async () => {
+    runtimeHandler((op) => {
+      if (op.kind === "groups.create") {
+        return {
+          group: {
+            groupId: "grp-1",
+            sessionId: "s",
+            profileId: "p",
+            name: "\u001b[31mwork\u001b[0m\nsecond line",
+            state: "ready",
+            browserEpoch: "e",
+            revision: 1,
+          },
+        };
+      }
+      return {
+        profiles: [
+          {
+            profileId: "p",
+            browser: "\u001b[32mchrome\u001b[0m",
+            label: "Work \u001b]0;x\u0007profile",
+            connected: true,
+            browserEpoch: "e",
+            capabilities: validCapabilities,
+          },
+        ],
+      };
+    });
+    const tools = allTools();
+    const groups = toolOf(tools, "browser_groups");
+    const group = await groups.execute(
+      "call-g",
+      { action: "create", profileId: "p", name: "work" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const groupLines = renderResultText(groups, group, { expanded: false });
+    expect(groupLines).not.toContain("\u001b");
+    expect(groupLines).toContain("work second line");
+    expect(groupLines.split("\n")).toHaveLength(2);
+
+    const hugeGroup = {
+      content: [{ type: "text" as const, text: "ok" }],
+      details: { group: { groupId: "grp-2", name: "名".repeat(3_000), profileId: "p", state: "ready" } },
+    };
+    const hugeLine = renderResultText(groups, hugeGroup, { expanded: false });
+    expect(Buffer.byteLength(hugeLine.split("\n")[0], "utf8")).toBeLessThan(700);
+
+    const profiles = toolOf(tools, "browser_profiles");
+    const profile = await profiles.execute("call-p", {}, undefined, undefined, makeCtx());
+    const profileLine = renderResultText(profiles, profile, { expanded: false });
+    expect(profileLine).not.toContain("\u001b");
+    expect(profileLine).toContain("chrome");
+  });
+
+  it("shows complete bounded multiline errors expanded and an affordance collapsed", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const nav = tools.find((t) => t.name === "browser_navigate")!;
+    const errorText = [
+      "strict mode violation: selector header resolved to 2 elements",
+      "\u001b[31msecond line with raw ESC\u001b[0m",
+      "native select failed",
+      "code=timeout · outcome=unknown",
+    ].join("\n");
+    const result = { content: [{ type: "text" as const, text: errorText }], details: {} };
+    const expanded = renderResultText(nav, result, { expanded: true, isError: true });
+    expect(expanded).not.toContain("\u001b");
+    expect(expanded).toContain("second line with raw ESC");
+    expect(expanded).toContain("native select failed");
+    expect(expanded).toContain("outcome=unknown");
+    const collapsed = renderResultText(nav, result, { expanded: false, isError: true });
+    expect(collapsed).toContain("strict mode violation");
+    expect(collapsed).not.toContain("native select failed");
+    expect(collapsed).toMatch(/inspect output/);
+
+    const huge = { content: [{ type: "text" as const, text: `head line\n${"E".repeat(300_000)}` }], details: {} };
+    const hugeExpanded = renderResultText(nav, huge, { expanded: true, isError: true });
+    expect(Buffer.byteLength(hugeExpanded, "utf8")).toBeLessThan(20_000);
+    expect(hugeExpanded).toContain("head line");
+  });
+
+  it("strips real ANSI/control sequences and keeps opaque ids intact", async () => {
+    runtimeHandler(() => ({
+      text: `- button "Save" [aria-ref=e5]\n\u001b[31mred\u001b[0m warning \u001b]0;injected title\u0007 tail\nliteral \\u001b stays text`,
+      snapshotId: "managed:ptab-mtwn3svh-5illhh1cdkl18:2:3:uuid",
+    }));
+    const snapshot = toolByName("browser_snapshot");
+    const result = await snapshot.execute(
+      "call-ansi",
+      { tabId: "ptab-mtwn3svh-5illhh1cdkl18" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const expanded = renderResultText(snapshot, result, { expanded: true });
+    expect(expanded).not.toContain("\u001b");
+    expect(expanded).not.toContain("injected title");
+    expect(expanded).toContain("red warning");
+    expect(expanded).toContain("literal \\u001b stays text");
+    expect(expanded).toContain("managed:ptab-mtwn3svh-5illhh1cdkl18:2:3:uuid");
+    const folded = renderResultText(snapshot, result, { expanded: false });
+    expect(folded).not.toContain("\u001b");
+    expect(folded).toMatch(/…/);
+  });
+
+  it("sanitizes value string leaves before serializing so raw ESC is not shown as \\u001b junk", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const evaluate = tools.find((t) => t.name === "browser_evaluate")!;
+    const rawEsc = {
+      content: [{ type: "text" as const, text: "ok" }],
+      details: { value: { nested: "\u001b[31mred\u001b[0m" } },
+    };
+    const folded = renderResultText(evaluate, rawEsc, { expanded: false, args: { tabId: "t" } });
+    expect(folded).not.toContain("\u001b");
+    expect(folded).toContain("red");
+    const expanded = renderResultText(evaluate, rawEsc, { expanded: true, args: { tabId: "t" } });
+    expect(expanded).not.toContain("\u001b");
+    expect(expanded).toContain("red");
+
+    // A literal backslash-u string is data, not a control sequence: preserved.
+    const literal = {
+      content: [{ type: "text" as const, text: "ok" }],
+      details: { value: { lit: "\\u001b" } },
+    };
+    const literalOut = renderResultText(evaluate, literal, { expanded: true, args: { tabId: "t" } });
+    expect(literalOut).toContain("\\\\u001b");
+    expect(literalOut).not.toContain("\u001b");
+  });
+
+  it("bounds expanded success detail instead of dumping unlimited raw details", async () => {
+    runtimeHandler(() => ({ text: "X".repeat(500_000), snapshotId: "snap-bounded" }));
+    const snapshot = toolByName("browser_snapshot");
+    const result = await snapshot.execute("call-big", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    const expanded = renderResultText(snapshot, result, { expanded: true });
+    expect(Buffer.byteLength(expanded, "utf8")).toBeLessThan(20_000);
+    expect(expanded).toContain("snap-bounded");
+  });
+
+  it("shows browser_execute value and logs instead of a bare ok", async () => {
+    runtimeHandler(() => ({ value: { rows: 3 }, logs: ["[log] one", "[error] boom"] }));
+    const execute = toolByName("browser_execute");
+    const result = await execute.execute(
+      "call-exec",
+      { tabId: "tab-1", code: "return { rows: 3 }" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const folded = renderResultText(execute, result, { expanded: false, args: { tabId: "tab-1" } });
+    expect(folded).toContain("value");
+    expect(folded).toContain("rows");
+    expect(folded).toContain("2 log line(s)");
+    expect(textOf(result.content)).toContain("\"rows\":3");
+  });
+
+  it("labels a filtered network list with matches and total retained, and keeps list a bare array", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string; operation: { kind: string; action?: string } };
+      if (body.operation.action === "stop") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              value: { captureId: "cap-1", entries: [{ url: "https://a.example" }] },
+              networkCapture: {
+                status: "stopped",
+                captureId: "cap-1",
+                retainedCount: 7,
+                droppedCount: 2,
+                reason: "worker-interrupted",
+              },
+            },
+          },
+        };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            value: [{ url: "https://a.example" }],
+            networkCapture: { status: "active", retainedCount: 5, droppedCount: 0 },
+          },
+        },
+      };
+    });
+    const tools = allTools();
+    const network = toolOf(tools, "browser_network");
+    const stopped = await network.execute(
+      "call-stop",
+      { tabId: "tab-1", action: "stop" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const stopFolded = renderResultText(network, stopped, { expanded: false, args: { action: "stop" } });
+    expect(stopFolded).toContain("stopped");
+    expect(stopFolded).toContain("7 retained");
+    expect(stopFolded).toContain("2 dropped");
+    expect(textOf(stopped.content)).toContain("network capture: status=stopped");
+    expect(stopped.details.networkCapture).toMatchObject({ status: "stopped", retainedCount: 7, droppedCount: 2 });
+
+    const listed = await network.execute(
+      "call-list",
+      { tabId: "tab-1", action: "list", filter: "a.example" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(Array.isArray(listed.details.value)).toBe(true);
+    expect(textOf(listed.content)).toContain("\"value\":[");
+    const listFolded = renderResultText(network, listed, { expanded: false, args: { action: "list" } });
+    // One matching entry, five retained: the row must not claim five matches.
+    expect(listFolded).toContain("1 request(s)");
+    expect(listFolded).toContain("of 5 retained");
+    expect(listFolded).not.toContain("5 request(s)");
+  });
+
+  it("shows the legacy network stop object count without metadata", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string };
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            value: {
+              captureId: "cap-legacy",
+              entries: [{ url: "https://a.example" }, { url: "https://b.example" }, { url: "https://c.example" }],
+            },
+          },
+        },
+      };
+    });
+    const network = toolByName("browser_network");
+    const result = await network.execute(
+      "call-stop-legacy",
+      { tabId: "tab-1", action: "stop" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const folded = renderResultText(network, result, { expanded: false, args: { action: "stop" } });
+    expect(folded).toContain("stopped");
+    expect(folded).toContain("3 retained");
+  });
+
+  it("caches observed page context per Pi session and never shows another session's title", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.create") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              tab: {
+                tabId: "tab-ctx",
+                groupId: "g",
+                sessionId: "s",
+                profileId: "p",
+                url: "https://billing.example.com/draft",
+                title: "Invoice draft",
+                state: "ready",
+                browserEpoch: "e",
+                revision: 1,
+                chromeTabId: 7,
+              },
+            },
+          },
+        };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: {} } };
+    });
+    const tools = allTools();
+    const tabs = toolOf(tools, "browser_tabs");
+    const click = toolOf(tools, "browser_click");
+    await tabs.execute(
+      "call-create",
+      { action: "create", groupId: "g", url: "https://billing.example.com/draft" },
+      undefined,
+      undefined,
+      makeCtx("session-a"),
+    );
+    const clickA = await click.execute(
+      "call-click-a",
+      { tabId: "tab-ctx", selector: "#go" },
+      undefined,
+      undefined,
+      makeCtx("session-a"),
+    );
+    const foldedA = renderResultText(click, clickA, {
+      expanded: false,
+      args: { tabId: "tab-ctx", selector: "#go" },
+    });
+    expect(foldedA).toContain("Invoice draft");
+    expect(foldedA).toContain("billing.example.com");
+
+    const clickB = await click.execute(
+      "call-click-b",
+      { tabId: "tab-ctx", selector: "#go" },
+      undefined,
+      undefined,
+      makeCtx("session-b"),
+    );
+    const foldedB = renderResultText(click, clickB, {
+      expanded: false,
+      args: { tabId: "tab-ctx", selector: "#go" },
+    });
+    expect(foldedB).not.toContain("Invoice draft");
+    expect(foldedB).not.toContain("billing.example.com");
+  });
+
+  it("uses pageInfo for later rows without any extra browser request", async () => {
+    let requestCount = 0;
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      requestCount++;
+      if (body.operation.kind === "page.snapshot") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              text: "tree",
+              snapshotId: "snap-pi",
+              pageInfo: { tabId: "tab-pi", url: "https://news.example.com/a", title: "Latest news" },
+            },
+          },
+        };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: {} } };
+    });
+    const tools = allTools();
+    const snapshot = toolOf(tools, "browser_snapshot");
+    const click = toolOf(tools, "browser_click");
+    const snap = await snapshot.execute("call-snap", { tabId: "tab-pi" }, undefined, undefined, makeCtx("session-pi"));
+    expect(renderResultText(snapshot, snap, { expanded: false, args: { tabId: "tab-pi" } })).toContain("Latest news");
+    const clickResult = await click.execute(
+      "call-click",
+      { tabId: "tab-pi", selector: "#go" },
+      undefined,
+      undefined,
+      makeCtx("session-pi"),
+    );
+    const folded = renderResultText(click, clickResult, {
+      expanded: false,
+      args: { tabId: "tab-pi", selector: "#go" },
+    });
+    expect(folded).toContain("Latest news");
+    expect(requestCount).toBe(2);
+  });
+
+  it("puts observed pageInfo into model-visible content and keeps value shape unchanged", async () => {
+    runtimeHandler(() => ({
+      value: { n: 1 },
+      pageInfo: { tabId: "ptab-url", url: "https://news.example.com/a", title: "Latest news" },
+    }));
+    const evaluate = toolByName("browser_evaluate");
+    const result = await evaluate.execute(
+      "call-pageinfo",
+      { tabId: "ptab-url", code: "return 1" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const parsed = structuredLine(textOf(result.content)) as {
+      pageInfo?: { tabId: string; url: string; title?: string };
+      value: unknown;
+    };
+    expect(parsed.pageInfo?.tabId).toBe("ptab-url");
+    expect(parsed.pageInfo?.url).toBe("https://news.example.com/a");
+    expect(parsed.value).toEqual({ n: 1 });
+    expect(result.details.value).toEqual({ n: 1 });
+  });
+
+  it("shows the back action instead of an empty URL", async () => {
+    runtimeHandler(() => ({ text: "Went back to https://example.com/list" }));
+    const nav = toolByName("browser_navigate");
+    const result = await nav.execute("call-back", { tabId: "tab-7", action: "back" }, undefined, undefined, makeCtx());
+    const folded = renderResultText(nav, result, { expanded: false, args: { tabId: "tab-7", action: "back" } });
+    expect(folded).toContain("✓ back");
+  });
+
+  it("keeps the screenshot image block and shows the saved path", async () => {
+    runtimeHandler(() => ({
+      images: [{ data: "aGVsbG8=", mimeType: "image/png" }],
+      artifacts: [{ path: "/tmp/shot.png", mimeType: "image/png" }],
+    }));
+    const screenshot = toolByName("browser_screenshot");
+    const ctx = { ...makeCtx(), model: { input: ["text", "image"] } };
+    const result = await screenshot.execute(
+      "call-shot",
+      { tabId: "tab-1", path: "/tmp/shot.png" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content.some((c) => c.type === "image")).toBe(true);
+    const folded = renderResultText(screenshot, result, { expanded: false, args: { tabId: "tab-1" } });
+    expect(folded).toContain("/tmp/shot.png");
+  });
+
+  it("falls back to a short opaque id when no page context is known", async () => {
+    runtimeHandler(() => ({
+      tab: {
+        tabId: "ptab-mtwn3svh-5illhh1cdkl18",
+        groupId: "g",
+        sessionId: "s",
+        profileId: "p",
+        url: "",
+        title: "",
+        state: "ready",
+        browserEpoch: "e",
+        revision: 1,
+        chromeTabId: 1,
+      },
+    }));
+    const tabs = toolByName("browser_tabs");
+    const result = await tabs.execute(
+      "call-create",
+      { action: "create", groupId: "g", url: "about:blank" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const folded = renderResultText(tabs, result, { expanded: false, args: { action: "create" } });
+    expect(folded).toContain("created");
+    expect(folded).toContain("…illhh1cdkl18");
+    const expanded = renderResultText(tabs, result, { expanded: true, args: { action: "create" } });
+    expect(expanded).toContain("ptab-mtwn3svh-5illhh1cdkl18");
+  });
+});
+
+describe("PageContextStore bounds and isolation", () => {
+  const page = (tabId: string) => ({ tabId, url: `https://example.com/${tabId}`, title: `T ${tabId}` });
+
+  it("evicts the oldest tab at the per-session cap", () => {
+    const store = new PageContextStore();
+    for (let i = 0; i < 70; i++) store.observe("s1", page(`tab-${i}`));
+    expect(store.lookup("s1", "tab-0")).toBeUndefined();
+    expect(store.lookup("s1", "tab-5")).toBeUndefined();
+    expect(store.lookup("s1", "tab-6")).toBeDefined();
+    expect(store.lookup("s1", "tab-69")?.title).toBe("T tab-69");
+  });
+
+  it("caps the number of sessions and never crosses them", () => {
+    const store = new PageContextStore();
+    for (let i = 0; i < 20; i++) store.observe(`session-${i}`, page("tab"));
+    expect(store.lookup("session-0", "tab")).toBeUndefined();
+    expect(store.lookup("session-19", "tab")?.url).toContain("tab");
+    expect(store.lookup("unrelated", "tab")).toBeUndefined();
+  });
+
+  it("clears one session without touching another", () => {
+    const store = new PageContextStore();
+    store.observe("a", page("tab"));
+    store.observe("b", page("tab"));
+    store.clear("a");
+    expect(store.lookup("a", "tab")).toBeUndefined();
+    expect(store.lookup("b", "tab")).toBeDefined();
   });
 });

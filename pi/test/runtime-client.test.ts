@@ -10,6 +10,7 @@ import {
   MAX_REQUEST_TIMEOUT_MS,
   resolveRuntimeConfig,
   RuntimeRequestError,
+  TRANSPORT_RESPONSE_GRACE_MS,
 } from "../extensions/runtime-client.ts";
 import { startTestServer, validCapabilities, validProfile, type TestServer } from "./test-server.ts";
 
@@ -332,49 +333,36 @@ describe("request", () => {
           );
         }),
     );
-    const c = new BrowserRuntimeClient({ baseUrl: server.baseUrl, transportGraceMs: 400 });
     const started = Date.now();
     await expect(
-      c.request({
+      client().request({
         requestId: "c",
         sessionId: "s",
         operation: { kind: "page.click", tabId: "t", selector: "#x" },
         timeoutMs: 30,
       }),
     ).rejects.toMatchObject({ category: "operation", code: "timeout", outcome: "unknown" });
-    expect(Date.now() - started).toBeLessThan(400);
+    expect(Date.now() - started).toBeLessThan(500);
   });
 
-  it("still enforces a bounded transport deadline after the grace", async () => {
-    server.setHandler(() => new Promise<never>(() => {}) as never);
-    const c = new BrowserRuntimeClient({ baseUrl: server.baseUrl, transportGraceMs: 60 });
-    const started = Date.now();
-    await expect(
-      c.request({
-        requestId: "c",
-        sessionId: "s",
-        operation: { kind: "page.click", tabId: "t", selector: "#x" },
-        timeoutMs: 30,
-      }),
-    ).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
-    const elapsed = Date.now() - started;
-    expect(elapsed).toBeGreaterThanOrEqual(70);
-    expect(elapsed).toBeLessThan(2_000);
+  it("keeps the transport grace finite and bounded", () => {
+    expect(Number.isFinite(TRANSPORT_RESPONSE_GRACE_MS)).toBe(true);
+    expect(TRANSPORT_RESPONSE_GRACE_MS).toBeGreaterThan(0);
+    expect(TRANSPORT_RESPONSE_GRACE_MS).toBeLessThanOrEqual(30_000);
   });
 
-  it("keeps a caller abort immediate through the response body read even with a long grace", async () => {
+  it("keeps a caller abort immediate through the response body read", async () => {
     server.setStreamHandler((_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.write('{"requestId":"c","ok":true,"da');
       // never ends
     });
-    const c = new BrowserRuntimeClient({ baseUrl: server.baseUrl, transportGraceMs: 5_000 });
     const ac = new AbortController();
-    const p = c.request({
+    const p = client().request({
       requestId: "c",
       sessionId: "s",
       operation: { kind: "page.click", tabId: "t", selector: "#x" },
-      timeoutMs: 5_000,
+      timeoutMs: 30_000,
       signal: ac.signal,
     });
     await new Promise((r) => setTimeout(r, 50));

@@ -1,17 +1,13 @@
 /**
- * Session-scoped page-context cache for the human-facing tool rows.
+ * Session-scoped page-context cache for human-facing rows.
  *
- * The tools already receive page facts from the runtime (a returned tab, a
- * `tabs.list`, or the optional `pageInfo` observation on page operations), so
- * the UI can remember "which page is this tabId on" without ever issuing an
- * extra browser call. The cache is keyed by Pi session UUID and every read
- * requires the exact session, so one session can never surface another
- * session's titles. It is bounded (LRU by tab) and cleared on session
- * shutdown.
- *
- * Renderers do not receive an ExtensionContext, so `bindResultSession()` links
- * the (UI-only, never serialized) tool `details` object of the current result
- * to its session id via a WeakMap. Restored rows simply get no context.
+ * Observed page facts (returned tabs, optional pageInfo) are remembered per Pi
+ * session so later rows on the same tab can show a title/domain without an
+ * extra browser call. Reads require the exact session, both sessions and their
+ * tabs are bounded, and session shutdown clears its context. Renderers do not
+ * receive an ExtensionContext, so `bindResultSession()` links a result's
+ * UI-only details object to its session through a WeakMap; restored rows get
+ * no context.
  */
 import { clampBytes, stripTerminalControls } from "./ui-format.ts";
 
@@ -22,10 +18,12 @@ export type ObservedPage = {
 };
 
 const MAX_FIELD_BYTES = 2_000;
+const MAX_PAGES_PER_SESSION = 64;
+const MAX_SESSIONS = 16;
 
 const resultSessions = new WeakMap<object, string>();
 
-/** Link the details object of one tool result to the session that produced it. */
+/** Link the details object of one result to the session that produced it. */
 export function bindResultSession(details: object, sessionId: string): void {
   if (!sessionId) return;
   resultSessions.set(details, sessionId);
@@ -40,36 +38,35 @@ export function boundResultSession(details: unknown): string | undefined {
 /** Bounded, session-isolated store of observed page context. */
 export class PageContextStore {
   private readonly bySession = new Map<string, Map<string, ObservedPage>>();
-  private readonly maxEntriesPerSession: number;
 
-  constructor(maxEntriesPerSession = 64) {
-    this.maxEntriesPerSession = Math.max(1, maxEntriesPerSession);
-  }
-
-  /**
-   * Record an observed page for a session. Refreshes recency on update and
-   * evicts the oldest tab when the bound is exceeded. Unknown sessions and
-   * malformed observations are ignored.
-   */
+  /** Record one observation; refreshes recency and evicts at both bounds. */
   observe(sessionId: string | undefined, page: ObservedPage): void {
     if (!sessionId) return;
     const tabId = stripTerminalControls(page.tabId).trim();
     if (!tabId) return;
     let entries = this.bySession.get(sessionId);
-    if (!entries) {
+    if (entries) {
+      // Refresh session recency so active sessions survive the session cap.
+      this.bySession.delete(sessionId);
+    } else {
       entries = new Map();
-      this.bySession.set(sessionId, entries);
     }
+    this.bySession.set(sessionId, entries);
     entries.delete(tabId);
     entries.set(tabId, {
       tabId,
       url: clampBytes(stripTerminalControls(page.url), MAX_FIELD_BYTES),
       ...(page.title ? { title: clampBytes(stripTerminalControls(page.title), MAX_FIELD_BYTES) } : {}),
     });
-    while (entries.size > this.maxEntriesPerSession) {
+    while (entries.size > MAX_PAGES_PER_SESSION) {
       const oldest = entries.keys().next().value;
       if (oldest === undefined) break;
       entries.delete(oldest);
+    }
+    while (this.bySession.size > MAX_SESSIONS) {
+      const oldest = this.bySession.keys().next().value;
+      if (oldest === undefined) break;
+      this.bySession.delete(oldest);
     }
   }
 

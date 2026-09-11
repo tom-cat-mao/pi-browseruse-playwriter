@@ -38,7 +38,7 @@ used.
 | `browser_groups` | list/create/rename/close this session's tab groups (create needs `name`+`profileId`) |
 | `browser_tabs` | list/create/attach/activate/close/release tabs; `discover` lists real open tabs with Pi-side `offset`/`limit` paging (active tabs first, `nextOffset`/`truncated` reported) |
 | `browser_navigate` | navigate a `tabId` to a URL, or `action:"back"` through real browser history |
-| `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` (default is the readable tree, `full` the unfiltered tree) |
+| `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` (default readable tree; `full` requests the complete tree, output bounded) |
 | `browser_click` | click by ref (`aria-ref=eN`/`@eN` + `snapshotId`) or strict CSS |
 | `browser_fill` | set input/textarea/contenteditable text (clear-and-insert) |
 | `browser_evaluate` | run JS in a tab's page (`document`/`window`, async) |

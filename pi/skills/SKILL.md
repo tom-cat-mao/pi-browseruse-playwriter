@@ -102,9 +102,10 @@ screenshots are an optional extra for visual/spatial questions.
 ## Reading vs seeing
 
 - Prefer `browser_snapshot` (text, cheap, gives refs) to read state. The default
-  output is the readable whole tree — page text, headings and controls, not only
+  output is the readable tree — page text, headings and controls, not only
   interactive nodes — so it can be large; use `search` (or a strict single-match
-  `selector`) to keep it compact. `full` returns the complete unfiltered tree.
+  `selector`) to keep it compact. `full` requests the complete tree; output
+  stays bounded either way.
 - `browser_evaluate` (`tabId`, `code`) runs JS in the page (`document`/`window`,
   async ok). End with `return <value>` — a bare expression returns undefined.
   It clears the latest snapshot (see selectors above).
