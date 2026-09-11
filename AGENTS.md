@@ -117,8 +117,8 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
   headless 启动浏览器造成意外，不要在测试里 `browser.close()` / `context.close()`。
 - 测试只创建自己的 fixture、临时目录与端口，并清理自己创建的资源。
 - 新测试不要 mock；只为已有模块/describe 补真实逻辑测试，不写占位测试。
-- bash 工具运行测试时把 timeout 设为至少 300s（即 300000ms；该参数单位是毫秒，
-  不要写成会被当成 300000 秒的形式）；断言与等待的超时不超过 5s。
+- 测试命令的工具超时至少 300s；按当前工具 schema 的单位填写（秒则填 300，毫秒
+  则填 300000），不要混用。断言与等待的超时不超过 5s。
 - 快照用 runner 的 `-u` 生成，然后必须读回文件、看 `git diff` 再提交；不手工写内联
   快照，也不无脑接受全部快照变化。
 - 声称"通过"之前必须真的跑过对应的 typecheck/test，并如实报告 PASS/FAIL/SKIP。
