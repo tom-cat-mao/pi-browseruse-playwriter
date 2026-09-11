@@ -25,7 +25,8 @@
  * (to the extension or to a worker) must report `unknown` on abnormal termination and
  * must never be replayed automatically.
  */
-import { ManagedExecutorPool } from './managed-executor-pool.js'
+import { ManagedCancellation, ManagedExecutorPool } from './managed-executor-pool.js'
+import { RuntimeNetworkCaptureStore } from './runtime-network-capture.js'
 import { parseTabCandidateId } from './browser-protocol.js'
 import {
   BROWSER_PROTOCOL_VERSION,
@@ -43,6 +44,7 @@ import {
   type BrowserTab,
   type BrowserTabCandidate,
   type BrowserTabOrigin,
+  type ManagedCancelReason,
   type ManagedExecutorPoolContract,
 } from './browser-protocol.js'
 
@@ -187,6 +189,15 @@ export type ManagedRelayOptions = {
       profileId: string
       stableKey: string
       request: BrowserRequest
+      timeoutMs: number
+    }) => Promise<unknown>
+    sendCdpCommand?: (options: {
+      profileId: string
+      stableKey: string
+      connectionId: string
+      sessionId: string
+      method: 'Network.enable'
+      params: Record<string, never>
       timeoutMs: number
     }) => Promise<unknown>
   }
@@ -1494,6 +1505,9 @@ export class ManagedRelay {
   private readonly scopes = new Map<string, ManagedScopeView>()
   private readonly slots = new Map<string, ManagedExecutionSlot>()
   private readonly managedClients = new Map<string, ManagedClientEntry>()
+  private readonly networkCaptures = new RuntimeNetworkCaptureStore()
+  private readonly pendingNetworkStarts = new Map<string, number>()
+  private nextNetworkStartToken = 0
   private pool: ManagedExecutorPoolContract | null = null
   private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
   private disposed = false
@@ -1542,6 +1556,12 @@ export class ManagedRelay {
       })
       this.clearProfileScopes(result.profile.profileId)
     }
+    this.networkCaptures.reconcileProfile({
+      profileId: result.profile.profileId,
+      connectionId,
+      browserEpoch: result.profile.browserEpoch,
+      tabs: result.profile.tabs,
+    })
     return result
   }
 
@@ -1553,6 +1573,7 @@ export class ManagedRelay {
         `[managed-relay] profile ${profile.profileId} offline, keeping cached ownership (${profile.groups.size} groups, ${profile.tabs.size} tabs)`,
       )
       this.abortPendingForProfile(profile.profileId)
+      this.networkCaptures.interruptProfile({ profileId: profile.profileId, reason: 'extension disconnected' })
       this.invalidateProfileExecutions({ profileId: profile.profileId, reason: 'extension disconnected' })
       this.clearProfileScopes(profile.profileId)
       void this.getExistingPool()
@@ -1636,7 +1657,8 @@ export class ManagedRelay {
       return existing.promise
     }
 
-    const promise = this.dispatch({ request, timeoutMs, clientSignal: options.clientSignal }).then((response) => {
+    const deadlineAt = (this.options.now?.() ?? Date.now()) + timeoutMs
+    const promise = this.dispatch({ request, timeoutMs, deadlineAt, clientSignal: options.clientSignal }).then((response) => {
       return this.enforceResponseLimit(response, request.requestId)
     })
     this.dedup.set(dedupKey, { kind: operation.kind, fingerprint, timestamp: Date.now(), promise })
@@ -1735,10 +1757,12 @@ export class ManagedRelay {
   private async dispatch({
     request,
     timeoutMs,
+    deadlineAt,
     clientSignal,
   }: {
     request: BrowserRequest
     timeoutMs: number
+    deadlineAt: number
     clientSignal?: AbortSignal
   }): Promise<BrowserResponse> {
     const operation = request.operation
@@ -1833,10 +1857,12 @@ export class ManagedRelay {
         case 'page.fill':
         case 'page.evaluate':
         case 'page.screenshot':
-        case 'page.network':
         case 'page.logs':
         case 'page.execute': {
-          return await this.executePageOperation({ request, operation, timeoutMs, clientSignal })
+          return await this.executePageOperation({ request, operation, timeoutMs, deadlineAt, clientSignal })
+        }
+        case 'page.network': {
+          return await this.executeNetworkOperation({ request, operation, timeoutMs, deadlineAt, clientSignal })
         }
         default: {
           return failureResponse(request.requestId, {
@@ -1915,6 +1941,10 @@ export class ManagedRelay {
       if (!resultCheck.ok) {
         return resultCheck.response
       }
+      if (request.operation.kind === 'tabs.release' || request.operation.kind === 'tabs.close') {
+        this.pendingNetworkStarts.delete(networkStartKey(request.sessionId, request.operation.tabId))
+        this.networkCaptures.deleteTab({ sessionId: request.sessionId, tabId: request.operation.tabId })
+      }
       return parsed.value
     } catch (error) {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
@@ -1971,11 +2001,13 @@ export class ManagedRelay {
     request,
     operation,
     timeoutMs,
+    deadlineAt,
     clientSignal,
   }: {
     request: BrowserRequest
     operation: BrowserPageOperation
     timeoutMs: number
+    deadlineAt: number
     clientSignal?: AbortSignal
   }): Promise<BrowserResponse> {
     const tabResult = this.resolveTab({ requestId: request.requestId, sessionId: request.sessionId, tabId: operation.tabId })
@@ -2026,7 +2058,7 @@ export class ManagedRelay {
             request,
             operation,
             profile: freshProfile.profile,
-            timeoutMs,
+            timeoutMs: this.remainingTimeout({ deadlineAt, pending }),
             signal,
           })
           if (!authoritative.ok) {
@@ -2047,9 +2079,10 @@ export class ManagedRelay {
               outcome: 'not-started',
             })
           }
+          const workerTimeoutMs = this.remainingTimeout({ deadlineAt, pending })
           pending.started = true
           return await pool.execute({
-            request: { ...request, operation },
+            request: { ...request, operation, timeoutMs: workerTimeoutMs },
             tab: authoritative.tab,
             cdpUrl: slot.cdpUrl,
             connectionEpoch: slot.connectionEpoch,
@@ -2080,6 +2113,214 @@ export class ManagedRelay {
       pending.detachClientSignal?.()
       this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
     }
+  }
+
+  private async executeNetworkOperation({
+    request,
+    operation,
+    timeoutMs,
+    deadlineAt,
+    clientSignal,
+  }: {
+    request: BrowserRequest
+    operation: Extract<BrowserPageOperation, { kind: 'page.network' }>
+    timeoutMs: number
+    deadlineAt: number
+    clientSignal?: AbortSignal
+  }): Promise<BrowserResponse> {
+    const tabResult = this.resolveTab({
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      tabId: operation.tabId,
+    })
+    if (!tabResult.ok) {
+      return tabResult.response
+    }
+    if (operation.action === 'list' || operation.action === 'stop') {
+      if (operation.action === 'stop') {
+        this.pendingNetworkStarts.delete(networkStartKey(request.sessionId, operation.tabId))
+      }
+      const capture = operation.action === 'list'
+        ? this.networkCaptures.list({ sessionId: request.sessionId, tabId: operation.tabId, filter: operation.filter })
+        : this.networkCaptures.stop({ sessionId: request.sessionId, tabId: operation.tabId, filter: operation.filter })
+      return successResponse(request.requestId, {
+        ...(operation.action === 'stop'
+          ? {
+              text: operation.filter
+                ? `Network capture stopped with ${capture.metadata.retainedCount} retained entries (${capture.entries.length} filter matches)`
+                : `Network capture stopped with ${capture.metadata.retainedCount} retained entries`,
+            }
+          : {}),
+        value: operation.action === 'list'
+          ? capture.entries
+          : { active: false, entries: capture.entries },
+        networkCapture: capture.metadata,
+      })
+    }
+    if (!this.networkCaptures.canStart({ sessionId: request.sessionId, tabId: operation.tabId })) {
+      return failureResponse(request.requestId, {
+        code: 'execution-failed',
+        message: 'runtime network capture limit reached; release a retained tab or restart one of its existing captures',
+        outcome: 'not-started',
+      })
+    }
+
+    const routable = this.requireRoutableProfile({
+      requestId: request.requestId,
+      profileId: tabResult.profile.profileId,
+    })
+    if (!routable.ok) {
+      return routable.response
+    }
+    const profileId = routable.profile.profileId
+    const startKey = networkStartKey(request.sessionId, operation.tabId)
+    const startToken = this.nextNetworkStartToken + 1
+    this.nextNetworkStartToken = startToken
+    this.pendingNetworkStarts.set(startKey, startToken)
+    const pending = this.createPending({
+      sessionId: request.sessionId,
+      requestId: request.requestId,
+      profileId,
+      kind: operation.kind,
+      clientSignal,
+    })
+    const timer = setTimeout(() => {
+      this.abortPending({ pending, reason: 'timeout' })
+    }, timeoutMs)
+    try {
+      return await this.queue.run({
+        key: profileId,
+        controller: pending.controller,
+        task: async (signal) => {
+          this.assertNetworkStartCurrent({ startKey, startToken, outcome: 'not-started' })
+          if (!this.networkCaptures.canStart({ sessionId: request.sessionId, tabId: operation.tabId })) {
+            throw new ManagedTransportError({
+              code: 'execution-failed',
+              message: 'runtime network capture limit reached; release a retained tab or restart one of its existing captures',
+              outcome: 'not-started',
+            })
+          }
+          const freshProfile = this.requireRoutableProfile({ requestId: request.requestId, profileId })
+          if (!freshProfile.ok) {
+            throw new ManagedTransportError(failureFromErrorResponse(freshProfile.response))
+          }
+          const authoritative = await this.resolveTabWithExtension({
+            request,
+            operation,
+            profile: freshProfile.profile,
+            timeoutMs: this.remainingTimeout({ deadlineAt, pending }),
+            signal,
+          })
+          if (!authoritative.ok) {
+            throw new ManagedTransportError(authoritative.failure)
+          }
+          this.assertNetworkStartCurrent({ startKey, startToken, outcome: 'not-started' })
+          const tab = authoritative.tab
+          if (!freshProfile.profile.connectionId || !tab.targetId || !tab.cdpSessionId) {
+            throw new ManagedTransportError({
+              code: 'profile-disconnected',
+              message: `tab ${tab.tabId} has no authoritative CDP target on the current extension connection`,
+              outcome: 'not-started',
+            })
+          }
+          if (!this.options.transport.sendCdpCommand) {
+            throw new ManagedTransportError({
+              code: 'unsupported-capability',
+              message: 'runtime CDP transport is not available',
+              outcome: 'not-started',
+            })
+          }
+          const commandTimeoutMs = this.remainingTimeout({ deadlineAt, pending })
+          pending.started = true
+          const commandPromise = this.options.transport.sendCdpCommand({
+            profileId,
+            stableKey: freshProfile.profile.stableKey,
+            connectionId: freshProfile.profile.connectionId,
+            sessionId: tab.cdpSessionId,
+            method: 'Network.enable',
+            params: {},
+            timeoutMs: commandTimeoutMs,
+          })
+          commandPromise.catch(() => {})
+          await this.awaitWithAbort({ promise: commandPromise, signal })
+          this.remainingTimeout({ deadlineAt, pending })
+          this.assertNetworkStartCurrent({ startKey, startToken, outcome: 'unknown' })
+          const currentProfile = this.state.profiles.get(profileId)
+          const currentTab = currentProfile?.tabs.get(tab.tabId)
+          if (
+            !currentProfile?.connected ||
+            currentProfile.connectionId !== freshProfile.profile.connectionId ||
+            currentProfile.browserEpoch !== tab.browserEpoch ||
+            currentTab?.sessionId !== request.sessionId ||
+            currentTab.targetId !== tab.targetId ||
+            currentTab.cdpSessionId !== tab.cdpSessionId ||
+            currentTab.state !== 'ready'
+          ) {
+            throw new ManagedTransportError({
+              code: 'profile-disconnected',
+              message: `tab ${tab.tabId} changed ownership or connection while network capture was starting`,
+              outcome: 'unknown',
+            })
+          }
+          const capture = this.networkCaptures.start({
+            sessionId: request.sessionId,
+            profileId,
+            tab,
+            connectionId: freshProfile.profile.connectionId,
+            filter: operation.filter,
+          })
+          return successResponse(request.requestId, {
+            text: 'Network capture started',
+            value: { active: true, filter: operation.filter ?? null, entries: [] },
+            networkCapture: capture.metadata,
+          })
+        },
+      })
+    } catch (error) {
+      return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
+    } finally {
+      clearTimeout(timer)
+      if (this.pendingNetworkStarts.get(startKey) === startToken) {
+        this.pendingNetworkStarts.delete(startKey)
+      }
+      pending.detachClientSignal?.()
+      this.pending.delete(`${request.sessionId}\u0000${request.requestId}`)
+    }
+  }
+
+  private assertNetworkStartCurrent({
+    startKey,
+    startToken,
+    outcome,
+  }: {
+    startKey: string
+    startToken: number
+    outcome: 'not-started' | 'unknown'
+  }): void {
+    if (this.pendingNetworkStarts.get(startKey) === startToken) {
+      return
+    }
+    throw new ManagedTransportError({
+      code: 'cancelled',
+      message: 'network capture start was superseded or stopped before activation',
+      outcome,
+    })
+  }
+
+  handleCdpEvent({
+    connectionId,
+    rootCdpSessionId,
+    sourceCdpSessionId,
+    method,
+    params,
+  }: {
+    connectionId: string
+    rootCdpSessionId?: string
+    sourceCdpSessionId?: string
+    method: string
+    params: unknown
+  }): void {
+    this.networkCaptures.handleEvent({ connectionId, rootCdpSessionId, sourceCdpSessionId, method, params })
   }
 
   /**
@@ -2247,6 +2488,14 @@ export class ManagedRelay {
   // -------------------------------------------------------------------------
 
   private async releaseSession({ requestId, sessionId }: { requestId: string; sessionId: string }): Promise<BrowserResponse> {
+    this.networkCaptures.deleteSession(sessionId)
+    Array.from(this.pendingNetworkStarts.keys())
+      .filter((key) => {
+        return key.startsWith(`${sessionId}\u0000`)
+      })
+      .map((key) => {
+        this.pendingNetworkStarts.delete(key)
+      })
     this.abortPendingForSession(sessionId, 'session-released')
     this.invalidateSessionExecutions({ sessionId, reason: 'session released' })
     try {
@@ -2330,7 +2579,7 @@ export class ManagedRelay {
       pending.cancelRequested = true
       pending.sessionReleased = true
     }
-    pending.controller.abort(new Error(reason))
+    pending.controller.abort(new ManagedCancellation(poolCancelReason(reason)))
     this.signalCancellationToOwner({ pending, reason })
   }
 
@@ -2346,6 +2595,7 @@ export class ManagedRelay {
         sessionId: pending.sessionId,
         requestId: pending.requestId,
         profileId: pending.profileId,
+        reason: poolCancelReason(reason),
       })
       return
     }
@@ -2396,15 +2646,17 @@ export class ManagedRelay {
     sessionId,
     requestId,
     profileId,
+    reason,
   }: {
     sessionId: string
     requestId: string
     profileId: string
+    reason: ManagedCancelReason
   }): Promise<void> {
     try {
       const pool = await this.getExistingPool()
       if (pool) {
-        await pool.cancel({ sessionId, requestId })
+        await pool.cancel({ sessionId, requestId, reason })
       }
     } catch (error) {
       this.options.logger?.error('[managed-relay] pool cancel failed:', error)
@@ -2828,6 +3080,8 @@ export class ManagedRelay {
 
   async dispose(): Promise<void> {
     this.disposed = true
+    this.networkCaptures.clear()
+    this.pendingNetworkStarts.clear()
     for (const pending of this.pending.values()) {
       pending.controller.abort(new Error('relay shutting down'))
     }
@@ -2968,6 +3222,17 @@ export class ManagedRelay {
         },
       )
     })
+  }
+
+  private remainingTimeout({ deadlineAt, pending }: { deadlineAt: number; pending: PendingManagedRequest }): number {
+    const remaining = Math.floor(deadlineAt - (this.options.now?.() ?? Date.now()))
+    if (remaining > 0) {
+      return remaining
+    }
+    this.abortPending({ pending, reason: 'timeout' })
+    throw pending.controller.signal.reason instanceof Error
+      ? pending.controller.signal.reason
+      : new Error('request timed out')
   }
 
   private enforceResponseLimit(response: BrowserResponse, requestId: string): BrowserResponse {
@@ -3188,6 +3453,13 @@ function isPageOperationKind(kind: BrowserOperation['kind']): boolean {
   return kind.startsWith('page.')
 }
 
+/** The pool only distinguishes a deadline from every other stop reason. */
+function poolCancelReason(
+  reason: 'cancelled' | 'timeout' | 'client-disconnected' | 'session-released',
+): ManagedCancelReason {
+  return reason === 'timeout' ? 'timeout' : 'cancelled'
+}
+
 /** Defensive shape check for discovery entries that travel over the WS link. */
 function isCandidateRecord(value: unknown): value is BrowserTabCandidate {
   if (!isRecord(value)) return false
@@ -3229,6 +3501,10 @@ function describeTransportFailure(error: unknown): ManagedFailure {
 
 function slotKey(sessionId: string, profileId: string): string {
   return `${sessionId}\u0000${profileId}`
+}
+
+function networkStartKey(sessionId: string, tabId: string): string {
+  return `${sessionId}\u0000${tabId}`
 }
 
 /**

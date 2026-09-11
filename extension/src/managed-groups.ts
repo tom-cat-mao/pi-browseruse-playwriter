@@ -77,6 +77,8 @@ const INTERNAL_MOVE_TTL_MS = 3000
 const MAX_LEDGER_ENTRIES = 200
 const LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const TAB_ID_NONE = -1
+/** Fixed coalescing interval (not a sliding debounce) for tab page-info publishes. */
+const PAGE_INFO_PUBLISH_COALESCE_MS = 250
 
 export interface ManagedGroupsDeps {
   getProfileId: () => Promise<string>
@@ -180,6 +182,54 @@ function buildExistingGroupName(title: string | undefined): string {
   return trimmed.length > 0 ? trimmed : 'Existing tab'
 }
 
+/** Fields needed to order a `tabs.discover` listing deterministically. */
+export interface DiscoverySortableTab {
+  windowId: number
+  index: number
+  active: boolean
+}
+
+/**
+ * Active tab of every window first; focus only breaks ties; windowId/index keep
+ * the order stable for pagination. No globally unique current tab is assumed.
+ */
+export function compareDiscoveredTabs(options: {
+  a: DiscoverySortableTab
+  b: DiscoverySortableTab
+  focusedWindowIds: ReadonlySet<number>
+}): number {
+  const { a, b, focusedWindowIds } = options
+  if (a.active !== b.active) return a.active ? -1 : 1
+  const aFocused = focusedWindowIds.has(a.windowId)
+  const bFocused = focusedWindowIds.has(b.windowId)
+  if (aFocused !== bFocused) return aFocused ? -1 : 1
+  if (a.windowId !== b.windowId) return a.windowId - b.windowId
+  return a.index - b.index
+}
+
+/**
+ * Fixed-window trailing coalescer: the first schedule opens a window, later
+ * calls join it, so bursts collapse without moving the deadline.
+ */
+export class CoalescedPublisher {
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private readonly delayMs: number
+  private readonly flush: () => void
+
+  constructor(options: { delayMs: number; flush: () => void }) {
+    this.delayMs = options.delayMs
+    this.flush = options.flush
+  }
+
+  schedule(): void {
+    if (this.timer !== null) return
+    this.timer = setTimeout(() => {
+      this.timer = null
+      this.flush()
+    }, this.delayMs)
+  }
+}
+
 interface CreateDedupeContext {
   key: string
   operation: 'groups.create' | 'tabs.create'
@@ -210,6 +260,14 @@ export class ManagedGroups {
   private readonly adoptingChromeTabIds = new Set<number>()
   private readonly pendingAdoptions = new Set<number>()
   private readonly inFlightRequests = new Map<string, { fingerprint?: string; promise: Promise<BrowserResponse> }>()
+  /** Connection generation captured when the pending page-info publish was scheduled. */
+  private pageInfoPublishGeneration = 0
+  private readonly pageInfoPublisher = new CoalescedPublisher({
+    delayMs: PAGE_INFO_PUBLISH_COALESCE_MS,
+    flush: () => {
+      this.flushPageInfoPublish()
+    },
+  })
 
   constructor(deps: ManagedGroupsDeps) {
     this.deps = deps
@@ -987,7 +1045,7 @@ export class ManagedGroups {
         return true
       })
       .sort((a, b) => {
-        return a.windowId - b.windowId || a.index - b.index
+        return compareDiscoveredTabs({ a, b, focusedWindowIds })
       })
       .map((tab) => {
         return this.buildCandidate({
@@ -1982,13 +2040,33 @@ export class ManagedGroups {
     }
   }
 
-  /** Best-effort url/title cache refresh; never persists or publishes on its own. */
+  /**
+   * Merge a managed tab's URL/title into the authoritative registry (revision
+   * bump) and coalesce one inventory publish, so `tabs.list` stops serving stale
+   * metadata. No per-title disk write; released tabs and other epochs never
+   * revive because the active lookup skips them.
+   */
   noteChromeTabPageInfo(chromeTabId: number, url: string, title: string): void {
     if (!this.registry) return
     const tab = this.findManagedTabByChromeTabId(chromeTabId)
     if (!tab) return
-    this.mutate((registry) => {
+    const before = this.getRegistry()
+    const next = this.mutate((registry) => {
       return setTabPageInfo(registry, { tabId: tab.tabId, url, title })
+    })
+    if (next === before) return
+    this.pageInfoPublishGeneration = this.generation
+    this.pageInfoPublisher.schedule()
+  }
+
+  /** Drop the publish when the connection generation changed: restore publishes freshly observed state. */
+  private flushPageInfoPublish(): void {
+    if (this.pageInfoPublishGeneration !== this.generation) {
+      this.deps.logger.debug('Dropping coalesced page-info publish: connection generation changed')
+      return
+    }
+    void this.publishInventory().catch((error: unknown) => {
+      this.deps.logger.error('Failed to publish coalesced tab page info:', error)
     })
   }
 

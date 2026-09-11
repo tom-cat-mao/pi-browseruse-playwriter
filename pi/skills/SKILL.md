@@ -39,7 +39,12 @@ a group first:
 1. `browser_tabs` (`action:"discover"`, optionally `query`, `windowId`,
    `profileId`) lists the real tabs of every connected profile with title, URL,
    window, whether it is the active tab of its window, and whether its window has
-   focus. It is metadata only — nothing is read from the pages.
+   focus. It is metadata only — nothing is read from the pages. Results are
+   ordered active-first (window focus is only a tie-break) and paginated: the
+   reply reports `total`, `returned`, `nextOffset` and `truncated`. When
+   `truncated=true`, call discover again with `offset: nextOffset` (optionally
+   `limit`, default 20) to read the rest — the page in front of you is not
+   necessarily every open tab.
 2. Pick the entry that matches what the user described. Several windows can each
    have an active tab and the browser may have no focus at all while the user
    types — there is no single "current tab", so match on title/URL/window. If two
@@ -86,14 +91,24 @@ screenshots are an optional extra for visual/spatial questions.
 - Refs are only valid against the snapshot that produced them. If the page
   changed, take a fresh `browser_snapshot` first — stale refs throw
   (`stale-snapshot`).
-- Plain CSS/role selectors are matched **strictly**: an ambiguous selector is an
-  error, never a silent `.first()`. When you need a specific element, use a ref.
+- Snapshot refs are invalidated **conservatively**: any `browser_evaluate` or
+  `browser_execute` call clears the latest snapshot even when it only read data.
+  Take a fresh snapshot before the next ref-based click/fill.
+- Plain CSS/role selectors are matched **strictly**: zero or multiple matches is
+  an error, never a silent `.first()`. That also applies to `browser_snapshot`
+  `selector`, which must match exactly one scope element. When you need a
+  specific element, use a ref.
 
 ## Reading vs seeing
 
-- Prefer `browser_snapshot` (text, cheap, gives refs) to read state.
+- Prefer `browser_snapshot` (text, cheap, gives refs) to read state. The default
+  output is the readable tree — page text, headings and controls, not only
+  interactive nodes — so it can be large; use `search` (or a strict single-match
+  `selector`) to keep it compact. `full` requests the complete tree; output
+  stays bounded either way.
 - `browser_evaluate` (`tabId`, `code`) runs JS in the page (`document`/`window`,
   async ok). End with `return <value>` — a bare expression returns undefined.
+  It clears the latest snapshot (see selectors above).
 - `browser_screenshot` (`tabId`) returns an inline image when your model can see
   images; pass `path` to save, `fullPage` for the whole page, `labels` to overlay
   interactive markers. (There is no PDF tool.)
@@ -104,7 +119,12 @@ screenshots are an optional extra for visual/spatial questions.
   check it after navigate/click/submit for hydration errors and failed requests.
 - `browser_network` (`tabId`, `action:"start"|"list"|"stop"`, optional url
   substring `filter`): start before the triggering action, list to inspect,
-  stop to clear.
+  stop when done. Stop does **not** erase the evidence: the retained entries stay
+  listable and the result reports the capture state (`active` / `stopped` /
+  `interrupted` / `not-started`) plus retained/dropped counts. After a timeout or
+  a worker interruption look for `interrupted` (or `not-started`) instead of a
+  silent empty list — a later explicit `start` replaces the previous capture.
+  `list` returns a bare array of entries; `start`/`stop` return an object.
 
 ## browser_execute (escape hatch)
 
@@ -114,6 +134,8 @@ Use it for iframes, custom waits, multi-step flows the typed tools don't cover.
 Each call is independent: return plain data or ids to carry forward, but
 `page`/locator/CDP handles cannot be reused across calls — re-acquire them each
 time. Await every action to completion and leave no background timers running.
+The returned value and the page logs the snippet produced are reported back to
+you, and the latest snapshot is invalidated like after `browser_evaluate`.
 `keyboard`/`mouse`/`touchscreen` input is not supported right now.
 Never call `browser.close()`/`context.close()` — close tabs with `browser_tabs`.
 Code is sent as JSON: no shell quoting layer, so quotes/`$`/backticks are safe.
