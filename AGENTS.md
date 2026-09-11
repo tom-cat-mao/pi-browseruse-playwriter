@@ -14,13 +14,13 @@ fork，保留 MIT 许可与上游署名。它让 Pi agent 通过本机 Chrome �
 ID。fork 开发扩展 ID 是 `eeklahpecooapnailfaebkjjembkjhhg`，不是上游的
 `jfeammnjpkecdekppnclgkkffahnhfhe` / `pebbngnfojnignonigcnkdilknapkgid`。
 
-| 路径 | 包 | 说明 |
-| --- | --- | --- |
-| playwriter/ | @tom-cat/pi-browser-runtime（public） | managed runtime / relay / executor / 协议类型 |
-| extension/ | mcp-extension（private） | 用 chrome.debugger 管理用户浏览器的 Chrome 扩展 |
-| pi/ | @tom-cat/pi-browser-use-extension（public） | Pi 工具 + 模型侧使用说明 |
-| playwright/ | @xmorse/playwright-core（子模块） | remorses/playwright，固定 playwriter 分支 |
-| website/、db/ | 上游遗留 | cloud/D1/网站代码，与当前产品无关，除非用户明确要求，不要投入 |
+| 路径          | 包                                          | 说明                                                          |
+| ------------- | ------------------------------------------- | ------------------------------------------------------------- |
+| playwriter/   | @tom-cat/pi-browser-runtime（public）       | managed runtime / relay / executor / 协议类型                 |
+| extension/    | mcp-extension（private）                    | 用 chrome.debugger 管理用户浏览器的 Chrome 扩展               |
+| pi/           | @tom-cat/pi-browser-use-extension（public） | Pi 工具 + 模型侧使用说明                                      |
+| playwright/   | @xmorse/playwright-core（子模块）           | remorses/playwright，固定 playwriter 分支                     |
+| website/、db/ | 上游遗留                                    | cloud/D1/网站代码，与当前产品无关，除非用户明确要求，不要投入 |
 
 `docs/exec/` 混合契约、计划与验收记录：其中的计划和旧验收只属于具体任务的历史上下文
 （含被取代的 A/B/C 方案与过期失败记录），不是长期指令，契约与代码才是权威；`docs/`
@@ -162,7 +162,7 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
   早返回、少嵌套；不做无意义抽象，不写无信息量注释。
 - 不新增 any，不写 `(x as any).field`；先找真实类型或读 `.d.ts`。
 - 改完 TS 必须跑该包的 typecheck。
-- 不要手改生成的公共 Playwright 类型（`types.d.ts`）：按 doc/*.md → overrides.d.ts →
+- 不要手改生成的公共 Playwright 类型（`types.d.ts`）：按 doc/\*.md → overrides.d.ts →
   生成器 → 重建 fork 的顺序修改。
 - 新文件名用 kebab-case，不要大写字母。
 
