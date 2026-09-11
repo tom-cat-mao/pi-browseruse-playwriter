@@ -25,6 +25,7 @@
 import type {
   BrowserCapabilities,
   BrowserErrorCode,
+  BrowserNetworkCaptureStatus,
   BrowserOperation,
   BrowserProfile,
   BrowserRequest,
@@ -35,6 +36,12 @@ import type {
 export const DEFAULT_RUNTIME_PORT = 19989;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const MAX_REQUEST_TIMEOUT_MS = 120_000;
+/**
+ * Transport time granted past the operation deadline so the runtime can return
+ * its typed `timeout` instead of the client aborting in the same tick. The
+ * operation deadline itself is still `timeoutMs` (capped at 120s).
+ */
+export const TRANSPORT_RESPONSE_GRACE_MS = 5_000;
 // The largest response body we will read into memory. Generous enough for a
 // couple of full-page screenshots (base64), but bounded so a runaway runtime
 // cannot exhaust memory.
@@ -285,6 +292,51 @@ function validateProfile(value: unknown): BrowserProfile {
   return value as unknown as BrowserProfile;
 }
 
+// Capture lifecycle values as frozen in the protocol type.
+const NETWORK_CAPTURE_STATUSES: readonly BrowserNetworkCaptureStatus[] = [
+  "active",
+  "stopped",
+  "interrupted",
+  "not-started",
+];
+
+function isCaptureStatus(value: string): value is BrowserNetworkCaptureStatus {
+  return (NETWORK_CAPTURE_STATUSES as readonly string[]).includes(value);
+}
+
+/** Validate the optional frozen `data.pageInfo {tabId, url, title?}` observation. */
+function validatePageInfo(value: unknown): void {
+  if (!isRecord(value) || typeof value.tabId !== "string" || typeof value.url !== "string") {
+    throw new RuntimeRequestError("protocol", "result data.pageInfo is missing tabId/url");
+  }
+  if (value.title !== undefined && typeof value.title !== "string") {
+    throw new RuntimeRequestError("protocol", "result data.pageInfo.title is not a string");
+  }
+}
+
+/** Validate the optional frozen `data.networkCapture` capture metadata. */
+function validateNetworkCapture(value: unknown): void {
+  if (!isRecord(value)) {
+    throw new RuntimeRequestError("protocol", "result data.networkCapture is not an object");
+  }
+  const status = value.status;
+  if (typeof status !== "string" || !isCaptureStatus(status)) {
+    throw new RuntimeRequestError("protocol", "result data.networkCapture.status is not a known capture state");
+  }
+  if (value.captureId !== undefined && typeof value.captureId !== "string") {
+    throw new RuntimeRequestError("protocol", "result data.networkCapture.captureId is not a string");
+  }
+  if (value.reason !== undefined && typeof value.reason !== "string") {
+    throw new RuntimeRequestError("protocol", "result data.networkCapture.reason is not a string");
+  }
+  for (const key of ["retainedCount", "droppedCount"] as const) {
+    const count = value[key];
+    if (typeof count !== "number" || !Number.isFinite(count) || count < 0) {
+      throw new RuntimeRequestError("protocol", `result data.networkCapture.${key} is not a non-negative number`);
+    }
+  }
+}
+
 /**
  * Validate the typed shape of a success payload's data. We do not reject
  * unknown extra keys (forward-compat), but every field we surface to the LLM is
@@ -297,6 +349,8 @@ function validateResultData(data: Record<string, unknown>): void {
   if (data.snapshotId !== undefined && typeof data.snapshotId !== "string") {
     throw new RuntimeRequestError("protocol", "result data.snapshotId is not a string");
   }
+  if (data.pageInfo !== undefined) validatePageInfo(data.pageInfo);
+  if (data.networkCapture !== undefined) validateNetworkCapture(data.networkCapture);
   for (const key of ["profiles", "groups", "tabs", "candidates", "logs", "images", "artifacts"] as const) {
     if (data[key] !== undefined && !Array.isArray(data[key])) {
       throw new RuntimeRequestError("protocol", `result data.${key} is not an array`);
@@ -441,6 +495,11 @@ export class BrowserRuntimeClient {
   async requestRaw(opts: RequestOptions): Promise<BrowserResponse> {
     const endpoint = "/browser/v1/request";
     const timeoutMs = clampTimeout(opts.timeoutMs);
+    // The operation deadline the runtime enforces and the transport deadline
+    // this client enforces are deliberately different: the transport waits one
+    // bounded grace past the operation deadline so a typed server timeout can
+    // arrive. A user abort is independent of both (see withTimeout).
+    const abortBudgetMs = (timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) + TRANSPORT_RESPONSE_GRACE_MS;
     const body: BrowserRequest = {
       requestId: opts.requestId,
       sessionId: opts.sessionId,
@@ -459,7 +518,7 @@ export class BrowserRuntimeClient {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders(this.config) },
         body: JSON.stringify(body),
-        signal: withTimeout(timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, opts.signal),
+        signal: withTimeout(abortBudgetMs, opts.signal),
       });
       if (!res.ok) throw await httpError(res, endpoint);
       return validateResponse(await readJson(res), opts.requestId);

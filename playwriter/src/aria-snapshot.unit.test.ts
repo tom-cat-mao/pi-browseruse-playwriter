@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 import type { Protocol } from 'devtools-protocol'
 import {
   buildRawSnapshotTree,
+  buildDomIndex,
   buildSnapshotLines,
+  describeScopeCapture,
+  describeScopeResolution,
   filterFullSnapshotTree,
   filterInteractiveSnapshotTree,
   finalizeSnapshotOutput,
@@ -15,6 +18,47 @@ const roleValue = (value: string): Protocol.Accessibility.AXValue => {
 
 const nameValue = (value: string): Protocol.Accessibility.AXValue => {
   return { type: 'string', value }
+}
+
+type DomInfoEntry = {
+  nodeId: Protocol.DOM.NodeId
+  parentId?: Protocol.DOM.NodeId
+  backendNodeId: Protocol.DOM.BackendNodeId
+  nodeName: string
+  attributes: Map<string, string>
+}
+
+function domNode({
+  nodeId,
+  parentId,
+  backendNodeId,
+  nodeType,
+  nodeName,
+  attributes,
+  shadowRootType,
+  shadowRoots,
+}: {
+  nodeId: number
+  parentId?: number
+  backendNodeId: number
+  nodeType: number
+  nodeName: string
+  attributes?: string[]
+  shadowRootType?: Protocol.DOM.ShadowRootType
+  shadowRoots?: Protocol.DOM.Node[]
+}): Protocol.DOM.Node {
+  return {
+    nodeId: nodeId as Protocol.DOM.NodeId,
+    ...(parentId === undefined ? {} : { parentId: parentId as Protocol.DOM.NodeId }),
+    backendNodeId: backendNodeId as Protocol.DOM.BackendNodeId,
+    nodeType,
+    nodeName,
+    localName: nodeType === 1 ? nodeName.toLowerCase() : '',
+    nodeValue: '',
+    ...(attributes ? { attributes } : {}),
+    ...(shadowRootType ? { shadowRootType } : {}),
+    ...(shadowRoots ? { shadowRoots } : {}),
+  }
 }
 
 describe('aria-snapshot tree filters', () => {
@@ -417,6 +461,24 @@ describe('aria-snapshot tree filters', () => {
         - textbox "Email" [data-testid="email-input"]
         - button "Save" [id="save-primary"]
         - button "Save" [id="save-secondary"]",
+        "snapshotLines": [
+          {
+            "shortRef": undefined,
+            "text": "- form "Account":",
+          },
+          {
+            "shortRef": "e1",
+            "text": "  - textbox "Email" [data-testid="email-input"]",
+          },
+          {
+            "shortRef": "e2",
+            "text": "  - button "Save" [id="save-primary"]",
+          },
+          {
+            "shortRef": "e3",
+            "text": "  - button "Save" [id="save-secondary"]",
+          },
+        ],
         "tree": [
           {
             "backendNodeId": undefined,
@@ -611,5 +673,320 @@ describe('aria-snapshot tree filters', () => {
         ],
       }
     `)
+  })
+
+  it('reports a clear error for missing and ambiguous scope selectors', () => {
+    expect(describeScopeResolution({ matchCount: 1 })).toEqual({ ok: true })
+    expect(describeScopeResolution({ matchCount: 0 })).toEqual({
+      ok: false,
+      error:
+        'snapshot scope selector matched no elements; verify the selector or take a full-page snapshot without a locator',
+    })
+    expect(describeScopeResolution({ matchCount: 3 })).toEqual({
+      ok: false,
+      error: 'snapshot scope selector matched 3 elements; pass a selector that resolves to exactly one element',
+    })
+    expect(describeScopeCapture({ nodeId: null })).toEqual({
+      ok: false,
+      error: 'snapshot scope element disappeared before the accessibility tree was captured',
+    })
+    expect(describeScopeCapture({ nodeId: 42 as Protocol.DOM.NodeId })).toEqual({ ok: true, nodeId: 42 })
+  })
+
+  it('exposes per-line shortRefs so callers can window refs with the text', () => {
+    const rawTree: SnapshotNode = {
+      role: 'main',
+      name: '',
+      ignored: false,
+      children: [
+        { role: 'button', name: 'Alpha', backendNodeId: 10 as Protocol.DOM.BackendNodeId, children: [] },
+        { role: 'button', name: 'Beta', backendNodeId: 11 as Protocol.DOM.BackendNodeId, children: [] },
+      ],
+    }
+    const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomInfoEntry>([
+      [
+        10 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 40 as Protocol.DOM.NodeId,
+          backendNodeId: 10 as Protocol.DOM.BackendNodeId,
+          nodeName: 'BUTTON',
+          attributes: new Map([['id', 'alpha']]),
+        },
+      ],
+      [
+        11 as Protocol.DOM.BackendNodeId,
+        {
+          nodeId: 41 as Protocol.DOM.NodeId,
+          backendNodeId: 11 as Protocol.DOM.BackendNodeId,
+          nodeName: 'BUTTON',
+          attributes: new Map([['id', 'beta']]),
+        },
+      ],
+    ])
+    let counter = 0
+    const filtered = filterInteractiveSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      labelContext: false,
+      domByBackendId,
+      createRefForNode: () => `alpha-beta-${(counter += 1)}`,
+    })
+    const lines = buildSnapshotLines(filtered.nodes)
+    const shortRefMap = new Map([
+      ['alpha-beta-1', 'e1'],
+      ['alpha-beta-2', 'e2'],
+    ])
+    const result = finalizeSnapshotOutput(lines, filtered.nodes, shortRefMap)
+    expect(result.snapshotLines).toEqual([
+      { text: '- main:', shortRef: undefined },
+      { text: '  - button "Alpha" [id="alpha"]', shortRef: 'e1' },
+      { text: '  - button "Beta" [id="beta"]', shortRef: 'e2' },
+    ])
+  })
+
+  it('gives native summaries an exact structural selector, never role=disclosuretriangle', () => {
+    const rawTree: SnapshotNode = {
+      role: 'main',
+      name: '',
+      ignored: false,
+      children: [
+        { role: 'disclosuretriangle', name: 'Details', backendNodeId: 50 as Protocol.DOM.BackendNodeId, children: [] },
+      ],
+    }
+    const { domByBackendId } = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 101, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 102, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 103, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 104, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 5, parentId: 4, backendNodeId: 50, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    const filtered = filterInteractiveSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      labelContext: false,
+      domByBackendId,
+      createRefForNode: () => 'summary-ref',
+    })
+    const summary = filtered.nodes[0].children[0]
+    expect(summary.baseLocator).toBe(
+      'html:nth-of-type(1) > body:nth-of-type(1) > details:nth-of-type(1) > summary:nth-of-type(1)',
+    )
+    expect(summary.baseLocator).not.toContain('disclosuretriangle')
+  })
+
+  it('counts hidden summaries through the real DOM rather than AX-visible order', () => {
+    const rawTree: SnapshotNode = {
+      role: 'main',
+      name: '',
+      ignored: false,
+      children: [
+        { role: 'disclosuretriangle', name: 'First', backendNodeId: 70 as Protocol.DOM.BackendNodeId, children: [] },
+        { role: 'disclosuretriangle', name: 'Second', backendNodeId: 71 as Protocol.DOM.BackendNodeId, children: [] },
+      ],
+    }
+    const { domByBackendId } = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 101, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 102, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 103, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 104, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 5, parentId: 4, backendNodeId: 70, nodeType: 1, nodeName: 'SUMMARY' }),
+      domNode({ nodeId: 6, parentId: 3, backendNodeId: 106, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({
+        nodeId: 7,
+        parentId: 6,
+        backendNodeId: 107,
+        nodeType: 1,
+        nodeName: 'SUMMARY',
+        attributes: ['hidden', ''],
+      }),
+      domNode({ nodeId: 8, parentId: 6, backendNodeId: 71, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    const filtered = filterInteractiveSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      labelContext: false,
+      domByBackendId,
+      createRefForNode: () => 'ref',
+    })
+    const [first, second] = filtered.nodes[0].children
+    expect(first.baseLocator).toContain('details:nth-of-type(1) > summary:nth-of-type(1)')
+    expect(second.baseLocator).toContain('details:nth-of-type(2) > summary:nth-of-type(2)')
+  })
+
+  it('builds shadow-scoped selectors and refuses iframe-document selectors', () => {
+    const shadow = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 201, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 202, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 203, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 204, nodeType: 1, nodeName: 'DETAILS-PANEL' }),
+      domNode({
+        nodeId: 5,
+        parentId: 4,
+        backendNodeId: 205,
+        nodeType: 11,
+        nodeName: '#document-fragment',
+        shadowRootType: 'open',
+      }),
+      domNode({ nodeId: 6, parentId: 5, backendNodeId: 206, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 7, parentId: 6, backendNodeId: 207, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(shadow.domByBackendId.get(207 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBe(
+      'html:nth-of-type(1) > body:nth-of-type(1) > details-panel:nth-of-type(1) >> details:nth-of-type(1) > summary:nth-of-type(1)',
+    )
+
+    const closedShadow = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 211, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 212, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 213, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 214, nodeType: 1, nodeName: 'DETAILS-PANEL' }),
+      domNode({
+        nodeId: 5,
+        parentId: 4,
+        backendNodeId: 215,
+        nodeType: 11,
+        nodeName: '#document-fragment',
+        shadowRootType: 'closed',
+      }),
+      domNode({ nodeId: 6, parentId: 5, backendNodeId: 216, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(closedShadow.domByBackendId.get(216 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBeUndefined()
+
+    const iframe = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 301, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 302, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 303, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 304, nodeType: 1, nodeName: 'IFRAME' }),
+      domNode({ nodeId: 5, parentId: 4, backendNodeId: 305, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 6, parentId: 5, backendNodeId: 306, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 7, parentId: 6, backendNodeId: 307, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 8, parentId: 7, backendNodeId: 308, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 9, parentId: 8, backendNodeId: 309, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(iframe.domByBackendId.get(309 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBeUndefined()
+  })
+
+  it('anchors open-shadow summary selectors through host.shadowRoots metadata instead of a partial chain', () => {
+    // Mirrors the real DOM.getFlattenedDocument shape: the shadow root node is
+    // absent from the flat list and only reachable via the host's shadowRoots
+    // metadata; shadow content points parentId at that missing node.
+    const { domByBackendId } = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 501, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 502, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 503, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 504, nodeType: 1, nodeName: 'SECTION' }),
+      domNode({ nodeId: 5, parentId: 4, backendNodeId: 505, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 6, parentId: 5, backendNodeId: 506, nodeType: 1, nodeName: 'SUMMARY' }),
+      domNode({
+        nodeId: 7,
+        parentId: 3,
+        backendNodeId: 507,
+        nodeType: 1,
+        nodeName: 'DIV',
+        attributes: ['id', 'shadow-host'],
+        shadowRoots: [
+          domNode({
+            nodeId: 8,
+            backendNodeId: 508,
+            nodeType: 11,
+            nodeName: '#document-fragment',
+            shadowRootType: 'open',
+          }),
+        ],
+      }),
+      // Nodes 9 and 10 live in the open shadow root: their parentId 8 exists
+      // only under the host's shadowRoots metadata, not in the flat list.
+      domNode({ nodeId: 9, parentId: 8, backendNodeId: 509, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 10, parentId: 9, backendNodeId: 510, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    const shadowSelector = domByBackendId.get(510 as Protocol.DOM.BackendNodeId)?.structuralSelector
+    expect(shadowSelector).toBe(
+      'html:nth-of-type(1) > body:nth-of-type(1) > div:nth-of-type(1) >> details:nth-of-type(1) > summary:nth-of-type(1)',
+    )
+    expect(shadowSelector).not.toBe('details:nth-of-type(1) > summary:nth-of-type(1)')
+    const lightSelector = domByBackendId.get(506 as Protocol.DOM.BackendNodeId)?.structuralSelector
+    expect(lightSelector).toBe(
+      'html:nth-of-type(1) > body:nth-of-type(1) > section:nth-of-type(1) > details:nth-of-type(1) > summary:nth-of-type(1)',
+    )
+    expect(lightSelector).not.toBe(shadowSelector)
+  })
+
+  it('refuses summaries whose shadow boundary or ancestor chain cannot be proven to the root', () => {
+    // Shadow content points parentId at a shadow root that is missing from the
+    // flat list, and the host carries no shadowRoots metadata to recover the
+    // link from: the chain cannot be proven, so no selector may be emitted.
+    const withoutHostMetadata = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 601, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 602, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 603, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 99, backendNodeId: 604, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 5, parentId: 4, backendNodeId: 605, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(withoutHostMetadata.domByBackendId.get(605 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBeUndefined()
+
+    const closedShadow = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 611, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 612, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 613, nodeType: 1, nodeName: 'BODY' }),
+      domNode({
+        nodeId: 4,
+        parentId: 3,
+        backendNodeId: 614,
+        nodeType: 1,
+        nodeName: 'DIV',
+        shadowRoots: [
+          domNode({
+            nodeId: 5,
+            backendNodeId: 615,
+            nodeType: 11,
+            nodeName: '#document-fragment',
+            shadowRootType: 'closed',
+          }),
+        ],
+      }),
+      domNode({ nodeId: 6, parentId: 5, backendNodeId: 616, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 7, parentId: 6, backendNodeId: 617, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(closedShadow.domByBackendId.get(617 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBeUndefined()
+
+    // Native <details> expose a user-agent shadow root with a slot in real
+    // Chrome responses; it must never be crossed either.
+    const userAgentShadow = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 621, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 622, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 623, nodeType: 1, nodeName: 'BODY' }),
+      domNode({
+        nodeId: 4,
+        parentId: 3,
+        backendNodeId: 624,
+        nodeType: 1,
+        nodeName: 'DETAILS',
+        shadowRoots: [
+          domNode({
+            nodeId: 5,
+            backendNodeId: 625,
+            nodeType: 11,
+            nodeName: '#document-fragment',
+            shadowRootType: 'user-agent',
+          }),
+        ],
+      }),
+      domNode({ nodeId: 6, parentId: 5, backendNodeId: 626, nodeType: 1, nodeName: 'SLOT' }),
+      domNode({ nodeId: 7, parentId: 6, backendNodeId: 627, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(userAgentShadow.domByBackendId.get(627 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBeUndefined()
+
+    const truncatedChain = buildDomIndex([
+      domNode({ nodeId: 1, backendNodeId: 631, nodeType: 9, nodeName: '#document' }),
+      domNode({ nodeId: 2, parentId: 1, backendNodeId: 632, nodeType: 1, nodeName: 'HTML' }),
+      domNode({ nodeId: 3, parentId: 2, backendNodeId: 633, nodeType: 1, nodeName: 'BODY' }),
+      domNode({ nodeId: 4, parentId: 3, backendNodeId: 634, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 5, parentId: 4, backendNodeId: 635, nodeType: 1, nodeName: 'SUMMARY' }),
+      domNode({ nodeId: 6, parentId: 99, backendNodeId: 636, nodeType: 1, nodeName: 'DETAILS' }),
+      domNode({ nodeId: 7, parentId: 6, backendNodeId: 637, nodeType: 1, nodeName: 'SUMMARY' }),
+    ])
+    expect(truncatedChain.domByBackendId.get(637 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBeUndefined()
+    expect(truncatedChain.domByBackendId.get(635 as Protocol.DOM.BackendNodeId)?.structuralSelector).toBe(
+      'html:nth-of-type(1) > body:nth-of-type(1) > details:nth-of-type(1) > summary:nth-of-type(1)',
+    )
   })
 })

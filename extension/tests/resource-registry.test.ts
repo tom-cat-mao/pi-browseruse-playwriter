@@ -1,4 +1,6 @@
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import { CoalescedPublisher, compareDiscoveredTabs } from '../src/managed-groups'
+import type { DiscoverySortableTab } from '../src/managed-groups'
 import {
   addGroup,
   addTab,
@@ -453,6 +455,67 @@ describe('managed resource registry ownership', () => {
         },
       }
     `)
+  })
+
+  test('page info refresh keeps ownership and cannot resurrect a released tab', () => {
+    let registry = createRegistryWithGroup()
+    registry = setTabPageInfo(registry, {
+      tabId: 'pt-1',
+      url: 'https://example.com/invoice',
+      title: 'Invoice',
+    })
+    const refreshedInventory = buildInventory(registry)
+    const refreshedTab = findTab(registry, 'pt-1')
+    const refreshedInventoryTab = refreshedInventory.tabs.find((tab) => {
+      return tab.tabId === 'pt-1'
+    })
+
+    expect({
+      refreshed: {
+        url: refreshedTab?.url,
+        title: refreshedTab?.title,
+        state: refreshedTab?.state,
+        sessionId: refreshedTab?.sessionId,
+        groupId: refreshedTab?.groupId,
+        targetId: refreshedTab?.targetId,
+        cdpSessionId: refreshedTab?.cdpSessionId,
+      },
+      inventory: {
+        url: refreshedInventoryTab?.url,
+        revision: refreshedInventory.revision,
+        registryRevision: registry.revision,
+      },
+    }).toEqual({
+      refreshed: {
+        url: 'https://example.com/invoice',
+        title: 'Invoice',
+        state: 'ready',
+        sessionId: 'session-1',
+        groupId: 'pg-1',
+        targetId: 'target-1',
+        cdpSessionId: 'pw-tab-1',
+      },
+      inventory: {
+        url: 'https://example.com/invoice',
+        revision: registry.revision,
+        registryRevision: registry.revision,
+      },
+    })
+
+    // A late onUpdated event for a released tab must not revive it.
+    const released = releaseTab(registry, 'pt-1')
+    const afterRelease = setTabPageInfo(released, {
+      tabId: 'pt-1',
+      url: 'https://example.com/late',
+      title: 'Late title',
+    })
+    expect(afterRelease).toBe(released)
+    expect(findTab(afterRelease, 'pt-1')).toMatchObject({
+      url: 'https://example.com/invoice',
+      title: 'Invoice',
+      state: 'released',
+      sessionId: 'session-1',
+    })
   })
 
   test('create dedup ledger persists payload fingerprints and prunes old entries', () => {
@@ -1046,5 +1109,147 @@ describe('managed resource registry ownership', () => {
         "wrongVersion": null,
       }
     `)
+  })
+})
+
+function discoveryTab(options: { windowId: number; index: number; active?: boolean }): DiscoverySortableTab {
+  return { windowId: options.windowId, index: options.index, active: options.active ?? false }
+}
+
+function summarizeDiscoveryTabs(tabs: DiscoverySortableTab[]): string[] {
+  return tabs.map((candidate) => {
+    return `${candidate.windowId}/${candidate.index}${candidate.active ? ' active' : ''}`
+  })
+}
+
+function orderDiscoveryTabs(options: {
+  tabs: DiscoverySortableTab[]
+  focusedWindowIds: number[]
+}): DiscoverySortableTab[] {
+  const focused = new Set(options.focusedWindowIds)
+  return [...options.tabs].sort((a, b) => {
+    return compareDiscoveredTabs({ a, b, focusedWindowIds: focused })
+  })
+}
+
+describe('tabs.discover ordering', () => {
+  test('active tabs of every window lead and the focused window only orders ties', () => {
+    const tabs: DiscoverySortableTab[] = [
+      discoveryTab({ windowId: 7, index: 0 }),
+      discoveryTab({ windowId: 9, index: 0 }),
+      discoveryTab({ windowId: 9, index: 2, active: true }),
+      discoveryTab({ windowId: 7, index: 3, active: true }),
+      discoveryTab({ windowId: 9, index: 1 }),
+      discoveryTab({ windowId: 7, index: 1 }),
+    ]
+
+    expect(summarizeDiscoveryTabs(orderDiscoveryTabs({ tabs, focusedWindowIds: [7] }))).toEqual([
+      '7/3 active',
+      '9/2 active',
+      '7/0',
+      '7/1',
+      '9/0',
+      '9/1',
+    ])
+  })
+
+  test('each window keeps its own active tab when no window has OS focus', () => {
+    const tabs: DiscoverySortableTab[] = [
+      discoveryTab({ windowId: 5, index: 0 }),
+      discoveryTab({ windowId: 2, index: 0, active: true }),
+      discoveryTab({ windowId: 5, index: 2, active: true }),
+      discoveryTab({ windowId: 5, index: 1 }),
+      discoveryTab({ windowId: 2, index: 1 }),
+    ]
+
+    expect(summarizeDiscoveryTabs(orderDiscoveryTabs({ tabs, focusedWindowIds: [] }))).toEqual([
+      '2/0 active',
+      '5/2 active',
+      '2/1',
+      '5/0',
+      '5/1',
+    ])
+  })
+
+  test('the focused window leads inactive tabs but never outranks another active tab', () => {
+    const tabs: DiscoverySortableTab[] = [
+      discoveryTab({ windowId: 3, index: 0, active: true }),
+      discoveryTab({ windowId: 8, index: 0, active: true }),
+      discoveryTab({ windowId: 3, index: 1 }),
+      discoveryTab({ windowId: 8, index: 1 }),
+    ]
+
+    expect(summarizeDiscoveryTabs(orderDiscoveryTabs({ tabs, focusedWindowIds: [8] }))).toEqual([
+      '8/0 active',
+      '3/0 active',
+      '8/1',
+      '3/1',
+    ])
+  })
+
+  test('the listing is deterministic and does not depend on input enumeration order', () => {
+    const tabs: DiscoverySortableTab[] = [
+      discoveryTab({ windowId: 4, index: 1 }),
+      discoveryTab({ windowId: 4, index: 0, active: true }),
+      discoveryTab({ windowId: 1, index: 2 }),
+      discoveryTab({ windowId: 1, index: 0 }),
+    ]
+    const reversed: DiscoverySortableTab[] = [...tabs].reverse()
+
+    const first = orderDiscoveryTabs({ tabs, focusedWindowIds: [1] })
+    const second = orderDiscoveryTabs({ tabs: reversed, focusedWindowIds: [1] })
+    expect(summarizeDiscoveryTabs(first)).toEqual(['4/0 active', '1/0', '1/2', '4/1'])
+    expect(summarizeDiscoveryTabs(second)).toEqual(summarizeDiscoveryTabs(first))
+  })
+})
+
+describe('CoalescedPublisher', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  test('a burst flushes once and later updates do not push the deadline forward', () => {
+    vi.useFakeTimers()
+    let flushes = 0
+    const publisher = new CoalescedPublisher({
+      delayMs: 250,
+      flush: () => {
+        flushes += 1
+      },
+    })
+
+    publisher.schedule()
+    vi.advanceTimersByTime(100)
+    publisher.schedule()
+    vi.advanceTimersByTime(100)
+    publisher.schedule()
+    expect(flushes).toBe(0)
+
+    vi.advanceTimersByTime(50)
+    expect(flushes).toBe(1)
+    vi.advanceTimersByTime(1000)
+    expect(flushes).toBe(1)
+  })
+
+  test('continuous updates flush on a bounded interval instead of starving', () => {
+    vi.useFakeTimers()
+    let flushes = 0
+    const publisher = new CoalescedPublisher({
+      delayMs: 250,
+      flush: () => {
+        flushes += 1
+      },
+    })
+
+    // 1000ms of updates every 10ms: a sliding debounce would never fire.
+    for (let i = 0; i < 100; i += 1) {
+      publisher.schedule()
+      vi.advanceTimersByTime(10)
+    }
+    expect(flushes).toBe(4)
+
+    publisher.schedule()
+    vi.advanceTimersByTime(250)
+    expect(flushes).toBe(5)
   })
 })

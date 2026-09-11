@@ -16,7 +16,6 @@
     "reload": "node scripts/legacy-action-guard.mjs reload",
     "reload:fork": "pnpm --filter @tom-cat/pi-browser-runtime build && pnpm --filter mcp-extension reload:fork",
     "reload:legacy": "pnpm --filter @tom-cat/pi-browser-runtime build && tsx playwriter/src/cli.ts serve restart && pnpm --filter mcp-extension reload:legacy",
-    "agents.md": "agentsdotmd ./PLAYWRITER_AGENTS.md core.md typescript.md pnpm.md vitest.md changelog.md docs-writing.md github.md playwright.md zod.md gitchamber.md",
     "release:check-cli-version": "tsx scripts/check-extension-cli-version.ts",
     "release": "node scripts/package-extension.mjs",
     "bootstrap": "git submodule update --init && pnpm install && node playwright/utils/generate_injected.js && node playwright/packages/playwright-core/build.mjs",

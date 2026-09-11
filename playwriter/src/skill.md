@@ -631,6 +631,7 @@ await snapshot({ page: state.page, search?, showDiffSinceLastCall? })
 
 - `search` - string/regex to filter results (returns first 10 matching lines)
 - `showDiffSinceLastCall` - returns diff since last snapshot (default: `true`, but `false` when `search` is provided). Pass `false` to get full snapshot.
+- `full` - the snapshot already defaults to the full readable tree (labels, contexts, and text, not just interactive elements). Pass `full: true` to force that complete readable tree even when a caller would otherwise narrow it to interactive-only. `full` never lifts the line/character caps: the output stays subject to the same `search`/`offset`/`limit` windowing and truncation as every other snapshot.
 
 Snapshots return full content on first call, then diffs on subsequent calls. Diff is only returned when shorter than full content. If nothing changed, returns "No changes since last snapshot" message. Use `showDiffSinceLastCall: false` to always get full content. When `search` is provided, diffing is disabled by default so the search filters the full content — pass `showDiffSinceLastCall: true` explicitly to combine both. This diffing behavior also applies to `getCleanHTML` and `getPageMarkdown`.
 

@@ -193,6 +193,22 @@ export interface BrowserImage {
   mimeType: string
 }
 
+export type BrowserNetworkCaptureStatus = 'active' | 'stopped' | 'interrupted' | 'not-started'
+
+export interface BrowserNetworkCaptureMetadata {
+  status: BrowserNetworkCaptureStatus
+  captureId?: string
+  retainedCount: number
+  droppedCount: number
+  reason?: string
+}
+
+export interface BrowserPageInfo {
+  tabId: string
+  url: string
+  title?: string
+}
+
 export interface BrowserResultData {
   text?: string
   value?: BrowserJson
@@ -206,6 +222,8 @@ export interface BrowserResultData {
   images?: BrowserImage[]
   artifacts?: BrowserArtifact[]
   logs?: string[]
+  networkCapture?: BrowserNetworkCaptureMetadata
+  pageInfo?: BrowserPageInfo
 }
 
 export type BrowserResponse =
@@ -256,9 +274,13 @@ export interface ManagedExecutorPoolOptions {
   }) => void | Promise<void>
 }
 
+/** Why a managed executor task is being stopped. Internal to the relay→pool
+ *  boundary: a server deadline must never be reported as a user cancel. */
+export type ManagedCancelReason = 'cancelled' | 'timeout'
+
 export interface ManagedExecutorPoolContract {
   execute(options: ManagedExecution & { signal?: AbortSignal }): Promise<BrowserResponse>
-  cancel(options: { sessionId: string; requestId: string }): Promise<void>
+  cancel(options: { sessionId: string; requestId: string; reason?: ManagedCancelReason }): Promise<void>
   releaseSession(options: { sessionId: string }): Promise<void>
   disconnectProfile(options: { profileId: string }): Promise<void>
   dispose(): Promise<void>
