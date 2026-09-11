@@ -22,7 +22,9 @@ ID。fork 开发扩展 ID 是 `eeklahpecooapnailfaebkjjembkjhhg`，不是上游�
 | playwright/ | @xmorse/playwright-core（子模块） | remorses/playwright，固定 playwriter 分支 |
 | website/、db/ | 上游遗留 | cloud/D1/网站代码，与当前产品无关，除非用户明确要求，不要投入 |
 
-`docs/exec/` 是现行计划与契约文档；`docs/` 下的其它文件、`slop/` 属于历史/上游资料。
+`docs/exec/` 混合契约、计划与验收记录：其中的计划和旧验收只属于具体任务的历史上下文
+（含被取代的 A/B/C 方案与过期失败记录），不是长期指令，契约与代码才是权威；`docs/`
+下的其它文件、`slop/` 属于历史/上游资料。
 
 扩展与 runtime 的 WS 协议必须向后兼容：扩展的加载/发布永远滞后于 runtime 与本地安装。
 编译契约的唯一来源是 `playwriter/src/browser-protocol.ts`，协议变更只能是可选、追加式
@@ -37,12 +39,13 @@ ID。fork 开发扩展 ID 是 `eeklahpecooapnailfaebkjjembkjhhg`，不是上游�
 - browserEpoch 标识一次 Chrome 运行期；revision 单调递增；release 是 tombstone，
   防止重连把用户已放手的标签拉回来。不得按 URL/标题/组名推断归属，不得 pages[0]/
   last tab，不得复活旧的单窗口假设或全局共享 page 模型。
-- 既有能力：profiles/groups/tabs 的 list/create/close/release；tabs.discover 与
-  tabs.attach 原地接管用户现有标签（不刷新、不搬窗口、保留滚动与表单）；sourceTabId
-  关联外链新开的标签；tabs.activate 切回原标签；page.back 走真实浏览器历史；
-  snapshot 返回 snapshotId 与 shortRef，click/fill 使用 ref 时必须带 snapshotId；
-  普通 CSS/role selector 严格匹配、无 `.first()` 回退；execute 在隔离 worker 中执行；
-  取消/超时不重放，已开始的动作如实返回 outcome unknown。
+- 既有能力：profiles 只读（list）；groups 可 list/create/rename/close；tabs 可
+  list/create/close/release；tabs.discover 与 tabs.attach 原地接管用户现有标签
+  （不刷新、不搬窗口、保留滚动与表单）；sourceTabId 关联外链新开的标签；
+  tabs.activate 切回原标签；page.back 走真实浏览器历史；snapshot 返回 snapshotId
+  与 shortRef，click/fill 使用 ref 时必须带 snapshotId；普通 CSS/role selector
+  严格匹配、无 `.first()` 回退；execute 在隔离 worker 中执行；取消/超时不重放，
+  已开始的动作如实返回 outcome unknown。
 - Pi 展示与模型可见内容是两回事：稳定 ID、evaluate 返回值、错误详情必须进入
   model-facing content，`details` 只给 UI。`page.evaluate` 必须显式 return；任何
   evaluate/execute 之后 ref 保守失效，需要重新 snapshot，不能猜只读而跳过验证。
@@ -114,7 +117,8 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
   headless 启动浏览器造成意外，不要在测试里 `browser.close()` / `context.close()`。
 - 测试只创建自己的 fixture、临时目录与端口，并清理自己创建的资源。
 - 新测试不要 mock；只为已有模块/describe 补真实逻辑测试，不写占位测试。
-- bash 运行测试 timeout 至少 300000ms；断言与等待的超时不超过 5s。
+- bash 工具运行测试时把 timeout 设为至少 300s（即 300000ms；该参数单位是毫秒，
+  不要写成会被当成 300000 秒的形式）；断言与等待的超时不超过 5s。
 - 快照用 runner 的 `-u` 生成，然后必须读回文件、看 `git diff` 再提交；不手工写内联
   快照，也不无脑接受全部快照变化。
 - 声称"通过"之前必须真的跑过对应的 typecheck/test，并如实报告 PASS/FAIL/SKIP。
@@ -123,14 +127,15 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
 
 - 只在独立 feature branch/worktree 工作；多 agent 并行时同一文件同一时间只能有一个
   owner，跨边界先协调。
-- 提交只在用户/协调者明确授权时进行（当前 swarm 已授权功能分支提交）；不 reset/revert
-  用户或其他 agent 的改动；不 force push。
+- 提交只在用户/协调者明确授权时进行，一次授权不自动延续到后续分支或任务；不
+  reset/revert 用户或其他 agent 的改动；不 force push。
 - PR 默认 base 是 `dev`；未经用户明确授权不合 main、不直接提交 main。发布相关操作
   （tag push、GitHub Release、npm、Web Store）只有用户明确授权才能做。
 - 所有 `gh` 命令显式 `-R tom-cat-mao/pi-browseruse-playwriter`；fork 的 issues 已禁用，
   不要引用 remorses 上游的 issue。
 - 外部 agent 只用 codex / traex / codebuddy，model 与 effort 用默认值，不要改用
-  reasonix；不用 external_agent_wait、sleep 轮询或 callback/steer/follow-up。
+  reasonix；不要用 external_agent_wait 或 sleep 轮询等待，完成通知用回调，沟通用
+  steer/follow-up。
 - 临时文件写到 `./tmp`（已在 .gitignore），不要写 `/tmp`；不要用 `&` 启动后台命令，
   不要自己起临时后台服务；tmux 只在用户安排或授权时使用。
 - 实现者不担任最终验收者：完成后安排全新 agent 做独立 review，再走合并。
@@ -146,8 +151,8 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
 - fork 的 `@xmorse/playwright-core` 只有在公共 API/行为变化时才写 changeset，且必须
   先更新 playwright 的 doc/override 源再跑生成器；不要手改生成的 `types.d.ts`。
 - 发布现状：没有 npm/商店发布；推送 `extension@*` tag 会自动构建并发布 GitHub
-  Release，所以 tag/release 只允许在用户明确发布授权下进行，当前开发 swarm 禁止
-  推送 tag。
+  Release，所以 tag/release 只允许在用户明确发布授权下进行；在开发/修复分支上默认
+  不推送 tag、不创建 Release。
 
 ## TypeScript 与代码风格
 
@@ -172,10 +177,11 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
 - `README.md`：安装与发行现状；`pi/README.md`：Pi 包与工具说明；`pi/skills/SKILL.md`：
   模型侧用法（source of truth）。
 - `docs/exec/browser-runtime-contract.md`：HTTP/WS 契约（目标态，当前实现以代码为准）；
-  `docs/exec/browser-reliability-plan.md`：本轮可靠性 swarm 计划；
-  `docs/exec/extension-distribution-plan.md`：发行清单。
+  `docs/exec/` 下的计划与验收文档只描述具体任务（含被取代方案），不是长期指令；
+  `docs/exec/extension-distribution-plan.md` 是可复用的发行清单。
 - `playwriter/src/browser-protocol.ts`：类型与操作定义的唯一来源；`playwriter/src/resource.md`：
   Playwright 通用知识。
-- `MEMORY.md` 是历史踩坑记录，可参考但先对照当前代码；`playwriter/src/skill.md`、
-  `website/`、`db/`、`slop/` 及 `docs/` 下的非 exec 文档属于历史/上游资料，不是本 fork
-  的现行指引。
+- `MEMORY.md` 是历史踩坑记录，可参考但先对照当前代码。`playwriter/src/skill.md` 仍是
+  上游 legacy MCP/CLI 文档的源文件与资源生成器输入：改 legacy CLI/MCP 时要同步改它，
+  模型侧现行用法以 `pi/skills/SKILL.md` 为准；`website/`、`db/`、`slop/` 及 `docs/` 下
+  的非 exec 文档属于历史/上游资料。
