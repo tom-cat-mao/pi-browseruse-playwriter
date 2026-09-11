@@ -193,6 +193,22 @@ export interface BrowserImage {
   mimeType: string
 }
 
+export type BrowserNetworkCaptureStatus = 'active' | 'stopped' | 'interrupted' | 'not-started'
+
+export interface BrowserNetworkCaptureMetadata {
+  status: BrowserNetworkCaptureStatus
+  captureId?: string
+  retainedCount: number
+  droppedCount: number
+  reason?: string
+}
+
+export interface BrowserPageInfo {
+  tabId: string
+  url: string
+  title?: string
+}
+
 export interface BrowserResultData {
   text?: string
   value?: BrowserJson
@@ -206,6 +222,8 @@ export interface BrowserResultData {
   images?: BrowserImage[]
   artifacts?: BrowserArtifact[]
   logs?: string[]
+  networkCapture?: BrowserNetworkCaptureMetadata
+  pageInfo?: BrowserPageInfo
 }
 
 export type BrowserResponse =
