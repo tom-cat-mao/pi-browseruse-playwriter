@@ -340,8 +340,12 @@ type DomNodeInfo = {
   nodeType?: number
   nodeName: string
   attributes: Map<string, string>
-  shadowRootType?: Protocol.DOM.ShadowRootType
   structuralSelector?: string
+}
+
+type ShadowRootLink = {
+  hostNodeId: Protocol.DOM.NodeId
+  shadowRootType: Protocol.DOM.ShadowRootType
 }
 
 function toAttributeMap(attributes?: string[]): Map<string, string> {
@@ -874,10 +878,12 @@ export function buildDomIndex(nodes: Protocol.DOM.Node[]): {
   domById: Map<Protocol.DOM.NodeId, DomNodeInfo>
   domByBackendId: Map<Protocol.DOM.BackendNodeId, DomNodeInfo>
   childrenByParent: Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>
+  shadowRootLinkByRootNodeId: Map<Protocol.DOM.NodeId, ShadowRootLink>
 } {
   const domById = new Map<Protocol.DOM.NodeId, DomNodeInfo>()
   const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomNodeInfo>()
   const childrenByParent = new Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>()
+  const shadowRootLinkByRootNodeId = new Map<Protocol.DOM.NodeId, ShadowRootLink>()
 
   for (const node of nodes) {
     const info: DomNodeInfo = {
@@ -887,7 +893,6 @@ export function buildDomIndex(nodes: Protocol.DOM.Node[]): {
       nodeType: node.nodeType,
       nodeName: node.nodeName,
       attributes: toAttributeMap(node.attributes),
-      shadowRootType: node.shadowRootType,
     }
     domById.set(node.nodeId, info)
     domByBackendId.set(node.backendNodeId, info)
@@ -896,6 +901,26 @@ export function buildDomIndex(nodes: Protocol.DOM.Node[]): {
         childrenByParent.set(node.parentId, [])
       }
       childrenByParent.get(node.parentId)!.push(node.nodeId)
+    }
+    // DOM.getFlattenedDocument omits shadow root nodes from the flat list in
+    // real Chrome: shadow content points at a parentId that only exists under
+    // the host's shadowRoots metadata. Other responses inline the shadow root
+    // node itself. Record both shapes so a shadow boundary is never mistaken
+    // for a broken ancestor chain.
+    for (const shadowRoot of node.shadowRoots ?? []) {
+      if (shadowRoot.shadowRootType === undefined) {
+        continue
+      }
+      shadowRootLinkByRootNodeId.set(shadowRoot.nodeId, {
+        hostNodeId: node.nodeId,
+        shadowRootType: shadowRoot.shadowRootType,
+      })
+    }
+    if (node.shadowRootType !== undefined && node.parentId !== undefined) {
+      shadowRootLinkByRootNodeId.set(node.nodeId, {
+        hostNodeId: node.parentId,
+        shadowRootType: node.shadowRootType,
+      })
     }
   }
 
@@ -910,10 +935,16 @@ export function buildDomIndex(nodes: Protocol.DOM.Node[]): {
       continue
     }
     info.structuralSelector =
-      buildStructuralSelector({ nodeId: info.nodeId, rootDocumentNodeId, domById, childrenByParent }) ?? undefined
+      buildStructuralSelector({
+        nodeId: info.nodeId,
+        rootDocumentNodeId,
+        domById,
+        childrenByParent,
+        shadowRootLinkByRootNodeId,
+      }) ?? undefined
   }
 
-  return { domById, domByBackendId, childrenByParent }
+  return { domById, domByBackendId, childrenByParent, shadowRootLinkByRootNodeId }
 }
 
 function buildStructuralSelector({
@@ -921,46 +952,70 @@ function buildStructuralSelector({
   rootDocumentNodeId,
   domById,
   childrenByParent,
+  shadowRootLinkByRootNodeId,
 }: {
   nodeId: Protocol.DOM.NodeId
   rootDocumentNodeId: Protocol.DOM.NodeId
   domById: Map<Protocol.DOM.NodeId, DomNodeInfo>
   childrenByParent: Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>
+  shadowRootLinkByRootNodeId: Map<Protocol.DOM.NodeId, ShadowRootLink>
 }): string | null {
   const segments: string[] = []
   let parts: string[] = []
   let current = domById.get(nodeId)
+  if (!current) {
+    return null
+  }
 
-  while (current) {
+  // The walk must prove every step up to the selected root. A chain that stops
+  // early (missing parent, unknown shadow root) returns null instead of a
+  // partial selector, which would only match by accident and can hit light DOM
+  // siblings once Playwright's CSS engine pierces open shadow roots.
+  while (true) {
     if (current.nodeType === 9) {
       if (current.nodeId !== rootDocumentNodeId) {
         return null
       }
       break
     }
-    if (current.shadowRootType !== undefined) {
-      if (current.shadowRootType !== 'open' || parts.length === 0 || current.parentId === undefined) {
-        return null
-      }
-      segments.push(parts.reverse().join(' > '))
-      parts = []
-      current = domById.get(current.parentId)
-      continue
-    }
     if (current.nodeType !== 1 || !/^[a-z][a-z0-9-]*$/i.test(current.nodeName) || current.parentId === undefined) {
       return null
     }
-    const siblings = childrenByParent.get(current.parentId) ?? []
+    const parentId = current.parentId
+    const nodeName = current.nodeName.toLowerCase()
+    const siblings = childrenByParent.get(parentId) ?? []
     const sameTagSiblings = siblings.filter((siblingId) => {
       const sibling = domById.get(siblingId)
-      return sibling?.nodeType === 1 && sibling.nodeName.toLowerCase() === current?.nodeName.toLowerCase()
+      return sibling?.nodeType === 1 && sibling.nodeName.toLowerCase() === nodeName
     })
     const siblingIndex = sameTagSiblings.indexOf(current.nodeId)
     if (siblingIndex < 0) {
       return null
     }
-    parts.push(`${current.nodeName.toLowerCase()}:nth-of-type(${siblingIndex + 1})`)
-    current = domById.get(current.parentId)
+    parts.push(`${nodeName}:nth-of-type(${siblingIndex + 1})`)
+
+    const shadowLink = shadowRootLinkByRootNodeId.get(parentId)
+    if (shadowLink) {
+      // Only open shadow roots are addressable from the page. Closed and
+      // user-agent roots must never be crossed.
+      if (shadowLink.shadowRootType !== 'open') {
+        return null
+      }
+      segments.push(parts.reverse().join(' > '))
+      parts = []
+      const host = domById.get(shadowLink.hostNodeId)
+      if (!host) {
+        return null
+      }
+      current = host
+      continue
+    }
+
+    const parent = domById.get(parentId)
+    if (!parent) {
+      return null
+    }
+    current = parent
   }
 
   if (parts.length > 0) {
