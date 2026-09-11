@@ -902,10 +902,15 @@ export function buildDomIndex(nodes: Protocol.DOM.Node[]): {
   const rootDocumentNodeId = nodes.find((node) => {
     return node.nodeType === 9 && node.parentId === undefined
   })?.nodeId
+  // Structural selectors are only consumed for native <summary> nodes. Building
+  // them for every node would rescan each ancestor's siblings per node, which is
+  // quadratic on wide DOMs.
   for (const info of domById.values()) {
-    info.structuralSelector = rootDocumentNodeId
-      ? (buildStructuralSelector({ nodeId: info.nodeId, rootDocumentNodeId, domById, childrenByParent }) ?? undefined)
-      : undefined
+    if (!rootDocumentNodeId || info.nodeName.toLowerCase() !== 'summary') {
+      continue
+    }
+    info.structuralSelector =
+      buildStructuralSelector({ nodeId: info.nodeId, rootDocumentNodeId, domById, childrenByParent }) ?? undefined
   }
 
   return { domById, domByBackendId, childrenByParent }
