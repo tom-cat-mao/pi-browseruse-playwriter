@@ -61,8 +61,28 @@ R2 要求 stop/cancel 对排队及进行中的 start 都生效，且 stop 不应
 协调者在集成树复跑 runtime 类型检查与 51 项聚焦测试、Pi 类型检查与 93 项
 测试及 12-tool load-check，均通过。reviewer 本次未运行测试/构建/浏览器。
 
+# executor 首版审查：b28788a
+
+TRAEX 源提交 `c55c9aa` 已纳入集成候选 `b28788a`，但协调者审查发现以下
+未完成项，原作者逐项确认；这不是已通过的最终交付：
+
+- E1：visibleRefs 在 40000 字符截断前计算，正文截掉的后部引用仍会返回；
+  Pi 后续 UTF-8 字节预算也必须纳入实际可见范围。
+- E2：第零个 summary 退化为不唯一的裸 tag；其他 nth 来自 flattened DOM，
+  跨 iframe/shadow 的排序不能直接作为 page.locator 的 DOM 序号。
+- E3：requestDeadline 尚未传入 click/fill/navigate/back 的实际操作等待。
+- E4：任意 evaluate/execute 返回 value.title 会被错误当成真实页面标题。
+- E5：现有测试未覆盖 worker 实际搜索/截断 formatter，只测行元数据。
+
+已委托新的 Codex（codex-8），在独立 `executor-finish` worktree 定点补齐。
+不继续调查未复现的历史 back；不扩展 href/control-state 功能；不启动 Chrome。
+
+协调者对 `b28788a` 已运行 build/smoke、浏览器无关 unit **252 项**、进程
+integration **34 项**、Pi **93 项**和 load-check，全部通过；日志位于
+`tmp/validation-b28788a/`。这说明已有回归未失败，不能抵消上述源码缺陷。
+
 # 后续
 
-executor/ARIA 合入后另做完整独立验收。需要 Chrome 时先告知用户并等待
+executor 定点补齐后另做完整独立验收。需要 Chrome 时先告知用户并等待
 准备确认。通过后 PR 目标只能是 dev；main、当前 Pi 安装及运行中的 runtime
 不变。阶段 findings 关闭不等于全量或真实 Chrome 验收通过。
