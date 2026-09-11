@@ -12,7 +12,7 @@ no npm release and no Chrome Web Store listing.
 
 The main download is the versioned ZIP on
 [GitHub Releases](https://github.com/tom-cat-mao/pi-browseruse-playwriter/releases).
-The first release is still being prepared.
+Use the versioned extension ZIP, not GitHub's automatically generated source archive.
 
 1. Download `pi-browser-use-extension-<version>.zip` from a Release.
 2. Unzip it into a fixed directory that you will keep, such as
@@ -32,7 +32,7 @@ The default development build has extension ID
 
 ## Build from source
 
-Use Node.js and pnpm `10.18.1`:
+Clone this repository, then use Node.js, Bun and pnpm `10.18.1`:
 
 ```bash
 pnpm bootstrap
@@ -48,6 +48,9 @@ local bundled JavaScript and assets. The output directory is ignored by Git.
 
 The Pi package and the browser runtime are separate from the Chrome ZIP. The
 ZIP does not install either one automatically.
+
+Until npm distribution is available, run these from a source checkout after
+completing the build steps above:
 
 ```bash
 pi install ./pi

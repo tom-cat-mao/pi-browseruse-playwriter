@@ -129,7 +129,7 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
     throw new Error('Built extension is missing background.js')
   }
   const background = fs.readFileSync(path.join(bundleDir, backgroundPath), 'utf8')
-  if (!background.includes('19989')) {
+  if (!/\b(?:var|let|const)\s+RELAY_PORT\s*=\s*19989\s*;/.test(background)) {
     throw new Error('Built extension does not target the managed runtime port 19989')
   }
   const builtText = files
@@ -341,6 +341,12 @@ function main() {
     fs.cpSync(sourceDir, stagingDir, { recursive: true })
     const validation = validateBundle({ bundleDir: stagingDir })
     const version = validation.manifest.version
+    const sourceManifest = readManifest(path.join(repoRoot, 'extension'))
+    if (version !== sourceManifest.version) {
+      throw new Error(
+        `Built extension ${version} is stale; rebuild extension ${sourceManifest.version} before packaging`,
+      )
+    }
     const zipName = `pi-browser-use-extension-${version}.zip`
     const zipPath = path.join(outputDir, zipName)
     const checksumPath = `${zipPath}.sha256`

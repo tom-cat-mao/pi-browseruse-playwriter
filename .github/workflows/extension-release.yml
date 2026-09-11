@@ -17,6 +17,8 @@ permissions:
 
 jobs:
   package:
+    if: github.repository == 'tom-cat-mao/pi-browseruse-playwriter'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - name: Check out requested ref
@@ -57,16 +59,19 @@ jobs:
       - name: Create Draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_REF: ${{ inputs.ref }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           VERSION="$(node --input-type=module -e "import fs from 'node:fs'; console.log(JSON.parse(fs.readFileSync('extension/manifest.json', 'utf8')).version)")"
           EXPECTED_TAG="extension@$VERSION"
           test "$RELEASE_TAG" = "$EXPECTED_TAG"
+          BUILD_SHA="$(git rev-parse HEAD)"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$BUILD_SHA"
+          fi
           ZIP="dist-release/pi-browser-use-extension-$VERSION.zip"
           gh release create "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" \
             --repo tom-cat-mao/pi-browseruse-playwriter \
-            --target "$RELEASE_REF" \
+            --target "$BUILD_SHA" \
             --title "Extension $VERSION" \
             --draft \
             --latest=false \
