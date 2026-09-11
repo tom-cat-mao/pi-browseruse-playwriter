@@ -1,0 +1,104 @@
+name: Extension release
+
+on:
+  push:
+    tags:
+      - 'extension@*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: true
+        type: string
+      tag:
+        description: Release tag, for example extension@0.0.130
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extension-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.repository == 'tom-cat-mao/pi-browseruse-playwriter'
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Verify release tag matches the build
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION="$(node --input-type=module -e "import fs from 'node:fs'; console.log(JSON.parse(fs.readFileSync('extension/manifest.json', 'utf8')).version)")"
+          test "$RELEASE_TAG" = "extension@$VERSION"
+          BUILD_SHA="$(git rev-parse HEAD)"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$BUILD_SHA"
+          fi
+          echo "EXTENSION_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_SHA=$BUILD_SHA" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare the local Playwright fork
+        run: |
+          node playwright/utils/generate_injected.js
+          node playwright/packages/playwright-core/build.mjs
+
+      - name: Build runtime assets
+        run: pnpm --filter @tom-cat/pi-browser-runtime build
+
+      - name: Create extension ZIP and checksum
+        run: pnpm package:extension
+
+      - name: Upload extension release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_EVENT: ${{ github.event_name }}
+        run: |
+          REPO="tom-cat-mao/pi-browseruse-playwriter"
+          ZIP="dist-release/pi-browser-use-extension-$EXTENSION_VERSION.zip"
+          if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" --repo "$REPO" --clobber
+            if [ "$RELEASE_EVENT" = "push" ]; then
+              gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false --latest=false
+            fi
+          else
+            OPTIONS=(--draft)
+            if [ "$RELEASE_EVENT" = "push" ]; then
+              OPTIONS=(--verify-tag)
+            fi
+            gh release create "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" \
+              --repo "$REPO" \
+              --target "$BUILD_SHA" \
+              --title "Extension $EXTENSION_VERSION" \
+              "${OPTIONS[@]}" \
+              --latest=false \
+              --notes "Prebuilt Pi Browser Use extension. Download the versioned ZIP, extract it to a permanent directory, then use Developer mode > Load unpacked at chrome://extensions. SHA256 checksum included. Pi and the companion runtime are installed separately."
+          fi
