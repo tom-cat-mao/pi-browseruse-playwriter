@@ -455,6 +455,64 @@ describe('managed resource registry ownership', () => {
     `)
   })
 
+  test('page info refresh keeps ownership and cannot resurrect a released tab', () => {
+    let registry = createRegistryWithGroup()
+    registry = setTabPageInfo(registry, {
+      tabId: 'pt-1',
+      url: 'https://example.com/invoice',
+      title: 'Invoice',
+    })
+    const refreshedInventory = buildInventory(registry)
+    const refreshedTab = findTab(registry, 'pt-1')
+
+    expect({
+      refreshed: {
+        url: refreshedTab?.url,
+        title: refreshedTab?.title,
+        state: refreshedTab?.state,
+        sessionId: refreshedTab?.sessionId,
+        groupId: refreshedTab?.groupId,
+        targetId: refreshedTab?.targetId,
+        cdpSessionId: refreshedTab?.cdpSessionId,
+      },
+      inventory: {
+        url: refreshedInventory.tabs.find((tab) => tab.tabId === 'pt-1')?.url,
+        revision: refreshedInventory.revision,
+        registryRevision: registry.revision,
+      },
+    }).toEqual({
+      refreshed: {
+        url: 'https://example.com/invoice',
+        title: 'Invoice',
+        state: 'ready',
+        sessionId: 'session-1',
+        groupId: 'pg-1',
+        targetId: 'target-1',
+        cdpSessionId: 'pw-tab-1',
+      },
+      inventory: {
+        url: 'https://example.com/invoice',
+        revision: registry.revision,
+        registryRevision: registry.revision,
+      },
+    })
+
+    // A late onUpdated event for a released tab must not revive it.
+    const released = releaseTab(registry, 'pt-1')
+    const afterRelease = setTabPageInfo(released, {
+      tabId: 'pt-1',
+      url: 'https://example.com/late',
+      title: 'Late title',
+    })
+    expect(afterRelease).toBe(released)
+    expect(findTab(afterRelease, 'pt-1')).toMatchObject({
+      url: 'https://example.com/invoice',
+      title: 'Invoice',
+      state: 'released',
+      sessionId: 'session-1',
+    })
+  })
+
   test('create dedup ledger persists payload fingerprints and prunes old entries', () => {
     const tabsFingerprint = buildCreateRequestFingerprint({
       kind: 'tabs.create',

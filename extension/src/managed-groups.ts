@@ -77,6 +77,13 @@ const INTERNAL_MOVE_TTL_MS = 3000
 const MAX_LEDGER_ENTRIES = 200
 const LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const TAB_ID_NONE = -1
+/**
+ * How long a burst of URL/title updates may wait before the authoritative
+ * inventory is published once. This is a fixed window, not a sliding debounce:
+ * later updates join the current window instead of moving the deadline, so the
+ * publish latency stays bounded and continuous title changes cannot starve it.
+ */
+const PAGE_INFO_PUBLISH_COALESCE_MS = 250
 
 export interface ManagedGroupsDeps {
   getProfileId: () => Promise<string>
@@ -180,6 +187,58 @@ function buildExistingGroupName(title: string | undefined): string {
   return trimmed.length > 0 ? trimmed : 'Existing tab'
 }
 
+/** Fields needed to order a `tabs.discover` listing deterministically. */
+export interface DiscoverySortableTab {
+  windowId: number
+  index: number
+  active: boolean
+}
+
+/**
+ * Discovery ordering. Active tabs come first because every window has its own
+ * active tab - there is no globally unique "current tab" - and Chrome may have
+ * no focused window at all while the user types in the terminal. The focused
+ * window is only a supplementary key: it orders otherwise equal tabs, and the
+ * stable windowId/index tie-breaks keep the listing deterministic so pagination
+ * never reshuffles entries.
+ */
+export function compareDiscoveredTabs(
+  a: DiscoverySortableTab,
+  b: DiscoverySortableTab,
+  focusedWindowIds: ReadonlySet<number>,
+): number {
+  if (a.active !== b.active) return a.active ? -1 : 1
+  const aFocused = focusedWindowIds.has(a.windowId)
+  const bFocused = focusedWindowIds.has(b.windowId)
+  if (aFocused !== bFocused) return aFocused ? -1 : 1
+  if (a.windowId !== b.windowId) return a.windowId - b.windowId
+  return a.index - b.index
+}
+
+/**
+ * Fixed-window trailing coalescer for small metadata updates. The first
+ * `schedule()` opens one window and later calls join it, so a burst produces a
+ * single flush while a continuous stream still flushes on a bounded interval.
+ */
+export class CoalescedPublisher {
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private readonly delayMs: number
+  private readonly flush: () => void
+
+  constructor(options: { delayMs: number; flush: () => void }) {
+    this.delayMs = options.delayMs
+    this.flush = options.flush
+  }
+
+  schedule(): void {
+    if (this.timer !== null) return
+    this.timer = setTimeout(() => {
+      this.timer = null
+      this.flush()
+    }, this.delayMs)
+  }
+}
+
 interface CreateDedupeContext {
   key: string
   operation: 'groups.create' | 'tabs.create'
@@ -210,6 +269,14 @@ export class ManagedGroups {
   private readonly adoptingChromeTabIds = new Set<number>()
   private readonly pendingAdoptions = new Set<number>()
   private readonly inFlightRequests = new Map<string, { fingerprint?: string; promise: Promise<BrowserResponse> }>()
+  /** Connection generation captured when the pending page-info publish was scheduled. */
+  private pageInfoPublishGeneration = 0
+  private readonly pageInfoPublisher = new CoalescedPublisher({
+    delayMs: PAGE_INFO_PUBLISH_COALESCE_MS,
+    flush: () => {
+      this.flushPageInfoPublish()
+    },
+  })
 
   constructor(deps: ManagedGroupsDeps) {
     this.deps = deps
@@ -987,7 +1054,7 @@ export class ManagedGroups {
         return true
       })
       .sort((a, b) => {
-        return a.windowId - b.windowId || a.index - b.index
+        return compareDiscoveredTabs(a, b, focusedWindowIds)
       })
       .map((tab) => {
         return this.buildCandidate({
@@ -1982,13 +2049,41 @@ export class ManagedGroups {
     }
   }
 
-  /** Best-effort url/title cache refresh; never persists or publishes on its own. */
+  /**
+   * Best-effort url/title refresh for a managed tab. The update is merged into
+   * the in-memory authoritative registry (which bumps its revision) and one
+   * coalesced inventory publish follows, so `tabs.list` stops showing stale
+   * url/title. Display metadata is never written to disk per title change:
+   * reconnect reconciliation re-reads it from Chrome. Released tabs and records
+   * from another browser epoch are never revived - the active lookup skips them -
+   * so this can neither change ownership nor resurrect a tombstone.
+   */
   noteChromeTabPageInfo(chromeTabId: number, url: string, title: string): void {
     if (!this.registry) return
     const tab = this.findManagedTabByChromeTabId(chromeTabId)
     if (!tab) return
-    this.mutate((registry) => {
+    const before = this.getRegistry()
+    const next = this.mutate((registry) => {
       return setTabPageInfo(registry, { tabId: tab.tabId, url, title })
+    })
+    if (next === before) return
+    this.pageInfoPublishGeneration = this.generation
+    this.pageInfoPublisher.schedule()
+  }
+
+  /**
+   * A reconnect/disconnect changed the connection generation while the metadata
+   * publish was coalescing. The pending snapshot could race the restore that
+   * publishes freshly observed Chrome state, so it is dropped instead of being
+   * allowed to re-advertise pre-reconnect ownership.
+   */
+  private flushPageInfoPublish(): void {
+    if (this.pageInfoPublishGeneration !== this.generation) {
+      this.deps.logger.debug('Dropping coalesced page-info publish: connection generation changed')
+      return
+    }
+    void this.publishInventory().catch((error: unknown) => {
+      this.deps.logger.error('Failed to publish coalesced tab page info:', error)
     })
   }
 
