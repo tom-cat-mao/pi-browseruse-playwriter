@@ -7,6 +7,8 @@ prompt: |
   然后可以进行修复，还是像之前的swarm的方案一样，启动多个agent并行执行可以使用traex, codex, codebuddy。model 和effort都不要懂，用默认的就可以
   剩下的要求和上面进行重构的时候一致
   需要开chrome的时候告诉我就可以额
+  用户补充合并边界：
+  这次最后合并的时候应该不会直接合并到main上边吧，应该是会合并到一个开发的分支上面吧
   上文确认：抓包必须在执行强制中止后保留已有记录；局部修复，不重构架构，
   不增加网站专用逻辑，不自动重放不确定动作。分工独立 worktree，功能分支
   提交和 PR，全新 agent 独立验收，Chrome 阶段先通知用户，验收后合并清理。
@@ -23,6 +25,9 @@ prompt: |
 
 基线 main 为 dfedbdc。集成分支 feat/browser-reliability，工作树
 `tmp/swarm-reliability/integration`；主目录不写功能代码。
+最终 PR 的目标分支是 dev，由基线 dfedbdc 创建。各 swarm 分支先合入
+feat/browser-reliability，验收通过后仅合入 dev；本轮不合入 main。
+main 的合并和当前安装更新均需用户另行明确授权。
 原任务日志与独立测试的脱敏证据在 `tmp/prior-diagnostic-evidence.json`。
 
 已确认：145 个候选只展示 61 个，活动页在末尾；只读 evaluate 清空引用；
@@ -43,7 +48,8 @@ back 25ms 成功：不能声称该特定等待问题已复现。旧 CDP JSONL �
 
 - 只用 codex、traex、codebuddy；model/effort 参数全部省略。
 - 每个写入 agent 独立 worktree；不 external_agent_wait，不 sleep 轮询。
-- 本次继承原 swarm 的功能分支提交、PR、独立验收、通过后合并清理授权。
+- 本次继承原 swarm 的功能分支提交、PR、独立验收、通过后合并清理授权，
+  但最终合并目标限定为 dev，禁止以 main 为 PR base 或合入 main。
   只向 `tom-cat-mao/pi-browseruse-playwriter` 操作；gh 必须显式 `-R`。
 - 不修改 Pi settings、主目录构建产物、已加载扩展或现行 runtime。
   不停止/重启/连接日常 19988、默认 19989、历史测试 19990/19991。
@@ -166,5 +172,6 @@ Chrome 阶段只测试本轮变更：独立 fixture 的选择器错误、搜索 
 第三方业务提交按钮、不复活已排除的 hash 专项验收门槛。
 
 需要用户打开 Chrome 时提供独立构建路径/端口，等确认后开始。验收通过
-再向 fork PR 合并；保留构建与证据，最后清理工作树/分支，不删运行期引用
-中的路径。默认本地 Pi 安装与 runtime 的更新必须单独确认时间。
+再将 feat/browser-reliability 通过 fork PR 合入 dev（显式 --base dev），
+不合 main。保留构建与证据，最后清理工作树/分支，不删运行期引用中的
+路径。默认本地 Pi 安装与 runtime 的更新必须单独确认时间。
