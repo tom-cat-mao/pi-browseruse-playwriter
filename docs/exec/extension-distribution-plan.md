@@ -8,22 +8,35 @@ prompt: |
   @extension/manifest.json @extension/permissions.md
   @scripts/package-extension.mjs @.github/workflows/extension-release.yml
   以及 Chrome Web Store prepare/publish/key 官方文档。
+  用户追加要求：
+  我觉得pr可以合，但是我还有一个问题，能不能每一次打tag的时候自动生成到releas中呢
+  这个应该不难做到吧
 ---
 
 # Extension distribution plan
 
-当前状态：GitHub Releases 由维护者手动触发 Draft release；Chrome Web Store
-仍是“上传准备包”，尚未创建、提交或发布 item。
+当前状态：推送 extension@<version> tag 自动构建并发布 GitHub Release；
+手动触发仍默认创建 Draft。Chrome Web Store 仍是“上传准备包”，尚未提交或上架。
 
 ## GitHub Releases
 
-1. 在目标 feature/tag 上确认 `extension/manifest.json` 版本递增。
-2. 运行 `pnpm --filter @tom-cat/pi-browser-runtime build` 生成本地 runtime
-   bundle，再运行 `pnpm package:extension`。
-3. 检查 `dist-release/` 中的版本 ZIP 和 `.sha256` 文件。
-4. 手工 dispatch `.github/workflows/extension-release.yml`，同时填写准确的
-   `ref` 和 `extension@<version>` tag。workflow 只创建 Draft release，不会
-   自动发布。
+1. 提交 `extension/manifest.json` 的新版本，并确保目标提交包含发行 workflow。
+2. 创建与 manifest 版本一致的 tag，推送到 origin，例如新版本为 0.0.131 时：
+
+   ```bash
+   git tag extension@0.0.131
+   git push origin extension@0.0.131
+   ```
+
+3. `.github/workflows/extension-release.yml` 自动检出该 tag、构建并校验 ZIP，
+   发布同名 Release，附版本 ZIP 与 `.sha256`。不触发 Chrome 商店或 npm 发布。
+4. 本地仅创建 tag 不触发；其他前缀的 tag 不触发；现有 tag 不会因 workflow
+   合并而补跑。版本或 tag 所指提交不匹配时停止，避免打包错版本。
+5. Actions 重跑会更新该 Release 的同名附件，不重复创建 Release；同 tag
+   串行执行。手工 dispatch 填写 ref/tag 时仍默认 Draft，便于提前检查。
+
+本地验证命令仍为 `pnpm --filter @tom-cat/pi-browser-runtime build` 后
+`pnpm package:extension`，产物位于 `dist-release/`。
 
 ZIP 必须把 `manifest.json` 放在根目录；扩展运行时 JavaScript、图标和 Prism
 资源全部随 ZIP 提供，不依赖远程脚本。

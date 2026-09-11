@@ -63,7 +63,9 @@ stores its data under `~/.pi-browser-use`.
 
 ## Project status
 
-- GitHub Releases: manual Draft release workflow is available for maintainers.
+- GitHub Releases: pushing an `extension@<version>` tag automatically builds
+  and publishes the extension ZIP and SHA256 file. Manual runs create a Draft.
+  The tag version must match `extension/manifest.json`.
 - Chrome Web Store: upload preparation only; no item has been submitted or
   published.
 - Store identity: the real Web Store item ID and public key must come from the
