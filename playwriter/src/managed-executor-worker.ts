@@ -14,7 +14,13 @@ import type {
   BrowserResultData,
   ManagedExecution,
 } from './browser-protocol.js'
-import { getAriaSnapshot, hideAriaRefLabels, screenshotWithAccessibilityLabels, type ScreenshotResult, type SnapshotOutputLine } from './aria-snapshot.js'
+import {
+  getAriaSnapshot,
+  hideAriaRefLabels,
+  screenshotWithAccessibilityLabels,
+  type ScreenshotResult,
+  type SnapshotOutputLine,
+} from './aria-snapshot.js'
 import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
 import { getChromium } from './playwright-import.js'
 import { waitForPageLoad } from './wait-for-page-load.js'
@@ -36,7 +42,11 @@ const DEFAULT_PAGE_TIMEOUT_MS = 60_000
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const MAX_SNAPSHOT_CHARS = 40_000
+const MAX_SNAPSHOT_BYTES = 40_000
+const MAX_SNAPSHOT_REFS_BYTES = 16_000
 const MAX_SNAPSHOT_LINES = 2_000
+const MAX_SELECTOR_TIMEOUT_MS = 5_000
+const RESPONSE_RESERVE_MS = 250
 const MAX_LOG_ENTRIES = 1_000
 const MAX_LOG_RETURN_ENTRIES = 500
 const MAX_NETWORK_ENTRIES = 500
@@ -97,6 +107,7 @@ interface SnapshotOptions {
   interactiveOnly?: boolean
   offset?: number
   limit?: number
+  deadline?: number
   markSideEffectsStarted?: () => void
 }
 
@@ -179,6 +190,7 @@ export class ManagedExecutorWorkerRuntime {
       const data = await this.executeOperation({
         request: execution.request,
         page,
+        deadline: requestDeadline,
         markSideEffectsStarted: () => {
           sideEffectsStarted = true
         },
@@ -257,7 +269,13 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
-  private async ensureConnection({ cdpUrl, connectionEpoch }: { cdpUrl: string; connectionEpoch: string }): Promise<void> {
+  private async ensureConnection({
+    cdpUrl,
+    connectionEpoch,
+  }: {
+    cdpUrl: string
+    connectionEpoch: string
+  }): Promise<void> {
     if (this.browser && this.context && this.cdpUrl === cdpUrl && this.connectionEpoch === connectionEpoch) {
       return
     }
@@ -444,9 +462,11 @@ export class ManagedExecutorWorkerRuntime {
           message: `Multiple Playwright pages reported targetId ${targetId}`,
         })
       }
-      return pages.find((page) => {
-        return page.targetId() === targetId
-      }) ?? null
+      return (
+        pages.find((page) => {
+          return page.targetId() === targetId
+        }) ?? null
+      )
     }
 
     const existingPage = findPage()
@@ -534,60 +554,36 @@ export class ManagedExecutorWorkerRuntime {
   private async executeOperation({
     request,
     page,
+    deadline,
     markSideEffectsStarted,
   }: {
     request: BrowserRequest & { operation: Extract<BrowserRequest['operation'], { kind: `page.${string}` }> }
     page: Page
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const operation = request.operation
-    const data = await this.dispatchOperation({ operation, page, markSideEffectsStarted })
-    // B7: attach observed page context from data we already hold. page.url() is a
-    // synchronous cached read; title is only surfaced when the operation already
-    // computed one (navigate/back), never an added unbounded page.title() query.
-    return this.attachPageInfo({ data, page, tabId: operation.tabId })
-  }
-
-  private attachPageInfo({
-    data,
-    page,
-    tabId,
-  }: {
-    data: BrowserResultData
-    page: Page
-    tabId: string
-  }): BrowserResultData {
-    if (data.pageInfo) {
-      return data
-    }
-    const observedTitle =
-      data.value && typeof data.value === 'object' && !Array.isArray(data.value) && typeof data.value.title === 'string'
-        ? data.value.title
-        : undefined
-    return {
-      ...data,
-      pageInfo: {
-        tabId,
-        url: page.url(),
-        ...(observedTitle !== undefined ? { title: observedTitle } : {}),
-      },
-    }
+    const data = await this.dispatchOperation({ operation, page, deadline, markSideEffectsStarted })
+    // page.url() is cached; only navigate/back may contribute a computed title.
+    return attachObservedPageInfo({ data, tabId: operation.tabId, url: page.url(), operationKind: operation.kind })
   }
 
   private async dispatchOperation({
     operation,
     page,
+    deadline,
     markSideEffectsStarted,
   }: {
     operation: Extract<BrowserRequest['operation'], { kind: `page.${string}` }>
     page: Page
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     switch (operation.kind) {
       case 'page.navigate':
-        return await this.navigate({ page, url: operation.url, markSideEffectsStarted })
+        return await this.navigate({ page, url: operation.url, deadline, markSideEffectsStarted })
       case 'page.back':
-        return await this.goBack({ page, markSideEffectsStarted })
+        return await this.goBack({ page, deadline, markSideEffectsStarted })
       case 'page.snapshot':
         return await this.snapshot({
           page,
@@ -595,16 +591,24 @@ export class ManagedExecutorWorkerRuntime {
           search: operation.search,
           full: operation.full,
           interactiveOnly: operation.interactiveOnly,
+          deadline,
           markSideEffectsStarted,
         })
       case 'page.click':
-        return await this.click({ page, selector: operation.selector, snapshotId: operation.snapshotId, markSideEffectsStarted })
+        return await this.click({
+          page,
+          selector: operation.selector,
+          snapshotId: operation.snapshotId,
+          deadline,
+          markSideEffectsStarted,
+        })
       case 'page.fill':
         return await this.fill({
           page,
           selector: operation.selector,
           snapshotId: operation.snapshotId,
           value: operation.value,
+          deadline,
           markSideEffectsStarted,
         })
       case 'page.evaluate':
@@ -615,6 +619,7 @@ export class ManagedExecutorWorkerRuntime {
           path: operation.path,
           fullPage: operation.fullPage,
           labels: operation.labels,
+          deadline,
           markSideEffectsStarted,
         })
       case 'page.network':
@@ -626,7 +631,7 @@ export class ManagedExecutorWorkerRuntime {
       case 'page.logs':
         return this.logs({ state: this.requirePageState({ page }), limit: operation.limit })
       case 'page.execute':
-        return await this.executeJavaScript({ page, code: operation.code, markSideEffectsStarted })
+        return await this.executeJavaScript({ page, code: operation.code, deadline, markSideEffectsStarted })
       default:
         return assertNever(operation)
     }
@@ -635,17 +640,20 @@ export class ManagedExecutorWorkerRuntime {
   private async navigate({
     page,
     url,
+    deadline,
     markSideEffectsStarted,
   }: {
     page: Page
     url: string
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     validateNavigationUrl(url)
+    const timeout = this.nativeOperationTimeout({ deadline, maximumMs: DEFAULT_NAVIGATION_TIMEOUT_MS })
     markSideEffectsStarted()
     const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: DEFAULT_NAVIGATION_TIMEOUT_MS,
+      timeout,
     })
     this.invalidateSnapshot({ page })
     return {
@@ -666,15 +674,18 @@ export class ManagedExecutorWorkerRuntime {
    */
   private async goBack({
     page,
+    deadline,
     markSideEffectsStarted,
   }: {
     page: Page
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
+    const timeout = this.nativeOperationTimeout({ deadline, maximumMs: DEFAULT_NAVIGATION_TIMEOUT_MS })
     markSideEffectsStarted()
     const response = await page.goBack({
       waitUntil: 'domcontentloaded',
-      timeout: DEFAULT_NAVIGATION_TIMEOUT_MS,
+      timeout,
     })
     this.invalidateSnapshot({ page })
     const url = page.url()
@@ -695,16 +706,19 @@ export class ManagedExecutorWorkerRuntime {
     page,
     selector,
     snapshotId,
+    deadline,
     markSideEffectsStarted,
   }: {
     page: Page
     selector: string
     snapshotId?: string
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const locator = this.resolveActionLocator({ page, selector, snapshotId })
+    const timeout = this.nativeOperationTimeout({ deadline, maximumMs: MAX_SELECTOR_TIMEOUT_MS })
     markSideEffectsStarted()
-    await locator.click()
+    await locator.click({ timeout })
     this.invalidateSnapshot({ page })
     // The URL is the tab's state observed right after the click returns — not a
     // promise that any navigation the click triggered has finished. We never sleep
@@ -720,20 +734,24 @@ export class ManagedExecutorWorkerRuntime {
     selector,
     snapshotId,
     value,
+    deadline,
     markSideEffectsStarted,
   }: {
     page: Page
     selector: string
     snapshotId?: string
     value: string
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const locator = this.resolveActionLocator({ page, selector, snapshotId })
     // Chrome debugger keyboard input follows the OS-focused surface. A real
     // click immediately before fill keeps extension-backed tabs focused.
+    const clickTimeout = this.nativeOperationTimeout({ deadline, maximumMs: MAX_SELECTOR_TIMEOUT_MS })
     markSideEffectsStarted()
-    await locator.click()
-    await locator.fill(value)
+    await locator.click({ timeout: clickTimeout })
+    const fillTimeout = this.nativeOperationTimeout({ deadline, maximumMs: MAX_SELECTOR_TIMEOUT_MS })
+    await locator.fill(value, { timeout: fillTimeout })
     this.invalidateSnapshot({ page })
     return {
       text: 'Filled the selected element',
@@ -741,7 +759,15 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
-  private resolveActionLocator({ page, selector, snapshotId }: { page: Page; selector: string; snapshotId?: string }): Locator {
+  private resolveActionLocator({
+    page,
+    selector,
+    snapshotId,
+  }: {
+    page: Page
+    selector: string
+    snapshotId?: string
+  }): Locator {
     const ref = normalizeSnapshotRef(selector)
     if (!ref) {
       return page.locator(selector)
@@ -804,12 +830,14 @@ export class ManagedExecutorWorkerRuntime {
     path: requestedPath,
     fullPage = false,
     labels = false,
+    deadline,
     markSideEffectsStarted,
   }: {
     page: Page
     path?: string
     fullPage?: boolean
     labels?: boolean
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const outputPath = requestedPath ? resolveArtifactPath({ requestedPath, cwd: this.sessionCwd }) : undefined
@@ -818,7 +846,13 @@ export class ManagedExecutorWorkerRuntime {
     let text = 'Screenshot captured'
 
     if (labels) {
-      const snapshot = await this.snapshot({ page, full: false, interactiveOnly: true, markSideEffectsStarted })
+      const snapshot = await this.snapshot({
+        page,
+        full: false,
+        interactiveOnly: true,
+        deadline,
+        markSideEffectsStarted,
+      })
       const collector: ScreenshotResult[] = []
       try {
         await screenshotWithAccessibilityLabels({ page, collector })
@@ -942,10 +976,12 @@ export class ManagedExecutorWorkerRuntime {
   private async executeJavaScript({
     page,
     code,
+    deadline,
     markSideEffectsStarted,
   }: {
     page: Page
     code: string
+    deadline: number
     markSideEffectsStarted: () => void
   }): Promise<BrowserResultData> {
     const context = this.context
@@ -1001,6 +1037,7 @@ export class ManagedExecutorWorkerRuntime {
         interactiveOnly: options.interactiveOnly,
         offset: options.offset,
         limit: options.limit,
+        deadline,
         markSideEffectsStarted,
       })
       return result.text ?? ''
@@ -1148,6 +1185,7 @@ export class ManagedExecutorWorkerRuntime {
     interactiveOnly,
     offset = 0,
     limit,
+    deadline,
     markSideEffectsStarted,
   }: SnapshotOptions & { page: Page }): Promise<BrowserResultData> {
     const pageState = this.requirePageState({ page })
@@ -1157,10 +1195,14 @@ export class ManagedExecutorWorkerRuntime {
     // complete readable tree regardless. Both outputs stay subject to the same
     // search/offset/limit windowing and MAX_SNAPSHOT_LINES/CHARS caps below.
     const useInteractiveOnly = full ? false : (interactiveOnly ?? false)
+    const scopeTimeoutMs = deadline
+      ? this.nativeOperationTimeout({ deadline, maximumMs: MAX_SELECTOR_TIMEOUT_MS })
+      : MAX_SELECTOR_TIMEOUT_MS
     const result = await getAriaSnapshot({
       page,
       locator,
       interactiveOnly: useInteractiveOnly,
+      scopeTimeoutMs,
     })
     const selectorByShortRef = new Map(
       result.refs.flatMap((entry) => {
@@ -1172,6 +1214,7 @@ export class ManagedExecutorWorkerRuntime {
     // the text. No match means empty refs; shortRef identities are preserved.
     const { text, visibleRefs } = formatSnapshotText({
       snapshotLines: result.snapshotLines,
+      refs: result.refs,
       search,
       offset,
       limit,
@@ -1211,6 +1254,17 @@ export class ManagedExecutorWorkerRuntime {
     }
   }
 
+  private nativeOperationTimeout({ deadline, maximumMs }: { deadline: number; maximumMs: number }): number {
+    const timeout = calculateNativeOperationTimeout({ deadline, now: Date.now(), maximumMs })
+    if (timeout > 0) {
+      return timeout
+    }
+    throw new ManagedExecutorOperationError({
+      code: 'timeout',
+      message: 'Request deadline left no time to start the browser operation',
+    })
+  }
+
   private errorResponse({
     requestId,
     error,
@@ -1244,6 +1298,51 @@ export class ManagedExecutorWorkerRuntime {
   }
 }
 
+export function calculateNativeOperationTimeout({
+  deadline,
+  now,
+  maximumMs,
+}: {
+  deadline: number
+  now: number
+  maximumMs: number
+}): number {
+  return Math.max(0, Math.min(maximumMs, Math.floor(deadline - now - RESPONSE_RESERVE_MS)))
+}
+
+export function attachObservedPageInfo({
+  data,
+  tabId,
+  url,
+  operationKind,
+}: {
+  data: BrowserResultData
+  tabId: string
+  url: string
+  operationKind: BrowserPageOperation['kind']
+}): BrowserResultData {
+  if (data.pageInfo) {
+    return data
+  }
+  const canSupplyTitle = operationKind === 'page.navigate' || operationKind === 'page.back'
+  const observedTitle =
+    canSupplyTitle &&
+    data.value &&
+    typeof data.value === 'object' &&
+    !Array.isArray(data.value) &&
+    typeof data.value.title === 'string'
+      ? data.value.title
+      : undefined
+  return {
+    ...data,
+    pageInfo: {
+      tabId,
+      url,
+      ...(observedTitle !== undefined ? { title: observedTitle } : {}),
+    },
+  }
+}
+
 export function resolveManagedOperationOutcome({
   sideEffectsStarted,
   outcome,
@@ -1254,27 +1353,108 @@ export function resolveManagedOperationOutcome({
   return sideEffectsStarted ? 'unknown' : outcome
 }
 
-function formatSnapshotText({
+type SnapshotRefMetadata = {
+  shortRef: string
+  role: string
+  name: string
+}
+
+export function formatSnapshotText({
   snapshotLines,
+  refs,
   search,
   offset,
   limit,
+  maxChars = MAX_SNAPSHOT_CHARS,
+  maxBytes = MAX_SNAPSHOT_BYTES,
+  maxRefsBytes = MAX_SNAPSHOT_REFS_BYTES,
+  maxLines = MAX_SNAPSHOT_LINES,
 }: {
   snapshotLines: SnapshotOutputLine[]
+  refs: SnapshotRefMetadata[]
   search?: string
   offset: number
   limit?: number
+  maxChars?: number
+  maxBytes?: number
+  maxRefsBytes?: number
+  maxLines?: number
 }): { text: string; visibleRefs: Set<string> } {
   const searchedLines = search ? selectSearchLines({ lines: snapshotLines, search }) : snapshotLines
   const boundedOffset = Number.isInteger(offset) && offset >= 0 ? offset : 0
-  const boundedLimit = limit === undefined ? MAX_SNAPSHOT_LINES : Math.max(0, Math.floor(limit))
-  const visibleLines = searchedLines.slice(boundedOffset, boundedOffset + Math.min(boundedLimit, MAX_SNAPSHOT_LINES))
-  const visibleRefs = new Set(visibleLines.flatMap((line) => (line.shortRef ? [line.shortRef] : [])))
-  let text = visibleLines.map((line) => line.text).join('\n')
-  if (visibleLines.length < searchedLines.length - boundedOffset) {
-    text += `\n[truncated; use search or offset/limit in execute snapshot helper]`
+  const boundedLimit = limit === undefined ? maxLines : Math.max(0, Math.floor(limit))
+  const window = searchedLines.slice(boundedOffset, boundedOffset + Math.min(boundedLimit, maxLines))
+  const refByShortRef = new Map(refs.map((entry) => [entry.shortRef, entry]))
+  const outputLines: string[] = []
+  const outputRefs: SnapshotRefMetadata[] = []
+  const visibleRefs = new Set<string>()
+  const marker = '[truncated; use search or offset/limit in execute snapshot helper]'
+  const textBudgetChars = Math.max(0, maxChars - marker.length - 1)
+  const textBudgetBytes = Math.max(0, maxBytes - Buffer.byteLength(marker, 'utf8') - 1)
+  let textChars = 0
+  let textBytes = 0
+  let budgetTruncated = false
+
+  for (const line of window) {
+    const separator = outputLines.length === 0 ? '' : '\n'
+    const lineChars = separator.length + line.text.length
+    const lineBytes = Buffer.byteLength(`${separator}${line.text}`, 'utf8')
+    const ref = line.shortRef ? refByShortRef.get(line.shortRef) : undefined
+    const nextRefs = ref && !visibleRefs.has(ref.shortRef) ? [...outputRefs, ref] : outputRefs
+    const refsFit = Buffer.byteLength(JSON.stringify({ refs: nextRefs }), 'utf8') <= maxRefsBytes
+    if (textChars + lineChars > textBudgetChars || textBytes + lineBytes > textBudgetBytes || !refsFit) {
+      budgetTruncated = true
+      if (!line.shortRef && textChars < textBudgetChars && textBytes < textBudgetBytes) {
+        const prefix = sliceUnicodeText({
+          value: `${separator}${line.text}`,
+          maxChars: textBudgetChars - textChars,
+          maxBytes: textBudgetBytes - textBytes,
+        })
+        if (prefix) {
+          outputLines.push(prefix.slice(separator.length))
+        }
+      }
+      break
+    }
+    outputLines.push(line.text)
+    textChars += lineChars
+    textBytes += lineBytes
+    if (ref && !visibleRefs.has(ref.shortRef)) {
+      outputRefs.push(ref)
+      visibleRefs.add(ref.shortRef)
+    }
   }
-  return { text: truncateString({ value: text, maxLength: MAX_SNAPSHOT_CHARS }), visibleRefs }
+
+  let text = outputLines.join('\n')
+  if (budgetTruncated || window.length < searchedLines.length - boundedOffset) {
+    text += `${text ? '\n' : ''}${marker}`
+  }
+  return { text, visibleRefs }
+}
+
+function sliceUnicodeText({
+  value,
+  maxChars,
+  maxBytes,
+}: {
+  value: string
+  maxChars: number
+  maxBytes: number
+}): string {
+  let result = ''
+  let chars = 0
+  let bytes = 0
+  for (const character of value) {
+    const characterChars = character.length
+    const characterBytes = Buffer.byteLength(character, 'utf8')
+    if (chars + characterChars > maxChars || bytes + characterBytes > maxBytes) {
+      break
+    }
+    result += character
+    chars += characterChars
+    bytes += characterBytes
+  }
+  return result
 }
 
 // A synthetic "No matches found" line carries no ref, so refs collapse to empty
@@ -1521,16 +1701,17 @@ function writeWorkerMessage(message: ManagedExecutorWorkerWireMessage): void {
     encoded = encodeManagedWorkerMessage(message)
   } catch (error) {
     console.error('[managed-executor] could not serialize worker message:', errorMessage(error))
-    const fallback = message.type === 'response'
-      ? {
-          type: 'error' as const,
-          id: message.id,
-          error: { message: 'Managed executor response exceeded the protocol message limit' },
-        }
-      : {
-          type: 'error' as const,
-          error: { message: 'Managed executor worker response could not be serialized' },
-        }
+    const fallback =
+      message.type === 'response'
+        ? {
+            type: 'error' as const,
+            id: message.id,
+            error: { message: 'Managed executor response exceeded the protocol message limit' },
+          }
+        : {
+            type: 'error' as const,
+            error: { message: 'Managed executor worker response could not be serialized' },
+          }
     try {
       process.stdout.write(encodeManagedWorkerMessage(fallback), () => {
         process.exit(1)

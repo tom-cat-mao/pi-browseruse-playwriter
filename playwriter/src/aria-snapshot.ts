@@ -269,13 +269,15 @@ const LABEL_ROLES = new Set(['labeltext'])
 const MAX_LABEL_POSITION_CONCURRENCY = 24
 const BOX_MODEL_TIMEOUT_MS = 5000
 
-// Scope selector resolution must be short-bounded so a missing (0) or ambiguous
-// (>1) selector reports a clear error long before the server request timeout
-// aborts the worker. No locator check may exceed this budget; the count() call
-// is non-retrying and the scope-marking evaluate carries a native {timeout}.
+// Scope selector resolution must fail before the outer worker deadline.
 const SCOPE_RESOLUTION_TIMEOUT_MS = 5000
+const SCOPE_CLEANUP_TIMEOUT_MS = 100
 
-export function describeScopeResolution({ matchCount }: { matchCount: number }): { ok: true } | { ok: false; error: string } {
+export function describeScopeResolution({
+  matchCount,
+}: {
+  matchCount: number
+}): { ok: true } | { ok: false; error: string } {
   if (matchCount === 0) {
     return {
       ok: false,
@@ -290,6 +292,16 @@ export function describeScopeResolution({ matchCount }: { matchCount: number }):
     }
   }
   return { ok: true }
+}
+
+export function describeScopeCapture({
+  nodeId,
+}: {
+  nodeId: Protocol.DOM.NodeId | null
+}): { ok: true; nodeId: Protocol.DOM.NodeId } | { ok: false; error: string } {
+  return nodeId === null
+    ? { ok: false, error: 'snapshot scope element disappeared before the accessibility tree was captured' }
+    : { ok: true, nodeId }
 }
 
 const CONTEXT_ROLES = new Set([
@@ -325,13 +337,11 @@ type DomNodeInfo = {
   nodeId: Protocol.DOM.NodeId
   parentId?: Protocol.DOM.NodeId
   backendNodeId: Protocol.DOM.BackendNodeId
+  nodeType?: number
   nodeName: string
   attributes: Map<string, string>
-  // Document-order index among DOM nodes sharing this (lowercased) tag. Used to
-  // build a unique `tag >> nth=` selector for disclosuretriangle summaries that
-  // have no stable id, so the selector identifies the exact DOM node rather than
-  // a visible-subtree guess.
-  sameTagIndex?: number
+  shadowRootType?: Protocol.DOM.ShadowRootType
+  structuralSelector?: string
 }
 
 function toAttributeMap(attributes?: string[]): Map<string, string> {
@@ -386,7 +396,13 @@ function buildBaseLocator({
   stable: { value: string; attr: string } | null
   isPromotedContentEditable?: boolean
   domInfo?: DomNodeInfo
-}): string {
+}): string | undefined {
+  if (
+    role === DISCLOSURE_TRIANGLE_ROLE &&
+    (!domInfo?.structuralSelector || domInfo.nodeName.toLowerCase() !== 'summary')
+  ) {
+    return undefined
+  }
   if (stable) {
     return buildLocatorFromStable(stable)
   }
@@ -398,10 +414,10 @@ function buildBaseLocator({
   if (isPromotedContentEditable) {
     return `[contenteditable="true"]`
   }
-  // disclosuretriangle (native <summary>) has no Playwright ARIA role; emit a
-  // unique DOM tag selector, never role=disclosuretriangle.
+  // disclosuretriangle has no Playwright ARIA role. Only expose it when the
+  // flattened DOM proves that page.locator can address this exact summary.
   if (role === DISCLOSURE_TRIANGLE_ROLE) {
-    return domTagSelector({ nodeName: domInfo?.nodeName, sameTagIndex: domInfo?.sameTagIndex })
+    return domInfo?.structuralSelector
   }
   const trimmedName = name.trim()
   if (trimmedName.length > 0) {
@@ -409,20 +425,6 @@ function buildBaseLocator({
     return `role=${role}[name="${escapedName}"]`
   }
   return `role=${role}`
-}
-
-function domTagSelector({ nodeName, sameTagIndex }: { nodeName?: string; sameTagIndex?: number }): string {
-  const tag = (nodeName ?? '').toLowerCase()
-  // Only bare tag names are safe as CSS selectors; anything else (namespaced
-  // nodes, missing name) falls back to the native summary element which is the
-  // only element Chrome maps to disclosuretriangle. When the tag is not unique in
-  // the document we append a document-order `>> nth=` so the selector resolves to
-  // the exact DOM node rather than a visible-subtree guess.
-  const safeTag = /^[a-z][a-z0-9-]*$/.test(tag) ? tag : 'summary'
-  if (sameTagIndex !== undefined && sameTagIndex > 0) {
-    return `${safeTag} >> nth=${sameTagIndex}`
-  }
-  return safeTag
 }
 
 function getAxValueString(value?: Protocol.Accessibility.AXValue): string {
@@ -654,7 +656,9 @@ export function filterInteractiveSnapshotTree(options: {
   if (includeInteractive) {
     const domInfo = options.node.backendNodeId ? options.domByBackendId.get(options.node.backendNodeId) : undefined
     const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
-    const isPromoted = options.node.backendNodeId != null && (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
+    const isPromoted =
+      options.node.backendNodeId != null &&
+      (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
     baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted, domInfo })
     ref = options.createRefForNode({ backendNodeId: options.node.backendNodeId, role, name })
   }
@@ -755,7 +759,9 @@ export function filterFullSnapshotTree(options: {
   if (includeInteractive) {
     const domInfo = options.node.backendNodeId ? options.domByBackendId.get(options.node.backendNodeId) : undefined
     const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
-    const isPromoted = options.node.backendNodeId != null && (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
+    const isPromoted =
+      options.node.backendNodeId != null &&
+      (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
     baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted, domInfo })
     ref = options.createRefForNode({ backendNodeId: options.node.backendNodeId, role, name })
   }
@@ -864,7 +870,7 @@ export function finalizeSnapshotOutput(
   return { snapshot, snapshotLines, tree: applyLocators(nodes) }
 }
 
-function buildDomIndex(nodes: Protocol.DOM.Node[]): {
+export function buildDomIndex(nodes: Protocol.DOM.Node[]): {
   domById: Map<Protocol.DOM.NodeId, DomNodeInfo>
   domByBackendId: Map<Protocol.DOM.BackendNodeId, DomNodeInfo>
   childrenByParent: Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>
@@ -872,21 +878,16 @@ function buildDomIndex(nodes: Protocol.DOM.Node[]): {
   const domById = new Map<Protocol.DOM.NodeId, DomNodeInfo>()
   const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomNodeInfo>()
   const childrenByParent = new Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>()
-  // Document-order counter per lowercased tag so disclosuretriangle summaries
-  // without a stable id get a unique `tag >> nth=` selector.
-  const tagCounts = new Map<string, number>()
 
   for (const node of nodes) {
-    const tag = node.nodeName.toLowerCase()
-    const sameTagIndex = tagCounts.get(tag) ?? 0
-    tagCounts.set(tag, sameTagIndex + 1)
     const info: DomNodeInfo = {
       nodeId: node.nodeId,
       parentId: node.parentId,
       backendNodeId: node.backendNodeId,
+      nodeType: node.nodeType,
       nodeName: node.nodeName,
       attributes: toAttributeMap(node.attributes),
-      sameTagIndex,
+      shadowRootType: node.shadowRootType,
     }
     domById.set(node.nodeId, info)
     domByBackendId.set(node.backendNodeId, info)
@@ -898,7 +899,69 @@ function buildDomIndex(nodes: Protocol.DOM.Node[]): {
     }
   }
 
+  const rootDocumentNodeId = nodes.find((node) => {
+    return node.nodeType === 9 && node.parentId === undefined
+  })?.nodeId
+  for (const info of domById.values()) {
+    info.structuralSelector = rootDocumentNodeId
+      ? (buildStructuralSelector({ nodeId: info.nodeId, rootDocumentNodeId, domById, childrenByParent }) ?? undefined)
+      : undefined
+  }
+
   return { domById, domByBackendId, childrenByParent }
+}
+
+function buildStructuralSelector({
+  nodeId,
+  rootDocumentNodeId,
+  domById,
+  childrenByParent,
+}: {
+  nodeId: Protocol.DOM.NodeId
+  rootDocumentNodeId: Protocol.DOM.NodeId
+  domById: Map<Protocol.DOM.NodeId, DomNodeInfo>
+  childrenByParent: Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>
+}): string | null {
+  const segments: string[] = []
+  let parts: string[] = []
+  let current = domById.get(nodeId)
+
+  while (current) {
+    if (current.nodeType === 9) {
+      if (current.nodeId !== rootDocumentNodeId) {
+        return null
+      }
+      break
+    }
+    if (current.shadowRootType !== undefined) {
+      if (current.shadowRootType !== 'open' || parts.length === 0 || current.parentId === undefined) {
+        return null
+      }
+      segments.push(parts.reverse().join(' > '))
+      parts = []
+      current = domById.get(current.parentId)
+      continue
+    }
+    if (current.nodeType !== 1 || !/^[a-z][a-z0-9-]*$/i.test(current.nodeName) || current.parentId === undefined) {
+      return null
+    }
+    const siblings = childrenByParent.get(current.parentId) ?? []
+    const sameTagSiblings = siblings.filter((siblingId) => {
+      const sibling = domById.get(siblingId)
+      return sibling?.nodeType === 1 && sibling.nodeName.toLowerCase() === current?.nodeName.toLowerCase()
+    })
+    const siblingIndex = sameTagSiblings.indexOf(current.nodeId)
+    if (siblingIndex < 0) {
+      return null
+    }
+    parts.push(`${current.nodeName.toLowerCase()}:nth-of-type(${siblingIndex + 1})`)
+    current = domById.get(current.parentId)
+  }
+
+  if (parts.length > 0) {
+    segments.push(parts.reverse().join(' > '))
+  }
+  return segments.length > 0 ? segments.reverse().join(' >> ') : null
 }
 
 function findScopeRootNodeId(
@@ -1037,6 +1100,7 @@ export async function getAriaSnapshot({
   refFilter,
   interactiveOnly = false,
   cdp,
+  scopeTimeoutMs = SCOPE_RESOLUTION_TIMEOUT_MS,
 }: {
   page: Page
   frame?: Frame | FrameLocator
@@ -1044,85 +1108,80 @@ export async function getAriaSnapshot({
   refFilter?: (info: { role: string; name: string }) => boolean
   interactiveOnly?: boolean
   cdp?: ICDPSession
+  scopeTimeoutMs?: number
 }): Promise<AriaSnapshotResult> {
   const session = cdp || (await getCDPSessionForPage({ page }))
 
-  // Resolve FrameLocator to an actual Frame. FrameLocator (from locator.contentFrame())
-  // is a scoping helper without CDP access. We need the real Frame from page.frames()
-  // which has frameId() for OOPIF session attachment.
-  const resolvedFrame = await resolveFrame({ frame, page })
-
-  // For cross-origin iframes (OOPIFs), we need to attach to the iframe's target
-  // to get a separate CDP session. Same-origin iframes can use frameId directly.
-  let oopifSessionId: string | null = null
-  const frameId = resolvedFrame?.frameId() ?? null
-
-  if (frameId) {
-    const { targetInfos } = await session.send('Target.getTargets')
-    const frameUrl = resolvedFrame!.url()
-    const iframeTarget = targetInfos.find((t) => {
-      return t.type === 'iframe' && t.url === frameUrl
-    })
-    if (iframeTarget) {
-      const { sessionId } = await session.send('Target.attachToTarget', {
-        targetId: iframeTarget.targetId,
-        flatten: true,
-      })
-      oopifSessionId = sessionId
-      await session.send('Runtime.runIfWaitingForDebugger', undefined, oopifSessionId)
-    }
-  }
-
-  await Promise.all([
-    session.send('DOM.enable', undefined, oopifSessionId),
-    session.send('Accessibility.enable', undefined, oopifSessionId),
-    // Blink updates its AX cache during rendering, after framework navigation changes the DOM.
-    (resolvedFrame || page).evaluate(() => {
-      return new Promise<void>((resolve) => {
-        const window = document.defaultView
-        if (!window) {
-          resolve()
-          return
-        }
-        if (document.visibilityState !== 'visible') {
-          document.documentElement.getBoundingClientRect()
-          resolve()
-          return
-        }
-        window.requestAnimationFrame(() => {
-          window.requestAnimationFrame(() => {
-            resolve()
-          })
-        })
-      })
-    }),
-  ])
   const scopeAttr = 'data-pw-scope'
   const scopeValue = crypto.randomUUID()
+  const boundedScopeTimeoutMs = Math.max(1, Math.min(SCOPE_RESOLUTION_TIMEOUT_MS, Math.floor(scopeTimeoutMs)))
   let scopeApplied = false
-  const scopeLocator = locator
-
+  let oopifSessionId: string | null = null
   try {
-    if (scopeLocator) {
-      // count() does not auto-wait, so a missing (0) or ambiguous (>1) selector
-      // reports a precise error immediately. The scope-marking evaluate carries a
-      // native {timeout} so locator resolution is bounded without an uncancelled
-      // Promise.race that could leave data-pw-scope set after we report failure.
-      const matchCount = await scopeLocator.count()
-      const decision = describeScopeResolution({ matchCount })
+    if (locator) {
+      const decision = describeScopeResolution({ matchCount: await locator.count() })
       if (!decision.ok) {
         throw new Error(decision.error)
       }
-      await scopeLocator.evaluate(
+      await locator.evaluate(
         (element, data) => {
           element.setAttribute(data.attr, data.value)
         },
         { attr: scopeAttr, value: scopeValue },
-        { timeout: SCOPE_RESOLUTION_TIMEOUT_MS },
+        { timeout: boundedScopeTimeoutMs },
       )
       scopeApplied = true
     }
 
+    // Resolve FrameLocator to an actual Frame. FrameLocator (from locator.contentFrame())
+    // is a scoping helper without CDP access. We need the real Frame from page.frames()
+    // which has frameId() for OOPIF session attachment.
+    const resolvedFrame = await resolveFrame({ frame, page })
+
+    // For cross-origin iframes (OOPIFs), we need to attach to the iframe's target
+    // to get a separate CDP session. Same-origin iframes can use frameId directly.
+    const frameId = resolvedFrame?.frameId() ?? null
+
+    if (frameId) {
+      const { targetInfos } = await session.send('Target.getTargets')
+      const frameUrl = resolvedFrame!.url()
+      const iframeTarget = targetInfos.find((t) => {
+        return t.type === 'iframe' && t.url === frameUrl
+      })
+      if (iframeTarget) {
+        const { sessionId } = await session.send('Target.attachToTarget', {
+          targetId: iframeTarget.targetId,
+          flatten: true,
+        })
+        oopifSessionId = sessionId
+        await session.send('Runtime.runIfWaitingForDebugger', undefined, oopifSessionId)
+      }
+    }
+
+    await Promise.all([
+      session.send('DOM.enable', undefined, oopifSessionId),
+      session.send('Accessibility.enable', undefined, oopifSessionId),
+      // Blink updates its AX cache during rendering, after framework navigation changes the DOM.
+      (resolvedFrame || page).evaluate(() => {
+        return new Promise<void>((resolve) => {
+          const window = document.defaultView
+          if (!window) {
+            resolve()
+            return
+          }
+          if (document.visibilityState !== 'visible') {
+            document.documentElement.getBoundingClientRect()
+            resolve()
+            return
+          }
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+              resolve()
+            })
+          })
+        })
+      }),
+    ])
     const { nodes: domNodes } = await session.send(
       'DOM.getFlattenedDocument',
       { depth: -1, pierce: true },
@@ -1132,24 +1191,24 @@ export async function getAriaSnapshot({
 
     let scopeRootNodeId: Protocol.DOM.NodeId | null = null
     let scopeRootBackendId: Protocol.DOM.BackendNodeId | null = null
-    if (scopeLocator) {
+    if (locator) {
       scopeRootNodeId = findScopeRootNodeId(domNodes, scopeAttr, scopeValue)
-      if (scopeRootNodeId) {
-        const scopeNode = domById.get(scopeRootNodeId)
-        if (scopeNode) {
-          scopeRootBackendId = scopeNode.backendNodeId
-        }
+      const capture = describeScopeCapture({ nodeId: scopeRootNodeId })
+      if (!capture.ok) {
+        throw new Error(capture.error)
       }
+      scopeRootNodeId = capture.nodeId
+      const scopeNode = domById.get(capture.nodeId)
+      if (!scopeNode) {
+        throw new Error('snapshot scope element is missing from the flattened DOM')
+      }
+      scopeRootBackendId = scopeNode.backendNodeId
     }
 
     const allowedBackendIds = scopeRootNodeId ? buildBackendIdSet(scopeRootNodeId, childrenByParent, domById) : null
 
     const axParams = !oopifSessionId && frameId ? { frameId } : undefined
-    const { nodes: axNodes } = await session.send(
-      'Accessibility.getFullAXTree',
-      axParams,
-      oopifSessionId,
-    )
+    const { nodes: axNodes } = await session.send('Accessibility.getFullAXTree', axParams, oopifSessionId)
 
     const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
     for (const node of axNodes) {
@@ -1230,6 +1289,12 @@ export async function getAriaSnapshot({
 
       const domInfo = options.backendNodeId ? domByBackendId.get(options.backendNodeId) : undefined
       const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
+      if (
+        options.role === DISCLOSURE_TRIANGLE_ROLE &&
+        (!domInfo?.structuralSelector || domInfo.nodeName.toLowerCase() !== 'summary')
+      ) {
+        return null
+      }
       let baseRef = stable?.value
       if (!baseRef) {
         fallbackCounter += 1
@@ -1250,11 +1315,9 @@ export async function getAriaSnapshot({
       if (!selector && options.backendNodeId != null && promotedContentEditableIds.has(options.backendNodeId)) {
         selector = '[contenteditable="true"]'
       }
-      // disclosuretriangle has no valid Playwright ARIA role. Without a stable
-      // selector, store a unique DOM tag selector so getSelectorForRef never
-      // emits role=disclosuretriangle.
+      // disclosuretriangle has no valid Playwright ARIA role.
       if (!selector && options.role === DISCLOSURE_TRIANGLE_ROLE) {
-        selector = domTagSelector({ nodeName: domInfo?.nodeName, sameTagIndex: domInfo?.sameTagIndex })
+        selector = domInfo?.structuralSelector
       }
 
       refs.push({ ref, role: options.role, name: options.name, selector, backendNodeId: options.backendNodeId })
@@ -1318,7 +1381,12 @@ export async function getAriaSnapshot({
         shortRef: shortRefMap.get(entry.ref) ?? entry.ref,
       }
     })
-    const result = { snapshot: finalized.snapshot, snapshotLines: finalized.snapshotLines, tree: finalized.tree, refs: refsWithShortRef }
+    const result = {
+      snapshot: finalized.snapshot,
+      snapshotLines: finalized.snapshotLines,
+      tree: finalized.tree,
+      refs: refsWithShortRef,
+    }
 
     // Build refToElement map
     const refToElement = new Map<string, { role: string; name: string; shortRef: string }>()
@@ -1359,9 +1427,7 @@ export async function getAriaSnapshot({
       const targetHandles = await Promise.all(
         locators.map(async (loc) => {
           try {
-            return 'elementHandle' in loc
-              ? await loc.elementHandle({ timeout: 1000 })
-              : loc
+            return 'elementHandle' in loc ? await loc.elementHandle({ timeout: 1000 }) : loc
           } catch {
             return null
           }
@@ -1438,16 +1504,16 @@ export async function getAriaSnapshot({
       getRefStringForLocator: async (loc) => (await getRefsForLocators([loc]))[0]?.ref ?? null,
     }
   } finally {
-    if (scopeApplied && scopeLocator) {
-      // Teardown is best-effort and bounded: the scoped element may have been
-      // removed by the page, so never let removeAttribute block the response.
-      await scopeLocator
+    if (scopeApplied && locator) {
+      await locator
         .evaluate(
-          (element, attr) => {
-            element.removeAttribute(attr)
+          (element, data) => {
+            if (element.getAttribute(data.attr) === data.value) {
+              element.removeAttribute(data.attr)
+            }
           },
-          scopeAttr,
-          { timeout: SCOPE_RESOLUTION_TIMEOUT_MS },
+          { attr: scopeAttr, value: scopeValue },
+          { timeout: SCOPE_CLEANUP_TIMEOUT_MS },
         )
         .catch((e) => {
           console.error('[aria-snapshot] Failed to remove scope attribute:', e)
