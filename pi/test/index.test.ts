@@ -447,11 +447,13 @@ describe("tool execution shaping (real HTTP runtime)", () => {
       candidates: Array<{ windowId: number; active: boolean; windowFocused: boolean; browser: string; profileLabel: string }>;
     };
     // Every window keeps its own active flag: nothing is collapsed into a
-    // single "current tab".
-    expect(parsed.candidates.map((c) => [c.windowId, c.active, c.windowFocused])).toEqual([
-      [3, true, false],
-      [4, true, true],
-    ]);
+    // single "current tab". (Display order is active-first, focused-window
+    // auxiliary — asserted by windowId, not array position.)
+    const byWindow = new Map(parsed.candidates.map((c) => [c.windowId, c]));
+    expect([byWindow.get(3)?.active, byWindow.get(3)?.windowFocused]).toEqual([true, false]);
+    expect([byWindow.get(4)?.active, byWindow.get(4)?.windowFocused]).toEqual([true, true]);
+    // Both are active; the focused window is the auxiliary tie-break.
+    expect(parsed.candidates.map((c) => c.windowId)).toEqual([4, 3]);
     // Browser + profile label survive so two Chrome builds/profiles with the
     // same tab title can be told apart.
     expect(parsed.candidates.map((c) => [c.browser, c.profileLabel])).toEqual([
@@ -516,5 +518,127 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(list?.body).toMatchObject({ operation: { kind: "tabs.list", sourceTabId: "tab-1" } });
     // The source link is part of what the model sees, not just details.
     expect(textOf((await tool.execute("call-22", { action: "list", sourceTabId: "tab-1" }, undefined, undefined, makeCtx())).content)).toContain("tab-1");
+  });
+
+  // --- Pi-only discover pagination -----------------------------------------
+
+  function discoverCandidates(count: number, activeIndex = -1) {
+    return Array.from({ length: count }, (_v, i) => ({
+      candidateId: `pcdt:profile-1:epoch-a:${i}`,
+      profileId: "profile-1",
+      profileLabel: "work@example.com",
+      browser: "chrome",
+      browserEpoch: "epoch-a",
+      windowId: 3,
+      active: i === activeIndex,
+      windowFocused: i === activeIndex,
+      chromeTabId: i,
+      url: `https://example.com/tab/${i}`,
+      title: `Tab ${i}`,
+      managed: false,
+      ownedByThisSession: false,
+      attachable: true,
+    }));
+  }
+
+  function structuredLine(text: string): Record<string, unknown> {
+    const line = text.split("\n").find((l) => l.startsWith("{"));
+    expect(line).toBeTruthy();
+    return JSON.parse(line!) as Record<string, unknown>;
+  }
+
+  it("paginates discover locally: active first, total/returned/nextOffset/truncated, no new wire fields", async () => {
+    runtimeHandler(() => ({
+      text: "Discovered 145 existing tab(s) across 1 connected profile(s).",
+      candidates: discoverCandidates(145, 144),
+    }));
+    const tool = toolByName("browser_tabs");
+    const res = await tool.execute(
+      "call-discover-page-1",
+      { action: "discover", query: "tab", profileId: "profile-1", windowId: 3, includeManaged: false },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const t = textOf(res.content);
+    expect(t).toContain("total=145 returned=20 nextOffset=20 truncated=true");
+    const parsed = structuredLine(t) as { candidates: Array<{ candidateId: string; active: boolean }> };
+    expect(parsed.candidates).toHaveLength(20);
+    // The active tab (last in runtime order) is surfaced before the byte budget.
+    expect(parsed.candidates[0]).toMatchObject({ candidateId: "pcdt:profile-1:epoch-a:144", active: true });
+    expect(res.details.discover).toMatchObject({
+      total: 145,
+      offset: 0,
+      returned: 20,
+      nextOffset: 20,
+      truncated: true,
+    });
+    // Existing discover semantics are forwarded; offset/limit are Pi-only.
+    const post = server.requests.find((r) => r.url === "/browser/v1/request");
+    const op = (post?.body as { operation: Record<string, unknown> }).operation;
+    expect(op).toMatchObject({
+      kind: "tabs.discover",
+      query: "tab",
+      profileId: "profile-1",
+      windowId: 3,
+      includeManaged: false,
+    });
+    expect("offset" in op).toBe(false);
+    expect("limit" in op).toBe(false);
+  });
+
+  it("walks every discover page without losing a single candidate id", async () => {
+    const candidates = discoverCandidates(145);
+    runtimeHandler(() => ({ candidates }));
+    const tool = toolByName("browser_tabs");
+    const seen: string[] = [];
+    let offset = 0;
+    for (let guard = 0; guard < 20; guard++) {
+      const res = await tool.execute(
+        `call-walk-${offset}`,
+        { action: "discover", offset, limit: 20 },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      const parsed = structuredLine(textOf(res.content)) as { candidates: Array<{ candidateId: string }> };
+      seen.push(...parsed.candidates.map((c) => c.candidateId));
+      const page = res.details.discover as { nextOffset: number | null; truncated: boolean };
+      if (!page.truncated) break;
+      offset = page.nextOffset!;
+    }
+    expect(seen).toHaveLength(145);
+    expect(new Set(seen).size).toBe(145);
+    expect(new Set(seen)).toEqual(new Set(candidates.map((c) => c.candidateId)));
+  });
+
+  it("cuts an oversized discover page on bytes and points nextOffset at the first unseen entry", async () => {
+    const multibyte = "超长标题用于字节预算测试".repeat(5_000); // far beyond one field clamp
+    // Every candidate carries the huge multibyte title, so the requested page
+    // cannot fit the byte budget and must be cut mid-page.
+    const candidates = discoverCandidates(40).map((candidate) => ({ ...candidate, title: multibyte }));
+    runtimeHandler(() => ({ candidates }));
+    const tool = toolByName("browser_tabs");
+    const first = await tool.execute("call-cut-1", { action: "discover", limit: 20 }, undefined, undefined, makeCtx());
+    const firstText = textOf(first.content);
+    const parsed = structuredLine(firstText) as { candidates: Array<{ candidateId: string }> };
+    const page = first.details.discover as { returned: number; nextOffset: number; truncated: boolean };
+    expect(page.returned).toBeGreaterThan(0);
+    expect(page.returned).toBeLessThan(20);
+    // nextOffset counts what was actually returned, not the requested page size.
+    expect(page.nextOffset).toBe(page.returned);
+    expect(page.truncated).toBe(true);
+    expect(Buffer.byteLength(firstText, "utf8")).toBeLessThan(95_000);
+    // The next page begins exactly at the first candidate that did not fit.
+    expect(parsed.candidates.at(-1)!.candidateId).toBe(candidates[page.returned - 1].candidateId);
+    const next = await tool.execute(
+      "call-cut-2",
+      { action: "discover", offset: page.nextOffset, limit: 20 },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const nextParsed = structuredLine(textOf(next.content)) as { candidates: Array<{ candidateId: string }> };
+    expect(nextParsed.candidates[0].candidateId).toBe(candidates[page.nextOffset].candidateId);
   });
 });

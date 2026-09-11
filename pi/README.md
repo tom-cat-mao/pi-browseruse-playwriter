@@ -36,20 +36,47 @@ used.
 |---|---|
 | `browser_profiles` | list Chrome profiles + connection state (needed for `profileId`) |
 | `browser_groups` | list/create/rename/close this session's tab groups (create needs `name`+`profileId`) |
-| `browser_tabs` | list/create/close/release tabs (create needs `groupId`+`url`) |
-| `browser_navigate` | navigate a `tabId` to a URL |
-| `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` |
+| `browser_tabs` | list/create/attach/activate/close/release tabs; `discover` lists real open tabs with Pi-side `offset`/`limit` paging (active tabs first, `nextOffset`/`truncated` reported) |
+| `browser_navigate` | navigate a `tabId` to a URL, or `action:"back"` through real browser history |
+| `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` (default is the readable tree, `full` the unfiltered tree) |
 | `browser_click` | click by ref (`aria-ref=eN`/`@eN` + `snapshotId`) or strict CSS |
 | `browser_fill` | set input/textarea/contenteditable text (clear-and-insert) |
 | `browser_evaluate` | run JS in a tab's page (`document`/`window`, async) |
 | `browser_screenshot` | screenshot a tab (inline image, optional `path`/`fullPage`/`labels`) |
-| `browser_network` | capture/list/stop a tab's network responses |
+| `browser_network` | capture/list/stop a tab's network responses; retained entries and capture state survive stop/interruption |
 | `browser_logs` | buffered console/log output for a tab |
 | `browser_execute` | escape hatch: Playwright snippet bound to a tab's `page` |
 
 Also registers the inspect-only `/browser-status` command (reachability,
 capabilities, connected profiles). There is no `browser_save_as_pdf` — it always
 errored on headed extension sessions.
+
+## Human-facing rows
+
+Tool rows are designed to be read, not skimmed:
+
+- The folded row shows the observed page (title — domain) plus the action and
+  verifiable counts/outcome; when no page is known yet it falls back to a short
+  tail of the opaque id. Full ids always stay in the model-visible content and in
+  the expanded detail.
+- Page context is remembered per Pi session from the page facts the runtime
+  already returned (a created/attached tab, a listing, or an optional
+  `pageInfo` observation). It is bounded, never triggers an extra browser call,
+  and is dropped on session shutdown — one session never shows another session's
+  titles.
+- Real ANSI/terminal control sequences are stripped before any shortening, with
+  Unicode/wide-character safe truncation; opaque ids are never rewritten.
+- Expanded success detail is byte-bounded (no unlimited raw dump) and errors
+  show the complete bounded multiline message with `code`/`outcome`; collapsed
+  errors keep the first line plus an expand affordance.
+- Screenshot images are still rendered by the framework from the result content;
+  the custom row only adds the saved path/image count.
+
+`browser_tabs discover` paginates in the Pi extension only: the full
+`tabs.discover` response is sorted active-first (window focus as tie-break) and
+paged locally, so `offset`/`limit` are never sent to the runtime. The result
+reports `total`/`returned`/`nextOffset`/`truncated`, and `nextOffset` counts the
+candidates actually returned even when the byte budget cuts a page short.
 
 ## Resource & identity model
 
@@ -84,9 +111,14 @@ errored on headed extension sessions.
 - On cancellation the extension fires a separate best-effort `request.cancel`
   with a fresh signal; page actions are never retried or replayed. An aborted
   mutating request reports `outcome: "unknown"`.
+- Deadlines are split: the operation `timeoutMs` (capped at 120s) is what the
+  runtime enforces, while the client transport waits one bounded grace past it so
+  the runtime can return its typed `timeout` result instead of a raw socket
+  abort. A user abort is immediate and independent of that grace, applies through
+  the whole body read, and cancellation is a separate request.
 - `session_shutdown` calls `session.release` only — it frees this session's
   workers/CDP clients but never deletes groups/tabs and never stops the shared
-  runtime.
+  runtime. Session-scoped page context is dropped at the same time.
 
 ## Development
 

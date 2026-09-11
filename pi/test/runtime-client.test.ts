@@ -168,8 +168,70 @@ describe("request", () => {
     expect((server.requests[0].body as { timeoutMs: number }).timeoutMs).toBe(MAX_REQUEST_TIMEOUT_MS);
   });
 
-  it("surfaces outcome:unknown when a mutating request is aborted mid-flight", async () => {
-    // Never respond, so the caller's signal aborts the in-flight POST.
+  it("accepts the frozen optional pageInfo/networkCapture metadata", async () => {
+    server.setHandler((req) => ({
+      json: {
+        requestId: (req.body as { requestId: string }).requestId,
+        ok: true,
+        data: {
+          pageInfo: { tabId: "ptab-1", url: "https://example.com/", title: "Example" },
+          networkCapture: {
+            status: "interrupted",
+            captureId: "cap-9",
+            retainedCount: 12,
+            droppedCount: 3,
+            reason: "worker-interrupted",
+          },
+        },
+      },
+    }));
+    const data = await client().request({
+      requestId: "c",
+      sessionId: "s",
+      operation: { kind: "page.network", tabId: "t", action: "list" },
+    });
+    expect(data.pageInfo).toEqual({ tabId: "ptab-1", url: "https://example.com/", title: "Example" });
+    expect(data.networkCapture).toEqual({
+      status: "interrupted",
+      captureId: "cap-9",
+      retainedCount: 12,
+      droppedCount: 3,
+      reason: "worker-interrupted",
+    });
+  });
+
+  it("rejects malformed pageInfo/networkCapture metadata as protocol errors", async () => {
+    const request = () =>
+      client().request({ requestId: "c", sessionId: "s", operation: { kind: "profiles.list" } });
+    server.setHandler((req) => ({
+      json: {
+        requestId: (req.body as { requestId: string }).requestId,
+        ok: true,
+        data: { networkCapture: { status: "gone", retainedCount: 1, droppedCount: 0 } },
+      },
+    }));
+    await expect(request()).rejects.toMatchObject({ category: "protocol" });
+
+    server.setHandler((req) => ({
+      json: {
+        requestId: (req.body as { requestId: string }).requestId,
+        ok: true,
+        data: { networkCapture: { status: "active", retainedCount: -1, droppedCount: 0 } },
+      },
+    }));
+    await expect(request()).rejects.toMatchObject({ category: "protocol" });
+
+    server.setHandler((req) => ({
+      json: {
+        requestId: (req.body as { requestId: string }).requestId,
+        ok: true,
+        data: { pageInfo: { tabId: "ptab-1" } },
+      },
+    }));
+    await expect(request()).rejects.toMatchObject({ category: "protocol" });
+  });
+
+  it("surfaces outcome:unknown when a mutating request is aborted mid-flight", async () => {    // Never respond, so the caller's signal aborts the in-flight POST.
     server.setHandler(() => new Promise<never>(() => {}) as never);
     const ac = new AbortController();
     const p = client().request({
@@ -235,6 +297,91 @@ describe("request", () => {
     await new Promise((r) => setTimeout(r, 50));
     ac.abort(new Error("cancelled during error body"));
     await expect(p).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
+  });
+
+  it("surfaces a mid-body stream failure as a transport error, never a fake success", async () => {
+    server.setStreamHandler((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"requestId":"c","ok":true,"da');
+      res.destroy();
+    });
+    const err = await client()
+      .request({ requestId: "c", sessionId: "s", operation: { kind: "page.click", tabId: "t", selector: "#x" } })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RuntimeRequestError);
+    // Never reported as a business operation result; it is a transport failure.
+    expect(["runtime-unreachable", "protocol"]).toContain((err as RuntimeRequestError).category);
+  });
+
+  it("waits past the operation deadline so the runtime can return its typed timeout", async () => {
+    // The runtime answers after its own 30ms deadline with a typed error; the
+    // client must not abort the socket at the same instant.
+    server.setHandler(
+      (req) =>
+        new Promise((resolve) => {
+          setTimeout(
+            () =>
+              resolve({
+                json: {
+                  requestId: (req.body as { requestId: string }).requestId,
+                  ok: false,
+                  error: { code: "timeout", message: "operation timed out", outcome: "unknown" },
+                },
+              }),
+            80,
+          );
+        }),
+    );
+    const c = new BrowserRuntimeClient({ baseUrl: server.baseUrl, transportGraceMs: 400 });
+    const started = Date.now();
+    await expect(
+      c.request({
+        requestId: "c",
+        sessionId: "s",
+        operation: { kind: "page.click", tabId: "t", selector: "#x" },
+        timeoutMs: 30,
+      }),
+    ).rejects.toMatchObject({ category: "operation", code: "timeout", outcome: "unknown" });
+    expect(Date.now() - started).toBeLessThan(400);
+  });
+
+  it("still enforces a bounded transport deadline after the grace", async () => {
+    server.setHandler(() => new Promise<never>(() => {}) as never);
+    const c = new BrowserRuntimeClient({ baseUrl: server.baseUrl, transportGraceMs: 60 });
+    const started = Date.now();
+    await expect(
+      c.request({
+        requestId: "c",
+        sessionId: "s",
+        operation: { kind: "page.click", tabId: "t", selector: "#x" },
+        timeoutMs: 30,
+      }),
+    ).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(70);
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  it("keeps a caller abort immediate through the response body read even with a long grace", async () => {
+    server.setStreamHandler((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"requestId":"c","ok":true,"da');
+      // never ends
+    });
+    const c = new BrowserRuntimeClient({ baseUrl: server.baseUrl, transportGraceMs: 5_000 });
+    const ac = new AbortController();
+    const p = c.request({
+      requestId: "c",
+      sessionId: "s",
+      operation: { kind: "page.click", tabId: "t", selector: "#x" },
+      timeoutMs: 5_000,
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const started = Date.now();
+    ac.abort(new Error("user cancelled mid-body"));
+    await expect(p).rejects.toMatchObject({ category: "timeout", outcome: "unknown" });
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });
 
