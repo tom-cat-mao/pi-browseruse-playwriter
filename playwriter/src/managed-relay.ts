@@ -25,7 +25,7 @@
  * (to the extension or to a worker) must report `unknown` on abnormal termination and
  * must never be replayed automatically.
  */
-import { ManagedExecutorPool } from './managed-executor-pool.js'
+import { ManagedCancellation, ManagedExecutorPool } from './managed-executor-pool.js'
 import { RuntimeNetworkCaptureStore } from './runtime-network-capture.js'
 import { parseTabCandidateId } from './browser-protocol.js'
 import {
@@ -44,6 +44,7 @@ import {
   type BrowserTab,
   type BrowserTabCandidate,
   type BrowserTabOrigin,
+  type ManagedCancelReason,
   type ManagedExecutorPoolContract,
 } from './browser-protocol.js'
 
@@ -2578,7 +2579,7 @@ export class ManagedRelay {
       pending.cancelRequested = true
       pending.sessionReleased = true
     }
-    pending.controller.abort(new Error(reason))
+    pending.controller.abort(new ManagedCancellation(poolCancelReason(reason)))
     this.signalCancellationToOwner({ pending, reason })
   }
 
@@ -2594,6 +2595,7 @@ export class ManagedRelay {
         sessionId: pending.sessionId,
         requestId: pending.requestId,
         profileId: pending.profileId,
+        reason: poolCancelReason(reason),
       })
       return
     }
@@ -2644,15 +2646,17 @@ export class ManagedRelay {
     sessionId,
     requestId,
     profileId,
+    reason,
   }: {
     sessionId: string
     requestId: string
     profileId: string
+    reason: ManagedCancelReason
   }): Promise<void> {
     try {
       const pool = await this.getExistingPool()
       if (pool) {
-        await pool.cancel({ sessionId, requestId })
+        await pool.cancel({ sessionId, requestId, reason })
       }
     } catch (error) {
       this.options.logger?.error('[managed-relay] pool cancel failed:', error)
@@ -3447,6 +3451,13 @@ export class ManagedRelay {
 
 function isPageOperationKind(kind: BrowserOperation['kind']): boolean {
   return kind.startsWith('page.')
+}
+
+/** The pool only distinguishes a deadline from every other stop reason. */
+function poolCancelReason(
+  reason: 'cancelled' | 'timeout' | 'client-disconnected' | 'session-released',
+): ManagedCancelReason {
+  return reason === 'timeout' ? 'timeout' : 'cancelled'
 }
 
 /** Defensive shape check for discovery entries that travel over the WS link. */

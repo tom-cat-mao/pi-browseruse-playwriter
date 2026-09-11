@@ -3,7 +3,7 @@ import path from 'node:path'
 import url from 'node:url'
 import { describe, expect, test } from 'vitest'
 import type { BrowserPageOperation, BrowserRequest, BrowserResponse, BrowserTab, ManagedExecution } from './browser-protocol.js'
-import { ManagedExecutorPool } from './managed-executor-pool.js'
+import { ManagedCancellation, ManagedExecutorPool } from './managed-executor-pool.js'
 
 function createTestDirectory(prefix: string): string {
   const root = path.join(process.cwd(), 'tmp')
@@ -75,6 +75,17 @@ async function waitForMilliseconds(milliseconds: number): Promise<void> {
   })
 }
 
+async function waitForFile(filePath: string): Promise<void> {
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) {
+      return
+    }
+    await waitForMilliseconds(10)
+  }
+  throw new Error(`timed out waiting for ${filePath}`)
+}
+
 describe('ManagedExecutorPool child-process lifecycle', () => {
   test('deadline kills a dispatched worker and the next request gets a new worker', async () => {
     const cwd = createTestDirectory('managed-executor-timeout-')
@@ -128,6 +139,68 @@ describe('ManagedExecutorPool child-process lifecycle', () => {
         error: { code: 'cancelled', outcome: 'unknown' },
       })
       expect(fs.existsSync(path.join(cwd, 'dispatched.txt'))).toBe(true)
+      await waitForMilliseconds(140)
+      expect(fs.existsSync(path.join(cwd, 'late.txt'))).toBe(false)
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('deadline signal wins over a same-tick explicit cancel and keeps timeout', async () => {
+    const cwd = createTestDirectory('managed-executor-race-timeout-')
+    const pool = new ManagedExecutorPool({ workerPath: workerPath('managed-executor-test-worker.ts') })
+    try {
+      await pool.execute(createExecution({ requestId: 'warmup', code: 'immediate', cwd, timeoutMs: 1_000 }))
+      const controller = new AbortController()
+      const pending = pool.execute({
+        ...createExecution({ requestId: 'race-timeout', code: 'delayed-80', cwd, timeoutMs: 5_000 }),
+        signal: controller.signal,
+      })
+      await waitForFile(path.join(cwd, 'dispatched.txt'))
+
+      // The relay aborts its controller with the deadline reason and then calls
+      // cancel() in the same tick; the first abort reason must win.
+      controller.abort(new ManagedCancellation('timeout'))
+      const cancel = pool.cancel({ sessionId: 'session-1', requestId: 'race-timeout', reason: 'cancelled' })
+
+      const response = await pending
+      await cancel
+      expect(response).toMatchObject({
+        requestId: 'race-timeout',
+        ok: false,
+        error: { code: 'timeout', outcome: 'unknown' },
+      })
+      await waitForMilliseconds(140)
+      expect(fs.existsSync(path.join(cwd, 'late.txt'))).toBe(false)
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('explicit cancel stays cancelled when a deadline signal arrives right after', async () => {
+    const cwd = createTestDirectory('managed-executor-race-cancel-')
+    const pool = new ManagedExecutorPool({ workerPath: workerPath('managed-executor-test-worker.ts') })
+    try {
+      await pool.execute(createExecution({ requestId: 'warmup', code: 'immediate', cwd, timeoutMs: 1_000 }))
+      const controller = new AbortController()
+      const pending = pool.execute({
+        ...createExecution({ requestId: 'race-cancel', code: 'delayed-80', cwd, timeoutMs: 5_000 }),
+        signal: controller.signal,
+      })
+      await waitForFile(path.join(cwd, 'dispatched.txt'))
+
+      const cancel = pool.cancel({ sessionId: 'session-1', requestId: 'race-cancel', reason: 'cancelled' })
+      controller.abort(new ManagedCancellation('timeout'))
+
+      await cancel
+      const response = await pending
+      expect(response).toMatchObject({
+        requestId: 'race-cancel',
+        ok: false,
+        error: { code: 'cancelled', outcome: 'unknown' },
+      })
       await waitForMilliseconds(140)
       expect(fs.existsSync(path.join(cwd, 'late.txt'))).toBe(false)
     } finally {

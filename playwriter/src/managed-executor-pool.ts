@@ -8,6 +8,7 @@ import type {
   BrowserRequest,
   BrowserResponse,
   BrowserTab,
+  ManagedCancelReason,
   ManagedExecution,
   ManagedExecutorPoolContract,
   ManagedExecutorPoolOptions,
@@ -67,6 +68,27 @@ interface WorkerSpawnSpec {
 interface ManagedExecutorValidation {
   timeoutMs: number
   operation: BrowserPageOperation
+}
+
+/**
+ * Abort reason the relay plants on the controller it passes into execute().
+ * The relay aborts that controller before it reaches pool.cancel(), so the
+ * signal listener must read the reason from the signal instead of classifying
+ * every abort as a user cancel. Plain aborts (client disconnect, profile
+ * disconnect, shutdown) stay `cancelled`.
+ */
+export class ManagedCancellation extends Error {
+  readonly cancelReason: ManagedCancelReason
+
+  constructor(reason: ManagedCancelReason) {
+    super(reason === 'timeout' ? 'Managed request deadline expired' : 'Managed request cancelled')
+    this.name = 'ManagedCancellation'
+    this.cancelReason = reason
+  }
+}
+
+function cancelReasonFromSignal(signal: AbortSignal): ManagedCancelReason {
+  return signal.reason instanceof ManagedCancellation ? signal.reason.cancelReason : 'cancelled'
 }
 
 /**
@@ -134,12 +156,20 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
     return taskAndPromise.promise
   }
 
-  async cancel({ sessionId, requestId }: { sessionId: string; requestId: string }): Promise<void> {
+  async cancel({
+    sessionId,
+    requestId,
+    reason = 'cancelled',
+  }: {
+    sessionId: string
+    requestId: string
+    reason?: ManagedCancelReason
+  }): Promise<void> {
     const task = this.pending.get(requestKeyFor({ sessionId, requestId }))
     if (!task) {
       return
     }
-    this.abortTask({ task, reason: 'cancelled' })
+    this.abortTask({ task, reason })
   }
 
   async releaseSession({ sessionId }: { sessionId: string }): Promise<void> {
@@ -224,14 +254,14 @@ export class ManagedExecutorPool implements ManagedExecutorPoolContract {
       return
     }
     const onAbort = () => {
-      this.abortTask({ task, reason: 'cancelled' })
+      this.abortTask({ task, reason: cancelReasonFromSignal(signal) })
     }
     signal.addEventListener('abort', onAbort, { once: true })
     task.removeAbortListener = () => {
       signal.removeEventListener('abort', onAbort)
     }
     if (signal.aborted) {
-      this.abortTask({ task, reason: 'cancelled' })
+      this.abortTask({ task, reason: cancelReasonFromSignal(signal) })
     }
 
     if (!this.pending.has(requestKey)) {

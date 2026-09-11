@@ -9,12 +9,19 @@
  * The isolated executor (owner C) is replaced through the documented
  * `managedExecutorPoolFactory` test seam so dispatch, serialization, timeout and
  * cancel semantics of the relay can be verified without spawning Chrome. The
- * relay itself is never mocked.
+ * executor deadline tests additionally run the real child-process
+ * ManagedExecutorPool (fixture worker, still no browser) through this HTTP relay
+ * so a pool-side `cancelled` response can never hide a relay deadline again.
+ * The relay itself is never mocked.
  */
 import { afterEach, describe, expect, test } from 'vitest'
+import fs from 'node:fs'
 import net from 'node:net'
+import path from 'node:path'
+import url from 'node:url'
 import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
+import { ManagedExecutorPool } from './managed-executor-pool.js'
 import {
   RUNTIME_NETWORK_MAX_BYTES,
   RUNTIME_NETWORK_MAX_CAPTURES,
@@ -45,6 +52,7 @@ import {
   type BrowserResultData,
   type BrowserTab,
   type BrowserTabCandidate,
+  type ManagedCancelReason,
   type ManagedExecutorPoolContract,
 } from './browser-protocol.js'
 
@@ -231,7 +239,7 @@ function makeInventory({
 
 type TestPool = ManagedExecutorPoolContract & {
   executions: Array<{ request: BrowserRequest; tab: BrowserTab; cdpUrl: string; connectionEpoch: string }>
-  cancels: Array<{ sessionId: string; requestId: string }>
+  cancels: Array<{ sessionId: string; requestId: string; reason?: ManagedCancelReason }>
   releasedSessions: string[]
   disconnectedProfiles: string[]
   hold: boolean
@@ -322,8 +330,8 @@ function createTestPool(): TestPool {
         concurrent -= 1
       }
     },
-    async cancel({ sessionId, requestId }) {
-      cancels.push({ sessionId, requestId })
+    async cancel({ sessionId, requestId, reason }) {
+      cancels.push({ sessionId, requestId, reason })
     },
     async releaseSession({ sessionId }) {
       releasedSessions.push(sessionId)
@@ -334,6 +342,41 @@ function createTestPool(): TestPool {
     async dispose() {},
   }
   return pool
+}
+
+/** Real child-process executor fixture (no browser/Chrome needed). */
+function realPoolWorkerPath(): string {
+  return url.fileURLToPath(new URL('./managed-executor-test-worker.ts', import.meta.url))
+}
+
+function createExecutorTestDirectory(prefix: string): string {
+  const root = path.join(process.cwd(), 'tmp')
+  fs.mkdirSync(root, { recursive: true })
+  return fs.mkdtempSync(path.join(root, prefix))
+}
+
+/** The fixture worker answers `immediate` with its own pid. */
+function executorResponsePid(body: unknown): number {
+  const response = body as BrowserResponse
+  if (typeof response !== 'object' || response === null || response.ok !== true) {
+    throw new Error('expected a successful executor response')
+  }
+  const value = response.data.value
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || typeof value.pid !== 'number') {
+    throw new Error('expected the fixture worker pid')
+  }
+  return value.pid
+}
+
+function executorErrorMessage(body: unknown): string {
+  const response = body as { error?: { message?: unknown } }
+  return typeof response.error?.message === 'string' ? response.error.message : ''
+}
+
+async function waitForMilliseconds(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, milliseconds)
+  })
 }
 
 type FakeExtensionOptions = {
@@ -1992,12 +2035,168 @@ describe('managed page execution', () => {
       },
       { message: 'pool cancel called' },
     )
-    expect(pool.cancels).toContainEqual({ sessionId: 's1', requestId: 'page-cancel' })
-    // The earlier timeout also revoked its worker request.
-    expect(pool.cancels).toContainEqual({ sessionId: 's1', requestId: 'page-timeout' })
+    expect(pool.cancels).toContainEqual({ sessionId: 's1', requestId: 'page-cancel', reason: 'cancelled' })
+    // The earlier timeout also revoked its worker request with the deadline reason.
+    expect(pool.cancels).toContainEqual({ sessionId: 's1', requestId: 'page-timeout', reason: 'timeout' })
     // The action is never replayed: exactly one execution per request.
     expect(pool.executions).toHaveLength(2)
   })
+
+  test('relay deadline through the real executor pool reports timeout and kills the worker once', async () => {
+    const cwd = createExecutorTestDirectory('managed-relay-pool-timeout-')
+    const pool = new ManagedExecutorPool({ workerPath: realPoolWorkerPath() })
+    try {
+      const relay = await startTrackedRelay({ poolFactory: async () => pool })
+      const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+      extension.sendInventory(
+        makeInventory({
+          groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+          tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+        }),
+      )
+      await waitForCondition(
+        () => {
+          return relay.logs.some((line) => {
+            return line.includes('inventory profile=profile-1')
+          })
+        },
+        { message: 'real executor pool inventory accepted' },
+      )
+
+      const warmup = await browserRequest({
+        port: relay.port,
+        request: {
+          requestId: 'real-warmup',
+          sessionId: 's1',
+          cwd,
+          operation: { kind: 'page.execute', tabId: 't1', code: 'immediate' },
+          timeoutMs: 10_000,
+        },
+      })
+      expect(warmup.body).toMatchObject({ ok: true })
+      const warmupPid = executorResponsePid(warmup.body)
+
+      // The worker is warm, so the pending command is dispatched immediately and
+      // the 40ms relay deadline expires while it is still running. The fixture
+      // writes a late marker after 120ms only if the worker survived the kill.
+      const deadlined = await browserRequest({
+        port: relay.port,
+        request: {
+          requestId: 'real-timeout',
+          sessionId: 's1',
+          cwd,
+          operation: { kind: 'page.execute', tabId: 't1', code: 'silent-startup' },
+          timeoutMs: 40,
+        },
+      })
+      expect(deadlined.body).toMatchObject({
+        ok: false,
+        error: { code: 'timeout', outcome: 'unknown' },
+      })
+      expect(executorErrorMessage(deadlined.body)).toContain('timed out')
+      // The pending command ran in the warm worker, then the deadline killed it.
+      expect(fs.readFileSync(path.join(cwd, 'silent-started.txt'), 'utf8')).toBe(String(warmupPid))
+      // The kill completed before the relay answered: the worker exited while
+      // the request was still pending and never wrote its late marker.
+      expect(fs.existsSync(path.join(cwd, `worker-exit-${warmupPid}.txt`))).toBe(true)
+
+      await waitForMilliseconds(200)
+      expect(fs.existsSync(path.join(cwd, 'silent-late.txt'))).toBe(false)
+
+      const replacement = await browserRequest({
+        port: relay.port,
+        request: {
+          requestId: 'real-replacement',
+          sessionId: 's1',
+          cwd,
+          operation: { kind: 'page.execute', tabId: 't1', code: 'immediate' },
+          timeoutMs: 10_000,
+        },
+      })
+      expect(replacement.body).toMatchObject({ ok: true })
+      expect(executorResponsePid(replacement.body)).not.toBe(warmupPid)
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  test('explicit request.cancel through the real executor pool stays cancelled', async () => {
+    const cwd = createExecutorTestDirectory('managed-relay-pool-cancel-')
+    const pool = new ManagedExecutorPool({ workerPath: realPoolWorkerPath() })
+    try {
+      const relay = await startTrackedRelay({ poolFactory: async () => pool })
+      const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1' })
+      extension.sendInventory(
+        makeInventory({
+          groups: [makeGroup({ groupId: 'g1', sessionId: 's1' })],
+          tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1' })],
+        }),
+      )
+      await waitForCondition(
+        () => {
+          return relay.logs.some((line) => {
+            return line.includes('inventory profile=profile-1')
+          })
+        },
+        { message: 'real executor pool inventory accepted' },
+      )
+
+      const warmup = await browserRequest({
+        port: relay.port,
+        request: {
+          requestId: 'cancel-warmup',
+          sessionId: 's1',
+          cwd,
+          operation: { kind: 'page.execute', tabId: 't1', code: 'immediate' },
+          timeoutMs: 10_000,
+        },
+      })
+      expect(warmup.body).toMatchObject({ ok: true })
+      const warmupPid = executorResponsePid(warmup.body)
+
+      const pending = browserRequest({
+        port: relay.port,
+        request: {
+          requestId: 'real-cancel',
+          sessionId: 's1',
+          cwd,
+          operation: { kind: 'page.execute', tabId: 't1', code: 'delayed-80' },
+          timeoutMs: 10_000,
+        },
+      })
+      await waitForCondition(
+        () => {
+          return fs.existsSync(path.join(cwd, 'dispatched.txt'))
+        },
+        { message: 'cancelled command was dispatched to the worker' },
+      )
+
+      const cancel = await browserRequest({
+        port: relay.port,
+        request: {
+          requestId: 'real-cancel-ack',
+          sessionId: 's1',
+          operation: { kind: 'request.cancel', targetRequestId: 'real-cancel' },
+        },
+      })
+      expect(cancel.body).toMatchObject({ ok: true })
+
+      const cancelled = await pending
+      expect(cancelled.body).toMatchObject({
+        ok: false,
+        error: { code: 'cancelled', outcome: 'unknown' },
+      })
+      expect(executorErrorMessage(cancelled.body)).toContain('cancelled')
+      expect(fs.existsSync(path.join(cwd, `worker-exit-${warmupPid}.txt`))).toBe(true)
+
+      await waitForMilliseconds(140)
+      expect(fs.existsSync(path.join(cwd, 'late.txt'))).toBe(false)
+    } finally {
+      await pool.dispose()
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 20_000)
 
   test('page execution re-checks the tab with the extension before running (release race)', async () => {
     const pool = createTestPool()
@@ -2253,7 +2452,7 @@ describe('managed page execution', () => {
       },
       { message: 'client disconnect cancels the pool request' },
     )
-    expect(pool.cancels[0]).toEqual({ sessionId: 's1', requestId: 'page-disconnect' })
+    expect(pool.cancels[0]).toEqual({ sessionId: 's1', requestId: 'page-disconnect', reason: 'cancelled' })
   })
 
   test('page operations on a released or foreign tab fail before the executor runs', async () => {
