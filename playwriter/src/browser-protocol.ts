@@ -366,10 +366,11 @@ export type BrowserDomCommand =
   | { method: 'click'; selector: string; snapshotId?: string }
   | { method: 'fill'; selector: string; value: string; snapshotId?: string }
   | { method: 'evaluate'; code: string; locator?: BrowserDomLocator }
-  | { method: 'locator'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[] }
+  | { method: 'locator'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[]; expectedPoint?: { x: number; y: number }; preparationId?: string }
   | { method: 'page'; action: 'title' | 'url' | 'content' | 'readyState' }
   | { method: 'frame.resolve'; locator: BrowserDomLocator }
   | { method: 'frame.check'; locator: BrowserDomLocator; point: { x: number; y: number } }
+  | { method: 'frame.actionPoint'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[] }
   | { method: 'invalidate' | 'dispose' }
   | { method: 'screenshot.prepare'; fullPage?: boolean; labels?: boolean }
   | { method: 'screenshot.cleanup' }
