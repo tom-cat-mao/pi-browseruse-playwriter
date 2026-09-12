@@ -73,7 +73,7 @@ non-zero when any assertion fails or the run is blocked.
 `iframe-geometry`, `navigate-back`, `navigation-chain`, `target-blank`,
 `screenshot`, `network`,
 `network-filter`, `logs`, `execute-reads`, `unsupported`, `locator-strictness`,
-`insecure-context`, `release-isolation`, `idle`, `cleanup`.
+`cancellation`, `insecure-context`, `release-isolation`, `idle`, `cleanup`.
 
 `iframe-geometry` and `network-filter` were added for the next integrated build.
 
@@ -127,6 +127,24 @@ All requests use runtime 3000 / HTTP 5000; a genuine timeout is reported as-is.
 
 `page.back` is asserted so its returned `pageInfo.url` must equal the URL after
 the navigation completes.
+
+### cancellation
+
+A fixture button exposes a visible counter. The harness issues a `page.execute`
+that waits ~1500 ms and then clicks, then ~250 ms later sends `request.cancel`
+with the **same session and requestId**. It asserts:
+
+- the cancelled execute returns a structured result (not a client abort);
+- after waiting past the original delay (2000 ms wall), the counter is unchanged
+  (no late dispatch);
+- a following normal run of the same code fires and increments the counter once
+  (positive control).
+
+This verifies late-dispatch safety after a real cancel only. It does **not**
+reproduce the frame-injection race. If the runtime returns no structured
+cancellation result (transport abort or a blocked independent worker), the check
+is recorded as SKIP/NOT RUN rather than asserted. Requests stay at runtime 3000 /
+HTTP 5000; the cancelled execute uses `timeoutMs: 4000`.
 
 ## Statuses
 

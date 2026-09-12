@@ -54,6 +54,7 @@ const RETEST_WATCH_ITEMS = [
   'non-secure HTTP origin: DOM driver must not depend on view.crypto.randomUUID (SecureContext) — owner switching to getRandomValues',
   'page.back response pageInfo.url must equal the completed navigation URL (Codex fix); re-check returned data against page.url()',
   'navigation chain: page.navigate must follow post-commit meta refresh / location.replace to the final document and return the real final pageInfo.url; load-time history.replaceState or hash change must settle (no wait on a load that already fired); same-document fragment and back included',
+  'cancellation: a real request.cancel of a delayed page.execute must return a structured result and must not late-dispatch the action; verified with a fixture counter plus a positive control. NOT a reproduction of the frame-injection race',
   'network: page realm must confirm complete original receipt (large body + UTF-8); retained capture bytes do not prove the in-flight memory budget, which is pure-logic provable only',
   'transient new-tab injection race (about:blank/document swap during create) — NOT RUN unless a real deterministic trigger exists',
 ]
@@ -240,6 +241,12 @@ function indexHtml({ crossOrigin }) {
  <pre id="event-log" aria-label="Observed events"></pre>
 </section>
 
+<section id="cancel-section">
+ <h2>Cancellation</h2>
+ <button id="cancel-counter">Increment counter</button>
+ <span id="cancel-count" aria-label="cancel count">0</span>
+</section>
+
 <section id="scroll-target"><h2>Scroll marker</h2><p>Scroll marker body.</p></section>
 
 <script>
@@ -272,6 +279,8 @@ function indexHtml({ crossOrigin }) {
    append('network status=' + r.status + ' bytes=' + (await r.text()).length);
  });
  document.querySelector('#log').addEventListener('click', () => { console.log('Pi Firefox swarm fixture page log'); append('page console.log emitted'); });
+ let cancelCount = 0;
+ document.querySelector('#cancel-counter').addEventListener('click', () => { cancelCount += 1; document.querySelector('#cancel-count').textContent = String(cancelCount); });
 </script>
 </body></html>`
 }
@@ -1343,6 +1352,78 @@ async function areaLocatorStrictness() {
   })
 }
 
+async function areaCancellation() {
+  const area = 'cancellation'
+  const readCount = async () => {
+    const result = await execute(`return await page.locator('#cancel-count').textContent()`, { area })
+    return result.ok === true ? Number(result.value) : null
+  }
+  const delayedClick = `
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await wait(1500);
+    await page.locator('#cancel-counter').click();
+    return 'clicked';
+  `
+
+  const before = await readCount()
+  check(area, 'fixture counter is readable', typeof before === 'number', { actual: before })
+
+  const requestId = crypto.randomUUID()
+  const startedAt = Date.now()
+  const executePromise = httpJson('POST', '/browser/v1/request', {
+    requestId,
+    sessionId,
+    timeoutMs: 4000,
+    operation: { kind: 'page.execute', tabId: state.tabId, code: delayedClick },
+  }, { timeoutMs: TRANSPORT_TIMEOUT_MS })
+  await delay(250)
+  const cancel = await send(sessionId, { kind: 'request.cancel', targetRequestId: requestId }, { area })
+  const executeResult = await executePromise
+  const structured = executeResult.json !== null && typeof executeResult.json?.ok === 'boolean'
+  check(area, 'cancelled page.execute returns a structured result', structured, {
+    actual: executeResult.json ?? executeResult.networkError,
+    request: { kind: 'page.execute', cancelled: true, requestId },
+  })
+  check(area, 'request.cancel is acknowledged', cancel.json !== null, {
+    actual: cancel.json ?? cancel.networkError,
+    request: { kind: 'request.cancel' },
+  })
+  if (!structured) {
+    skip(area, 'cancelled action does not fire late', {
+      actual: executeResult.networkError,
+      note: 'No structured cancellation result (transport abort or blocked independent worker); timing is not reliable, so this is recorded rather than asserted.',
+    })
+    return
+  }
+
+  const elapsed = Date.now() - startedAt
+  if (elapsed < 2000) await delay(2000 - elapsed)
+  const afterCancel = await readCount()
+  check(area, 'cancelled action does not fire after its original wait', afterCancel === before, {
+    expected: before,
+    actual: afterCancel,
+    note: 'Waited past the 1500ms action delay plus margin; the counter must be unchanged.',
+  })
+  if (afterCancel !== before) {
+    finding(area, 'cancelled action fired late', {
+      expected: `counter unchanged at ${before}`,
+      actual: afterCancel,
+      minimalRepro: 'request.cancel a page.execute that waits 1500ms then clicks, then wait past 2000ms',
+      note: 'A real late dispatch after cancel. This verifies late-dispatch safety only; it does not reproduce the frame-injection race.',
+    })
+  }
+
+  const control = await execute(delayedClick, { area })
+  check(area, 'positive control: same action fires without cancel', control.ok === true && control.value === 'clicked', {
+    actual: control.ok === true ? control.value : control.raw,
+  })
+  const afterControl = await readCount()
+  check(area, 'positive control increments the counter exactly once', afterControl === before + 1, {
+    expected: before + 1,
+    actual: afterControl,
+  })
+}
+
 async function areaInsecureContext() {
   const area = 'insecure-context'
   let address = null
@@ -1687,6 +1768,7 @@ try {
       await areaExecuteReads()
       await areaUnsupported()
       await areaLocatorStrictness()
+      await areaCancellation()
       await areaInsecureContext()
       await areaReleaseAndIsolation()
       await areaIdleObservation()
