@@ -113,18 +113,36 @@ CSS/role selector 零个或多个匹配都报错，不使用 `.first()` 猜测�
 | 查找 | `locator`、`getByRole`、`getByText`、`getByLabel`、`getByPlaceholder`、`getByTestId`、`getByAltText`、`getByTitle` |
 | 组合 | 链式 locator、`filter` 的 `has` / `hasNot` / `hasText` / `hasNotText`、显式 `nth` / `first` / `last` / `all`、`frameLocator` |
 | 动作 | `click` / `dblclick`、`fill` / `clear` / `type` / `pressSequentially` / `press`、`check` / `uncheck` / `setChecked` / `selectOption`、`hover` / `focus` / `blur` / `scrollIntoViewIfNeeded` |
+| 焦点输入 | `page.keyboard.press` / `page.keyboard.type`，仅对当前受控 tab 中匹配 `:focus` 的元素执行 DOM 操作 |
 | 读取 | `count`、文本/HTML/输入值/属性、可见/启用/勾选状态、`boundingBox`、`waitFor` |
 | page | `goto` / `goBack`、`title` / `url` / `content`、`evaluate`、`screenshot` 及常用 locator 动作的 page 简写 |
-| 辅助 | `snapshot`、`getLatestLogs`、`screenshotWithAccessibilityLabels`、`waitForPageLoad`、纯数据 `state`、console 和返回值 |
+| 等待 | `waitForURL` / `waitForLoadState` / `waitForFunction` / `waitForSelector`，以及 `setDefaultTimeout` |
+| 辅助 | `snapshot`、`refToLocator`、`getLatestLogs`、`screenshotWithAccessibilityLabels`、`waitForPageLoad`、纯数据 `state`、console 和返回值 |
 
 普通 selector 仍严格匹配；`first` / `nth` 仅在代码显式调用时选择位置，不能作为模糊匹配的自动回退。
 文本匹配参数目前用字符串，不支持正则。`goto` / `goBack` 返回 `null`，不返回 Playwright 的
 Response 对象。`page.url()` 是最近受控页面响应观察到的同步 URL；需要最新导航结果时先执行并等待页面操作。
 `getLatestLogs` 需要 await。`state` 属于 session/profile/浏览器代际，worker 被取消、重启或释放后不能假定仍在。
 
-不支持的 Playwright 接口明确报错，例如 CDP session、浏览器/上下文创建或关闭、原生
-`keyboard` / `mouse` / `touchscreen`。返回普通数据，不跨调用保存 page/locator 句柄。
-await 每一个动作，不留下后台任务；需要动态页面 evaluate 时满足上面的可选权限要求。
+Firefox 的 `page.keyboard.press/type` 是对当前 tab 中 `:focus` 元素的 DOM helper，遵守严格匹配，
+不会向系统或其它标签派发原生键盘输入。Chrome execute 仍不公开 `keyboard` 对象；两端都不支持
+`mouse` / `touchscreen`，Firefox 也不支持 `keyboard.down/up` 等其余键盘方法。
+
+等待的默认 timeout 为 5000 ms，显式 timeout 和 `setDefaultTimeout` 接受 1–5000 ms，
+同时受整个 execute 剩余时限约束。`waitForURL` 接受 URL 字符串以及 `*` / `**` 通配符，不接受正则；
+`waitForLoadState` 可等待 `load` / `domcontentloaded`，`commit` 不附加等待，`networkidle` 不支持。
+`waitForURL` 的可选 `waitUntil` 会在 URL 匹配后增加对应的加载状态等待，两阶段分别受等待上限约束。
+`waitForSelector` 保持严格匹配，返回 locator；等待 `hidden` / `detached` 时返回 `null`，不是 ElementHandle。
+`waitForFunction` 通过 evaluate 轮询，需要 Firefox 153+ 和可选页面 JavaScript 权限，返回首个为真的
+JSON 可序列化普通值，不返回 JSHandle。
+
+在 execute 中使用 snapshot ref 也必须绑定 `snapshotId`：可通过 `page.locator(ref, { snapshotId })`
+显式传入，或在当前调用获取 `snapshot` 后使用 `refToLocator({ page, ref })` 生成带 snapshot 绑定的
+selector。查不到 ref 时 helper 返回 `null`；不要去掉返回 selector 的 snapshot 后缀，也不要把裸 ref
+自动解释为最新快照。导航、元素变化或 evaluate 后仍需重新观察。
+
+CDP session、浏览器/上下文创建或关闭等不支持的接口明确报错。返回普通数据，不跨调用保存
+page/locator 句柄。await 每一个动作，不留下后台任务；需要动态页面 evaluate 时满足上面的可选权限要求。
 
 ## 验证与维护
 

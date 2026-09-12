@@ -146,7 +146,11 @@ Each call is independent: return plain data or ids to carry forward, but
 time. Await every action to completion and leave no background timers running.
 The returned value and the page logs the snippet produced are reported back to
 you, and the latest snapshot is invalidated like after `browser_evaluate`.
-`keyboard`/`mouse`/`touchscreen` input is not supported right now.
+Chrome execute does not expose `page.keyboard`. Firefox provides only
+`page.keyboard.press` and `page.keyboard.type` as DOM helpers for a strict
+`:focus` match in the selected tab; they do not send native keyboard input.
+`mouse`/`touchscreen` remain unsupported on both backends, and Firefox rejects
+other keyboard methods such as `keyboard.down`/`keyboard.up`.
 Never call `browser.close()`/`context.close()` — close tabs with `browser_tabs`.
 Code is sent as JSON: no shell quoting layer, so quotes/`$`/backticks are safe.
 
@@ -157,6 +161,27 @@ A site that requires it may reject the action even when the element was found.
 Re-observe the outcome; do not repeat actions blindly or try to gain broader
 browser permissions. DOM/ARIA snapshots can also differ from Chrome's native
 accessibility tree.
+
+Firefox execute supports `page.waitForURL`, `page.waitForLoadState`,
+`page.waitForFunction`, `page.waitForSelector`, and `page.setDefaultTimeout`.
+The default wait timeout is 5000 ms; explicit timeouts and `setDefaultTimeout`
+accept 1–5000 ms and are also bounded by the execute call's remaining deadline.
+`waitForURL` accepts a URL string with optional `*`/`**` wildcards, not a regular
+expression. `waitForLoadState` supports `load`/`domcontentloaded`; `commit` adds
+no wait and `networkidle` is unsupported. With `waitUntil`, `waitForURL` waits
+for the URL and then the load state, applying the wait limit to each phase.
+`waitForSelector` returns a locator, or `null` for `hidden`/`detached`, rather
+than an ElementHandle. `waitForFunction` uses evaluate, requires the optional
+Firefox page-JavaScript capability, and returns the first truthy plain JSON
+value rather than a JSHandle.
+
+Firefox execute snapshot refs must carry their `snapshotId`: pass it to
+`page.locator(ref, { snapshotId })`, or call `snapshot` in the current execute
+and use `refToLocator({ page, ref })` to obtain a selector bound to that
+snapshot. The helper returns `null` if the ref is absent. Preserve the returned
+selector's snapshot suffix; bare refs are never attached to the latest
+snapshot automatically. Navigation, DOM changes, and evaluate still require
+fresh observation before ref-based actions.
 
 Firefox logs and network capture start when the controlled tab is instrumented
 or capture is explicitly started; earlier activity is not reconstructed.

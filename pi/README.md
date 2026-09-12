@@ -74,6 +74,18 @@ DOM tools remain available and evaluate reports `unsupported-capability`.
 `browser_execute` supports documented page/locator methods and fails explicitly
 for unsupported APIs, including CDP and browser/context creation or closure.
 
+Firefox execute provides `page.keyboard.press/type` as DOM helpers targeting
+the selected tab's strict `:focus` match. They do not send native keyboard
+input. Chrome execute does not expose `keyboard`; `mouse`/`touchscreen` remain
+unsupported on both backends, as do Firefox keyboard methods such as `down/up`.
+
+Firefox supports `waitForURL`, `waitForLoadState`, `waitForFunction`,
+`waitForSelector`, and `setDefaultTimeout`. Wait timeouts default to 5000 ms,
+accept 1–5000 ms, and remain subject to the overall execute deadline.
+`waitForFunction` requires the optional evaluate capability and returns a
+plain value. Snapshot refs in execute also require a `snapshotId`;
+`refToLocator` produces a selector carrying that snapshot binding.
+
 After evaluate or execute, acquire a new snapshot before using refs again on
 either backend. An unsupported operation or unknown outcome is returned as a
 typed error; it is never silently retried through another browser.
