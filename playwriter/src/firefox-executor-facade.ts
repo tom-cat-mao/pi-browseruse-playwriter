@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer/index.js'
 import type {
   BrowserDomCommand,
   BrowserDomLocator,

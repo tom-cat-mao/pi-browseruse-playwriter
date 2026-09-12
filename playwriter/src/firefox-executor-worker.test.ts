@@ -8,7 +8,7 @@ import { ManagedCancellation } from './managed-executor-pool.js'
 class CommandPeer {
   readonly requests: BrowserDomRequest[] = []
   readonly snapshotMessages: BrowserResultData[] = []
-  beforeReply?: (request: BrowserDomRequest) => Promise<void>
+  beforeReply?: (request: BrowserDomRequest) => Promise<void | BrowserResponse>
 
   async receive(value: BrowserDomRequest): Promise<BrowserResponse> {
     const request = parseBrowserDomRequest(JSON.parse(JSON.stringify(value)))
@@ -16,7 +16,8 @@ class CommandPeer {
       throw new Error('Invalid DOM wire request')
     }
     this.requests.push(request)
-    await this.beforeReply?.(request)
+    const override = await this.beforeReply?.(request)
+    if (override) return override
     return {
       requestId: request.requestId,
       ok: true,
@@ -68,7 +69,7 @@ describe('FirefoxExecutorPool real child process', () => {
     const peer = new CommandPeer()
     try {
       const first = await pool.execute(execution({ id: 'first', peer, code: "state.count = 4; console.log('count', state.count); return { count: state.count, url: page.url() }" }))
-      expect(first).toMatchObject({ ok: true, data: { value: { count: 4, url: 'https://example.test/current' }, logs: ['[log] count 4'] } })
+      expect(first, JSON.stringify(first)).toMatchObject({ ok: true, data: { value: { count: 4, url: 'https://example.test/current' }, logs: ['[log] count 4'] } })
       expect(peer.requests.map((request) => { return request.command.method })).toEqual(['invalidate', 'invalidate'])
       const next = await pool.execute(execution({ id: 'next', peer, code: 'state.count + 1' }))
       expect(next).toMatchObject({ ok: true, data: { value: 5 } })
@@ -262,4 +263,53 @@ describe('FirefoxExecutorPool real child process', () => {
       await pool.dispose()
     }
   })
+
+  test('constructs script-visible APIs, promises, bytes and errors in the execution context', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    try {
+      const response = await pool.execute(execution({ id: 'context-values', peer, code: `
+        const pending = page.title();
+        const timer = setTimeout(() => {}, 100);
+        clearTimeout(timer);
+        const address = new URL('/search?q=hello%20world', 'https://example.test');
+        address.searchParams.set('page', '2');
+        const encoded = new TextEncoder().encode('Firefox');
+        return {
+          pageFunction: page.title.constructor.constructor === Function,
+          consoleFunction: console.log.constructor === Function,
+          promise: pending.constructor === Promise,
+          state: Object.getPrototypeOf(state) === null,
+          bytes: Buffer.from('abc').constructor.constructor === Function,
+          timerType: typeof timer,
+          text: new TextDecoder().decode(encoded),
+          address: address.href,
+          runtimeApi: typeof process.getBuiltinModule,
+          bootstrap: typeof globalThis.__createFirefoxExecutorRealm,
+        };
+      ` }))
+      expect(response, JSON.stringify(response)).toMatchObject({ ok: true, data: { value: {
+        pageFunction: true, consoleFunction: true, promise: true, state: true, bytes: true,
+        timerType: 'number', text: 'Firefox', address: 'https://example.test/search?q=hello+world&page=2',
+        runtimeApi: 'undefined', bootstrap: 'undefined',
+      } } })
+    } finally { await pool.dispose() }
+  })
+
+  test('reports an unawaited DOM rejection without losing worker state', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.beforeReply = async (request) => {
+      if (request.command.method === 'page') return { requestId: request.requestId, ok: false, error: { code: 'execution-failed', message: 'Command peer rejected the page request', outcome: 'unknown' } }
+    }
+    try {
+      const failed = await pool.execute(execution({ id: 'rejected-command', peer, code: 'state.marker = 41; page.title(); return 7' }))
+      expect(failed, JSON.stringify(failed)).toMatchObject({ ok: false, error: { code: 'execution-failed' } })
+      const continued = await pool.execute(execution({ id: 'continued-state', peer, code: 'return ++state.marker' }))
+      expect(continued).toMatchObject({ ok: true, data: { value: 42 } })
+      const handled = await pool.execute(execution({ id: 'handled-rejection', peer, code: 'try { await page.title() } catch {} return 12' }))
+      expect(handled).toMatchObject({ ok: true, data: { value: 12 } })
+    } finally { await pool.dispose() }
+  })
+
 })
