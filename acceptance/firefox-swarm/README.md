@@ -21,21 +21,30 @@ that DNS is unavailable the probe is reported as SKIP/NOT RUN.
 
 ## Run
 
+`PI_BROWSER_RUNTIME_URL` and `PI_FIREFOX_EXPECT_VERSION` are **required**; there
+are no implicit defaults for the current test port or version. Missing either
+exits with an error before any browser action.
+
 ```bash
 # full baseline (includes a 96s read-only idle connection observation)
+PI_BROWSER_RUNTIME_URL=http://127.0.0.1:<port> \
+PI_FIREFOX_EXPECT_VERSION=<version> \
 node acceptance/firefox-swarm/firefox-swarm-acceptance.mjs
 
 # fast pass (skips the idle observation)
-PI_ACCEPT_SKIP_IDLE=1 node acceptance/firefox-swarm/firefox-swarm-acceptance.mjs
+PI_BROWSER_RUNTIME_URL=http://127.0.0.1:<port> \
+PI_FIREFOX_EXPECT_VERSION=<version> \
+PI_ACCEPT_SKIP_IDLE=1 \
+node acceptance/firefox-swarm/firefox-swarm-acceptance.mjs
 ```
 
 Environment:
 
-| Variable | Default | Meaning |
+| Variable | Requirement | Meaning |
 | --- | --- | --- |
-| `PI_BROWSER_RUNTIME_URL` | `http://127.0.0.1:19991` | managed runtime base URL (non-loopback refused) |
-| `PI_FIREFOX_EXPECT_VERSION` | `0.0.136` | expected extension version; mismatch blocks the run |
-| `PI_ACCEPT_SKIP_IDLE` | unset | set to `1` to skip the 96s idle sampling |
+| `PI_BROWSER_RUNTIME_URL` | required | managed runtime base URL (must be loopback) |
+| `PI_FIREFOX_EXPECT_VERSION` | required | expected extension version; mismatch blocks the run |
+| `PI_ACCEPT_SKIP_IDLE` | optional | set to `1` to skip the 96s idle sampling |
 
 Outputs are written under `tmp/firefox-swarm-acceptance/evidence-<timestamp>/`:
 `evidence.json` (raw) and `report.md` (per-run summary). The harness exits
@@ -51,8 +60,10 @@ non-zero when any assertion fails or the run is blocked.
 - `tabs.create` is documented to return before navigation settles
   (`about:blank` transition), so the harness waits for the URL to settle.
 - Runtime deadline is requested as `timeoutMs: 3000` with a 5000 ms HTTP
-  transport grace, so the runtime's own typed timeout wins instead of a
-  client-side abort.
+  transport grace for **every** request (including screenshot and cleanup), so
+  the runtime's own typed timeout wins instead of a client-side abort. No
+  request or assertion waits longer than 5 s. If a real operation is slow enough
+  to time out, report that as-is; do not widen the limits.
 - Assertions never wait longer than 5 s; the whole script has no fixed timeout.
 
 ## Areas

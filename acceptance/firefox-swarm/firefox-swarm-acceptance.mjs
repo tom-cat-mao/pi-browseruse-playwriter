@@ -10,13 +10,20 @@ import { setTimeout as delay } from 'node:timers/promises'
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url))
 const WORKTREE = path.resolve(HERE, '..', '..')
-const RUNTIME = new URL(process.env.PI_BROWSER_RUNTIME_URL || 'http://127.0.0.1:19991')
-const EXPECTED_VERSION = process.env.PI_FIREFOX_EXPECT_VERSION || '0.0.136'
+
+const runtimeUrl = process.env.PI_BROWSER_RUNTIME_URL
+const expectedVersion = process.env.PI_FIREFOX_EXPECT_VERSION
+if (!runtimeUrl || !expectedVersion) {
+  console.error('PI_BROWSER_RUNTIME_URL and PI_FIREFOX_EXPECT_VERSION are required (no implicit defaults); nothing was contacted.')
+  process.exit(2)
+}
+
+const RUNTIME = new URL(runtimeUrl)
+const EXPECTED_VERSION = expectedVersion
 const SKIP_IDLE = process.env.PI_ACCEPT_SKIP_IDLE === '1'
 
 const REQUEST_TIMEOUT_MS = 3000
 const TRANSPORT_TIMEOUT_MS = 5000
-const LONG_TRANSPORT_TIMEOUT_MS = 8000
 const ASSERT_WAIT_MS = 5000
 const POLL_INTERVAL_MS = 250
 const IDLE_SAMPLE_COUNT = 24
@@ -959,7 +966,7 @@ async function areaScreenshot() {
   const area = 'screenshot'
   const plainPath = path.join(evidenceDir, 'screenshot-plain.png')
   const labelsPath = path.join(evidenceDir, 'screenshot-labels.png')
-  const screenshotOptions = { area, timeoutMs: 5000, transportMs: LONG_TRANSPORT_TIMEOUT_MS }
+  const screenshotOptions = { area, timeoutMs: REQUEST_TIMEOUT_MS, transportMs: TRANSPORT_TIMEOUT_MS }
   const plain = await send(sessionId, { kind: 'page.screenshot', tabId: state.tabId, path: plainPath }, screenshotOptions)
   check(area, 'plain screenshot returns an artifact', plain.json?.ok === true && Array.isArray(plain.json.data?.artifacts) && plain.json.data.artifacts.length === 1, {
     actual: plain.json?.ok === true ? plain.json.data : plain.json?.error ?? plain.networkError,
@@ -1436,7 +1443,7 @@ async function areaIdleObservation() {
 async function cleanup() {
   const area = 'cleanup'
   for (const groupId of [...created.attachedGroups].reverse()) {
-    const result = await send(sessionId, { kind: 'groups.close', groupId }, { area, timeoutMs: 5000, transportMs: LONG_TRANSPORT_TIMEOUT_MS })
+    const result = await send(sessionId, { kind: 'groups.close', groupId }, { area })
     evidence.cleanup.push({ groupId, kind: 'attached-group', ok: result.json?.ok === true, error: result.json?.error })
   }
   for (const tabId of [...created.tabs]) {
@@ -1446,7 +1453,7 @@ async function cleanup() {
     evidence.cleanup.push({ tabId, kind: 'tab', ok: result.json?.ok === true, error: result.json?.error })
   }
   for (const groupId of [...created.groups].reverse()) {
-    const result = await send(sessionId, { kind: 'groups.close', groupId }, { area, timeoutMs: 5000, transportMs: LONG_TRANSPORT_TIMEOUT_MS })
+    const result = await send(sessionId, { kind: 'groups.close', groupId }, { area })
     evidence.cleanup.push({ groupId, kind: 'group', ok: result.json?.ok === true, error: result.json?.error })
   }
   const remaining = await send(sessionId, { kind: 'tabs.list' }, { area })

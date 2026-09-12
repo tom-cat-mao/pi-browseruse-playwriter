@@ -8,9 +8,14 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`
 
 ## 结论
 
-**PASS 77 / FAIL 8 / SKIP 1（+9 findings）**。预检未阻断（唯一 connected profile、版本 `0.0.136`、
-无多连接歧义），但这不代表产品可用：基线仍发现 8 项与已声明能力不符的真实 Firefox 运行问题，
-其中多项已由平台 owner 接手。**不能宣称 Firefox 与 Chrome 对等，也不能把预检未阻断写成产品无阻断。**
+**原始实跑计数：PASS 77 / FAIL 8 / SKIP 1（+9 findings）**。预检未阻断（唯一 connected profile、
+版本 `0.0.136`、无多连接歧义），但这不代表产品可用：基线仍发现 8 项与已声明能力不符的真实 Firefox
+运行问题，其中多项已由平台 owner 接手。**不能宣称 Firefox 与 Chrome 对等，也不能把预检未阻断写成
+产品无阻断。**
+
+> **计数口径说明**：上面的 `FAIL 8` 是 2026-09-12 原始实跑的原始计数，**未被改写**。其中 1 项
+> （复合跨 shadow CSS）在本轮范围校正中被单列为「未交付限制」——这是**后续范围分类调整，不是重新跑
+> 得到的计数**；原始 FAIL 包含该项，最终复验时才按新分类呈现。
 
 ## 基线之后的状态（2026-09-13 更新）
 
@@ -74,6 +79,9 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`
 
 ## FAIL（执行过、与声明能力不符）
 
+> 下表按本轮范围校正列出 7 项。**原始实跑为 8 项**：多出的 1 项是复合跨 shadow CSS，
+> 已按本轮范围校正移入下方「未交付限制」（后续范围分类调整，非重新跑得的计数）。
+
 | # | 区域 | 期望 | 实际 | 最小复现 |
 | --- | --- | --- | --- | --- |
 | 1 | shadow-dom | 链式 `page.locator('#shadow-host').locator('input')` 应进入 host 的 shadowRoot（必需能力） | `count=0`（非等待型 count，排除自造超时） | `page.locator('#shadow-host').locator('input').count()` |
@@ -92,10 +100,11 @@ FAIL 2/3 与 4/5 已分别由平台 owner 接手（iframe 严格边界、无变�
 
 ## 未交付限制（SKIP，不称已修）
 
-- **复合跨 shadow CSS**（`page.locator('#shadow-host input')`）：本轮**明确不交付**完整跨 shadow
-  解析器。集成后的模型 capabilities/guide 将声明：native CSS 在**每个 document/shadow root 内**
-  匹配，跨 host 可用**显式链式** locator 或 role/label/text。baseline 曾记录 `count=0` 作为证据并
-  保留；本轮已把 harness 中该断言改为 SKIP + limitation finding，**最终报告单列此限制，不能称已修**。
+- **复合跨 shadow CSS**（`page.locator('#shadow-host input')`）：**原始实跑记为 FAIL（count=0）**；
+  按本轮范围校正，本轮**明确不交付**完整跨 shadow 解析器，故单列为「未交付限制」——这是
+  **后续范围分类调整，不是重新跑得的计数**。集成后的模型 capabilities/guide 将声明：native CSS 在
+  **每个 document/shadow root 内**匹配，跨 host 可用**显式链式** locator 或 role/label/text。
+  原始 `count=0` 证据保留；harness 中该断言已改为 SKIP + limitation finding，**不能称已修**。
 - `target=_blank` 的 `sourceTabId`：DOM 点击是非可信输入，Firefox 弹窗拦截未开新标签，
   故继承逻辑未被触发。属已声明的 untrusted-input/弹窗边界，**不通过改用户弹窗设置绕过**；
   该代码路径记为 NOT RUN。
@@ -134,7 +143,12 @@ FAIL 2/3 与 4/5 已分别由平台 owner 接手（iframe 严格边界、无变�
   shadow 复合改为 SKIP + limitation（链式仍为必需断言）；network 增加**页面 realm 完整性**断言。
 - 移除 harness 内的解释性/分隔注释，说明统一放在本报告与 README；**代码行为不变**（仅 `node --check`，
   未跑浏览器）。
-- 依据：协调者要求暂停真实浏览器动作，只完善测试/报告，等通知新版本加载后再复验。
+- 时限统一：删除 8000ms 分支，截图与 cleanup 也使用**请求 3000 / HTTP 5000** grace；**每个请求/等待
+  仍 <=5s**。若未来真实操作慢到超时，如实报告，不放宽时限。
+- `PI_BROWSER_RUNTIME_URL`、`PI_FIREFOX_EXPECT_VERSION` 改为**显式必填**（不再把当前测试端口/版本写成
+  隐式默认）；缺失时在任何浏览器动作前清楚退出；README 已同步。
+- 依据：协调者要求暂停真实浏览器动作，只完善测试/报告，等通知新版本加载后再复验。最终复验时由协调者
+  明确提供 19991 与新版号。
 
 ## 范围与限制
 
