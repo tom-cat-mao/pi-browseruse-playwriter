@@ -174,15 +174,13 @@ export function assertStaticFrameTransform(options: {
   perspective: string
   offsetPath: string
 }): void {
-  if (!options.transform || options.transform.trim() === '' || options.transform.trim() === 'none') {
-    // An untransformed box keeps the client rect aligned with layout coordinates.
-  } else if (!isIdentityMatrix(options.transform)) {
+  const transform = options.transform.trim()
+  if (transform !== '' && transform !== 'none' && !isIdentityMatrix(transform))
     throw new FirefoxDomError({
       code: 'unsupported-capability',
       message:
         'Firefox frame actions without getBoxQuads cannot prove an axis-aligned frame under a non-identity transform.',
     })
-  }
   if (options.perspective && options.perspective !== 'none')
     throw new FirefoxDomError({
       code: 'unsupported-capability',
