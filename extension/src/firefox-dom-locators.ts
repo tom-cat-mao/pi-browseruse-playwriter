@@ -96,6 +96,8 @@ export function allElements(root: QueryRoot): Element[] {
       if (element.shadowRoot) visit(element.shadowRoot)
     }
   }
+  const rootShadow = root.nodeType === 1 ? (root as Element).shadowRoot : null
+  if (rootShadow) visit(rootShadow)
   visit(root)
   return result
 }
@@ -189,6 +191,8 @@ function selectElements(options: {
     }
     try {
       query(root)
+      const rootShadow = root.nodeType === 1 ? (root as Element).shadowRoot : null
+      if (rootShadow) query(rootShadow)
       for (const element of elements) {
         if (element.shadowRoot) query(element.shadowRoot)
       }

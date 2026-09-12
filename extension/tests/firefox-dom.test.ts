@@ -221,6 +221,28 @@ describe('Firefox DOM locator and accessible name logic', () => {
     ])
   })
 
+  test('resolves a chained locator into the root element own open shadow root', () => {
+    const host = element('#shadow-host')
+    const shadow = host.attachShadow({ mode: 'open' })
+    shadow.innerHTML = '<input id="shadow-input" aria-label="Shadow field" /><button>Shadow action</button>'
+    expect(
+      select({
+        steps: [
+          { kind: 'selector', engine: 'css', value: '#shadow-host' },
+          { kind: 'selector', engine: 'css', value: 'input' },
+        ],
+      }),
+    ).toEqual([shadow.querySelector('input')])
+    expect(
+      select({
+        steps: [
+          { kind: 'selector', engine: 'css', value: '#shadow-host' },
+          { kind: 'selector', engine: 'role', value: 'textbox', name: 'Shadow field', exact: true },
+        ],
+      }),
+    ).toEqual([shadow.querySelector('input')])
+  })
+
   test('enters explicit same-origin frames and keeps parent queries outside frames', () => {
     const frame = element('#same-origin') as HTMLIFrameElement
     frame.contentDocument!.body.innerHTML = '<button>Frame action</button>'
