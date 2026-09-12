@@ -40,7 +40,8 @@ Window 接收者错误）不回退。
 **根因（代码 + 规范证据）**：
 
 - `createFirefoxDomDriver` 在建 driver 时直接 `view.crypto.randomUUID()`
-  （原 `extension/src/firefox-dom.ts:196`，snapshot id `:476`、prepared action id `:744`）。
+  （修复前行号：document id `extension/src/firefox-dom.ts:196`、snapshot id `:476`、
+  prepared action id `:744`；修复后对应 `:206`、`:486`、`:754`，均改为 `randomId()`）。
   `view = document.defaultView`，即**页面自身窗口**。
 - WebCrypto 规范中 `Crypto.randomUUID()` 标注 `[SecureContext]`，
   `getRandomValues()` 没有（<https://w3c.github.io/webcrypto/> 第 10 节）。MDN 亦标注
