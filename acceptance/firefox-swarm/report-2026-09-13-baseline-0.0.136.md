@@ -138,10 +138,13 @@ FAIL 2/3 与 4/5 已分别由平台 owner 接手（iframe 严格边界、无变�
     `page.navigate` 必须跟随并返回**真实最终** `pageInfo.url`（与 `page.url()` 一致）；load 回调里
     `history.replaceState` 或 hash 变化必须能 settle，不能等一个已触发的 load；补充同文档 fragment
     与 back 常规案例。新增 `navigation-chain` area 覆盖。
-12. 真实取消（新增 `cancellation` area）：自有 fixture 计数器按钮；发 `page.execute` 等待 ~1500ms 后点击，
-    约 250ms 后用**同 session/requestId** 发 `request.cancel`；断言取消有结构化结果、超过原等待（2000ms）
-    后计数**未变化**，再做一次不取消的正常点击作正向对照。仅验证「真实取消后不迟发该动作」，**不宣称
-    复现 frame 注入竞态**；无可靠时序或独立 worker 被阻断时明确记 SKIP/NOT RUN，不用 mock/不开权限。
+12. 真实取消（新增 `cancellation` area）：自有 fixture 计数器按钮（初值用 `Number.isFinite` 校验，
+    读失败即阻断该 area 不起动作）；发 `page.execute` 等待 ~1500ms 后点击，约 250ms 后用**同
+    session/requestId** 发 `request.cancel`。断言：`request.cancel` 返回 **`ok:true`**（非仅 body 非空）；
+    被取消的 execute 必须 **`ok:false` 且 `error.code==='cancelled'`**（outcome 可为 unknown），**其它
+    typed error 不当作取消 PASS**；超过原等待（2000ms）后计数**未变化**；再做一次不取消的正常点击作
+    正向对照。仅验证「真实取消后不迟发该动作」，**不宣称复现 frame 注入竞态**；拿不到结构化取消结果
+    （传输 abort / 独立 worker 阻断）时记 SKIP/NOT RUN，不用 mock/不开权限。
 13. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：无可可靠构造的真实触发前记为 **NOT RUN**，
     不用 API 替身冒充。
 

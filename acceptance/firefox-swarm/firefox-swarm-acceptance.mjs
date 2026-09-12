@@ -1366,7 +1366,17 @@ async function areaCancellation() {
   `
 
   const before = await readCount()
-  check(area, 'fixture counter is readable', typeof before === 'number', { actual: before })
+  const counterReadable = Number.isFinite(before)
+  check(area, 'fixture counter readable (Number.isFinite)', counterReadable, { actual: before })
+  if (!counterReadable) {
+    finding(area, 'counter fixture not readable; cancellation area blocked', {
+      expected: 'a finite numeric counter before any action',
+      actual: before,
+      minimalRepro: "read #cancel-count textContent in the fixture",
+      note: 'The initial counter read failed, so no action was started for this area.',
+    })
+    return
+  }
 
   const requestId = crypto.randomUUID()
   const startedAt = Date.now()
@@ -1378,20 +1388,41 @@ async function areaCancellation() {
   }, { timeoutMs: TRANSPORT_TIMEOUT_MS })
   await delay(250)
   const cancel = await send(sessionId, { kind: 'request.cancel', targetRequestId: requestId }, { area })
-  const executeResult = await executePromise
-  const structured = executeResult.json !== null && typeof executeResult.json?.ok === 'boolean'
-  check(area, 'cancelled page.execute returns a structured result', structured, {
-    actual: executeResult.json ?? executeResult.networkError,
-    request: { kind: 'page.execute', cancelled: true, requestId },
-  })
-  check(area, 'request.cancel is acknowledged', cancel.json !== null, {
+  const cancelOk = cancel.json?.ok === true
+  check(area, 'request.cancel returns ok:true', cancelOk, {
     actual: cancel.json ?? cancel.networkError,
-    request: { kind: 'request.cancel' },
+    request: { kind: 'request.cancel', targetRequestId: requestId },
   })
-  if (!structured) {
-    skip(area, 'cancelled action does not fire late', {
+  const executeResult = await executePromise
+  if (!cancelOk) {
+    finding(area, 'request.cancel was not acknowledged; cancellation area blocked', {
+      expected: { ok: true },
+      actual: cancel.json ?? cancel.networkError,
+      request: { kind: 'request.cancel', targetRequestId: requestId },
+      note: 'Without an acknowledged cancel the scenario is invalid; the remaining cancellation checks are not asserted.',
+    })
+    return
+  }
+  if (executeResult.json === null) {
+    skip(area, 'cancelled page.execute returns ok:false with code cancelled', {
       actual: executeResult.networkError,
-      note: 'No structured cancellation result (transport abort or blocked independent worker); timing is not reliable, so this is recorded rather than asserted.',
+      note: 'Transport abort or blocked independent worker: no structured result, so this is NOT RUN rather than fabricated.',
+    })
+    return
+  }
+  const cancelled = executeResult.json.ok === false && executeResult.json.error?.code === 'cancelled'
+  check(area, 'cancelled page.execute returns ok:false with code cancelled', cancelled, {
+    expected: { ok: false, code: 'cancelled' },
+    actual: executeResult.json,
+    request: { kind: 'page.execute', cancelled: true, requestId },
+    note: 'A different typed error (timeout/other) is NOT accepted as cancellation success.',
+  })
+  if (!cancelled) {
+    finding(area, 'cancel did not yield a cancelled result; not treated as cancel success', {
+      expected: { ok: false, code: 'cancelled' },
+      actual: executeResult.json,
+      request: { kind: 'page.execute', cancelled: true, requestId },
+      note: 'The action may have failed or timed out for another reason; late-dispatch checks are not asserted as cancellation evidence.',
     })
     return
   }

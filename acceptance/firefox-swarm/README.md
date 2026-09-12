@@ -134,7 +134,12 @@ A fixture button exposes a visible counter. The harness issues a `page.execute`
 that waits ~1500 ms and then clicks, then ~250 ms later sends `request.cancel`
 with the **same session and requestId**. It asserts:
 
-- the cancelled execute returns a structured result (not a client abort);
+- the fixture counter is readable (`Number.isFinite`); if not, the area is
+  blocked and no action is started;
+- `request.cancel` itself returns `ok: true` (a non-null body is not enough);
+- the cancelled execute returns `ok: false` with `error.code === 'cancelled'`
+  (outcome may be `unknown`); any other typed error is **not** accepted as
+  cancellation success;
 - after waiting past the original delay (2000 ms wall), the counter is unchanged
   (no late dispatch);
 - a following normal run of the same code fires and increments the counter once
