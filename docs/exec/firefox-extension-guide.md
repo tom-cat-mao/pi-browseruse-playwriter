@@ -1,5 +1,7 @@
 # Firefox 普通扩展使用与能力边界
 
+当前为开发预览：生产代码审查、浏览器无关测试及打包已通过；真实 Firefox 验收按用户本轮决定保留待办。状态见[交付与验收记录](firefox-extension-acceptance.md)。
+
 本分支提供普通 Firefox WebExtension 后端，使用现有 Pi 包和本地 managed runtime。
 它接管已经打开的真实标签和登录态，不要求 Remote Agent、BiDi、Marionette 或调试启动参数。
 开发目标为桌面 Firefox 139+；其它 Firefox 衍生浏览器需分别验证。
