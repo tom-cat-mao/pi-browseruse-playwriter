@@ -23,7 +23,14 @@ import {
   strictElement,
 } from '../src/firefox-dom-locators'
 import { checkedState, clickElement, fillElement, pressKey, selectOptions, setChecked } from '../src/firefox-dom-input'
-import { assertFrameTransform, checkFramePoint, mapFramePoint } from '../src/firefox-dom-frame'
+import {
+  assertFrameTransform,
+  assertStaticFrameTransform,
+  checkFramePoint,
+  frameContentQuad,
+  mapFramePoint,
+  untransformedFrameContentBox,
+} from '../src/firefox-dom-frame'
 import { assertFirefoxCsp } from '../../scripts/firefox-csp.mjs'
 
 const repoRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '../..')
@@ -702,5 +709,93 @@ describe('Firefox frame action point mapping', () => {
     expect(() => {
       checkFramePoint({ frame: element('#name'), point: { x: 1, y: 1 } })
     }).toThrow('iframe or frame')
+  })
+
+  test('derives an untransformed frame content quad from provable border/client geometry', () => {
+    expect(
+      frameContentQuad({
+        box: { left: 100, top: 50, width: 320, height: 220 },
+        client: { left: 2, top: 3, width: 316, height: 217 },
+        border: { left: 2, right: 2, top: 3, bottom: 0 },
+        padding: { left: 8, right: 6, top: 4, bottom: 5 },
+      }),
+    ).toEqual({
+      quad: {
+        p1: { x: 110, y: 57 },
+        p2: { x: 412, y: 57 },
+        p3: { x: 412, y: 265 },
+        p4: { x: 110, y: 265 },
+      },
+      viewport: { width: 302, height: 208 },
+    })
+  })
+
+  test('rejects frame boxes that cannot be proven exact without getBoxQuads', () => {
+    const base = {
+      box: { left: 100, top: 50, width: 320, height: 220 },
+      client: { left: 2, top: 3, width: 316, height: 217 },
+      border: { left: 2, right: 2, top: 3, bottom: 0 },
+      padding: { left: 8, right: 6, top: 4, bottom: 5 },
+    }
+    expect(() => {
+      frameContentQuad({ ...base, box: { ...base.box, width: 0 } })
+    }).toThrow('non-degenerate')
+    expect(() => {
+      frameContentQuad({ ...base, box: { ...base.box, left: Number.NaN } })
+    }).toThrow('non-degenerate')
+    expect(() => {
+      frameContentQuad({ ...base, border: { ...base.border, left: 2.5 } })
+    }).toThrow('rounded client offset')
+    expect(() => {
+      frameContentQuad({ ...base, box: { ...base.box, width: 321 } })
+    }).toThrow('disagree')
+    expect(() => {
+      frameContentQuad({ ...base, padding: { ...base.padding, right: 316 } })
+    }).toThrow('positive content box')
+  })
+
+  test('requires a strictly untransformed frame chain for the getBoxQuads-free path', () => {
+    const neutral = {
+      transform: 'none',
+      rotate: 'none',
+      scale: 'none',
+      translate: 'none',
+      zoom: '1',
+      perspective: 'none',
+      offsetPath: 'none',
+    }
+    for (const style of [
+      neutral,
+      { ...neutral, transform: '' },
+      { ...neutral, transform: 'matrix(1, 0, 0, 1, 0, 0)' },
+      { ...neutral, transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)' },
+      { ...neutral, rotate: '0deg', scale: '1 1', translate: '0px 0px', zoom: '100%' },
+      { ...neutral, rotate: '', scale: '', translate: '', zoom: '' },
+    ]) {
+      expect(() => {
+        assertStaticFrameTransform(style)
+      }).not.toThrow()
+    }
+    for (const style of [
+      { ...neutral, transform: 'matrix(2, 0, 0, 2, 0, 0)' },
+      { ...neutral, transform: 'matrix(1, 0, 0, 1, 40, 0)' },
+      { ...neutral, transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1.5)' },
+      { ...neutral, rotate: '45deg' },
+      { ...neutral, scale: '2' },
+      { ...neutral, translate: '10px' },
+      { ...neutral, zoom: '1.5' },
+      { ...neutral, perspective: '1000px' },
+      { ...neutral, offsetPath: 'path("M0 0 L10 10")' },
+    ]) {
+      expect(() => {
+        assertStaticFrameTransform(style)
+      }).toThrow('without getBoxQuads')
+    }
+  })
+
+  test('refuses a frame action when the frame has no provable layout box without getBoxQuads', () => {
+    expect(() => {
+      untransformedFrameContentBox({ frame: element('#same-origin') })
+    }).toThrow('single unfragmented frame box')
   })
 })
