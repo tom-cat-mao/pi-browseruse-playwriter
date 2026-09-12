@@ -330,6 +330,7 @@ export interface ManagedExecutorPoolContract {
 /** Serialized locator program; physical page ownership is carried by the envelope. */
 export interface BrowserDomLocator {
   steps: BrowserDomLocatorStep[]
+  snapshotId?: string
 }
 
 export type BrowserDomLocatorStep =
@@ -366,7 +367,7 @@ export type BrowserDomCommand =
   | { method: 'fill'; selector: string; value: string; snapshotId?: string }
   | { method: 'evaluate'; code: string; locator?: BrowserDomLocator }
   | { method: 'locator'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[] }
-  | { method: 'page'; action: 'title' | 'url' | 'content' }
+  | { method: 'page'; action: 'title' | 'url' | 'content' | 'readyState' }
   | { method: 'frame.resolve'; locator: BrowserDomLocator }
   | { method: 'invalidate' | 'dispose' }
   | { method: 'screenshot.prepare'; fullPage?: boolean; labels?: boolean }
