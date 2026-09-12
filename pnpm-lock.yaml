@@ -387,6 +387,9 @@ importers:
       better-auth:
         specifier: ^1.6.20
         version: 1.6.20(@opentelemetry/api@1.9.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.0.8)
+      buffer:
+        specifier: ^6.0.3
+        version: 6.0.3
       diff:
         specifier: ^8.0.2
         version: 8.0.2
@@ -13050,7 +13053,6 @@ snapshots:
     dependencies:
       base64-js: 1.5.1
       ieee754: 1.2.1
-    optional: true
 
   bufferutil@4.0.9:
     dependencies:
@@ -14768,8 +14770,7 @@ snapshots:
     dependencies:
       safer-buffer: 2.1.2
 
-  ieee754@1.2.1:
-    optional: true
+  ieee754@1.2.1: {}
 
   ignore@5.3.2: {}
 
