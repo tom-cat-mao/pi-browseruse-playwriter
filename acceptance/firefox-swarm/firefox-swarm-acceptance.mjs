@@ -1,27 +1,4 @@
 #!/usr/bin/env node
-/**
- * Firefox swarm independent acceptance harness (0.0.136 baseline).
- *
- * Standalone, self-contained acceptance for an already-loaded real Firefox
- * extension. It talks directly to the managed runtime over the documented v1
- * HTTP contract, uses an independent random Pi session id, and only ever
- * creates/controls its own group and tabs against a local fixture it serves.
- *
- * It NEVER: touches the user's existing tabs/groups, closes a browser/context,
- * changes Firefox settings/permissions, enables userScripts, reloads the
- * extension, starts/kills processes on 19989 or 19991, or runs any runtime
- * unit/integration suite.
- *
- * Fixture servers are started inside this single foreground process, bound to
- * 127.0.0.1 on random ports, and always closed in finally.
- *
- * Usage:
- *   node acceptance/firefox-swarm/firefox-swarm-acceptance.mjs
- * Env:
- *   PI_BROWSER_RUNTIME_URL  default http://127.0.0.1:19991
- *   PI_FIREFOX_EXPECT_VERSION  default 0.0.136
- *   PI_ACCEPT_SKIP_IDLE=1   skip the 96s idle observation (for quick reruns)
- */
 
 import crypto from 'node:crypto'
 import dns from 'node:dns/promises'
@@ -36,9 +13,7 @@ const WORKTREE = path.resolve(HERE, '..', '..')
 const RUNTIME = new URL(process.env.PI_BROWSER_RUNTIME_URL || 'http://127.0.0.1:19991')
 const EXPECTED_VERSION = process.env.PI_FIREFOX_EXPECT_VERSION || '0.0.136'
 const SKIP_IDLE = process.env.PI_ACCEPT_SKIP_IDLE === '1'
-// Runtime deadline is passed as the operation timeoutMs; the HTTP transport gets
-// a small grace on top so the runtime's own typed timeout wins instead of a
-// client-side abort masquerading as a product failure.
+
 const REQUEST_TIMEOUT_MS = 3000
 const TRANSPORT_TIMEOUT_MS = 5000
 const LONG_TRANSPORT_TIMEOUT_MS = 8000
@@ -59,12 +34,6 @@ fs.mkdirSync(evidenceDir, { recursive: true })
 const sessionId = crypto.randomUUID()
 const secondSessionId = crypto.randomUUID()
 
-/**
- * Items raised by the coordinator's static review. They are NOT covered by the
- * 0.0.136 baseline below and must be re-checked on the next integrated build.
- * Transient injection races that cannot be reliably constructed in a live
- * browser are listed as NOT RUN rather than faked with API doubles.
- */
 const RETEST_WATCH_ITEMS = [
   'inject/attach must not ignore frame-level executeScript.error or a missing target frame',
   'frame routing/injection wait paths must observe cancellation after the wait',
@@ -72,11 +41,12 @@ const RETEST_WATCH_ITEMS = [
   'tabs.create must persist the native tabId in the request context so the post-create release check is not weakened',
   'network concurrent in-flight chunks are not counted against the 2 MiB total budget; budget unit is raw in-flight bytes + retained UTF-8 bytes, not an OS memory cap (owner is fixing the real logic)',
   'network response filter forwarding must be complete even when the recorded body is truncated — covered by the network-filter suite (bounded concurrency, UTF-8, large body, stop/restart)',
-  'iframe getBoxQuads: platform owner adding a strictly bounded no-transform frame fallback; iframe-geometry suite re-checks bordered/padded, occlusion, and scale/rotate/perspective refusal',
+  'iframe getBoxQuads: no-transform, exactly provable client/rect/border/padding boxes only; fractional/transformed/scaled geometry must be explicitly refused. iframe-geometry re-checks the positive no-transform case plus occlusion and geometry-negatives',
   'console bridge: firefox-dom.ts original.apply(pageView.console, args) with a content-script rest array (platform owner)',
-  'open shadow DOM: compound CSS and explicit chained locators are asserted separately — a chained fix must not be reported as also fixing the compound selector',
+  'open shadow DOM: compound cross-shadow CSS is an explicit non-goal this round (per-root native CSS; cross-host via chained/role/label/text). Chained traversal is required and must actually succeed; the two are asserted separately',
   'non-secure HTTP origin: DOM driver must not depend on view.crypto.randomUUID (SecureContext) — owner switching to getRandomValues',
   'page.back response pageInfo.url must equal the completed navigation URL (Codex fix); re-check returned data against page.url()',
+  'network: page realm must confirm complete original receipt (large body + UTF-8); retained capture bytes do not prove the in-flight memory budget, which is pure-logic provable only',
   'transient new-tab injection race (about:blank/document swap during create) — NOT RUN unless a real deterministic trigger exists',
 ]
 const evidence = {
@@ -134,7 +104,6 @@ function skip(area, name, details = {}) {
   return record(area, name, 'SKIP', details)
 }
 
-/** A real runtime problem that is not a pass/fail assertion of a supported feature. */
 function finding(area, title, details = {}) {
   const entry = { area, title, at: new Date().toISOString(), ...details }
   evidence.findings.push(entry)
@@ -195,10 +164,6 @@ async function runtimeGet(pathname, { timeoutMs = 3000 } = {}) {
   return httpJson('GET', pathname, undefined, { timeoutMs })
 }
 
-/* ------------------------------------------------------------------ */
-/* Fixtures                                                            */
-/* ------------------------------------------------------------------ */
-
 const FIXTURE_TITLE = 'Pi Firefox swarm acceptance fixture'
 
 function indexHtml({ crossOrigin }) {
@@ -254,6 +219,7 @@ function indexHtml({ crossOrigin }) {
   <span id="occluder" style="position:absolute;inset:0;background:#0009;z-index:5"></span>
  </span>
  <iframe id="scaled-frame" title="Scaled frame" src="/frame2.html" style="width:320px;height:170px;transform:perspective(420px) scale(1.3) rotate(7deg);transform-origin:top left"></iframe>
+ <iframe id="fraction-frame" title="Fractional frame" src="/frame2.html" style="border:1.5px solid #333;padding:9.5px;margin-left:0.5px;width:319.5px;height:169.5px"></iframe>
  <div id="shadow-host"></div>
 </section>
 
@@ -362,8 +328,7 @@ const SECURE_PROBE_HTML = `<!doctype html>
     protocol: location.protocol,
   };
   document.querySelector('#secure-probe').textContent = JSON.stringify(report);
-  // Exposed through the browser tab title so it can be read without the
-  // content-script DOM driver (which is exactly what fails here).
+
   document.title = JSON.stringify(report);
   document.querySelector('#probe-button').addEventListener('click', () => {
     document.querySelector('#probe-log').textContent += 'probe clicked; ';
@@ -388,10 +353,6 @@ function closeServer(server) {
     server.closeAllConnections?.()
   })
 }
-
-/* ------------------------------------------------------------------ */
-/* Helpers for resource creation with unknown-outcome recovery         */
-/* ------------------------------------------------------------------ */
 
 async function recoverGroupByName(name) {
   const listed = await send(sessionId, { kind: 'groups.list' }, { area: 'recovery' })
@@ -446,7 +407,6 @@ async function waitFor(predicate, { timeoutMs = ASSERT_WAIT_MS, intervalMs = POL
   return last ?? { done: false }
 }
 
-/** tabs.create can return while the tab is still about:blank; wait for the real URL. */
 async function waitForTabUrl(tabId, predicate, { timeoutMs = ASSERT_WAIT_MS, intervalMs = 150 } = {}) {
   return waitFor(async () => {
     const resolved = await send(sessionId, { kind: 'tab.resolve', tabId }, { area: 'recovery' })
@@ -456,10 +416,6 @@ async function waitForTabUrl(tabId, predicate, { timeoutMs = ASSERT_WAIT_MS, int
 }
 
 const state = { profileId: null, connectionId: null, epoch: null, version: null, groupId: null, tabId: null, baseUrl: null, insecureOrigin: null }
-
-/* ------------------------------------------------------------------ */
-/* Areas                                                               */
-/* ------------------------------------------------------------------ */
 
 async function preflight() {
   const area = 'preflight'
@@ -562,9 +518,6 @@ async function areaGroupAndTab() {
     actual: { groupId: tab.groupId, url: tab.url, state: tab.state },
   })
 
-  // tabs.create is documented to return a committed tab that may still be at
-  // about:blank while it navigates; the URL settles shortly after. This is
-  // expected, so assert on the settled URL rather than the create response.
   const settled = await waitForTabUrl(state.tabId, (currentUrl) => currentUrl.startsWith(state.baseUrl))
   check(area, 'created tab navigates to the fixture URL', settled.done === true && settled.tab?.url?.includes('/index.html'), {
     expected: `${state.baseUrl}/index.html`,
@@ -576,8 +529,7 @@ async function areaGroupAndTab() {
 
 async function areaSnapshotAndRef() {
   const area = 'snapshot-ref'
-  // The document may still be parsing right after the URL settles; take the
-  // snapshot once the fixture's accessible content is present.
+
   let snap = null
   let data = null
   const ready = await waitFor(async () => {
@@ -730,8 +682,7 @@ async function areaHiddenFiltering() {
 
 async function areaShadowDom() {
   const area = 'shadow-dom'
-  // Open shadow DOM is reached through ARIA role/label locators (verified by role
-  // traversal + actual DOM mutation), not through CSS descendant selectors.
+
   const result = await execute(`
     const box = page.getByRole('textbox', { name: 'Shadow name' });
     await box.fill('Shadow v2');
@@ -749,23 +700,18 @@ async function areaShadowDom() {
     actual: result.value?.clicked,
   })
 
-  // Diagnostics (count() avoids auto-wait, so these are not self-made timeouts):
-  //  - compound CSS #shadow-host input
-  //  - chained page.locator('#shadow-host').locator('input')
-  // The Firefox guide declares DOM locators traverse open shadow DOM.
   const compound = await execute(`return await page.locator('#shadow-host input').count()`, { area })
-  check(area, 'compound CSS selector resolves through the open shadow root', compound.ok === true && compound.value === 1, {
+  skip(area, 'compound CSS selector crosses the shadow boundary', {
     actual: compound.ok === true ? { count: compound.value } : compound.error ?? compound.networkError,
     request: { kind: 'page.execute', code: "page.locator('#shadow-host input').count()" },
+    note: 'Not delivered this round: native CSS matches per document/shadow root; cross-host access uses explicit chained locators or role/label/text. Baseline recorded count 0 — listed as a limitation, not fixed.',
   })
-  if (!(compound.ok === true && compound.value === 1)) {
-    finding(area, 'compound CSS selector does not traverse the open shadow root', {
-      expected: 'count 1 for an input inside an open shadow root',
-      actual: compound.ok === true ? compound.value : compound.error ?? compound.networkError,
-      minimalRepro: "page.locator('#shadow-host input').count() against an open shadow root",
-      note: 'A bare `input` selector does match (global shadow enumeration), but the compound descendant selector returns 0. Actions then auto-wait to the runtime deadline.',
-    })
-  }
+  finding(area, 'compound cross-shadow CSS is an explicit non-goal for this round', {
+    expected: 'native CSS matches within each document/shadow root; cross-host requires chained or role/label/text',
+    actual: compound.ok === true ? compound.value : compound.error ?? compound.networkError,
+    minimalRepro: "page.locator('#shadow-host input').count() against an open shadow root",
+    note: 'Undelivered by design this round. Do not report it fixed; the integrated model/guide will state the per-root CSS rule.',
+  })
 
   const chained = await execute(`return await page.locator('#shadow-host').locator('input').count()`, { area })
   check(area, 'chained locator traverses the host element shadowRoot', chained.ok === true && chained.value === 1, {
@@ -777,7 +723,7 @@ async function areaShadowDom() {
       expected: 'chaining from an element traverses its open shadowRoot',
       actual: chained.ok === true ? chained.value : chained.error ?? chained.networkError,
       minimalRepro: "page.locator('#shadow-host').locator('input').count() against an open shadow root",
-      note: 'Distinct from the compound-CSS case: the root element itself is not descended into. Confirmed with a non-waiting count().',
+      note: 'Chained traversal is a required capability and must actually succeed; independent of the undelivered compound-CSS case.',
     })
   }
 }
@@ -802,8 +748,7 @@ async function areaSameOriginFrame() {
   if (action.ok === true) {
     check(area, 'same-origin iframe locator fills content', action.value === 'Frame v2', { actual: action.value })
   } else {
-    // The Firefox guide declares frameLocator actions; an executed, explicitly
-    // refused action is a capability failure, not a SKIP.
+
     check(area, 'same-origin iframe locator fills content', false, {
       actual: action.error ?? action.networkError,
       request: { kind: 'page.execute', code: "page.frameLocator('#local-frame').locator('#frame-input').fill(...)" },
@@ -856,8 +801,6 @@ async function areaCrossOriginFrame() {
 async function areaIframeGeometry() {
   const area = 'iframe-geometry'
 
-  // No-transform same-origin frame wrapped in border+padding: a click must map
-  // coordinates through the frame offset and hit the intended element.
   const padded = await execute(`
     const frame = page.frameLocator('#padded-frame');
     await frame.getByRole('button', { name: 'Padded action' }).click();
@@ -868,8 +811,6 @@ async function areaIframeGeometry() {
     request: { code: "frameLocator('#padded-frame').getByRole('button',{name:'Padded action'}).click()" },
   })
 
-  // Scale/rotate/perspective frame: geometry is uncertain, so an action must be
-  // explicitly refused, never approximated to a bounding box.
   const transformed = await execute(`
     const frame = page.frameLocator('#scaled-frame');
     await frame.getByRole('button', { name: 'Padded action' }).click();
@@ -881,7 +822,17 @@ async function areaIframeGeometry() {
     request: { code: "frameLocator('#scaled-frame').getByRole('button',{name:'Padded action'}).click()" },
   })
 
-  // Occluded frame: a parent-level overlay must block the action.
+  const fractional = await execute(`
+    const frame = page.frameLocator('#fraction-frame');
+    await frame.getByRole('button', { name: 'Padded action' }).click();
+    return await frame.locator('#padded-heading').textContent();
+  `, { area })
+  check(area, 'fractional-geometry frame action is explicitly refused (no approximation)', fractional.ok === false && fractional.error?.code === 'unsupported-capability', {
+    expected: 'unsupported-capability',
+    actual: fractional.ok === true ? { heading: fractional.value } : fractional.error ?? fractional.networkError,
+    request: { code: "frameLocator('#fraction-frame').getByRole('button',{name:'Padded action'}).click()" },
+  })
+
   const occluded = await execute(`
     const frame = page.frameLocator('#occluded-frame');
     await frame.getByRole('button', { name: 'Occluded action' }).click();
@@ -923,8 +874,7 @@ async function areaNavigateBack() {
     expected: `${state.baseUrl}/index.html`,
     actual: afterBack.value ?? afterBack.raw,
   })
-  // The returned pageInfo must describe the completed navigation, not the URL
-  // the tab was on before going back. (Handed to Codex on .136.)
+
   const backReported = back.json?.data?.pageInfo?.url
   if (back.json?.ok === true && afterBack.ok === true) {
     check(area, 'page.back response URL matches the completed navigation', backReported === afterBack.value, {
@@ -942,7 +892,7 @@ async function areaNavigateBack() {
       note: 'page.url() afterwards is correct; only the back response metadata is stale. Handed to Codex for the fix; re-check the returned data matches the completed navigation.',
     })
   }
-  // Restore a clean base page for later areas.
+
   if (!(afterBack.ok === true && afterBack.value?.endsWith('/index.html'))) {
     await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: `${state.baseUrl}/index.html` })
     await waitForTabUrl(state.tabId, (currentUrl) => currentUrl.endsWith('/index.html'))
@@ -1081,7 +1031,6 @@ async function areaNetworkFilter() {
     actual: start.json?.ok === true ? start.json.data?.networkCapture : start.json?.error ?? start.networkError,
   })
 
-  // Bounded concurrency (6 in-flight fetches) with UTF-8 JSON payloads.
   const concurrent = await execute(`
     const results = await Promise.all([0, 1, 2, 3, 4, 5].map(async (i) => {
       const r = await fetch('/api/echo?n=' + i);
@@ -1102,8 +1051,16 @@ async function areaNetworkFilter() {
     actual: { echoRows: captured.echo?.length ?? 0, meta: captured.meta },
   })
 
-  // Forwarded/recorded UTF-8 JSON must decode to the exact payload. A recorded
-  // body may be explicitly truncated, but then it must say so.
+  const pageUtf8 = await execute(`
+    const r = await fetch('/api/echo?n=200');
+    const text = await r.text();
+    const parsed = JSON.parse(text);
+    return { n: parsed.n, text, utf8Bytes: new TextEncoder().encode(text).length };
+  `, { area })
+  check(area, 'page realm receives the complete UTF-8 payload', pageUtf8.ok === true && pageUtf8.value?.n === 200 && String(pageUtf8.value?.text).includes('中文-✓-😀'), {
+    actual: pageUtf8.ok === true ? pageUtf8.value : pageUtf8.raw,
+  })
+
   const details = []
   let utf8Ok = true
   for (const row of captured.echo ?? []) {
@@ -1126,27 +1083,33 @@ async function areaNetworkFilter() {
   }
   check(area, 'recorded UTF-8 JSON bodies are complete (or explicitly truncated) and decode exactly', utf8Ok, {
     actual: details,
-    note: 'Budget unit is raw in-flight bytes + retained UTF-8 bytes, not an OS memory cap.',
   })
 
-  // Large body: either complete or explicitly truncated, and retained bytes are
-  // counted in UTF-8 bytes.
-  const bigTrigger = await execute(`const r = await fetch('/api/big?kb=3072'); return (await r.text()).length`, { area })
-  check(area, 'large-body fetch completes', bigTrigger.ok === true && typeof bigTrigger.value === 'number' && bigTrigger.value > 0, {
+  const bigTrigger = await execute(`
+    const r = await fetch('/api/big?kb=3072');
+    const text = await r.text();
+    return { chars: text.length, tail: text.slice(-8), utf8Bytes: new TextEncoder().encode(text).length };
+  `, { area })
+  const tailChars = '-END-中文'.length
+  const tailBytes = Buffer.byteLength('-END-中文', 'utf8')
+  const fullChars = 3072 * 1024 + tailChars
+  const fullBytes = 3072 * 1024 + tailBytes
+  check(area, 'page realm receives the complete original large response', bigTrigger.ok === true && bigTrigger.value?.chars === fullChars && bigTrigger.value?.utf8Bytes === fullBytes && String(bigTrigger.value?.tail).endsWith('-END-中文'), {
+    expected: { chars: fullChars, utf8Bytes: fullBytes, tail: '-END-中文' },
     actual: bigTrigger.ok === true ? bigTrigger.value : bigTrigger.raw,
+    note: 'Verified by reading the response in the page realm, not from the capture record.',
   })
+
   const big = await waitFor(async () => {
     const { rows, meta } = await listRows()
     const row = rows.find((entry) => typeof entry.url === 'string' && entry.url.includes('/api/big'))
     return row ? { done: true, row, meta } : { done: false, meta }
   })
-  const expectedFullBytes = 3072 * 1024 + Buffer.byteLength('-END-中文', 'utf8')
-  check(area, 'large body is complete or explicitly truncated', big.done === true && (big.row?.bodyTruncated === true || Buffer.byteLength(big.row?.responseBody ?? '', 'utf8') === expectedFullBytes || big.row?.bodyUnavailable !== undefined), {
-    actual: big.row ? { bodyChars: big.row.responseBody?.length, utf8Bytes: Buffer.byteLength(big.row.responseBody ?? '', 'utf8'), truncated: big.row.bodyTruncated, unavailable: big.row.bodyUnavailable, expectedFullBytes } : big.meta,
+  check(area, 'capture record for the large body is bounded or explicitly truncated', big.done === true && (big.row?.bodyTruncated === true || Buffer.byteLength(big.row?.responseBody ?? '', 'utf8') <= fullBytes || big.row?.bodyUnavailable !== undefined), {
+    actual: big.row ? { recordedChars: big.row.responseBody?.length, recordedUtf8Bytes: Buffer.byteLength(big.row.responseBody ?? '', 'utf8'), truncated: big.row.bodyTruncated, unavailable: big.row.bodyUnavailable, fullBytes } : big.meta,
+    note: 'Retained bytes only describe the bounded record; they do not prove the in-flight memory budget, which is provable only in pure logic.',
   })
 
-  // stop -> restart: a new request must be captured, and earlier rows must not
-  // be silently lost (a bounded drop with metadata is acceptable).
   const stop = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'stop' }, { area })
   check(area, 'capture stops before restart', stop.json?.ok === true && ['stopped', 'interrupted'].includes(stop.json.data?.networkCapture?.status), {
     actual: stop.json?.data?.networkCapture ?? stop.json?.error ?? stop.networkError,
@@ -1178,8 +1141,7 @@ async function areaLogs() {
     await page.getByRole('button', { name: 'Emit page log' }).click();
     return await page.locator('#event-log').textContent();
   `, { area })
-  // The fixture runs console.log(...) and then appends to the page DOM. If the
-  // console bridge breaks the page's own console.log, the append never runs.
+
   check(area, 'console.log call still lets the page run (DOM event-log appended)', trigger.ok === true && typeof trigger.value === 'string' && trigger.value.includes('page console.log emitted'), {
     actual: trigger.ok === true ? trigger.value : trigger.raw,
     request: { kind: 'page.execute', code: "click #log then read #event-log" },
@@ -1201,8 +1163,6 @@ async function areaLogs() {
   })
   check(area, 'page.logs captures the fixture console line', found.done === true, { actual: (found.lines ?? []).slice(-5) })
 
-  // Capturing one console.log must not inject unrelated page errors. On .136 a
-  // cross-realm `arguments.length` access adds an [error] entry per console call.
   const spurious = (found.lines ?? []).filter((line) => typeof line === 'string' && line.includes('Permission denied to access property "length"'))
   check(area, 'captured page error must be absent for a plain console.log', spurious.length === 0, {
     actual: { spurious, lines: (found.lines ?? []).slice(-6) },
@@ -1250,9 +1210,6 @@ async function areaLocatorStrictness() {
     actual: ambiguous.error ?? ambiguous.networkError,
   })
 
-  // A missing selector is allowed to auto-wait until the runtime deadline and
-  // then report a typed timeout. The transport grace lets the runtime's own
-  // deadline win, so this must NOT be a client-side abort.
   const missingExe = await execute(`await page.locator('#definitely-absent').fill('x'); return 'filled'`, { area })
   check(area, 'execute action on a missing selector returns a typed timeout', missingExe.ok === false && ['timeout', 'outcome-unknown'].includes(missingExe.error?.code), {
     actual: missingExe.error ?? missingExe.networkError,
@@ -1301,9 +1258,6 @@ async function areaInsecureContext() {
     return
   }
 
-  // Page-realm evidence, read through the browser tab API (independent of the
-  // content-script DOM driver that fails below). The fixture writes its report
-  // into document.title.
   const titleReport = await waitFor(async () => {
     const resolved = await send(sessionId, { kind: 'tab.resolve', tabId: probeTabId }, { area })
     const title = resolved.json?.data?.tab?.title ?? ''
@@ -1321,8 +1275,6 @@ async function areaInsecureContext() {
     note: 'Read via the browser tab title; localtest.me resolves to 127.0.0.1 but is not a localhost/secure origin.',
   })
 
-  // The content-script DOM driver is exercised by snapshot; if it calls
-  // view.crypto.randomUUID on an insecure page, this is where it surfaces.
   const snap = await send(sessionId, { kind: 'page.snapshot', tabId: probeTabId }, { area })
   const snapOk = snap.json?.ok === true
   check(area, 'snapshot works on a non-secure HTTP origin', snapOk, {
@@ -1330,8 +1282,6 @@ async function areaInsecureContext() {
     request: { kind: 'page.snapshot' },
   })
 
-  // A plain locator read does not itself need snapshot ids, so it shows whether
-  // the content-script driver is usable at all on this origin.
   const readBack = await execute(`return await page.locator('#probe-heading').textContent()`, { area, tabId: probeTabId })
   check(area, 'content-script locator read works on a non-secure HTTP origin', readBack.ok === true && readBack.value === 'Secure-context probe', {
     actual: readBack.ok === true ? readBack.value : readBack.error ?? readBack.networkError,
@@ -1422,7 +1372,6 @@ async function areaReleaseAndIsolation() {
     actual: secondClose.json?.error ?? secondClose.networkError,
   })
 
-  // Re-adopt the released physical tab so it can be closed and no leftover remains.
   const discovered = await send(sessionId, { kind: 'tabs.discover', profileId: state.profileId }, { area })
   const candidates = discovered.json?.data?.candidates ?? []
   const candidate = candidates.find((entry) => entry.browserTabId === releaseTab.browserTabId)
@@ -1484,10 +1433,6 @@ async function areaIdleObservation() {
   })
 }
 
-/* ------------------------------------------------------------------ */
-/* Cleanup                                                             */
-/* ------------------------------------------------------------------ */
-
 async function cleanup() {
   const area = 'cleanup'
   for (const groupId of [...created.attachedGroups].reverse()) {
@@ -1517,10 +1462,6 @@ async function cleanup() {
     note: 'Browser-truth check via tabs.discover.',
   })
 }
-
-/* ------------------------------------------------------------------ */
-/* Main                                                                */
-/* ------------------------------------------------------------------ */
 
 let primary = null
 let secondary = null

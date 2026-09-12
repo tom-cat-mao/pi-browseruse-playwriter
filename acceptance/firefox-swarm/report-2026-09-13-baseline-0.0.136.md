@@ -76,23 +76,26 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`
 
 | # | 区域 | 期望 | 实际 | 最小复现 |
 | --- | --- | --- | --- | --- |
-| 1 | shadow-dom | 复合 `#shadow-host input` 应遍历 open shadow root | `count=0` | `page.locator('#shadow-host input').count()` |
-| 2 | shadow-dom | 链式 `page.locator('#shadow-host').locator('input')` 应进入 host 的 shadowRoot | `count=0`（非等待型 count，排除自造超时） | `page.locator('#shadow-host').locator('input').count()` |
-| 3 | iframe 同源 | 指南声明 frameLocator 动作可用；读已 PASS | `unsupported-capability`：`Firefox getBoxQuads is required to verify the frame content box` | `page.frameLocator('#local-frame').locator('#frame-input').fill('Frame v2')` |
-| 4 | iframe 跨源 | 同上 | 同一 `getBoxQuads` 拒绝 | `page.frameLocator('#cross-frame').locator('#xo-input').fill('Cross v2')` |
-| 5 | logs | `console.log` 后页面能继续执行 | 页面 `#event-log` **未追加** `page console.log emitted`，即页面 realm 的 `console.log` 抛错 | 点击按钮执行 `console.log('x'); eventLog += 'appended'` |
-| 6 | logs | 捕获一条普通 `console.log` 不应产生额外页面错误 | 每次 console 调用额外产生 `[error] Error: Permission denied to access property "length"`，位置指向页面调用点 | `console.log('plain string')` 后 `page.logs`（log/warn/error 与对象/Error 参数均可复现） |
-| 7 | insecure-context | 普通 http 页面 snapshot 应可用 | `execution-failed`：`Firefox content script returned an invalid result` | 受控标签打开 `http://localtest.me:<port>/`（页面 realm `isSecureContext=false`、`crypto.randomUUID` 为 `undefined`，经浏览器标题 API 独立读取）后 `page.snapshot` |
-| 8 | insecure-context | 普通 http 页面 locator 读取应可用 | 同 7 的 `invalid result` | 同源 `page.locator('#probe-heading').textContent()` |
+| 1 | shadow-dom | 链式 `page.locator('#shadow-host').locator('input')` 应进入 host 的 shadowRoot（必需能力） | `count=0`（非等待型 count，排除自造超时） | `page.locator('#shadow-host').locator('input').count()` |
+| 2 | iframe 同源 | 指南声明 frameLocator 动作可用；读已 PASS | `unsupported-capability`：`Firefox getBoxQuads is required to verify the frame content box` | `page.frameLocator('#local-frame').locator('#frame-input').fill('Frame v2')` |
+| 3 | iframe 跨源 | 同上 | 同一 `getBoxQuads` 拒绝 | `page.frameLocator('#cross-frame').locator('#xo-input').fill('Cross v2')` |
+| 4 | logs | `console.log` 后页面能继续执行 | 页面 `#event-log` **未追加** `page console.log emitted`，即页面 realm 的 `console.log` 抛错 | 点击按钮执行 `console.log('x'); eventLog += 'appended'` |
+| 5 | logs | 捕获一条普通 `console.log` 不应产生额外页面错误 | 每次 console 调用额外产生 `[error] Error: Permission denied to access property "length"`，位置指向页面调用点 | `console.log('plain string')` 后 `page.logs`（log/warn/error 与对象/Error 参数均可复现） |
+| 6 | insecure-context | 普通 http 页面 snapshot 应可用 | `execution-failed`：`Firefox content script returned an invalid result` | 受控标签打开 `http://localtest.me:<port>/`（页面 realm `isSecureContext=false`、`crypto.randomUUID` 为 `undefined`，经浏览器标题 API 独立读取）后 `page.snapshot` |
+| 7 | insecure-context | 普通 http 页面 locator 读取应可用 | 同 6 的 `invalid result` | 同源 `page.locator('#probe-heading').textContent()` |
 
-FAIL 3/4 与 5/6 已分别由平台 owner 接手（iframe 严格边界、无变换的 frame fallback；console bridge
-`firefox-dom.ts original.apply(pageView.console, args)`）。FAIL 7/8 与 owner 的
+FAIL 2/3 与 4/5 已分别由平台 owner 接手（iframe 严格边界、无变换的 frame fallback；console bridge
+`firefox-dom.ts original.apply(pageView.console, args)`）。FAIL 6/7 与 owner 的
 `view.crypto.randomUUID`（SecureContext）假设一致，**证据为高置信运行期对照，但不是内容脚本
-堆栈级根因**，修复尚未集成，故不宣称 P1 已定案。FAIL 1/2 为 locator 遍历缺口（role/label 路径正常），
-且复合与链式为**两个独立缺陷**，需分别验证。
+堆栈级根因**，修复尚未集成，故不宣称 P1 已定案。FAIL 1 是链式遍历缺口，**链式必须实际成功**；
+其与复合跨 shadow CSS 是两件独立的事（见下）。
 
-## SKIP（真实未执行 / 明确文档限制）
+## 未交付限制（SKIP，不称已修）
 
+- **复合跨 shadow CSS**（`page.locator('#shadow-host input')`）：本轮**明确不交付**完整跨 shadow
+  解析器。集成后的模型 capabilities/guide 将声明：native CSS 在**每个 document/shadow root 内**
+  匹配，跨 host 可用**显式链式** locator 或 role/label/text。baseline 曾记录 `count=0` 作为证据并
+  保留；本轮已把 harness 中该断言改为 SKIP + limitation finding，**最终报告单列此限制，不能称已修**。
 - `target=_blank` 的 `sourceTabId`：DOM 点击是非可信输入，Firefox 弹窗拦截未开新标签，
   故继承逻辑未被触发。属已声明的 untrusted-input/弹窗边界，**不通过改用户弹窗设置绕过**；
   该代码路径记为 NOT RUN。
@@ -110,22 +113,28 @@ FAIL 3/4 与 5/6 已分别由平台 owner 接手（iframe 严格边界、无变�
 3. `tabs.create` 返回后需在 ctx 保存原生 tabId，避免释放检查被削弱。
 4. network 并发 in-flight chunks 未计入 2 MiB 总预算；预算口径为**原始在途字节 + 保留 UTF-8 字节**，
    非 OS 内存上限（owner 补真实预算逻辑）。
-5. network response filter 转发应完整，即便记录有截断；新增有界并发 / UTF-8 / 大响应 / stop-restart 场景。
-6. iframe `getBoxQuads` 的严格边界无变换 fallback（平台 owner）；新增 border+padding 坐标、遮挡拒绝、
-   scale/rotate/perspective/几何不确定的显式拒绝复验。
+5. network response filter 转发应完整；**fixture 必须确认页面 realm 实际收到完整原始大响应与
+   UTF-8 内容**，而不只是看采集记录的 truncated flag。6 路有界并发验证接线；in-flight 内存预算
+   上限本身仅纯逻辑可证，**不得把黑盒留存字节等同为全部在途内存的证明**。
+6. iframe `getBoxQuads` 的严格边界无变换 fallback（平台 owner）：只支持 client/used-border/padding
+   可精确证明的盒模型；新增 border+padding 正向坐标、遮挡拒绝、`scale/rotate/perspective` 与
+   **分数几何**的显式拒绝（正负边界均记录，不为压低 FAIL 改正向 fixture）。
 7. console bridge `original.apply(pageView.console, args)`（平台 owner）；页面继续执行与无 length 越权错误
    均为必需断言。
-8. open shadow DOM：复合 CSS 与显式链式 locator 需分别遍历 root shadowRoot，**分别断言、分别结论**。
+8. open shadow DOM：**复合跨 shadow CSS 本轮明确不交付**（native CSS 每 root 内匹配，跨 host 用链式或
+   role/label/text），最终报告单列限制、不称已修；**链式必须实际成功**，两者分别断言、分别结论。
 9. 非安全 HTTP origin：DOM driver 不得依赖 `view.crypto.randomUUID`，改用 `getRandomValues`。
 10. `page.back` 响应 `pageInfo.url` 需等于已完成导航的 URL（Codex）。
 11. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：无可可靠构造的真实触发前记为 **NOT RUN**，
     不用 API 替身冒充。
 
-## 本轮变更（2026-09-13 后续，仅测试/报告）
+## 本轮变更（2026-09-13 后续，仅离线测试/报告）
 
-- harness 新增 `iframe-geometry`、`network-filter` 两个 area，并把 `page.back` 响应 URL 收紧为必需断言；
-  shadow 复合/链式保持独立断言。**未运行**（等待新版本加载后再复验）。
-- 依据：协调者要求暂停真实浏览器动作；只完善测试/报告。
+- harness 新增 `iframe-geometry`、`network-filter` 两个 area；`page.back` 响应 URL 收紧为必需断言；
+  shadow 复合改为 SKIP + limitation（链式仍为必需断言）；network 增加**页面 realm 完整性**断言。
+- 移除 harness 内的解释性/分隔注释，说明统一放在本报告与 README；**代码行为不变**（仅 `node --check`，
+  未跑浏览器）。
+- 依据：协调者要求暂停真实浏览器动作，只完善测试/报告，等通知新版本加载后再复验。
 
 ## 范围与限制
 

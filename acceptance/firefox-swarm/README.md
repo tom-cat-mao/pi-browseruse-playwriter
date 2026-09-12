@@ -63,11 +63,43 @@ non-zero when any assertion fails or the run is blocked.
 `network-filter`, `logs`, `execute-reads`, `unsupported`, `locator-strictness`,
 `insecure-context`, `release-isolation`, `idle`, `cleanup`.
 
-`iframe-geometry` and `network-filter` were added for the next integrated build
-(no-transform frame actions with border/padding coordinates, occlusion refusal,
-scale/rotate/perspective refusal; bounded concurrency, UTF-8, large body, and
-stop/restart for the response filter). `page.back` is asserted so its returned
-`pageInfo.url` must equal the URL after the navigation completes.
+`iframe-geometry` and `network-filter` were added for the next integrated build.
+
+### iframe-geometry (positive and negative boundaries)
+
+The frame fallback is only intended for no-transform frames whose box model is
+exactly provable from client rect / used border / padding. Both boundaries are
+asserted:
+
+- positive: a no-transform same-origin frame wrapped in border+padding must map a
+  click to the intended element;
+- negative: a frame with `scale/rotate/perspective`, a fractional-geometry frame
+  (fractional border/padding/offset/size), and a parent-occluded frame must be
+  **explicitly refused** (`unsupported-capability`), never approximated.
+
+Do not weaken the positive fixture to lower the FAIL count.
+
+### shadow-dom (compound vs chained)
+
+Native CSS matches **within each document/shadow root**. Compound cross-shadow
+CSS (`#shadow-host input`) is an explicit non-goal this round and is recorded as
+a limitation/SKIP, not a fix. Cross-host access is via an explicit chained
+locator (`page.locator('#shadow-host').locator('input')`) or role/label/text
+locators; the chained case is a required assertion that must actually succeed.
+The baseline recorded the compound case as `count 0`; that evidence is retained.
+
+### network-filter
+
+Native response forwarding must be complete. The fixture confirms the page realm
+actually received the complete original large body and the exact UTF-8 payload
+(reading the response in the page), not merely that the capture record looks
+truncated. Six bounded concurrent fetches verify the wiring. The capture record's
+retained bytes are bounded and are **not** proof of the in-flight memory budget:
+that budget unit is raw in-flight bytes + retained UTF-8 bytes and is provable
+only in pure logic.
+
+`page.back` is asserted so its returned `pageInfo.url` must equal the URL after
+the navigation completes.
 
 ## Statuses
 
