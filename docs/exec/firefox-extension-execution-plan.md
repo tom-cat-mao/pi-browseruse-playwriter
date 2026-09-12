@@ -25,9 +25,10 @@ flowchart LR
 1. `playwriter/src/browser-protocol.ts` 仍是唯一共享编译契约。先落协议，再并行实现。
 2. Chrome 不迁移到新执行后端。缺省 backend 仍为 CDP，旧扩展不发送任何新字段时行为不变。
 3. Firefox 用独立 background/build 入口，共享真实的纯逻辑模块；不通过伪造 CDP 让 Chromium Playwright 误认 Firefox。
-4. 普通结构化 page 操作直接经现有扩展 WS 路由，扩展重新核验 session/tab/epoch。`page.execute` 在独立 Node 子进程中执行，页面 RPC 每次都校验当前归属和租约。JS 无限循环不得卡住 runtime。
-5. Firefox 最初使用仍受支持的 Manifest V2 background + `tabs.executeScript`，避免依赖实验 API或为基本注入要求远程调试。最低版本以明确用到的 API 实测与兼容数据确定，初始目标桌面 Firefox 139+。既有脚本可按代码注入普通已开标签，无须刷新。evaluate 的默认语义是隔离的内容脚本世界，DOM 可访问；与页面全局变量/主世界的差异必须说明。不得通过放宽 CSP 或特权来隐藏限制。
-6. 打包为独立 Firefox 目录与本地 ZIP/XPI 候选。临时加载用于开发验收，正式 Firefox 安装仍要求 AMO 签名；本轮不申请签名或宣称商店已发布。
+4. 跨源 frameLocator 使用 Firefox `runtime.getFrameId(iframeElement)` 取得权威 frameId，再通过 frameIds 定向执行；背景复核当前 tab/epoch 的 frame。不得通过 URL、顺序或页面可伪造的 nonce 关联。该 ID 查询只发生在可信静态脚本，不暴露给动态用户代码。普通结构化 page 操作直接经现有扩展 WS 路由，扩展重新核验 session/tab/epoch。`page.execute` 在独立 Node 子进程中执行，页面 RPC 每次都校验当前归属和租约。JS 无限循环不得卡住 runtime。
+5. Firefox 使用 Manifest V3 background scripts，基本 DOM 操作通过 `scripting.executeScript` 注入打包脚本并调用静态函数，无须刷新。基本目标为桌面 Firefox 139+。动态 `evaluate` 只在 `userScripts.execute` 的 USER_SCRIPT 沙箱执行，绝不在能访问 WebExtension API 的内容脚本世界运行模型代码，也不开启用户脚本 messaging。该即时 API 自 Firefox 153 起；用户通过扩展弹窗授权可选 userScripts 权限后启用。较旧版本/未授权时，其余结构化工具与 execute 的非 evaluate 方法仍可用，只对 evaluate 返回具体不支持提示。evaluate 世界能访问 DOM，但不能访问扩展 storage/runtime，也不声称与页面 MAIN 世界相同。不得放宽 CSP 或改用特权入口。
+6. 实现核验发现原 MV2 动态 tabs.executeScript 会暴露扩展权限，已采用以上 MV3 沙箱路线。原生依据：[userScripts](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/userScripts)、[execute](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/userScripts/execute)、[Firefox153兼容数据](https://raw.githubusercontent.com/mdn/browser-compat-data/main/webextensions/api/userScripts.json)。对外最低版本与每项能力分开判断。
+7. 打包为独立 Firefox 目录与本地 ZIP/XPI 候选。临时加载用于开发验收，正式 Firefox 安装仍要求 AMO 签名；本轮不申请签名或宣称商店已发布。
 
 ## 兼容契约冻结
 
@@ -49,7 +50,7 @@ flowchart LR
 | navigate/back | HTTP(S) 导航与真实历史 | 按显式 tabId，受限页面在动作前拒绝 |
 | snapshot | DOM/ARIA 快照、short ref、snapshotId、selector/search/full/interactiveOnly | 与 Chrome 原生 AX 树存在差异；使用可访问名称算法；ref 必须固定元素与文档代际 |
 | click/fill | strict CSS/role/ref；可见性、禁用、遮挡等可实现的检查；表单与 contenteditable | DOM 输入不等价浏览器原生输入；不伪造 trusted 事件、不扩大控制范围来绕错误 |
-| evaluate | async JavaScript、显式 return、BrowserJson、错误与超时 | 隔离内容脚本世界，页面 MAIN 全局对象可访问范围明确；执行后保守失效 refs |
+| evaluate | async JavaScript、显式 return、BrowserJson、错误与超时 | 153+ USER_SCRIPT 沙箱与可选权限；页面 MAIN 全局对象可访问范围明确；基本 DOM 世界 refs 在执行前后保守失效 |
 | screenshot | 显式 tabId，viewport/fullPage，labels，inline image + 可选 path | Firefox captureTab/rect；不滚动拼接损坏页面；页面尺寸等失败如实报告 |
 | network | start/list/stop、状态、保留与容量限制，尽可能正文 | 只处理可绑定受控 tab 的事件；stream/body 受限时明确字段，不伪造完整 response |
 | logs | 接管后的 console/error/rejection 可用内容与有界缓冲 | 接管前日志不保证；注入和页面执行世界差异明确 |
