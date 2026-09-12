@@ -8,6 +8,7 @@ import type {
 } from 'playwriter/browser-protocol'
 import fixture from '../test-fixtures/firefox-dom.html?raw'
 import { browserJson, createFirefoxDomDriver } from '../src/firefox-dom'
+import { firefoxScreenshotCleanupRequest } from '../src/firefox-resources'
 import type { FirefoxDomDriver } from '../src/firefox-dom'
 import {
   accessibleName,
@@ -279,6 +280,26 @@ describe('Firefox DOM snapshot lifetime and isolation', () => {
     expect(prepared.value).toMatchObject({ viewportWidth: window.innerWidth, viewportHeight: window.innerHeight })
     success(await driver.run(request({ method: 'screenshot.cleanup' })))
     expect(document.body.innerHTML).toBe(before)
+  })
+
+  test('screenshot cancellation still removes labels through its independent cleanup request', async () => {
+    const before = document.documentElement.innerHTML
+    const screenshot = request({ method: 'screenshot.prepare', labels: true })
+    success(await driver.run(screenshot))
+    expect(document.documentElement.innerHTML).not.toBe(before)
+
+    driver.cancel(screenshot.requestId)
+    const cleanup = firefoxScreenshotCleanupRequest(screenshot)
+    expect(cleanup.requestId).not.toBe(screenshot.requestId)
+    expect(cleanup).toMatchObject({
+      sessionId: screenshot.sessionId,
+      tabId: screenshot.tabId,
+      browserEpoch: screenshot.browserEpoch,
+    })
+    success(await driver.run(cleanup))
+    expect(document.documentElement.innerHTML).toBe(before)
+    success(await driver.run(firefoxScreenshotCleanupRequest(screenshot)))
+    expect(document.documentElement.innerHTML).toBe(before)
   })
 
   test('captures real DOM error events with bounded logs and states the missing page console bridge', async () => {

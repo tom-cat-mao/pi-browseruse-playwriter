@@ -1,5 +1,6 @@
 import { BROWSER_PROTOCOL_VERSION } from 'playwriter/src/browser-protocol'
 import type {
+  BrowserDomRequest,
   BrowserCapabilities,
   BrowserErrorCode,
   BrowserGroup,
@@ -57,6 +58,15 @@ export class FirefoxResourceError extends Error {
 
 export function firefoxId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`
+}
+
+export function firefoxScreenshotCleanupRequest(request: BrowserDomRequest): BrowserDomRequest {
+  return {
+    ...request,
+    requestId: firefoxId('screenshot-cleanup'),
+    timeoutMs: 5000,
+    command: { method: 'screenshot.cleanup' },
+  }
 }
 
 export function isFirefoxRecord(value: unknown): value is Record<string, unknown> {

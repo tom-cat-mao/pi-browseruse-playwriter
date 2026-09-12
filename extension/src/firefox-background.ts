@@ -31,6 +31,7 @@ import {
   firefoxInventory,
   firefoxPageSupported,
   firefoxRequestFingerprint,
+  firefoxScreenshotCleanupRequest,
   isFirefoxRecord,
   ownedFirefoxTab,
   parseFirefoxRegistry,
@@ -1611,7 +1612,7 @@ class FirefoxBackground {
         pageInfo: prepared.pageInfo,
       }
     } finally {
-      const cleanup: BrowserDomRequest = { ...request, command: { method: 'screenshot.cleanup' } }
+      const cleanup = firefoxScreenshotCleanupRequest(request)
       await this.script({ browserTabId: options.tab.browserTabId!, request: cleanup }).catch(() => {})
     }
   }
