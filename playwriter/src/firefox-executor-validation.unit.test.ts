@@ -18,6 +18,17 @@ describe('Firefox DOM command boundary', () => {
     expect(parseBrowserDomCommand(command)).toEqual(command)
   })
 
+  test('validates frame lookup locators without accepting another page identity', () => {
+    const command = { method: 'frame.resolve', locator: { steps: [{ kind: 'selector', engine: 'css', value: 'iframe.payment' }] } }
+    expect(parseBrowserDomCommand(command)).toEqual(command)
+    expect(parseBrowserDomCommand({ method: 'page', action: 'readyState' })).toEqual({ method: 'page', action: 'readyState' })
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'inputValue', locator: { steps: [{ kind: 'selector', engine: 'css', value: 'aria-ref=e1' }], snapshotId: 'snapshot-1' } })).not.toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'fill', locator: command.locator, args: [42] })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'click', locator: command.locator, args: [{ timeout: -1 }] })).toBeNull()
+    expect(parseBrowserDomCommand({ ...command, tabId: 'other' })).toBeNull()
+    expect(parseBrowserDomCommand({ ...command, locator: { steps: [{ kind: 'nth', index: NaN }] } })).toBeNull()
+  })
+
   test('rejects scope-changing fields, unknown commands and cross-tab nested operations', () => {
     const base = { requestId: 'r', sessionId: 's', tabId: 'tab', browserEpoch: 'e' }
     expect(parseBrowserDomRequest({ ...base, command: { method: 'operation', operation: { kind: 'page.back', tabId: 'other' } } })).toBeNull()

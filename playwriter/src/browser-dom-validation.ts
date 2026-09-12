@@ -35,10 +35,13 @@ export function parseBrowserDomCommand(value: unknown): BrowserDomCommand | null
     case 'locator':
       valid = fields({ value, keys: ['method', 'locator', 'action', 'args'] }) &&
         typeof value.action === 'string' && LOCATOR_ACTIONS.has(value.action) && validLocator({ value: value.locator, depth: 0 }) &&
-        (value.args === undefined || (Array.isArray(value.args) && value.args.length <= 4))
+        validLocatorArgs({ action: value.action, args: value.args })
+      break
+    case 'frame.resolve':
+      valid = fields({ value, keys: ['method', 'locator'] }) && validLocator({ value: value.locator, depth: 0 })
       break
     case 'page':
-      valid = fields({ value, keys: ['method', 'action'] }) && ['title', 'url', 'content'].includes(String(value.action))
+      valid = fields({ value, keys: ['method', 'action'] }) && ['title', 'url', 'content', 'readyState'].includes(String(value.action))
       break
     case 'invalidate':
     case 'dispose':
@@ -109,8 +112,9 @@ function validPageOperation(value: unknown): boolean {
 }
 
 function validLocator({ value, depth }: { value: unknown; depth: number }): boolean {
-  if (depth > 8 || !isRecord(value) || !fields({ value, keys: ['steps'] }) ||
-    !Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > 32) {
+  if (depth > 8 || !isRecord(value) || !fields({ value, keys: ['steps', 'snapshotId'] }) || !optionalString(value.snapshotId) ||
+    !Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > 32 ||
+    !isRecord(value.steps[0]) || !['selector', 'frame'].includes(String(value.steps[0].kind))) {
     return false
   }
   return value.steps.every((step) => {
@@ -136,6 +140,73 @@ function validLocator({ value, depth }: { value: unknown; depth: number }): bool
       default:
         return false
     }
+  })
+}
+
+function validLocatorArgs({ action, args }: { action: unknown; args: unknown }): boolean {
+  if (typeof action !== 'string' || (args !== undefined && !Array.isArray(args))) {
+    return false
+  }
+  const values: unknown[] = args ?? []
+  if (['count', 'allTextContents', 'allInnerTexts'].includes(action)) {
+    return values.length === 0
+  }
+  const hasValue = ['fill', 'type', 'press', 'setChecked', 'selectOption', 'getAttribute'].includes(action)
+  const optionIndex = hasValue ? 1 : 0
+  if (values.length > optionIndex + 1 || (hasValue && values.length === 0)) {
+    return false
+  }
+  if (['fill', 'type', 'press', 'getAttribute'].includes(action) && !boundedString(values[0])) {
+    return false
+  }
+  if (action === 'setChecked' && typeof values[0] !== 'boolean') {
+    return false
+  }
+  if (action === 'selectOption' && !validSelectOptions(values[0])) {
+    return false
+  }
+  const options = values[optionIndex]
+  if (options === undefined) {
+    return true
+  }
+  if (!isRecord(options)) {
+    return false
+  }
+  if (action === 'waitFor') {
+    return fields({ value: options, keys: ['state', 'timeout'] }) &&
+      (options.state === undefined || ['attached', 'detached', 'visible', 'hidden'].includes(String(options.state))) &&
+      optionalInteger({ value: options.timeout, minimum: 0, maximum: 120_000 })
+  }
+  if (!fields({ value: options, keys: ['timeout', 'delay', 'force', 'trial', 'noWaitAfter', 'button', 'clickCount', 'position', 'modifiers'] }) ||
+    !optionalInteger({ value: options.timeout, minimum: 0, maximum: 120_000 }) ||
+    !optionalInteger({ value: options.delay, minimum: 0, maximum: 5_000 }) ||
+    !optionalBoolean(options.force) || !optionalBoolean(options.trial) || !optionalBoolean(options.noWaitAfter) ||
+    !optionalInteger({ value: options.clickCount, minimum: 1, maximum: 3 }) ||
+    (options.button !== undefined && !['left', 'right', 'middle'].includes(String(options.button)))) {
+    return false
+  }
+  if (options.position !== undefined && (!isRecord(options.position) || !fields({ value: options.position, keys: ['x', 'y'] }) ||
+    typeof options.position.x !== 'number' || !Number.isFinite(options.position.x) || options.position.x < 0 ||
+    typeof options.position.y !== 'number' || !Number.isFinite(options.position.y) || options.position.y < 0)) {
+    return false
+  }
+  return options.modifiers === undefined || (Array.isArray(options.modifiers) && options.modifiers.length <= 5 && options.modifiers.every((modifier) => {
+    return ['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift'].includes(String(modifier))
+  }))
+}
+
+function validSelectOptions(value: unknown): boolean {
+  const values = Array.isArray(value) ? value : [value]
+  if (values.length > 1_000) {
+    return false
+  }
+  return values.every((option) => {
+    if (option === null || boundedString(option)) {
+      return true
+    }
+    return isRecord(option) && fields({ value: option, keys: ['value', 'label', 'index'] }) &&
+      Object.keys(option).length > 0 && optionalString(option.value) && optionalString(option.label) &&
+      optionalInteger({ value: option.index, minimum: 0, maximum: 100_000 })
   })
 }
 
