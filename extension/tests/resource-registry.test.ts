@@ -236,6 +236,19 @@ describe('managed resource registry ownership', () => {
     }).toThrow('restarted')
   })
 
+  test('Firefox a committed create stays listable and owned when its response is lost', () => {
+    const registry = firefoxFixture()
+    const inventory = firefoxInventory(registry)
+    expect(inventory.tabs.map((tab) => tab.tabId)).toEqual(['firefox-tab'])
+    expect(inventory.tabs[0]).toMatchObject({ state: 'ready', browserTabId: 42, url: 'https://example.com' })
+    expect(inventory).not.toHaveProperty('ledger')
+    expect(activeFirefoxTab({ registry, browserTabId: 42 })?.tabId).toBe('firefox-tab')
+    expect(ownedFirefoxTab({ registry, sessionId: 'session-1', tabId: 'firefox-tab' }).tabId).toBe('firefox-tab')
+    expect(() => {
+      ownedFirefoxTab({ registry, sessionId: 'session-2', tabId: 'firefox-tab' })
+    }).toThrow('another Pi session')
+  })
+
   test('Firefox session and execution epoch are checked independently', () => {
     const registry = firefoxFixture()
     expect(() => {

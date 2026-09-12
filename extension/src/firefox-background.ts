@@ -899,7 +899,10 @@ class FirefoxBackground {
         this.assertContinue(context)
         tab = await this.bindTaskGroup({ tab, group, context })
         await this.badge({ tab, controlled: true })
-        if (actual.status === 'complete') await this.inject({ tab })
+        if (actual.status === 'complete' && firefoxPageSupported(actual.url))
+          await this.inject({ tab }).catch((error: unknown) => {
+            console.warn('Firefox page instrumentation failed:', String(error))
+          })
         return { tab }
       }
       case 'session.release': {
