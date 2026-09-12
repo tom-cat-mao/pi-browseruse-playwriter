@@ -26,6 +26,7 @@ import {
   FIREFOX_CAPABILITIES,
   FirefoxResourceError,
   activeFirefoxTab,
+  assertFirefoxInjectionResult,
   emptyFirefoxRegistry,
   firefoxFailure,
   firefoxId,
@@ -772,6 +773,7 @@ class FirefoxBackground {
         }),
       })
     }
+    this.assertContinue(options.context)
     return tab
   }
 
@@ -896,6 +898,8 @@ class FirefoxBackground {
         // Persist the exact physical result even if cancellation arrived during create.
         let tab = this.makeTab({ actual, group, origin: 'task' })
         await this.commit({ ...this.registry, revision: tab.revision, tabs: [...this.registry.tabs, tab] })
+        context.browserTabId = tab.browserTabId
+        context.tabId = tab.tabId
         this.assertContinue(context)
         tab = await this.bindTaskGroup({ tab, group, context })
         await this.badge({ tab, controlled: true })
@@ -1170,13 +1174,14 @@ class FirefoxBackground {
     this.assertContinue(options.context)
     options.context.started = true
     // Injection is the capability probe. It does not navigate, scroll or regroup.
-    await this.browserDeadline(
+    const results = await this.browserDeadline(
       this.api.scripting.executeScript({
         target: { tabId: candidate.browserTabId },
         files: ['firefox-dom.js'],
         injectImmediately: true,
       }),
     )
+    assertFirefoxInjectionResult({ results, frameId: 0 })
     this.assertContinue(options.context)
     const group = this.makeGroup({
       sessionId: options.request.sessionId,
@@ -1310,13 +1315,14 @@ class FirefoxBackground {
   }
 
   private async inject(options: { tab: BrowserTab; frameId?: number }): Promise<void> {
-    await this.browserDeadline(
+    const results = await this.browserDeadline(
       this.api.scripting.executeScript({
         target: { tabId: options.tab.browserTabId!, frameIds: [options.frameId ?? 0] },
         files: ['firefox-dom.js'],
         injectImmediately: true,
       }),
     )
+    assertFirefoxInjectionResult({ results, frameId: options.frameId ?? 0 })
   }
 
   private async invalidate(tab: BrowserTab): Promise<void> {
@@ -1349,6 +1355,7 @@ class FirefoxBackground {
     await this.inject({ tab })
     this.assertContinue(context)
     const routed = await this.routeFrame({ request, tab, context })
+    this.assertContinue(context)
     let command = routed.request.command
     if (routed.ancestors.length > 0 && command.method === 'locator' && FRAME_ACTIONS.has(command.action)) {
       command = await this.prepareFrameAction({ ...routed, command, tab, context })

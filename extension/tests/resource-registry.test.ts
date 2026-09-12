@@ -1,5 +1,6 @@
 import {
   activeFirefoxTab,
+  assertFirefoxInjectionResult,
   emptyFirefoxRegistry,
   firefoxInventory,
   firefoxPageSupported,
@@ -107,6 +108,23 @@ describe('managed resource registry ownership', () => {
     })
     return registry
   }
+
+  test('Firefox injection requires the requested frame and propagates its script error', () => {
+    expect(() => {
+      assertFirefoxInjectionResult({ results: [{ frameId: 0 }], frameId: 0 })
+    }).not.toThrow()
+    for (const results of [[], [{ frameId: 4 }]]) {
+      expect(() => {
+        assertFirefoxInjectionResult({ results, frameId: 0 })
+      }).toThrow('requested frame injection result')
+    }
+    expect(() => {
+      assertFirefoxInjectionResult({
+        results: [{ frameId: 4, error: { message: 'injected script failed' } }],
+        frameId: 4,
+      })
+    }).toThrow('injected script failed')
+  })
 
   test('Firefox persisted identity roundtrips without inventing CDP bindings', () => {
     const registry = firefoxFixture()

@@ -56,6 +56,18 @@ export class FirefoxResourceError extends Error {
   }
 }
 
+export function assertFirefoxInjectionResult(options: {
+  results: { frameId: number; error?: { message: string } }[]
+  frameId: number
+}): void {
+  const result = options.results.find((entry) => {
+    return entry.frameId === options.frameId
+  })
+  if (!result)
+    throw new Error('Firefox did not return the requested frame injection result; the document may have navigated')
+  if (result.error) throw new Error(result.error.message)
+}
+
 export function firefoxId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`
 }
