@@ -1,6 +1,6 @@
 # Browser Use (managed runtime) — usage discipline
 
-You can drive the user's real Chrome (their real login sessions, cookies) through
+You can drive the user's real Chrome or Firefox (their real login sessions, cookies) through
 the `browser_*` tools. These talk to a paired **managed browser runtime** over a
 local HTTP contract — no new browser is launched by you, and cookies/logins are
 the user's real ones. You only execute and report facts; you own every decision.
@@ -10,8 +10,12 @@ the user's real ones. You only execute and report facts; you own every decision.
 The runtime is explicit — there is **no implicit "current page"** and no matching
 by URL or title. Everything is addressed by id:
 
-- **Profile** — an installed Chrome identity. List them with `browser_profiles`.
+- **Profile** — an installed browser identity. List them with `browser_profiles`.
   A `profileId` is required to create a group; a profile must be `connected`.
+  Read its `capabilities`: a Firefox profile advertises `backend: webextension`,
+  `inputMode: dom`, `snapshotMode: dom-aria`, `executeMode: dom-compatible`,
+  `evaluateWorld: isolated`, supported operations, and concrete limitations.
+  Older Chrome profiles may omit these optional fields.
 - **Group** — a named tab group owned by *this* Pi session and bound to one fixed
   profile for its lifetime. Create with `browser_groups` (`action:"create"`,
   `name`, `profileId`). Same-name groups are allowed — each has its own `groupId`.
@@ -51,10 +55,10 @@ a group first:
    entries are genuinely indistinguishable, ask one short question instead of
    guessing.
 3. `browser_tabs` (`action:"attach"`, `candidateId`) takes control **in place**:
-   no reload, no window move, no Chrome group change, scroll and form state
+   no reload, no window move, no native group change, scroll and form state
    survive. You get back an ordinary `tabId` and every page tool works on it.
    Tabs another session controls are refused, and only the tab you picked is
-   attached — never the rest of its Chrome group.
+   attached — never the rest of its native browser group.
 4. Continue with the normal loop below.
 
 ## Following a link and coming back
@@ -108,6 +112,12 @@ screenshots are an optional extra for visual/spatial questions.
   stays bounded either way.
 - `browser_evaluate` (`tabId`, `code`) runs JS in the page (`document`/`window`,
   async ok). End with `return <value>` — a bare expression returns undefined.
+  Firefox runs in an isolated world: the DOM is available, but page-defined
+  globals and JavaScript objects may not be. Do not assume access to application
+  internals or use a MAIN-world injection workaround.
+  It requires Firefox 153+ and the user-enabled optional page-JavaScript
+  permission in the add-on popup. Earlier versions or an ungranted permission
+  return `unsupported-capability`; use structured DOM tools where suitable.
   It clears the latest snapshot (see selectors above).
 - `browser_screenshot` (`tabId`) returns an inline image when your model can see
   images; pass `path` to save, `fullPage` for the whole page, `labels` to overlay
@@ -139,6 +149,19 @@ you, and the latest snapshot is invalidated like after `browser_evaluate`.
 `keyboard`/`mouse`/`touchscreen` input is not supported right now.
 Never call `browser.close()`/`context.close()` — close tabs with `browser_tabs`.
 Code is sent as JSON: no shell quoting layer, so quotes/`$`/backticks are safe.
+
+Firefox's `dom-compatible` mode exposes a documented page/locator subset.
+Use ordinary locators and DOM reads; unsupported APIs return an explicit error.
+DOM clicks, fills, and key events cannot create trusted native browser input.
+A site that requires it may reject the action even when the element was found.
+Re-observe the outcome; do not repeat actions blindly or try to gain broader
+browser permissions. DOM/ARIA snapshots can also differ from Chrome's native
+accessibility tree.
+
+Firefox logs and network capture start when the controlled tab is instrumented
+or capture is explicitly started; earlier activity is not reconstructed.
+Read returned capture metadata and limitation messages before interpreting
+missing logs or response bodies as evidence that nothing happened.
 
 ## Cancellation and outcomes
 

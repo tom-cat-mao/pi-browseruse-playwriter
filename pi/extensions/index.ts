@@ -1,7 +1,7 @@
 /**
  * Pi Browser Use tools — managed runtime edition.
  *
- * These tools drive the user's real Chrome through the paired managed browser
+ * These tools drive the user's real browser through the paired managed browser
  * runtime (`@tom-cat/pi-browser-runtime`, default 127.0.0.1:19989) over the
  * frozen HTTP v1 contract (playwriter/src/browser-protocol.ts). They only
  * execute and report facts — the Pi LLM owns every decision. There is NO agent
@@ -618,12 +618,45 @@ export default function (pi: ExtensionAPI) {
     ...(c.tabId ? { tabId: c.tabId } : {}),
     ...(c.reason ? { reason: c.reason } : {}),
   });
-  const compactProfile = (p: BrowserProfile): Json => ({
-    profileId: p.profileId,
-    label: clampField(p.label),
-    browser: p.browser,
-    connected: p.connected,
-  });
+  const compactProfile = (p: BrowserProfile): Json => {
+    const caps = p.capabilities;
+    const limitations: string[] = [];
+    let remainingBytes = 4_000;
+    let limitationsTruncated = false;
+    for (const limitation of caps.limitations ?? []) {
+      if (remainingBytes < 4) {
+        limitationsTruncated = true;
+        break;
+      }
+      const clean = stripTerminalControls(limitation);
+      const bounded = clampBytes(clean, Math.min(1_000, remainingBytes));
+      if (bounded !== clean) limitationsTruncated = true;
+      limitations.push(bounded);
+      remainingBytes -= byteLen(bounded);
+    }
+    return {
+      profileId: p.profileId,
+      label: clampField(p.label),
+      browser: p.browser,
+      connected: p.connected,
+      capabilities: {
+        protocolVersion: caps.protocolVersion,
+        managedGroups: caps.managedGroups,
+        persistentOwnership: caps.persistentOwnership,
+        explicitTabs: caps.explicitTabs,
+        isolatedExecution: caps.isolatedExecution,
+        ...(caps.existingTabControl !== undefined ? { existingTabControl: caps.existingTabControl } : {}),
+        ...(caps.backend ? { backend: caps.backend } : {}),
+        ...(caps.inputMode ? { inputMode: caps.inputMode } : {}),
+        ...(caps.snapshotMode ? { snapshotMode: caps.snapshotMode } : {}),
+        ...(caps.executeMode ? { executeMode: caps.executeMode } : {}),
+        ...(caps.evaluateWorld ? { evaluateWorld: caps.evaluateWorld } : {}),
+        ...(caps.supportedOperations ? { supportedOperations: caps.supportedOperations } : {}),
+        ...(caps.limitations ? { limitations } : {}),
+        ...(limitationsTruncated ? { limitationsTruncated: true } : {}),
+      },
+    };
+  };
 
   // --- human-facing result rows ---------------------------------------------
   // Folded: page/domain + action + counts, short-id fallback. Full ids stay in
@@ -860,11 +893,12 @@ export default function (pi: ExtensionAPI) {
     name: "browser_profiles",
     label: "Browser Profiles",
     description:
-      "List the browser profiles (installed Chrome identities) the managed runtime knows about, with their connection state. " +
-      "A profileId is required to create a group. This is connection metadata, not filtered by session.",
+      "List the browser profiles (installed browser identities) the managed runtime knows about, with connection state " +
+      "and actual backend capabilities. A profileId is required to create a group. This is connection metadata, not filtered by session.",
     promptSnippet: "List available browser profiles",
     promptGuidelines: [
       "Use browser_profiles to discover a profileId before browser_groups create. A profile must be connected to open groups/tabs in it.",
+      "Use browser_profiles capabilities to choose the execution approach: Firefox webextension uses DOM input and DOM/ARIA snapshots, isolated-world evaluate, and a documented Playwright-compatible subset. Read its limitations before relying on native input, page globals, or CDP.",
     ],
     parameters: Type.Object({}),
     async execute(toolCallId, _params, signal, _onUpdate, ctx) {
@@ -875,7 +909,8 @@ export default function (pi: ExtensionAPI) {
       const profiles = (view.details.profiles as BrowserProfile[] | undefined) ?? [];
       if (profiles.length === 1) {
         const profile = profiles[0];
-        return `✓ ${profile.label} · ${profile.browser} · ${profile.connected ? "connected" : "disconnected"}`;
+        const backend = profile.capabilities.backend === "webextension" ? " · DOM input" : "";
+        return `✓ ${profile.label} · ${profile.browser} · ${profile.connected ? "connected" : "disconnected"}${backend}`;
       }
       const connected = profiles.filter((p) => p.connected).length;
       return `✓ ${profiles.length} profile(s) · ${connected} connected`;
@@ -1238,7 +1273,8 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Evaluate",
     description:
       "Run JavaScript inside a managed tab's page (document/window available, async/await supported). Returns the " +
-      "JSON-serializable result value. Use browser_execute for the Node/Playwright sandbox instead.",
+      "JSON-serializable result value. Firefox uses an isolated world (requires Firefox 153+ and the add-on's optional " +
+      "page-JavaScript permission): DOM is available, page-script globals may not be. Use browser_execute for the Node/Playwright sandbox instead.",
     promptSnippet: "Run JavaScript in a managed tab's page",
     promptGuidelines: [
       "Use browser_evaluate for attributes/scrolling/complex reads a snapshot can't give; it runs in the page (document/window). End with `return <value>` — a bare expression returns undefined. Use browser_execute for Playwright-level control.",
@@ -1399,7 +1435,8 @@ export default function (pi: ExtensionAPI) {
       "requested tab (its `page`); there is no newPage/close/context escape. Each call is independent: you may keep plain " +
       "data or ids in variables you return, but page/locator/CDP handles cannot be reused across calls — re-acquire them " +
       "each time. Await every action to completion and leave no background timers running. keyboard/mouse/touchscreen input " +
-      "is not supported right now. Errors and output are returned verbatim. Optional timeout in ms (runtime caps it at 120s).",
+      "is not supported right now. Firefox profiles expose a DOM-compatible subset; unsupported APIs fail explicitly. " +
+      "Errors and output are returned verbatim. Optional timeout in ms (runtime caps it at 120s).",
     promptSnippet: "Run a Playwright snippet against a managed tab (escape hatch)",
     promptGuidelines: [
       "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Do not rely on page/locator/CDP objects surviving between calls (re-acquire them); await all actions and leave no background timers; keyboard/mouse/touchscreen input is unsupported for now. Never call browser.close()/context.close(); close tabs via browser_tabs.",

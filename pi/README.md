@@ -1,9 +1,9 @@
 # @tom-cat/pi-browser-use-extension
 
-Pi extension that drives the **user's real Chrome** (their real login sessions)
+Pi extension that drives the **user's real Chrome or Firefox** (their real login sessions)
 through a paired **managed browser runtime** (`@tom-cat/pi-browser-runtime`).
 No new browser is launched by the extension, no cloud — the tools speak a frozen
-HTTP v1 contract to a local runtime that owns the Chrome connection.
+HTTP v1 contract to a local runtime that owns the browser connection.
 
 The extension only executes and reports facts; the Pi LLM owns every decision.
 There is no agent loop, HITL, captcha, or danger-confirmation logic here.
@@ -14,8 +14,10 @@ There is no agent loop, HITL, captcha, or danger-confirmation logic here.
 - The **managed browser runtime** on `127.0.0.1:19989` (default). It is started
   automatically on first tool use (see *How it works*); inspect it any time with
   `/browser-status`.
-- **Chrome** connected to the runtime as a profile (`browser_profiles` must show
+- **Chrome or Firefox** connected to the runtime as a profile (`browser_profiles` must show
   a `connected` profile before you can open groups/tabs).
+- Firefox uses the ordinary add-on's DOM backend; development loading and its
+  signing/compatibility status are described in the [Firefox guide](../docs/exec/firefox-extension-guide.md).
 
 ## Configuration
 
@@ -34,22 +36,47 @@ used.
 
 | Tool | Purpose |
 |---|---|
-| `browser_profiles` | list Chrome profiles + connection state (needed for `profileId`) |
+| `browser_profiles` | list browser profiles, connection state, and actual backend capabilities (needed for `profileId`) |
 | `browser_groups` | list/create/rename/close this session's tab groups (create needs `name`+`profileId`) |
 | `browser_tabs` | list/create/attach/activate/close/release tabs; `discover` lists real open tabs with Pi-side `offset`/`limit` paging (active tabs first, `nextOffset`/`truncated` reported) |
 | `browser_navigate` | navigate a `tabId` to a URL, or `action:"back"` through real browser history |
 | `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` (default readable tree; `full` requests the complete tree, output bounded) |
 | `browser_click` | click by ref (`aria-ref=eN`/`@eN` + `snapshotId`) or strict CSS |
 | `browser_fill` | set input/textarea/contenteditable text (clear-and-insert) |
-| `browser_evaluate` | run JS in a tab's page (`document`/`window`, async) |
+| `browser_evaluate` | run JS against a tab's DOM (`document`/`window`, async; isolated world on Firefox) |
 | `browser_screenshot` | screenshot a tab (inline image, optional `path`/`fullPage`/`labels`) |
 | `browser_network` | capture/list/stop a tab's network responses; retained entries and capture state survive stop/interruption |
 | `browser_logs` | buffered console/log output for a tab |
-| `browser_execute` | escape hatch: Playwright snippet bound to a tab's `page` |
+| `browser_execute` | escape hatch: Playwright snippet bound to a tab's `page`; Firefox provides a DOM-compatible subset |
 
 Also registers the inspect-only `/browser-status` command (reachability,
 capabilities, connected profiles). There is no `browser_save_as_pdf` — it always
 errored on headed extension sessions.
+
+## Firefox capability differences
+
+The same structured tools address Chrome and Firefox by explicit `profileId`
+and `tabId`. `browser_profiles` puts optional backend metadata into the model's
+**content**, including `backend`, `inputMode`, `snapshotMode`, `executeMode`,
+`evaluateWorld`, `supportedOperations`, and `limitations`. Older Chrome profiles
+can omit these fields. The compact human row marks a Firefox profile as using
+DOM input; ordinary actions do not repeat a long warning.
+
+Firefox profiles report `webextension` / `dom` / `dom-aria` / `dom-compatible`
+/ `isolated`. Input is performed through DOM APIs, so sites that require
+trusted native keyboard or pointer events can behave differently. Snapshots
+use DOM accessibility semantics rather than Chrome's native AX tree.
+`browser_evaluate` can read and change DOM but does not expose page-script
+globals as if it were Chrome's main world; code must explicitly return a value.
+Firefox evaluate requires Firefox 153+ and the optional page-JavaScript
+permission, enabled by the user in the add-on popup. Without it, the basic
+DOM tools remain available and evaluate reports `unsupported-capability`.
+`browser_execute` supports documented page/locator methods and fails explicitly
+for unsupported APIs, including CDP and browser/context creation or closure.
+
+After evaluate or execute, acquire a new snapshot before using refs again on
+either backend. An unsupported operation or unknown outcome is returned as a
+typed error; it is never silently retried through another browser.
 
 ## Human-facing rows
 
@@ -130,7 +157,7 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check   # jiti load + regis
 
 Tests use a real `node:http` server (no mocked `fetch`) to exercise the wire
 contract, response validation, output bounds, lifecycle, and result shaping.
-None of them start Chrome or a real runtime.
+None of them start a browser or a real runtime.
 
 Runtime dependencies: the type-only `@tom-cat/pi-browser-runtime/browser-protocol`
 export plus Pi packages (`@earendil-works/*`, `typebox`); at runtime only global

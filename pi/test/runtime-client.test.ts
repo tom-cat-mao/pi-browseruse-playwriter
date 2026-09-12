@@ -97,6 +97,48 @@ describe("listProfiles", () => {
     server.setHandler(() => ({ json: { profiles: [bad] } }));
     await expect(client().listProfiles()).rejects.toMatchObject({ category: "protocol" });
   });
+  it("accepts Firefox backend capabilities alongside an older Chrome profile", async () => {
+    const firefoxProfile = {
+      ...validProfile,
+      profileId: "profile-firefox",
+      browser: "firefox",
+      capabilities: {
+        ...validCapabilities,
+        backend: "webextension",
+        inputMode: "dom",
+        snapshotMode: "dom-aria",
+        executeMode: "dom-compatible",
+        evaluateWorld: "isolated",
+        supportedOperations: ["page.snapshot", "page.evaluate"],
+        limitations: ["DOM input cannot create trusted user events."],
+      },
+    };
+    server.setHandler(() => {
+      return { json: { profiles: [validProfile, firefoxProfile] } };
+    });
+    await expect(client().listProfiles()).resolves.toEqual([validProfile, firefoxProfile]);
+  });
+  it("rejects invalid or unbounded optional backend capabilities", async () => {
+    const invalidCapabilities = [
+      { backend: "remote-agent" },
+      { inputMode: true },
+      { snapshotMode: "cdp" },
+      { executeMode: "unrestricted" },
+      { evaluateWorld: "extension-background" },
+      { existingTabControl: "yes" },
+      { limitations: "DOM input" },
+      { limitations: ["x".repeat(2_001)] },
+      { limitations: Array.from({ length: 33 }, () => { return "bounded"; }) },
+      { supportedOperations: ["tabs.create"] },
+      { supportedOperations: "page.click" },
+    ];
+    for (const invalid of invalidCapabilities) {
+      server.setHandler(() => {
+        return { json: { profiles: [{ ...validProfile, capabilities: { ...validCapabilities, ...invalid } }] } };
+      });
+      await expect(client().listProfiles()).rejects.toMatchObject({ category: "protocol" });
+    }
+  });
 });
 
 describe("request", () => {
