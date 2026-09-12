@@ -307,7 +307,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
           } catch {
             /* Logging must not interrupt the page. */
           }
-          return original.apply(pageView.console, args)
+          return Reflect.apply(original, pageView.console, args)
         }, pageView.console)
         pageView.console[method] = wrapped
         consoleAvailable = true
