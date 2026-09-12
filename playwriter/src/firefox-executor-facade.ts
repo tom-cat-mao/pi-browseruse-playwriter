@@ -12,6 +12,10 @@ export class FirefoxCapabilityError extends Error {
   readonly code = 'unsupported-capability'
 }
 
+export class FirefoxSnapshotError extends Error {
+  readonly code = 'stale-snapshot'
+}
+
 export interface FirefoxFacadeOptions {
   tabId: string
   initialUrl: string
@@ -55,7 +59,18 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     args: unknown[]
   }): Promise<BrowserJson> => {
     options.assertActive()
-    const normalizedArgs = args.map((value) => {
+    const values = [...args]
+    while (values.length > 0 && values[values.length - 1] === undefined) {
+      values.pop()
+    }
+    if (!['count', 'allTextContents', 'allInnerTexts'].includes(name)) {
+      const optionIndex = ['fill', 'type', 'press', 'setChecked', 'selectOption', 'getAttribute'].includes(name) ? 1 : 0
+      const settings = recordOptions(values[optionIndex])
+      if (values.length <= optionIndex + 1) {
+        values[optionIndex] = { timeout: defaultTimeout, ...settings }
+      }
+    }
+    const normalizedArgs = values.map((value) => {
       if (value === undefined) {
         return null
       }
@@ -63,12 +78,22 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     })
     return await sendValue({ method: 'locator', locator, action: name, args: normalizedArgs })
   }
-  const query = ({ base, engine, args }: { base: BrowserDomLocatorStep[]; engine: SelectorStep['engine']; args: unknown[] }): object => {
+  const query = ({ base, engine, args, snapshotId }: { base: BrowserDomLocatorStep[]; engine: SelectorStep['engine']; args: unknown[]; snapshotId?: string }): object => {
     options.assertActive()
-    const value = stringMatcher(args[0])
+    let value = stringMatcher(args[0])
     const queryOptions = recordOptions(args[1])
     const roleKeys = ['name', 'exact', 'checked', 'disabled', 'expanded', 'selected', 'pressed', 'level', 'includeHidden']
-    assertOptions({ value: queryOptions, keys: engine === 'role' ? roleKeys : ['exact'] })
+    assertOptions({ value: queryOptions, keys: engine === 'role' ? roleKeys : engine === 'css' ? ['hasText', 'hasNotText', 'has', 'hasNot', 'snapshotId'] : ['exact'] })
+    const ref = engine === 'css' ? /^(?:aria-ref=|@)(e[0-9]+)(?:;snapshot=(.+))?$/.exec(value) : null
+    if (ref) {
+      value = `aria-ref=${ref[1]}`
+      snapshotId = ref[2] ? decodeURIComponent(ref[2]) : queryOptions.snapshotId === undefined ? snapshotId : stringArgument(queryOptions.snapshotId)
+      if (!snapshotId) {
+        throw new FirefoxSnapshotError('A snapshot ref requires an explicit snapshotId or a selector returned by refToLocator; it is never bound to the latest snapshot automatically')
+      }
+    } else if (queryOptions.snapshotId !== undefined) {
+      throw new FirefoxCapabilityError('snapshotId is only accepted with a snapshot ref selector')
+    }
     const step: SelectorStep = { kind: 'selector', engine, value }
     if (queryOptions.exact !== undefined) {
       step.exact = booleanArgument(queryOptions.exact)
@@ -90,9 +115,13 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
         step.options = roleOptions
       }
     }
-    return locatorFacade({ steps: [...base, step] })
+    const steps: BrowserDomLocatorStep[] = [...base, step]
+    if (engine === 'css' && Object.keys(queryOptions).some((key) => { return key !== 'snapshotId' })) {
+      steps.push(makeFilter(queryOptions))
+    }
+    return locatorFacade({ steps, ...(snapshotId ? { snapshotId } : {}) })
   }
-  const queryMethods = (steps: BrowserDomLocatorStep[]): Record<string, unknown> => {
+  const queryMethods = (base: BrowserDomLocator): Record<string, unknown> => {
     const methods: Record<string, unknown> = {}
     const engines = {
       locator: 'css', getByRole: 'role', getByText: 'text', getByLabel: 'label',
@@ -100,16 +129,16 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     } as const
     for (const [method, engine] of Object.entries(engines)) {
       methods[method] = (...args: unknown[]) => {
-        return query({ base: steps, engine, args })
+        return query({ base: base.steps, engine, args, snapshotId: base.snapshotId })
       }
     }
     methods.frameLocator = (selector: unknown) => {
-      return locatorFacade({ steps: [...steps, { kind: 'frame', selector: stringArgument(selector) }] })
+      return locatorFacade({ ...base, steps: [...base.steps, { kind: 'frame', selector: stringArgument(selector) }] })
     }
     return methods
   }
   const locatorFacade = (locator: BrowserDomLocator): object => {
-    const methods = queryMethods(locator.steps)
+    const methods = queryMethods(locator)
     for (const name of [
       'count', 'click', 'dblclick', 'fill', 'type', 'press', 'check', 'uncheck', 'setChecked',
       'selectOption', 'hover', 'focus', 'blur', 'scrollIntoViewIfNeeded', 'waitFor',
@@ -127,31 +156,20 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
       return await action({ locator, name: 'type', args })
     }
     methods.nth = (index: unknown) => {
-      return locatorFacade({ steps: [...locator.steps, { kind: 'nth', index: integerArgument({ value: index, minimum: 0, maximum: 100_000 }) }] })
+      return locatorFacade({ ...locator, steps: [...locator.steps, { kind: 'nth', index: integerArgument({ value: index, minimum: 0, maximum: 100_000 }) }] })
     }
     methods.first = () => {
-      return locatorFacade({ steps: [...locator.steps, { kind: 'nth', index: 0 }] })
+      return locatorFacade({ ...locator, steps: [...locator.steps, { kind: 'nth', index: 0 }] })
     }
     methods.last = () => {
-      return locatorFacade({ steps: [...locator.steps, { kind: 'nth', index: -1 }] })
+      return locatorFacade({ ...locator, steps: [...locator.steps, { kind: 'nth', index: -1 }] })
     }
     methods.filter = (filterOptions: unknown) => {
       options.assertActive()
       const value = recordOptions(filterOptions)
       assertOptions({ value, keys: ['hasText', 'hasNotText', 'has', 'hasNot'] })
-      const step: Extract<BrowserDomLocatorStep, { kind: 'filter' }> = { kind: 'filter' }
-      if (value.hasText !== undefined) {
-        step.hasText = stringMatcher(value.hasText)
-      }
-      if (value.hasNotText !== undefined) {
-        step.hasNotText = stringMatcher(value.hasNotText)
-      }
-      for (const key of ['has', 'hasNot'] as const) {
-        if (value[key] !== undefined) {
-          step[key] = localLocator(value[key])
-        }
-      }
-      return locatorFacade({ steps: [...locator.steps, step] })
+      const step = makeFilter(value)
+      return locatorFacade({ ...locator, steps: [...locator.steps, step] })
     }
     methods.all = async () => {
       const count = await action({ locator, name: 'count', args: [] })
@@ -159,7 +177,7 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
         throw new Error('Locator count exceeds the 10000-element execute limit')
       }
       return Array.from({ length: count }, (_, index) => {
-        return locatorFacade({ steps: [...locator.steps, { kind: 'nth', index }] })
+        return locatorFacade({ ...locator, steps: [...locator.steps, { kind: 'nth', index }] })
       })
     }
     methods.evaluate = async (...args: unknown[]) => {
@@ -175,6 +193,21 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     const result = unsupportedProxy({ methods, label: 'locator' })
     locators.set(result, locator)
     return result
+  }
+  const makeFilter = (value: Record<string, unknown>): Extract<BrowserDomLocatorStep, { kind: 'filter' }> => {
+    const step: Extract<BrowserDomLocatorStep, { kind: 'filter' }> = { kind: 'filter' }
+    if (value.hasText !== undefined) {
+      step.hasText = stringMatcher(value.hasText)
+    }
+    if (value.hasNotText !== undefined) {
+      step.hasNotText = stringMatcher(value.hasNotText)
+    }
+    for (const key of ['has', 'hasNot'] as const) {
+      if (value[key] !== undefined) {
+        step[key] = localLocator(value[key])
+      }
+    }
+    return step
   }
   const localLocator = (value: unknown): BrowserDomLocator => {
     if (typeof value !== 'object' || value === null) {
@@ -232,7 +265,7 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     const entry: unknown = data.refs.find((item) => {
       return isFirefoxWorkerRecord(item) && item.ref === ref
     })
-    return isFirefoxWorkerRecord(entry) && typeof entry.selector === 'string' ? entry.selector : null
+    return isFirefoxWorkerRecord(entry) && latestSnapshot?.snapshotId ? `aria-ref=${ref};snapshot=${encodeURIComponent(latestSnapshot.snapshotId)}` : null
   }
   const screenshot = async (input: unknown = {}): Promise<Buffer> => {
     const value = recordOptions(input)
@@ -253,7 +286,7 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     }
     return Buffer.from(image.data, 'base64')
   }
-  const pageMethods = queryMethods([])
+  const pageMethods = queryMethods({ steps: [] })
   pageMethods.url = () => {
     options.assertActive()
     return currentUrl
@@ -267,14 +300,15 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     return await sendValue({ method: 'evaluate', code: evaluationCode({ input: args[0], arg: args[1], element: false }) })
   }
   pageMethods.goto = async (...args: unknown[]) => {
-    const value = recordOptions(args[1])
-    assertOptions({ value, keys: [] })
+    const value = navigationOptions(args[1])
     await operation({ kind: 'page.navigate', tabId: options.tabId, url: stringArgument(args[0]) })
+    await waitForLoadState(value.waitUntil)
     return null
   }
   pageMethods.goBack = async (input?: unknown) => {
-    assertOptions({ value: recordOptions(input), keys: [] })
+    const value = navigationOptions(input)
     await operation({ kind: 'page.back', tabId: options.tabId })
+    await waitForLoadState(value.waitUntil)
     return null
   }
   pageMethods.screenshot = screenshot
@@ -285,10 +319,12 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
   }
   for (const name of ['click', 'dblclick', 'fill', 'type', 'press', 'check', 'uncheck', 'selectOption', 'hover', 'focus', 'textContent', 'innerText', 'innerHTML', 'inputValue', 'getAttribute', 'isVisible', 'isHidden', 'isEnabled', 'isDisabled', 'isChecked'] as const) {
     pageMethods[name] = async (...args: unknown[]) => {
-      return await action({ locator: { steps: [{ kind: 'selector', engine: 'css', value: stringArgument(args[0]) }] }, name, args: args.slice(1) })
+      const locator = localLocator(query({ base: [], engine: 'css', args: [args[0]] }))
+      return await action({ locator, name, args: args.slice(1) })
     }
   }
   pageMethods.setDefaultTimeout = (timeout: unknown) => {
+    options.assertActive()
     defaultTimeout = integerArgument({ value: timeout, minimum: 1, maximum: 5_000 })
   }
   const waitForFunction = async (...args: unknown[]): Promise<BrowserJson> => {
@@ -307,13 +343,73 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
     throw new Error(`Firefox waitForFunction timed out after ${timeout} ms`)
   }
   pageMethods.waitForFunction = waitForFunction
-  pageMethods.waitForLoadState = async (...args: unknown[]) => {
+  const waitForPageValue = async ({ action, accept, input }: {
+    action: 'url' | 'readyState'
+    accept: (value: BrowserJson) => boolean
+    input?: unknown
+  }): Promise<void> => {
+    const value = recordOptions(input)
+    assertOptions({ value, keys: ['timeout'] })
+    const timeout = value.timeout === undefined ? defaultTimeout : integerArgument({ value: value.timeout, minimum: 1, maximum: 5_000 })
+    const deadline = Math.min(options.deadline, Date.now() + timeout)
+    while (Date.now() < deadline) {
+      const observation = await sendValue({ method: 'page', action })
+      if (accept(observation)) {
+        return
+      }
+      await new Promise<void>((resolve) => { setTimeout(resolve, 50) })
+    }
+    throw new Error(`Firefox page ${action} wait timed out after ${timeout} ms`)
+  }
+  const waitForLoadState = async (...args: unknown[]): Promise<void> => {
     const state = args[0] ?? 'load'
-    if (state !== 'load' && state !== 'domcontentloaded') {
+    if (state !== 'load' && state !== 'domcontentloaded' && state !== 'commit') {
       throw new FirefoxCapabilityError('Firefox supports load and domcontentloaded waits; networkidle needs browser-level instrumentation')
     }
-    return await waitForFunction(`return document.readyState ${state === 'load' ? "=== 'complete'" : "!== 'loading'"}`, undefined, args[1])
+    if (state === 'commit') {
+      options.assertActive()
+      return
+    }
+    await waitForPageValue({
+      action: 'readyState', input: args[1],
+      accept: (value) => { return state === 'load' ? value === 'complete' : value === 'interactive' || value === 'complete' },
+    })
   }
+  pageMethods.waitForLoadState = waitForLoadState
+  pageMethods.waitForURL = async (...args: unknown[]) => {
+    const value = recordOptions(args[1])
+    assertOptions({ value, keys: ['timeout', 'waitUntil'] })
+    const matcher = urlMatcher(stringMatcher(args[0]))
+    await waitForPageValue({
+      action: 'url', input: value.timeout === undefined ? {} : { timeout: value.timeout },
+      accept: (urlValue) => { return typeof urlValue === 'string' && matcher.test(urlValue) },
+    })
+    if (value.waitUntil !== undefined) {
+      await waitForLoadState(value.waitUntil, value.timeout === undefined ? {} : { timeout: value.timeout })
+    }
+  }
+  pageMethods.waitForTimeout = async (timeout: unknown) => {
+    options.assertActive()
+    const milliseconds = integerArgument({ value: timeout, minimum: 0, maximum: 5_000 })
+    await new Promise<void>((resolve) => { setTimeout(resolve, milliseconds) })
+    options.assertActive()
+  }
+  pageMethods.waitForSelector = async (...args: unknown[]) => {
+    const locator = localLocator(query({ base: [], engine: 'css', args: [args[0]] }))
+    const settings = recordOptions(args[1])
+    assertOptions({ value: settings, keys: ['state', 'timeout', 'strict'] })
+    if (settings.strict === false) {
+      throw new FirefoxCapabilityError('Firefox execute selectors always require a strict single match')
+    }
+    const waitSettings = { ...settings }
+    delete waitSettings.strict
+    await action({ locator, name: 'waitFor', args: [waitSettings] })
+    return settings.state === 'hidden' || settings.state === 'detached' ? null : locatorFacade(locator)
+  }
+  pageMethods.keyboard = unsupportedProxy({ label: 'page.keyboard', methods: {
+    press: async (...args: unknown[]) => { return await action({ locator: { steps: [{ kind: 'selector', engine: 'css', value: ':focus' }] }, name: 'press', args }) },
+    type: async (...args: unknown[]) => { return await action({ locator: { steps: [{ kind: 'selector', engine: 'css', value: ':focus' }] }, name: 'type', args }) },
+  } })
   const context = unsupportedProxy({ methods: {}, label: 'context' })
   pageMethods.context = () => {
     options.assertActive()
@@ -336,7 +432,7 @@ export function createFirefoxFacade(options: FirefoxFacadeOptions): FirefoxFacad
       const value = recordOptions(input)
       assertOptions({ value, keys: ['page', 'timeout'] })
       selectedPage(value.page)
-      return await waitForFunction("return document.readyState === 'complete'", undefined, value.timeout === undefined ? {} : { timeout: value.timeout })
+      return await waitForLoadState('load', value.timeout === undefined ? {} : { timeout: value.timeout })
     },
     getCDPSession: () => {
       throw new FirefoxCapabilityError('Firefox ordinary extensions do not provide CDP sessions')
@@ -425,4 +521,31 @@ function jsonArgument(value: unknown): BrowserJson {
     throw new FirefoxCapabilityError('Firefox execute arguments must be finite JSON values; handles, functions and cyclic values are not supported')
   }
   return value
+}
+
+function navigationOptions(input: unknown): { waitUntil?: unknown } {
+  const value = recordOptions(input)
+  assertOptions({ value, keys: ['waitUntil'] })
+  if (value.waitUntil !== undefined && !['load', 'domcontentloaded', 'commit'].includes(String(value.waitUntil))) {
+    throw new FirefoxCapabilityError('Firefox navigation supports load, domcontentloaded and commit waits')
+  }
+  return value
+}
+
+function urlMatcher(pattern: string): RegExp {
+  let source = '^'
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]
+    if (character === '*') {
+      if (pattern[index + 1] === '*') {
+        source += '.*'
+        index += 1
+      } else {
+        source += '[^/]*'
+      }
+    } else {
+      source += character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    }
+  }
+  return new RegExp(`${source}$`)
 }

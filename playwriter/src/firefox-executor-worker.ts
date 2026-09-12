@@ -4,7 +4,7 @@ import path from 'node:path'
 import vm from 'node:vm'
 import type { BrowserDomCommand, BrowserErrorCode, BrowserImage, BrowserResultData, BrowserResponse } from './browser-protocol.js'
 import { parseBrowserDomCommand } from './browser-dom-validation.js'
-import { createFirefoxFacade, FirefoxCapabilityError } from './firefox-executor-facade.js'
+import { createFirefoxFacade, FirefoxCapabilityError, FirefoxSnapshotError } from './firefox-executor-facade.js'
 import {
   parseFirefoxWorkerCommand,
   validateFirefoxMessageSize,
@@ -170,7 +170,7 @@ export function startFirefoxExecutorWorker(): void {
         requestId: command.execution.requestId,
         ok: true,
         data: {
-          value: serializeBrowserJson(value),
+          value: serializeFirefoxValue(value),
           ...(logs.length > 0 ? { logs } : {}),
           ...(images.length > 0 ? { images } : {}),
           ...(artifacts.length > 0 ? { artifacts } : {}),
@@ -231,7 +231,7 @@ function createConsole(logs: string[]): Record<string, (...args: unknown[]) => v
   for (const method of ['log', 'info', 'warn', 'error', 'debug', 'dir', 'table']) {
     methods[method] = (...args: unknown[]) => {
       const line = args.map((arg) => {
-        return typeof arg === 'string' ? arg : JSON.stringify(serializeBrowserJson(arg))
+        return typeof arg === 'string' ? arg : JSON.stringify(serializeFirefoxValue(arg))
       }).join(' ')
       logs.push(`[${method}] ${truncateString({ value: line, maxLength: 4_000 })}`)
       if (logs.length > 100) {
@@ -242,13 +242,22 @@ function createConsole(logs: string[]): Record<string, (...args: unknown[]) => v
   return methods
 }
 
+function serializeFirefoxValue(value: unknown): ReturnType<typeof serializeBrowserJson> {
+  try {
+    return serializeBrowserJson(structuredClone(value))
+  } catch {
+    return serializeBrowserJson(value)
+  }
+}
+
 function executionFailure({ execution, error, started, logs }: {
   execution: FirefoxWorkerExecution
   error: unknown
   started: boolean
   logs: string[]
 }): BrowserResponse {
-  const code = error instanceof FirefoxDomError ? error.code : error instanceof FirefoxCapabilityError ? error.code : 'execution-failed'
+  const vmTimeout = error && typeof error === 'object' && 'code' in error && error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT'
+  const code = error instanceof FirefoxDomError ? error.code : error instanceof FirefoxCapabilityError || error instanceof FirefoxSnapshotError ? error.code : vmTimeout ? 'timeout' : 'execution-failed'
   const logText = logs.length > 0 ? `\nExecute console:\n${logs.join('\n')}` : ''
   return {
     requestId: execution.requestId, ok: false,

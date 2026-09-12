@@ -487,9 +487,19 @@ async function terminateWorker(child: childProcess.ChildProcess): Promise<void> 
     }
     child.once('exit', done)
     child.once('error', done)
-    child.kill('SIGTERM')
+    try {
+      child.kill('SIGTERM')
+    } catch {
+      done()
+      return
+    }
     forceKill = setTimeout(() => {
-      child.kill('SIGKILL')
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        done()
+        return
+      }
       finalTimeout = setTimeout(done, 250)
     }, 250)
   })

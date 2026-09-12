@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import type { BrowserDomRequest, BrowserResponse, BrowserTab } from './browser-protocol.js'
+import type { BrowserDomRequest, BrowserResponse, BrowserTab, BrowserResultData } from './browser-protocol.js'
 import { parseBrowserDomRequest } from './browser-dom-validation.js'
 import { FirefoxExecutorPool, type FirefoxExecution } from './firefox-executor-pool.js'
 import { ManagedCancellation } from './managed-executor-pool.js'
@@ -7,6 +7,7 @@ import { ManagedCancellation } from './managed-executor-pool.js'
 /** A real protocol peer that records wire commands without pretending to implement a browser DOM. */
 class CommandPeer {
   readonly requests: BrowserDomRequest[] = []
+  readonly snapshotMessages: BrowserResultData[] = []
   beforeReply?: (request: BrowserDomRequest) => Promise<void>
 
   async receive(value: BrowserDomRequest): Promise<BrowserResponse> {
@@ -19,7 +20,7 @@ class CommandPeer {
     return {
       requestId: request.requestId,
       ok: true,
-      data: {
+      data: request.command.method === 'snapshot' && this.snapshotMessages.length > 0 ? this.snapshotMessages.shift()! : {
         value: JSON.parse(JSON.stringify(request.command)),
         pageInfo: { tabId: request.tabId, url: 'https://example.test/current', title: 'Command peer' },
       },
@@ -50,7 +51,10 @@ function execution({ id, code, peer, session = 'session-1', profile = 'profile-1
 
 function barrier(): { promise: Promise<void>; release: () => void } {
   let release: () => void = () => {}
-  const promise = new Promise<void>((resolve) => { release = resolve })
+  const promise = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => { reject(new Error('Protocol test barrier exceeded 3 seconds')) }, 3_000)
+    release = () => { clearTimeout(timeout); resolve() }
+  })
   return { promise, release }
 }
 
@@ -99,6 +103,45 @@ describe('FirefoxExecutorPool real child process', () => {
         throw new Error('Missing evaluate command')
       }
       expect(evaluation.command.code).toContain('element, "!"')
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('preserves a bound snapshot identity when a later snapshot reuses the same short ref', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.snapshotMessages.push(
+      { snapshotId: 'snapshot-old', text: 'e1 Name', value: { refs: [{ ref: 'e1', role: 'textbox', name: 'Name' }] } },
+      { snapshotId: 'snapshot-new', text: 'e1 Other', value: { refs: [{ ref: 'e1', role: 'textbox', name: 'Other' }] } },
+    )
+    try {
+      const response = await pool.execute(execution({ id: 'old-ref', peer, code: `
+        await snapshot();
+        const old = refToLocator({ref: 'e1'});
+        await snapshot();
+        return await page.locator(old).locator('input').inputValue();
+      ` }))
+      expect(response).toMatchObject({ ok: true, data: { value: {
+        method: 'locator', action: 'inputValue', locator: { snapshotId: 'snapshot-old', steps: [
+          { kind: 'selector', engine: 'css', value: 'aria-ref=e1' },
+          { kind: 'selector', engine: 'css', value: 'input' },
+        ] },
+      } } })
+      expect(await pool.execute(execution({ id: 'bare-ref', peer, code: "await page.locator('aria-ref=e1').click()" }))).toMatchObject({ ok: false, error: { code: 'stale-snapshot' } })
+      expect(await pool.execute(execution({ id: 'explicit-ref', peer, code: "await page.locator('aria-ref=e1', { snapshotId: 'snapshot-old' }).click()" }))).toMatchObject({ ok: true, data: { value: { locator: { snapshotId: 'snapshot-old' } } } })
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('applies locator default timeouts, supports clear without options and keeps rich VM values', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    try {
+      expect(await pool.execute(execution({ id: 'clear', peer, code: "page.setDefaultTimeout(700); return await page.getByTestId('name').clear()" }))).toMatchObject({ ok: true, data: { value: { action: 'fill', args: ['', { timeout: 700 }] } } })
+      expect(await pool.execute(execution({ id: 'rich', peer, code: "return { date: new Date('2026-01-01T00:00:00Z'), values: new Set([1, 2]) }" }))).toMatchObject({ ok: true, data: { value: { date: '2026-01-01T00:00:00.000Z', values: [1, 2] } } })
+      expect(await pool.execute(execution({ id: 'navigate', peer, code: "await page.goto('https://example.test/next', { waitUntil: 'commit' }); return page.url()" }))).toMatchObject({ ok: true, data: { value: 'https://example.test/current' } })
     } finally {
       await pool.dispose()
     }
