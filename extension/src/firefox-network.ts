@@ -82,17 +82,18 @@ export class FirefoxNetwork {
     }, filter)
   }
 
-  private current(details: FirefoxWebRequestDetails): Capture | undefined {
-    const tab = this.lookup(details.tabId)
+  private current(browserTabId: number): Capture | undefined {
+    const tab = this.lookup(browserTabId)
     if (!tab) return undefined
     const capture = this.captures.get(tab.tabId)
-    return capture?.status === 'active' && capture.sessionId === tab.sessionId && capture.browserTabId === details.tabId
+    return capture?.status === 'active' && capture.sessionId === tab.sessionId && capture.browserTabId === browserTabId
       ? capture
       : undefined
   }
 
   private begin(details: FirefoxWebRequestDetails): void {
-    const capture = this.current(details)
+    const browserTabId = details.tabId
+    const capture = this.current(browserTabId)
     if (!capture || (capture.filter && !details.url.includes(capture.filter))) return
     const previous = this.pending.get(details.requestId)
     if (previous) this.detach(previous)
@@ -144,8 +145,14 @@ export class FirefoxNetwork {
       pending.stream = stream
       stream.ondata = (event) => {
         // Always forward bytes before doing optional inspection.
-        stream.write(event.data)
-        if (this.current(details) !== capture) {
+        try {
+          stream.write(event.data)
+        } catch {
+          row.bodyUnavailable = 'Firefox ended the response stream during capture'
+          this.detach(pending)
+          return
+        }
+        if (this.current(browserTabId) !== capture) {
           this.detach(pending)
           return
         }
@@ -163,7 +170,7 @@ export class FirefoxNetwork {
       stream.onstop = () => {
         try {
           if (
-            this.current(details) === capture &&
+            this.current(browserTabId) === capture &&
             (!row.contentType ||
               /^(text\/|application\/(?:[\w.+-]*json|[\w.+-]*xml|javascript|x-www-form-urlencoded))/i.test(
                 row.contentType,
@@ -200,7 +207,7 @@ export class FirefoxNetwork {
 
   private headers(details: FirefoxWebRequestDetails): void {
     const pending = this.pending.get(details.requestId)
-    if (!pending || this.current(details) !== pending.capture) return
+    if (!pending || this.current(details.tabId) !== pending.capture) return
     pending.row.status = details.statusCode
     pending.row.contentType = details.responseHeaders?.find((header) => {
       return header.name.toLowerCase() === 'content-type'
@@ -210,7 +217,7 @@ export class FirefoxNetwork {
   private complete(details: FirefoxWebRequestDetails): void {
     const pending = this.pending.get(details.requestId)
     if (!pending) return
-    if (this.current(details) === pending.capture) {
+    if (this.current(details.tabId) === pending.capture) {
       pending.row.status = details.statusCode ?? pending.row.status
       pending.row.error = details.error
       pending.row.durationMs = Math.max(0, details.timeStamp - pending.row.startedAt)
@@ -220,7 +227,12 @@ export class FirefoxNetwork {
 
   private detach(pending: PendingRequest): void {
     try {
-      pending.stream?.disconnect()
+      if (pending.stream) {
+        pending.stream.ondata = null
+        pending.stream.onstop = null
+        pending.stream.onerror = null
+        pending.stream.disconnect()
+      }
     } catch {
       /* Already closed by Firefox. */
     }
