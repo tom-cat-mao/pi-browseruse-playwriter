@@ -36,7 +36,7 @@ flowchart LR
 - `BrowserTab` / candidate 追加可选 `browserTabId`；group 可追加 `browserGroupId`。现有必填 `chromeTabId` 保留，Firefox 使用明确的不可用标记 -1，同时提供真实 browserTabId；不得把它当有效 Chrome ID。ready Chrome 的 CDP 校验不变；ready Firefox 必须有匹配的真实 browserTabId，且不能伪造 targetId/cdpSessionId。
 - 老 candidate 格式与 builder 保留。新增 Firefox candidate 前缀和统一解析 helper，把 profile + epoch + 真实 browserTabId 一起固定；不能按 URL、标题或数组位置关联。
 - `BrowserDomRequest` / `BrowserDomCommand` 在共享协议中定义，使用独立 `browserDomRequest` 内部消息。请求包含 requestId/sessionId/tabId/browserEpoch，command 为受控命令和序列化 locator 描述；不得由 execute 提供另一个 session 或 tab。
-- 浏览器返回值统一转为 BrowserJson。扩展返回 images；本地 runtime 负责相对 cwd 的文件保存与 artifact，扩展不能访问本地文件系统。
+- 浏览器返回值统一转为 BrowserJson。扩展返回 images；本地 runtime 验证绝对 path 后负责文件保存与 artifact（与现有 Chrome 一致），扩展不能访问本地文件系统。
 - 所有新增运行时 parser 都做字段、范围和大小验证；拒绝未知或不支持的操作。不得削弱 Chrome 的旧校验来接受 Firefox 数据。
 
 ## 目标功能与差异
