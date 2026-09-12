@@ -105,9 +105,12 @@ v4 UUID（`getRandomValues` 不受安全上下文限制，且跨文档/调用者
 
 - 输入类命令的真实语义与效果：`fill`/`type`/`press`/`check`/`uncheck`/`setChecked`/
   `selectOption`/`hover`/`focus`/`blur`（代码层 realm 与原语选择正确，未实测）。
-- iframe/frame 相关：`frameLocator`、role/ref 在 iframe 内定位、frame 内点击
-  （`getBoxQuads` 路径）。
+- iframe/frame 相关：frame 读已通过；`frameLocator` 与 frame 内 fill/click 已由
+  [firefox-frame-shadow-console-fix.md](firefox-frame-shadow-console-fix.md) 增加无
+  `getBoxQuads` 的严格路径，**待实机复验**（普通 iframe、带边框/内边距、遮挡、变换拒绝）。
 - 真实页面的隐藏/aria-hidden/inert 子树过滤（0.0.136 仅覆盖 JSDOM 语义）。
+- 复合跨 shadow CSS（如 `#shadow-host input`）：链式 locator 的根 shadow 遍历已修，
+  复合 CSS 仍不支持；其超时需要与验收 client/request 同 5000ms 截止区分后再定性。
 - 截图 `labels`、logs、network 等（多数属其他 owner 的文件）。
 - **非可信 HTTP 页面**的 driver 初始化（P1 的定级依据）。注意反例必须是**非可能可信
   origin**：`127.0.0.1`/`localhost`/`*.localhost` 本身是潜在可信 origin（安全上下文），
@@ -120,10 +123,17 @@ v4 UUID（`getRandomValues` 不受安全上下文限制，且跨文档/调用者
 - closed shadow DOM 不可读；跨源 iframe 走扩展 frame 身份；`about:`/特权页/受限域不可控。
 - snapshot 是 DOM/ARIA 而非 Chrome 原生 AX 树，隐藏节点与名称可能有差异。
 - evaluate 需 Firefox 153+ 与可选 userScripts 权限；ref 不可跨执行世界。
-- frame 检查依赖 `getBoxQuads`：已核对 Gecko `dom/webidl/GeometryUtils.webidl` 中
-  `getBoxQuads` 为 `[Throws, Func="nsINode::HasBoxQuadsSupport", NeedsCallerType]`，
-  **非** `ChromeOnly`、**非** Pref 门控，内容脚本可见；缺失或非轴对齐时给出明确
-  `unsupported-capability`。
+- frame 检查曾依赖 `getBoxQuads`。**更正（2026-09-12 实机基线）**：本条原有结论“非 Pref
+  门控、内容脚本可见”是**错的**，当时只读了 WebIDL 的 `Func=` 注解，没有追 C++ 实现。
+  `nsINode::HasBoxQuadsSupport` 实为
+  `xpc::AccessCheck::isChrome(js::GetContextCompartment(aCx)) ||
+  StaticPrefs::layout_css_getBoxQuads_enabled()`（`dom/base/nsINode.cpp:3995-3998`），
+  且 `layout.css.getBoxQuads.enabled` 默认 `false`
+  （`modules/libpref/init/StaticPrefList.yaml`）。内容脚本不是 chrome，因此**stock Firefox
+  上 `Element.getBoxQuads` 不存在**，实机基线证实所有 frame 动作被
+  `unsupported-capability` 拒绝。已改为：有 `getBoxQuads` 时保留原校验；缺失时用严格
+  可证明的 client rect/border/padding 计算 content quad，详见
+  [firefox-frame-shadow-console-fix.md](firefox-frame-shadow-console-fix.md)。
 
 ## 逐类核对：未发现其它已确认问题
 
