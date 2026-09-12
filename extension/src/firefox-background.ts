@@ -1380,7 +1380,13 @@ class FirefoxBackground {
     }
     if (!isFirefoxRecord(result.data)) throw new Error('Firefox content script result has no data')
     const data = result.data as BrowserResultData
-    return { ...data, pageInfo: data.pageInfo ?? { tabId: tab.tabId, url: tab.url, title: tab.title } }
+    const current = await this.resolve({
+      sessionId: request.sessionId,
+      tabId: request.tabId,
+      browserEpoch: request.browserEpoch,
+      context,
+    })
+    return { ...data, pageInfo: { tabId: current.tabId, url: current.url, title: current.title } }
   }
 
   private async routeFrame(options: {
