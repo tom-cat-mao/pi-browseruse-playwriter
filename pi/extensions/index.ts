@@ -1434,12 +1434,13 @@ export default function (pi: ExtensionAPI) {
       "Escape hatch: run a Playwright snippet against a managed tab in the runtime's Node sandbox. Scope is fixed to the " +
       "requested tab (its `page`); there is no newPage/close/context escape. Each call is independent: you may keep plain " +
       "data or ids in variables you return, but page/locator/CDP handles cannot be reused across calls — re-acquire them " +
-      "each time. Await every action to completion and leave no background timers running. keyboard/mouse/touchscreen input " +
-      "is not supported right now. Firefox profiles expose a DOM-compatible subset; unsupported APIs fail explicitly. " +
+      "each time. Await every action to completion and leave no background timers running. Chrome does not expose raw " +
+      "keyboard/mouse/touchscreen objects. Firefox supports DOM-only page.keyboard.press/type on the focused element; " +
+      "other APIs are limited to its documented DOM-compatible subset and fail explicitly when unsupported. " +
       "Errors and output are returned verbatim. Optional timeout in ms (runtime caps it at 120s).",
     promptSnippet: "Run a Playwright snippet against a managed tab (escape hatch)",
     promptGuidelines: [
-      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Do not rely on page/locator/CDP objects surviving between calls (re-acquire them); await all actions and leave no background timers; keyboard/mouse/touchscreen input is unsupported for now. Never call browser.close()/context.close(); close tabs via browser_tabs.",
+      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Do not rely on page/locator/CDP objects surviving between calls (re-acquire them); await all actions and leave no background timers; Chrome does not expose keyboard/mouse/touchscreen objects; Firefox page.keyboard.press/type dispatch DOM input to :focus, while native input and other raw keyboard methods remain unsupported. Never call browser.close()/context.close(); close tabs via browser_tabs.",
       "browser_execute conservatively invalidates the latest browser_snapshot (it may have changed the page): take a fresh snapshot before the next ref-based browser_click/browser_fill. Its returned value and the page logs it produced are reported in the tool result.",
     ],
     parameters: Type.Object({
