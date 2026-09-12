@@ -9,6 +9,8 @@ runtime、协议、manifest/版本与构建脚本不属本 owner；仅只读核�
 **定级口径**（本文严格区分，避免把未实测当缺陷）：
 
 - **已实测缺陷**：真实 Firefox 上复现或已修复并有实机证据。
+- **基线对照失败 + 高置信根因**：在真实不可信 origin 上已观测到相关失败，根因有实现级
+  证据；未取得精确内容脚本堆栈，修复实机待验。
 - **代码风险**：有代码/实现级证据，但未在真实环境复现；需实机基线确认或否定。
 - **待实机验证**：功能尚未在真实浏览器跑过，本身不是缺陷，只是覆盖缺口。
 - **平台已声明限制**：已知且文档化的边界，不作为缺陷。
@@ -17,8 +19,12 @@ runtime、协议、manifest/版本与构建脚本不属本 owner；仅只读核�
 
 - 已实测：0.0.136 基线场景（建组、创建标签、snapshot、screenshot、`page.title`
   execute、release）在真实 Firefox 155.0.1 PASS（用户）。
-- 代码风险：1 条（`crypto.randomUUID` 的安全上下文暴露）。有实现级证据支持，但**未实测**，
-  等待真实非可信 HTTP 基线；按上面的口径，**不列为“已确认缺陷”**。
+- 基线对照失败 + 高置信根因：1 条（`crypto.randomUUID` 的安全上下文暴露）。独立基线
+  已在**不可信 origin**（`http://localtest.me:<loopback fixture port>`）拿到失败对照：
+  页面自身 `isSecureContext=false`、`crypto.randomUUID=undefined`，且该页面的
+  snapshot/locator 进 driver 失败（`content script returned invalid result`）；同
+  fixture 在 `127.0.0.1`（潜在可信 origin）正常。根因有 Gecko 实现级证据，但**未取得
+  精确内容脚本堆栈**。修复**实机待验**（并入集成后用新版闭环）。
 - 未发现其它已确认问题。
 - 未修的其余项仅为低频代码风险，或属待实机验证的覆盖缺口，或平台已声明限制。
 
@@ -26,7 +32,7 @@ runtime、协议、manifest/版本与构建脚本不属本 owner；仅只读核�
 
 无。
 
-## P1——代码风险（实现级证据，等待真实 HTTP 基线；未实测）
+## P1——基线对照失败 + 高置信根因（修复实机待验）
 
 ### `crypto.randomUUID` 的 `[SecureContext]` 暴露依赖调用者/对象 realm
 
@@ -34,6 +40,17 @@ runtime、协议、manifest/版本与构建脚本不属本 owner；仅只读核�
 document/snapshot/prepared-action id（修复前 `firefox-dom.ts:196/476/744`）。若在普通
 `http:` 页面上该成员不可见，driver 顶层构造会抛错，`globalThis.__piFirefoxDom` 为空，
 attach 探针与所有 DOM 工具对该标签失败。
+
+**独立基线对照（owner 13，只读观测）**：
+
+- 对照页：`http://localtest.me:<本机 loopback fixture port>`（`localtest.me` 解析到
+  loopback，但 origin 不是潜在可信 origin，因此不是安全上下文）。
+- 页内独立读数：`isSecureContext=false`、`crypto.randomUUID=undefined`。
+- 该页 `snapshot`/`locator` 进 driver 失败，报 `content script returned invalid result`。
+- 对照组：同一 fixture 在 `127.0.0.1` 可用（`127.0.0.1` 是潜在可信 origin）。
+- 结论口径：这是**实际不可信 origin 的失败对照 + 高置信根因**，不是“仅规范推断”。
+  未取得内容脚本精确堆栈（也不声称有）。
+
 
 **为什么不能只靠规范断言“http 一定失败”**：WebCrypto 规范只说明 `randomUUID()` 标注
 `[SecureContext]`（`getRandomValues()` 没有），它只直接证明**普通页面 realm** 的暴露规则，
@@ -74,19 +91,20 @@ attach 探针与所有 DOM 工具对该标签失败。
 
 **据此的推断**：内容脚本在普通 http 页面上访问页面 `crypto.randomUUID` 时，
 调用者 realm（sandbox，非安全）与对象 realm（页面，非安全）都为 false ⇒ **不暴露**；
-在 https 页面上对象 realm 为安全 ⇒ 暴露，与用户实机 https PASS 一致。
+在 https 页面上对象 realm 为安全 ⇒ 暴露，与用户实机 https PASS 一致。上面的独立基线
+对照为该推断提供了实际失败证据。
 
-**残余不确定性（因此只定级为代码风险）**：
+**仍未闭合的部分**：
 
-- 上述第 4 点由源码推断，未在真实非可信 HTTP 页面上观测。
+- 未取得内容脚本精确堆栈，因此“driver 初始化抛错”与“内容脚本 returned invalid result”
+  之间的精确因果链属**高置信推断**，不是逐帧堆栈证据。
 - 未排除某些 Firefox 版本/路径以其他方式把扩展内容脚本 sandbox 标为安全上下文。
-- 因此结论是“高置信代码风险，等待真实 HTTP 基线”，不是“已确认缺陷”。
 
 **修复与当前状态**：修改为用 `view.crypto.getRandomValues(new Uint8Array(16))` 生成
 v4 UUID（`getRandomValues` 不受安全上下文限制，且跨文档/调用者语义一致）。该改法在
 “randomUUID 可用”与“不可用”两种结论下都正确：可用时仅换一种取随机数方式，不可用时
-才真正避免初始化失败。**尚未集成、未在真实 HTTP 复验**；若基线证明 `randomUUID` 实际可用，
-此改动可按需回退（无行为损失）。
+才真正避免初始化失败。**修复已具备失败对照，纳入集成后用新版实机复验闭环**；若复验
+证明原 `randomUUID` 路径本可用，此改动可按需回退（无行为损失）。
 
 ## P2——未修的代码风险（低频/边界，均未实测为缺陷）
 
@@ -112,9 +130,12 @@ v4 UUID（`getRandomValues` 不受安全上下文限制，且跨文档/调用者
 - 复合跨 shadow CSS（如 `#shadow-host input`）：链式 locator 的根 shadow 遍历已修，
   复合 CSS 仍不支持；其超时需要与验收 client/request 同 5000ms 截止区分后再定性。
 - 截图 `labels`、logs、network 等（多数属其他 owner 的文件）。
-- **非可信 HTTP 页面**的 driver 初始化（P1 的定级依据）。注意反例必须是**非可能可信
+- **非可信 HTTP 页面**的 driver 初始化：独立基线已用
+  `http://localtest.me:<loopback fixture port>`（非潜在可信 origin，页面自身
+  `isSecureContext=false`、`crypto.randomUUID=undefined`）取得失败对照，`127.0.0.1`
+  对照正常。剩余为**并入 crypto 修复后用新版实机复验闭环**。注意反例必须是**非可能可信
   origin**：`127.0.0.1`/`localhost`/`*.localhost` 本身是潜在可信 origin（安全上下文），
-  不能用作 http 反例；应使用如局域网 IP 的 `http://<lan-ip>/` 或公网明文 HTTP 主机。
+  不能用作 http 反例。
 
 ## 平台已声明限制（非缺陷，不回退）
 
@@ -180,11 +201,12 @@ v4 UUID（`getRandomValues` 不受安全上下文限制，且跨文档/调用者
 
 ## 需实机复验场景（优先级排序）
 
-1. **P1（最高优先）**：加载含本修复的构建，attach 一个**非可能可信**的明文 HTTP 页面
-   （如 `http://<lan-ip>/` 或公网 http 主机；不要用 127.0.0.1/localhost），观察
-   `snapshot`/driver 是否初始化成功。同时（在修复前后的构建上）读取
-   `'randomUUID' in pageWindow.crypto` 与 `pageWindow.isSecureContext` 作为直接证据；
-   这能一次定论 P1。
+1. **P1 闭环（最高优先）**：加载含 crypto 修复的新构建，在已取得失败对照的
+   `http://localtest.me:<loopback fixture port>` 上复验 `snapshot`/`locator` 进入 driver
+   成功；同时保留 `127.0.0.1` 正向对照与页面 `isSecureContext`/`crypto.randomUUID`
+   读数作为前后证据。
 2. `fill`/`type`/`press`/`check`/`selectOption`/`hover` 的真实事件语义与效果。
-3. iframe 内 role/ref、`frameLocator`、frame 内点击（`getBoxQuads` 路径）。
+3. iframe/frame：`frameLocator` 与 frame 内 fill/click 的无 `getBoxQuads` 严格路径
+   （普通 iframe、带边框/内边距、遮挡仍拒绝、变换/缩放/zoom 拒绝）。
 4. 真实页面隐藏/aria-hidden/inert 过滤，以及折叠 `<details>` 内容是否进入 snapshot。
+5. 链式 locator 进入根 open shadow root；复合跨 shadow CSS 的超时与 5000ms 截止的关系。

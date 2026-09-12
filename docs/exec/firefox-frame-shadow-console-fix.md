@@ -91,14 +91,26 @@ JSDOM 无法复现跨 compartment 权限错误，且不为它伪造浏览器 API
 
 ### 修复
 
-两处都补上 root 自身 open shadow root 的遍历。未实现跨 shadow 的复合 CSS 解析器；
-`#shadow-host input` 这类单条复合选择器仍不跨 shadow，其超时需先与验收 client/request
-同为 5000ms 截止区分，暂不判为完整 bug。
+两处都补上 root 自身 open shadow root 的遍历。
+
+### 边界（不要把链式修好等同全 CSS 穿透）
+
+- 本次只修“**scope 根元素自身**的 open shadow root 遍历”，即
+  `page.locator('#shadow-host').locator('input')` 这类**链式**写法。
+- **单条复合 CSS 选择器跨 shadow 边界仍不支持**：`page.locator('#shadow-host input')`
+  （或 `page.click('#shadow-host input')`）不会因为本修复而工作，因为 `querySelectorAll`
+  本身不跨 shadow 边界，而我们**没有**实现跨 shadow 的复合选择器解析器（用户明确要求
+  不为此写大解析器）。跨 shadow 定位应使用链式 locator（显式作用域）或 role/label/text 等
+  会遍历 composed 树的引擎。
+- 该复合 CSS 在验收基线上表现为 5000ms 超时：这是“等待未命中元素直到请求截止”的既有
+  行为，而不是本修复的目标；其超时是否只是验收 client 与 DOM request 同为 5000ms 截止
+  所致，需由 runtime/验收 client owner 区分后再定性，本文不判为完整 bug。
+- 模型侧 capability 的全局 `limitations` 文案由协调者统一补充，本文只记录实现边界。
 
 ### 回归
 
 新增 1 例：链式 CSS 与链式 role locator 均能命中 root 自身 open shadow root 内的元素
-（修复前为 0 匹配）。
+（修复前为 0 匹配）。该用例只覆盖链式写法，不覆盖也不声称覆盖复合跨 shadow CSS。
 
 ## 验证
 
