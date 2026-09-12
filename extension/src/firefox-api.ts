@@ -76,6 +76,11 @@ export interface FirefoxApi {
     onStartup: FirefoxEvent<() => void>
   }
   storage: { local: FirefoxStorageArea; session: FirefoxStorageArea }
+  alarms: {
+    get(name: string): Promise<{ name: string } | undefined>
+    create(name: string, schedule: { delayInMinutes: number; periodInMinutes: number }): Promise<void>
+    onAlarm: FirefoxEvent<(alarm: { name: string }) => void>
+  }
   tabs: {
     query(query: { windowId?: number; active?: boolean; currentWindow?: boolean }): Promise<FirefoxTab[]>
     get(tabId: number): Promise<FirefoxTab>

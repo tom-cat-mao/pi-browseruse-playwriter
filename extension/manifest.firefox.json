@@ -10,6 +10,7 @@
     }
   },
   "permissions": [
+    "alarms",
     "tabs",
     "tabGroups",
     "scripting",

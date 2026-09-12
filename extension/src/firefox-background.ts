@@ -51,6 +51,7 @@ const HOST = RAW_HOST === '::1' ? '[::1]' : RAW_HOST
 const PORT = Number(process.env.PI_BROWSER_PORT) || BROWSER_RUNTIME_PORT
 const REQUEST_TIMEOUT = 30000
 const DOM_TIMEOUT = 5000
+const RECONNECT_ALARM = 'pi-firefox-runtime-reconnect'
 
 interface FirefoxDomGlobal {
   __piFirefoxDom?: {
@@ -87,6 +88,7 @@ class FirefoxBackground {
   private readonly active = new Map<string, ActiveRequest>()
   private readonly revoked = new Set<number>()
   private readonly network: FirefoxNetwork
+  private readonly initialized: Promise<void>
   private socket: WebSocket | null = null
   private unavailable?: string
   private reconnectTimer?: ReturnType<typeof setTimeout>
@@ -105,9 +107,11 @@ class FirefoxBackground {
           : undefined
       },
     })
+    this.bindEvents()
+    this.initialized = this.initialize()
   }
 
-  async start(): Promise<void> {
+  private async initialize(): Promise<void> {
     if (!['127.0.0.1', 'localhost', '[::1]'].includes(HOST) || !Number.isSafeInteger(PORT) || PORT < 1 || PORT > 65535)
       throw new Error('Firefox runtime endpoint must be a valid loopback host and port')
     const profileStored = await this.api.storage.local.get(PROFILE_KEY)
@@ -135,11 +139,34 @@ class FirefoxBackground {
     this.token = typeof tokenStored.piBrowserToken === 'string' ? tokenStored.piBrowserToken : undefined
     this.browserName = (await this.api.runtime.getBrowserInfo()).name || 'Firefox'
     await this.updateCapabilities()
+    if (!(await this.api.alarms.get(RECONNECT_ALARM))) {
+      await this.api.alarms.create(RECONNECT_ALARM, { delayInMinutes: 1, periodInMinutes: 1 })
+    }
+  }
+
+  async start(): Promise<void> {
+    await this.initialized
+    await this.connect()
+    for (const tab of this.registry.tabs) {
+      if (tab.state !== 'ready') continue
+      this.event(async () => {
+        const current = activeFirefoxTab({ registry: this.registry, browserTabId: tab.browserTabId! })
+        if (!current || this.revoked.has(tab.browserTabId!)) return
+        await this.badge({ tab: current, controlled: true })
+      })
+    }
+  }
+
+  private bindEvents(): void {
     this.api.permissions.onAdded.addListener(() => {
-      void this.updateCapabilities()
+      this.event(() => {
+        return this.updateCapabilities()
+      })
     })
     this.api.permissions.onRemoved.addListener(() => {
-      void this.updateCapabilities()
+      this.event(() => {
+        return this.updateCapabilities()
+      })
     })
     this.api.runtime.onMessage.addListener((message, sender) => {
       if (
@@ -155,6 +182,7 @@ class FirefoxBackground {
       this.revoked.add(browserTabId)
       return this.queue.run('resources', async () => {
         try {
+          await this.initialized
           const tab = activeFirefoxTab({ registry: this.registry, browserTabId })
           if (!tab) {
             this.revoked.delete(browserTabId)
@@ -173,20 +201,30 @@ class FirefoxBackground {
       })
     })
     this.api.tabs.onUpdated.addListener((id, change, tab) => {
-      const owned = activeFirefoxTab({ registry: this.registry, browserTabId: id })
-      if (!owned) return
-      const group = this.registry.groups.find((candidate) => {
-        return candidate.groupId === owned.groupId
-      })
-      if (
-        change.groupId !== undefined &&
-        group?.browserGroupId !== undefined &&
-        change.groupId !== group.browserGroupId
-      )
-        this.revoked.add(id)
+      if (this.registry) {
+        const owned = activeFirefoxTab({ registry: this.registry, browserTabId: id })
+        const group = this.registry.groups.find((candidate) => {
+          return candidate.groupId === owned?.groupId
+        })
+        if (
+          change.groupId !== undefined &&
+          group?.browserGroupId !== undefined &&
+          change.groupId !== group.browserGroupId
+        )
+          this.revoked.add(id)
+      }
       this.event(async () => {
         const current = activeFirefoxTab({ registry: this.registry, browserTabId: id })
         if (!current) return
+        const group = this.registry.groups.find((candidate) => {
+          return candidate.groupId === current.groupId
+        })
+        if (
+          change.groupId !== undefined &&
+          group?.browserGroupId !== undefined &&
+          change.groupId !== group.browserGroupId
+        )
+          this.revoked.add(id)
         if (this.revoked.has(id)) {
           await this.release({ tabs: [current] })
           return
@@ -215,33 +253,46 @@ class FirefoxBackground {
       })
     })
     this.api.action.onClicked.addListener((tab) => {
-      if (tab.id === undefined) return
-      const owned = activeFirefoxTab({ registry: this.registry, browserTabId: tab.id })
-      if (!owned) {
-        void this.connect()
-        return
-      }
-      this.revoked.add(tab.id)
-      this.event(() => {
-        return this.release({ tabs: [owned] })
+      const browserTabId = tab.id
+      if (browserTabId === undefined) return
+      if (this.registry && activeFirefoxTab({ registry: this.registry, browserTabId })) this.revoked.add(browserTabId)
+      this.event(async () => {
+        const owned = activeFirefoxTab({ registry: this.registry, browserTabId })
+        if (!owned) {
+          await this.connect()
+          return
+        }
+        this.revoked.add(browserTabId)
+        await this.release({ tabs: [owned] })
       })
     })
-    for (const tab of this.registry.tabs) {
-      if (tab.state === 'ready') {
-        await this.badge({ tab, controlled: true })
-        if (firefoxPageSupported(tab.url))
-          await this.inject({ tab }).catch((error: unknown) => {
-            console.warn('Firefox page instrumentation unavailable:', String(error))
-          })
-      }
-    }
-    await this.connect()
+    this.api.runtime.onStartup.addListener(() => {
+      this.wakeConnection()
+    })
+    this.api.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === RECONNECT_ALARM) this.wakeConnection()
+    })
+  }
+
+  private wakeConnection(): void {
+    void this.initialized
+      .then(() => {
+        return this.connect()
+      })
+      .catch((error: unknown) => {
+        console.error('Firefox runtime wakeup failed:', error instanceof Error ? error.message : String(error))
+      })
   }
 
   private event(task: () => Promise<void>): void {
-    void this.queue.run('resources', task).catch((error: unknown) => {
-      console.error('Firefox resource event failed:', String(error))
-    })
+    void this.queue
+      .run('resources', async () => {
+        await this.initialized
+        await task()
+      })
+      .catch((error: unknown) => {
+        console.error('Firefox resource event failed:', String(error))
+      })
   }
 
   private async commit(next: FirefoxRegistry): Promise<void> {
