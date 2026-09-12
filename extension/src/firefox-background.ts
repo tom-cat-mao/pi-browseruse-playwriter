@@ -75,6 +75,25 @@ interface RequestContext {
   frameId?: number
 }
 
+interface FrameAncestor {
+  parentFrameId: number
+  childFrameId: number
+  locator: BrowserDomLocator
+}
+
+const FRAME_ACTIONS = new Set([
+  'click',
+  'dblclick',
+  'fill',
+  'type',
+  'press',
+  'check',
+  'uncheck',
+  'setChecked',
+  'selectOption',
+  'hover',
+])
+
 interface ActiveRequest {
   context: RequestContext
   fingerprint: string
@@ -1324,7 +1343,10 @@ class FirefoxBackground {
     await this.inject({ tab })
     this.assertContinue(context)
     const routed = await this.routeFrame({ request, tab, context })
-    const command = routed.request.command
+    let command = routed.request.command
+    if (routed.ancestors.length > 0 && command.method === 'locator' && FRAME_ACTIONS.has(command.action)) {
+      command = await this.prepareFrameAction({ ...routed, command, tab, context })
+    }
     context.frameId = routed.frameId
     if (
       !['snapshot', 'page', 'logs', 'screenshot.prepare', 'screenshot.cleanup', 'invalidate', 'dispose'].includes(
@@ -1353,7 +1375,11 @@ class FirefoxBackground {
       )
     )
       context.started = true
-    const boundedRequest = { ...routed.request, timeoutMs: Math.min(request.timeoutMs ?? DOM_TIMEOUT, DOM_TIMEOUT) }
+    const boundedRequest = {
+      ...routed.request,
+      command,
+      timeoutMs: Math.min(request.timeoutMs ?? DOM_TIMEOUT, DOM_TIMEOUT),
+    }
     const values = await this.bounded({
       context,
       timeoutMs: boundedRequest.timeoutMs,
@@ -1393,7 +1419,8 @@ class FirefoxBackground {
     request: BrowserDomRequest
     tab: BrowserTab
     context: RequestContext
-  }): Promise<{ request: BrowserDomRequest; frameId: number }> {
+  }): Promise<{ request: BrowserDomRequest; frameId: number; ancestors: FrameAncestor[] }> {
+    const ancestors: FrameAncestor[] = []
     const command = options.request.command
     let locator: BrowserDomLocator | undefined =
       command.method === 'locator' || command.method === 'evaluate' ? command.locator : undefined
@@ -1459,14 +1486,121 @@ class FirefoxBackground {
           code: 'resource-not-found',
           message: 'The selected iframe changed or is no longer part of this tab',
         })
+      ancestors.push({ parentFrameId: frameId, childFrameId, locator: prefix })
       frameId = childFrameId
       options.context.frameId = frameId
       await this.inject({ tab: options.tab, frameId })
       locator = { steps: locator.steps.slice(index + 1) }
     }
     if (!locator || (command.method !== 'locator' && command.method !== 'evaluate'))
-      return { request: options.request, frameId }
-    return { request: { ...options.request, command: { ...command, locator } }, frameId }
+      return { request: options.request, frameId, ancestors }
+    return { request: { ...options.request, command: { ...command, locator } }, frameId, ancestors }
+  }
+
+  private async frameCommand(options: {
+    request: BrowserDomRequest
+    frameId: number
+    context: RequestContext
+    command: BrowserDomCommand
+  }): Promise<BrowserResultData> {
+    const tab = ownedFirefoxTab({
+      registry: this.registry,
+      sessionId: options.request.sessionId,
+      tabId: options.request.tabId,
+      browserEpoch: options.request.browserEpoch,
+    })
+    options.context.frameId = options.frameId
+    this.assertContinue(options.context)
+    const request = { ...options.request, command: options.command, timeoutMs: DOM_TIMEOUT }
+    const values = await this.bounded({
+      context: options.context,
+      timeoutMs: DOM_TIMEOUT,
+      promise: this.script({ browserTabId: tab.browserTabId!, frameId: options.frameId, request }),
+    })
+    this.assertContinue(options.context)
+    const response = values[0]
+    if (!isFirefoxRecord(response) || response.requestId !== request.requestId || typeof response.ok !== 'boolean')
+      throw new Error('Firefox frame command returned an invalid response')
+    if (!response.ok) {
+      const failed = response as unknown as Extract<BrowserResponse, { ok: false }>
+      if (!failed.error || typeof failed.error.message !== 'string')
+        throw new Error('Firefox frame command returned an invalid error')
+      throw new FirefoxResourceError(failed.error)
+    }
+    if (!isFirefoxRecord(response.data)) throw new Error('Firefox frame command returned no data')
+    return response.data as BrowserResultData
+  }
+
+  private async prepareFrameAction(options: {
+    request: BrowserDomRequest
+    frameId: number
+    ancestors: FrameAncestor[]
+    command: Extract<BrowserDomCommand, { method: 'locator' }>
+    tab: BrowserTab
+    context: RequestContext
+  }): Promise<Extract<BrowserDomCommand, { method: 'locator' }>> {
+    options.context.started = true
+    const prepared = await this.frameCommand({
+      ...options,
+      command: {
+        method: 'frame.actionPoint',
+        locator: options.command.locator,
+        action: options.command.action,
+        args: options.command.args,
+      },
+    })
+    const value = prepared.value
+    if (
+      !isFirefoxRecord(value) ||
+      !isFirefoxRecord(value.point) ||
+      !Number.isFinite(value.point.x) ||
+      !Number.isFinite(value.point.y) ||
+      typeof value.preparationId !== 'string' ||
+      !value.preparationId
+    )
+      throw new Error('Firefox could not prepare a stable action point in this child frame')
+    const originalPoint = { x: Number(value.point.x), y: Number(value.point.y) }
+    let point = originalPoint
+    options.context.started = true
+    try {
+      for (let index = options.ancestors.length - 1; index >= 0; index -= 1) {
+        const ancestor = options.ancestors[index]
+        const checked = await this.frameCommand({
+          ...options,
+          frameId: ancestor.parentFrameId,
+          command: { method: 'frame.check', locator: ancestor.locator, point },
+        })
+        const mapped = checked.value
+        if (
+          !isFirefoxRecord(mapped) ||
+          mapped.frameId !== ancestor.childFrameId ||
+          !Number.isFinite(mapped.x) ||
+          !Number.isFinite(mapped.y)
+        )
+          throw new FirefoxResourceError({
+            code: 'resource-not-found',
+            message: 'The ancestor iframe changed during actionability checks',
+          })
+        const actual = await this.api.webNavigation.getFrame({
+          tabId: options.tab.browserTabId!,
+          frameId: ancestor.childFrameId,
+        })
+        this.assertContinue(options.context)
+        if (!actual || actual.parentFrameId !== ancestor.parentFrameId || actual.errorOccurred)
+          throw new FirefoxResourceError({
+            code: 'resource-not-found',
+            message: 'The action target is no longer inside the verified ancestor frame',
+          })
+        point = { x: Number(mapped.x), y: Number(mapped.y) }
+      }
+    } catch (error) {
+      if (error instanceof FirefoxResourceError)
+        throw new FirefoxResourceError({ code: error.code, message: error.message, outcome: 'unknown' })
+      throw error
+    }
+    options.context.frameId = options.frameId
+    this.assertContinue(options.context)
+    return { ...options.command, expectedPoint: originalPoint, preparationId: value.preparationId }
   }
 
   private async script(options: {
