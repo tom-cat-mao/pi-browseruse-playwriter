@@ -520,6 +520,8 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     resolve: () => Element[]
     actionable?: boolean
     editable?: boolean
+    enabled?: boolean
+    retargetControl?: boolean
     force?: boolean
   }): Promise<Element> => {
     let lastError: unknown
@@ -531,8 +533,9 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
         try {
           if (options.actionable)
             assertActionable({
-              element: controlForElement(elements[0]),
+              element: options.retargetControl ? controlForElement(elements[0]) : elements[0],
               editable: options.editable,
+              enabled: options.enabled,
               force: options.force,
             })
           return elements[0]
@@ -609,14 +612,19 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     if (settings.timeout && settings.timeout > 0)
       execution.deadline = Math.min(execution.deadline, Date.now() + settings.timeout)
     const mutating = !READ_ACTIONS.has(action)
+    const retargetControl = !['click', 'dblclick', 'hover', 'scrollIntoViewIfNeeded'].includes(action)
+    const requiresEnabled = !['hover', 'scrollIntoViewIfNeeded', 'focus', 'blur'].includes(action)
     const element = await waitElement({
       execution,
       resolve,
       actionable: mutating && action !== 'blur',
       editable: action === 'fill' || action === 'type',
+      enabled: requiresEnabled,
+      retargetControl,
       force: settings.force,
     })
     const control = controlForElement(element)
+    const actionElement = retargetControl ? control : element
     if (action === 'textContent') return { value: element.textContent }
     if (action === 'innerText') return { value: (element as HTMLElement).innerText ?? element.textContent ?? '' }
     if (action === 'innerHTML') return { value: element.innerHTML }
@@ -637,13 +645,13 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     }
     startAction(execution)
     if (!['focus', 'blur'].includes(action)) {
-      control.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+      actionElement.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
       checkActive(execution)
       if (!settings.force && ['click', 'dblclick', 'check', 'uncheck', 'setChecked', 'hover'].includes(action)) {
-        let previous = control.getBoundingClientRect()
+        let previous = actionElement.getBoundingClientRect()
         while (true) {
           await pause({ execution, delay: 20 })
-          const current = control.getBoundingClientRect()
+          const current = actionElement.getBoundingClientRect()
           if (
             current.x === previous.x &&
             current.y === previous.y &&
@@ -655,8 +663,9 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
         }
       }
       assertActionable({
-        element: control,
+        element: actionElement,
         editable: action === 'fill' || action === 'type',
+        enabled: requiresEnabled,
         receivesEvents: ['click', 'dblclick', 'check', 'uncheck', 'setChecked', 'hover'].includes(action),
         force: settings.force,
       })

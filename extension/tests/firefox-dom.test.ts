@@ -369,6 +369,13 @@ describe('Firefox DOM input logic with real document fixtures', () => {
     clickElement({ element: element('#save') })
     expect(trusted).toBe(false)
   })
+
+  test('clicking a label retains native activation of its associated hidden checkbox', () => {
+    const checkbox = element('#notifications') as HTMLInputElement
+    checkbox.hidden = true
+    clickElement({ element: checkbox.parentElement! })
+    expect(checkbox.checked).toBe(true)
+  })
 })
 
 describe('Firefox DOM JSON response serialization', () => {

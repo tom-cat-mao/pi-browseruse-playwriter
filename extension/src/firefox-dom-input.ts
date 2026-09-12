@@ -21,12 +21,13 @@ function composedContains(options: { ancestor: Element; element: Element }): boo
 export function assertActionable(options: {
   element: Element
   editable?: boolean
+  enabled?: boolean
   receivesEvents?: boolean
   force?: boolean
 }): void {
   const { element } = options
   if (!element.isConnected) throw new FirefoxDomError({ message: 'The selected element is detached.' })
-  if (isDisabled(element))
+  if (options.enabled !== false && isDisabled(element))
     throw new FirefoxDomError({ message: 'The selected element is disabled or inside an inert subtree.' })
   if (options.editable && !isEditable(element))
     throw new FirefoxDomError({ message: 'The selected element is not editable.' })
@@ -34,6 +35,7 @@ export function assertActionable(options: {
     throw new FirefoxDomError({ message: 'The selected element is not visible.' })
   if (!options.receivesEvents || options.force) return
   let target = element
+  let point: { x: number; y: number } | undefined
   while (true) {
     const rect = target.getBoundingClientRect()
     const view = target.ownerDocument.defaultView
@@ -44,24 +46,27 @@ export function assertActionable(options: {
     const bottom = Math.min(rect.bottom, view.innerHeight)
     if (left >= right || top >= bottom)
       throw new FirefoxDomError({ message: 'The selected element is outside the viewport.' })
-    const x = (left + right) / 2
-    const y = (top + bottom) / 2
+    const x = point?.x ?? (left + right) / 2
+    const y = point?.y ?? (top + bottom) / 2
+    if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight)
+      throw new FirefoxDomError({ message: 'The selected element is outside an ancestor frame viewport.' })
     let hit = target.ownerDocument.elementFromPoint(x, y)
     while (hit?.shadowRoot) {
       const inner = hit.shadowRoot.elementFromPoint(x, y)
       if (!inner || inner === hit) break
       hit = inner
     }
-    if (
-      !hit ||
-      (!composedContains({ ancestor: target, element: hit }) && !composedContains({ ancestor: hit, element: target }))
-    ) {
+    if (!hit || !composedContains({ ancestor: target, element: hit })) {
       throw new FirefoxDomError({
         message: `The selected element is covered by ${hit ? `<${hit.localName}>` : 'another surface'}.`,
       })
     }
     const frame = view.frameElement
     if (!frame) break
+    const frameRect = frame.getBoundingClientRect()
+    const scaleX = frameRect.width / ((frame as HTMLElement).offsetWidth || frameRect.width)
+    const scaleY = frameRect.height / ((frame as HTMLElement).offsetHeight || frameRect.height)
+    point = { x: frameRect.left + (frame.clientLeft + x) * scaleX, y: frameRect.top + (frame.clientTop + y) * scaleY }
     target = frame
   }
 }
