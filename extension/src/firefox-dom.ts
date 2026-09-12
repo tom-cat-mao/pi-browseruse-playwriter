@@ -193,7 +193,17 @@ function actionOptions(options: { args: BrowserJson[]; index: number }): ActionO
 export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
   const view = document.defaultView
   if (!view) throw new FirefoxDomError({ message: 'The document has no active window.' })
-  const documentId = view.crypto.randomUUID()
+  const randomId = (): string => {
+    const bytes = new Uint8Array(16)
+    view.crypto.getRandomValues(bytes)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+    const hex = Array.from(bytes, (byte) => {
+      return byte.toString(16).padStart(2, '0')
+    }).join('')
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+  }
+  const documentId = randomId()
   const active = new Map<string, AbortController>()
   const cancelled = new Set<string>()
   const observers = new Map<Document | ShadowRoot, MutationObserver>()
@@ -473,7 +483,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     }
     if (count >= 20000 || lines.length >= MAX_SNAPSHOT_LINES || output.length < selected.length)
       output.push('[Snapshot truncated; narrow selector/search to inspect additional content.]')
-    snapshot = { id: `firefox:${documentId}:${view.crypto.randomUUID()}`, refs, url: document.URL }
+    snapshot = { id: `firefox:${documentId}:${randomId()}`, refs, url: document.URL }
     return {
       text: output.join('\n') || '(No matching accessible content.)',
       snapshotId: snapshot.id,
@@ -741,7 +751,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       })
     if (options.prepareOnly) {
       if (!point) throw new FirefoxDomError({ message: 'The Firefox frame action has no visible input point.' })
-      const preparationId = view.crypto.randomUUID()
+      const preparationId = randomId()
       for (const [id, record] of preparations) {
         if (record.expiresAt <= Date.now()) preparations.delete(id)
       }

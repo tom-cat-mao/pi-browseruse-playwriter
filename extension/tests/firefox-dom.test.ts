@@ -289,6 +289,17 @@ describe('Firefox DOM ARIA visibility from the element own document', () => {
 })
 
 describe('Firefox DOM snapshot lifetime and isolation', () => {
+  test('derives document and snapshot identities from page crypto without the secure-context-only randomUUID', async () => {
+    const shape =
+      /^firefox:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
+    const first = success(await driver.run(request({ method: 'snapshot' })))
+    const second = success(await driver.run(request({ method: 'snapshot' })))
+    expect(first.snapshotId).toMatch(shape)
+    expect(second.snapshotId).toMatch(shape)
+    expect(first.snapshotId).not.toBe(second.snapshotId)
+    expect(first.snapshotId!.split(':')[1]).toBe(second.snapshotId!.split(':')[1])
+  })
+
   test('snapshot refs have correct names and are invalidated after dynamic replacement', async () => {
     const first = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
     expect(first.text).toContain('button "Save profile"')
