@@ -312,4 +312,25 @@ describe('FirefoxExecutorPool real child process', () => {
     } finally { await pool.dispose() }
   })
 
+
+  test('keeps URL searchParams identity and mutations live in both directions', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    try {
+      const response = await pool.execute(execution({ id: 'url-params', peer, code: `
+        const address = new URL('https://example.test/?a=1');
+        const params = address.searchParams;
+        address.search = '?b=2';
+        params.set('c', '3');
+        const iterator = params.entries();
+        const first = iterator.next().value;
+        params.append('d', '4');
+        return { same: params === address.searchParams, href: address.href, first, rest: Array.from(iterator) };
+      ` }))
+      expect(response).toMatchObject({ ok: true, data: { value: {
+        same: true, href: 'https://example.test/?b=2&c=3&d=4', first: ['b', '2'], rest: [['c', '3'], ['d', '4']],
+      } } })
+    } finally { await pool.dispose() }
+  })
+
 })

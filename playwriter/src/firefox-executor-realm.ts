@@ -110,13 +110,14 @@ globalThis.__createFirefoxExecutorRealm = (bridge: Bridge): RealmController => {
   class RealmURLSearchParams {
     private value: string
     private changed?: (value: string) => void
+    private current?: () => string
     constructor(input: unknown = '') {
       const normalized = input instanceof RealmURLSearchParams ? input.toString() : input
       this.value = call({ kind: 'params', value: normalized, method: 'toString', args: [] }) as string
     }
-    bind(changed: (value: string) => void): void { this.changed = changed }
+    bind(options: { changed: (value: string) => void; current: () => string }): void { this.changed = options.changed; this.current = options.current }
     private invoke(options: { method: string; args: unknown[] }): unknown {
-      const response = call({ kind: 'params', value: this.value, ...options }) as { value: string; result: unknown }
+      const response = call({ kind: 'params', value: this.current?.() ?? this.value, ...options }) as { value: string; result: unknown }
       this.value = response.value
       if (['append', 'delete', 'set', 'sort'].includes(options.method)) this.changed?.(this.value)
       return response.result
@@ -128,10 +129,17 @@ globalThis.__createFirefoxExecutorRealm = (bridge: Bridge): RealmController => {
     getAll(name: string): string[] { return this.invoke({ method: 'getAll', args: [name] }) as string[] }
     has(...args: [name: string, value?: string]): boolean { return this.invoke({ method: 'has', args }) as boolean }
     sort(): void { this.invoke({ method: 'sort', args: [] }) }
-    toString(): string { return this.value }
-    entries(): IterableIterator<[string, string]> { return (this.invoke({ method: 'entries', args: [] }) as Array<[string, string]>)[Symbol.iterator]() }
-    keys(): IterableIterator<string> { return Array.from(this.entries(), (entry) => { return entry[0] })[Symbol.iterator]() }
-    values(): IterableIterator<string> { return Array.from(this.entries(), (entry) => { return entry[1] })[Symbol.iterator]() }
+    toString(): string { return call({ kind: 'params', value: this.current?.() ?? this.value, method: 'toString', args: [] }) as string }
+    *entries(): IterableIterator<[string, string]> {
+      let index = 0
+      while (true) {
+        const entries = this.invoke({ method: 'entries', args: [] }) as Array<[string, string]>
+        if (index >= entries.length) return
+        yield entries[index++]
+      }
+    }
+    *keys(): IterableIterator<string> { for (const [key] of this.entries()) yield key }
+    *values(): IterableIterator<string> { for (const [, value] of this.entries()) yield value }
     [Symbol.iterator](): IterableIterator<[string, string]> { return this.entries() }
     get size(): number { return Array.from(this.entries()).length }
     forEach(callback: (value: string, key: string, parent: RealmURLSearchParams) => void): void {
@@ -140,6 +148,7 @@ globalThis.__createFirefoxExecutorRealm = (bridge: Bridge): RealmController => {
   }
   class RealmURL {
     private fields: Record<string, string>
+    private params?: RealmURLSearchParams
     constructor(...args: [input: string, base?: string]) {
       this.fields = call({ kind: 'url', input: String(args[0]), base: args[1] === undefined ? undefined : String(args[1]) }) as Record<string, string>
     }
@@ -168,9 +177,9 @@ globalThis.__createFirefoxExecutorRealm = (bridge: Bridge): RealmController => {
     get password(): string { return this.fields.password }
     set password(value: string) { this.setField({ key: 'password', value: String(value) }) }
     get searchParams(): RealmURLSearchParams {
-      const params = new RealmURLSearchParams(this.fields.search)
-      params.bind((value) => { this.search = value })
-      return params
+      this.params ??= new RealmURLSearchParams(this.fields.search)
+      this.params.bind({ changed: (value) => { this.search = value }, current: () => { return this.fields.search } })
+      return this.params
     }
     toString(): string { return this.href }
     toJSON(): string { return this.href }
