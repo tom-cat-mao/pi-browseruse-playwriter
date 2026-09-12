@@ -5,13 +5,15 @@ import type {
   BrowserTab,
 } from 'playwriter/src/browser-protocol'
 import type { FirefoxApi, FirefoxResponseFilter, FirefoxWebRequestDetails } from './firefox-api'
+import { FirefoxNetworkBudget } from './firefox-network-budget'
+import type { FirefoxNetworkBody } from './firefox-network-budget'
 import { firefoxId } from './firefox-resources'
 
 const MAX_REQUESTS = 200
 const MAX_BODY_BYTES = 64 * 1024
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 const BODY_NOTE =
-  'Capture includes requests observed after start. Text request/response bodies are bounded; binary, cached, service-worker and privileged responses may be unavailable.'
+  'Capture includes requests observed after start. Body accounting is limited to 64 KiB per body and 2 MiB per capture, including in-flight bytes and UTF-8 bytes of retained text (not an OS memory limit); binary, cached, service-worker and privileged responses may be unavailable.'
 
 interface NetworkRow {
   requestId: string
@@ -37,7 +39,7 @@ interface Capture {
   status: 'active' | 'stopped' | 'interrupted'
   rows: NetworkRow[]
   droppedCount: number
-  retainedBytes: number
+  budget: FirefoxNetworkBudget
   filter?: string
   reason?: string
 }
@@ -46,14 +48,15 @@ interface PendingRequest {
   capture: Capture
   row: NetworkRow
   stream?: FirefoxResponseFilter
-  chunks: Uint8Array[]
-  length: number
+  body: FirefoxNetworkBody
+  completed: boolean
 }
 
 export class FirefoxNetwork {
   private readonly api: FirefoxApi
   private readonly lookup: (browserTabId: number) => BrowserTab | undefined
   private readonly captures = new Map<string, Capture>()
+  private readonly bodies = new WeakMap<NetworkRow, { request: FirefoxNetworkBody; response: FirefoxNetworkBody }>()
   private readonly pending = new Map<string, PendingRequest>()
 
   constructor(options: { api: FirefoxApi; lookup: (browserTabId: number) => BrowserTab | undefined }) {
@@ -94,21 +97,23 @@ export class FirefoxNetwork {
   private begin(details: FirefoxWebRequestDetails): void {
     const browserTabId = details.tabId
     const capture = this.current(browserTabId)
-    if (!capture || (capture.filter && !details.url.includes(capture.filter))) return
     const previous = this.pending.get(details.requestId)
-    if (previous) this.detach(previous)
+    if (previous) {
+      if (previous.stream)
+        previous.row.bodyUnavailable ??= 'Request redirected or its identifier was reused before the body completed'
+      this.detach(previous)
+    }
+    if (!capture || (capture.filter && !details.url.includes(capture.filter))) return
     while (capture.rows.length >= MAX_REQUESTS) {
       const dropped = capture.rows.shift()
       if (!dropped) break
       capture.droppedCount += 1
-      capture.retainedBytes = Math.max(
-        0,
-        capture.retainedBytes - (dropped.responseBody?.length ?? 0) - (dropped.requestBody?.length ?? 0),
-      )
+      const bodies = this.bodies.get(dropped)
+      bodies?.request.release()
+      bodies?.response.release()
       const pending = this.pending.get(dropped.requestId)
       if (pending?.row === dropped) {
         this.detach(pending)
-        this.pending.delete(dropped.requestId)
       }
     }
     const row: NetworkRow = {
@@ -118,23 +123,20 @@ export class FirefoxNetwork {
       type: details.type,
       startedAt: details.timeStamp,
     }
+    const requestBody = capture.budget.createBody(MAX_BODY_BYTES)
+    const responseBody = capture.budget.createBody(MAX_BODY_BYTES)
+    this.bodies.set(row, { request: requestBody, response: responseBody })
     if (details.requestBody?.formData) {
-      row.requestBody = JSON.stringify(details.requestBody.formData).slice(0, MAX_BODY_BYTES)
+      row.requestBody = requestBody.retainText(JSON.stringify(details.requestBody.formData))
     } else if (details.requestBody?.raw) {
-      const decoder = new TextDecoder()
-      let body = ''
       for (const part of details.requestBody.raw) {
-        if (part.bytes && body.length < MAX_BODY_BYTES)
-          body += decoder.decode(new Uint8Array(part.bytes).subarray(0, MAX_BODY_BYTES - body.length))
+        if (part.bytes) requestBody.append(new Uint8Array(part.bytes))
       }
-      if (body) row.requestBody = body
+      row.requestBody = requestBody.finish()
     }
-    if (row.requestBody) {
-      row.requestBody = row.requestBody.slice(0, Math.max(0, MAX_CAPTURE_BYTES - capture.retainedBytes))
-      capture.retainedBytes += row.requestBody.length
-    }
+    if (requestBody.truncated) row.bodyTruncated = true
     capture.rows.push(row)
-    const pending: PendingRequest = { capture, row, chunks: [], length: 0 }
+    const pending: PendingRequest = { capture, row, body: responseBody, completed: false }
     this.pending.set(details.requestId, pending)
     if (!this.api.webRequest.filterResponseData) {
       row.bodyUnavailable = 'Firefox response filtering API is unavailable'
@@ -156,18 +158,12 @@ export class FirefoxNetwork {
           this.detach(pending)
           return
         }
-        const room = Math.min(
-          MAX_BODY_BYTES - pending.length,
-          MAX_CAPTURE_BYTES - capture.retainedBytes - pending.length,
-        )
-        if (room > 0) {
-          const part = new Uint8Array(event.data).slice(0, room)
-          pending.chunks.push(part)
-          pending.length += part.byteLength
-        }
-        if (event.data.byteLength > room) row.bodyTruncated = true
+        if (pending.stream !== stream) return
+        pending.body.append(new Uint8Array(event.data))
+        if (pending.body.truncated) row.bodyTruncated = true
       }
       stream.onstop = () => {
+        if (pending.stream !== stream) return
         try {
           if (
             this.current(browserTabId) === capture &&
@@ -176,29 +172,24 @@ export class FirefoxNetwork {
                 row.contentType,
               ))
           ) {
-            const bytes = new Uint8Array(pending.length)
-            let offset = 0
-            for (const chunk of pending.chunks) {
-              bytes.set(chunk, offset)
-              offset += chunk.byteLength
-            }
-            row.responseBody = new TextDecoder().decode(bytes).slice(0, MAX_CAPTURE_BYTES - capture.retainedBytes)
-            capture.retainedBytes += row.responseBody.length
+            row.responseBody = pending.body.finish()
+            if (pending.body.truncated) row.bodyTruncated = true
           } else {
-            row.bodyUnavailable = row.contentType
-              ? 'Non-text response body is not retained'
-              : 'Capture ended before the response body completed'
+            row.bodyUnavailable = 'Non-text response or capture ended before the response body completed'
+            pending.body.release()
           }
         } finally {
-          pending.chunks = []
           pending.stream = undefined
+          if (pending.completed) this.forget(pending)
           stream.close()
         }
       }
       stream.onerror = () => {
+        if (pending.stream !== stream) return
         row.bodyUnavailable = 'Firefox could not provide the response stream (for example cached or privileged content)'
-        pending.chunks = []
+        pending.body.release()
         pending.stream = undefined
+        if (pending.completed) this.forget(pending)
       }
     } catch {
       row.bodyUnavailable = 'Firefox did not allow capturing this response body'
@@ -207,7 +198,13 @@ export class FirefoxNetwork {
 
   private headers(details: FirefoxWebRequestDetails): void {
     const pending = this.pending.get(details.requestId)
-    if (!pending || this.current(details.tabId) !== pending.capture) return
+    if (
+      !pending ||
+      details.timeStamp < pending.row.startedAt ||
+      details.url.slice(0, 8192) !== pending.row.url ||
+      this.current(details.tabId) !== pending.capture
+    )
+      return
     pending.row.status = details.statusCode
     pending.row.contentType = details.responseHeaders?.find((header) => {
       return header.name.toLowerCase() === 'content-type'
@@ -216,28 +213,42 @@ export class FirefoxNetwork {
 
   private complete(details: FirefoxWebRequestDetails): void {
     const pending = this.pending.get(details.requestId)
-    if (!pending) return
+    if (
+      !pending ||
+      details.tabId !== pending.capture.browserTabId ||
+      details.timeStamp < pending.row.startedAt ||
+      details.url.slice(0, 8192) !== pending.row.url
+    )
+      return
     if (this.current(details.tabId) === pending.capture) {
       pending.row.status = details.statusCode ?? pending.row.status
       pending.row.error = details.error
       pending.row.durationMs = Math.max(0, details.timeStamp - pending.row.startedAt)
     }
-    this.pending.delete(details.requestId)
+    pending.completed = true
+    if (details.error) this.detach(pending)
+    else if (!pending.stream) this.forget(pending)
+  }
+
+  private forget(pending: PendingRequest): void {
+    if (this.pending.get(pending.row.requestId) === pending) this.pending.delete(pending.row.requestId)
   }
 
   private detach(pending: PendingRequest): void {
+    const stream = pending.stream
+    pending.stream = undefined
+    if (stream) pending.body.release()
+    this.forget(pending)
     try {
-      if (pending.stream) {
-        pending.stream.ondata = null
-        pending.stream.onstop = null
-        pending.stream.onerror = null
-        pending.stream.disconnect()
+      if (stream) {
+        stream.ondata = null
+        stream.onstop = null
+        stream.onerror = null
+        stream.disconnect()
       }
     } catch {
       /* Already closed by Firefox. */
     }
-    pending.stream = undefined
-    pending.chunks = []
   }
 
   stopTab(options: { tabId: string; reason?: string; release?: boolean }): void {
@@ -245,13 +256,19 @@ export class FirefoxNetwork {
     if (!capture) return
     capture.status = options.reason ? 'interrupted' : 'stopped'
     capture.reason = options.reason
-    for (const [id, pending] of this.pending) {
+    for (const pending of this.pending.values()) {
       if (pending.capture !== capture) continue
-      pending.row.bodyUnavailable ??= 'Capture stopped before the response completed'
+      if (pending.stream) pending.row.bodyUnavailable ??= 'Capture stopped before the response completed'
       this.detach(pending)
-      this.pending.delete(id)
     }
-    if (options.release) this.captures.delete(options.tabId)
+    if (options.release) {
+      for (const row of capture.rows) {
+        const bodies = this.bodies.get(row)
+        bodies?.request.release()
+        bodies?.response.release()
+      }
+      this.captures.delete(options.tabId)
+    }
   }
 
   interrupt(): void {
@@ -274,7 +291,7 @@ export class FirefoxNetwork {
         captureId: firefoxId('capture'),
         status: 'active',
         rows: [],
-        retainedBytes: 0,
+        budget: new FirefoxNetworkBudget(MAX_CAPTURE_BYTES),
         droppedCount: 0,
         filter: options.filter,
       }
