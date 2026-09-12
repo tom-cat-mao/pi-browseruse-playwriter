@@ -6,114 +6,143 @@
 `firefox-background.ts`、`firefox-resources.ts`、`firefox-api.ts`、`firefox-network.ts`、
 runtime、协议、manifest/版本与构建脚本不属本 owner；仅只读核对，结论见“跨边界”。
 
-用户已在真实 Firefox 155.0.1 验证 0.0.136 的建组、创建标签（返回 tabId）、snapshot、
-screenshot、`execute page.title()`、release 成功。本轮据此系统核对同类风险，
-区分**已确认 bug**、**需实机验证**与**平台已声明限制**，不无依据改动、不放宽校验、
-不删除检查、不改 Chrome 专用实现。
+**定级口径**（本文严格区分，避免把未实测当缺陷）：
 
-## 逐类结论
+- **已实测缺陷**：真实 Firefox 上复现或已修复并有实机证据。
+- **代码风险**：有代码/实现级证据，但未在真实环境复现；需实机基线确认或否定。
+- **待实机验证**：功能尚未在真实浏览器跑过，本身不是缺陷，只是覆盖缺口。
+- **平台已声明限制**：已知且文档化的边界，不作为缺陷。
 
-| 审计类别 | 结论 | 关键证据 |
-| --- | --- | --- |
-| DOM/WebIDL 方法提取丢 `this` | 仅 0.0.136 的 `getComputedStyle` 一处，已修；本文件已无其它裸提取 | 全文件扫描无未被调用的 DOM 方法引用；3 处 `getComputedStyle` 均为方法调用或已绑定 helper |
-| 第三方库默认回调 | 已闭合 | `dom-accessibility-api@0.7.1` 只有 `isInaccessible` 存在默认解构（`is-inaccessible.mjs:17/48`）；`computeAccessibleName` 默认 `safeWindow(root).getComputedStyle.bind(window)`（`accessible-name-and-description.mjs:226/232`，`util.mjs:25-32`）；`getRole` 不用 computed style |
-| 跨 iframe/Window realm 构造器 | 干净 | driver 内 DOM 构造器全部为 `view.X`/元素自身 `defaultView`；`XMLSerializer`、`MutationObserver`、`PointerEvent`、`MouseEvent`、`KeyboardEvent`、`InputEvent`、`Event` 均按元素所在文档取 realm |
-| 跨 realm `instanceof`/原型/setter | 干净（1 处低风险见 P2-2） | 无 `instanceof HTML*`；元素判定用 `localName`；`setNativeValue` 用 `element.ownerDocument.defaultView.HTMLInputElement.prototype` 的原生 setter 并 `.call(element)` |
-| Shadow DOM | 干净 | `composedParent` 走 `assignedSlot`/`parentElement`/ShadowRoot.host；`allElements`、snapshot 递归 shadowRoot，slot 用 `assignedNodes({flatten:true})` |
-| 可见性/ARIA 语义 | 干净（1 处待验见 P2-3） | `isVisible` 逐 composed 祖先查 display/visibility + 包围盒；`ariaVisible` 逐 composed 祖先 `isInaccessible`（own-document view）+ `inert`；role options（checked/disabled/expanded/selected/pressed/level/includeHidden）与协议一致 |
-| input 语义 | 代码层干净，未实机（P2-1） | Enter/Space/Tab/方向键分支；`input[type=number]` 等 `selectionStart` 返回 null 时提前给出 `unsupported-capability`，不调用会抛 `InvalidStateError` 的 `setSelectionRange` |
+## 结论摘要
+
+- 已实测：0.0.136 基线场景（建组、创建标签、snapshot、screenshot、`page.title`
+  execute、release）在真实 Firefox 155.0.1 PASS（用户）。
+- 代码风险：1 条（`crypto.randomUUID` 的安全上下文暴露）。有实现级证据支持，但**未实测**，
+  等待真实非可信 HTTP 基线；按上面的口径，**不列为“已确认缺陷”**。
+- 未发现其它已确认问题。
+- 未修的其余项仅为低频代码风险，或属待实机验证的覆盖缺口，或平台已声明限制。
 
 ## P0
 
-无新增。0.0.136 已修的真实 Firefox 阻断（snapshot/role locator 的 `getComputedStyle`
-Window 接收者错误）不回退。
+无。
 
-## P1（已确认，已修）
+## P1——代码风险（实现级证据，等待真实 HTTP 基线；未实测）
 
-### P1-1 纯 HTTP 页面进不了 DOM driver：`crypto.randomUUID` 只在安全上下文暴露
+### `crypto.randomUUID` 的 `[SecureContext]` 暴露依赖调用者/对象 realm
 
-**现象（推断的确定性失败路径）**：在受支持的 `http:` 页面上，注入 `firefox-dom.js`
-时 driver 顶层构造抛错，`globalThis.__piFirefoxDom` 保持 undefined；随后 `attach`
-的能力探针注入与所有 DOM 工具（snapshot/click/fill/…）都对该标签失败。用户实机只测过
-`https://example.com`，因此未暴露。
+**风险描述**：`createFirefoxDomDriver` 用页面窗口的 `view.crypto.randomUUID()` 生成
+document/snapshot/prepared-action id（修复前 `firefox-dom.ts:196/476/744`）。若在普通
+`http:` 页面上该成员不可见，driver 顶层构造会抛错，`globalThis.__piFirefoxDom` 为空，
+attach 探针与所有 DOM 工具对该标签失败。
 
-**根因（代码 + 规范证据）**：
+**为什么不能只靠规范断言“http 一定失败”**：WebCrypto 规范只说明 `randomUUID()` 标注
+`[SecureContext]`（`getRandomValues()` 没有），它只直接证明**普通页面 realm** 的暴露规则，
+不能推出 Firefox 内容脚本/Xray 是按“调用者”还是“页面窗口”决定暴露。这一点必须查 Gecko
+实现，下面是核查结果。
 
-- `createFirefoxDomDriver` 在建 driver 时直接 `view.crypto.randomUUID()`
-  （修复前行号：document id `extension/src/firefox-dom.ts:196`、snapshot id `:476`、
-  prepared action id `:744`；修复后对应 `:206`、`:486`、`:754`，均改为 `randomId()`）。
-  `view = document.defaultView`，即**页面自身窗口**。
-- WebCrypto 规范中 `Crypto.randomUUID()` 标注 `[SecureContext]`，
-  `getRandomValues()` 没有（<https://w3c.github.io/webcrypto/> 第 10 节）。MDN 亦标注
-  randomUUID 仅安全上下文可用。非安全上下文里该成员**不存在**（不是抛错），所以
-  `view.crypto.randomUUID()` 抛 `... is not a function`。
-- 页面选择并未排除 http：`firefoxPageSupported` 接受 `http:` 与 `https:`
-  （`extension/src/firefox-resources.ts:80`），`inject()` 对任意支持页面注入
-  `firefox-dom.js`（`extension/src/firefox-background.ts:1314-1318`）。
-- 该文件顶层无条件构造 driver（`firefox-dom.ts:1081-1082`），因此失败发生在注入期，
-  而非某个具体命令。
-- 与 0.0.136 同类：都是“Firefox 平台 API 暴露/接收者语义与 Chrome 假设不一致，
-  让本应可用的代码整体失败”。
+**Gecko 实现证据链**（来源见文末，均只读）：
 
-**修复（最小、根因）**：`firefox-dom.ts` 内新增局部 `randomId()`，用
-`view.crypto.getRandomValues(new Uint8Array(16))` 生成 16 字节并置 v4 版本/变体位，
-格式化为 UUID；三处 `randomUUID()` 全部改为 `randomId()`。`getRandomValues` 不受安全
-上下文限制，且在安全上下文下同样工作，因此单一代码路径不会留下未测分支。ID 仍是随机
-v4 UUID，外部形状 `firefox:<document>:<snapshot>` 不变。
+1. `[SecureContext]` 成员的条件由 Codegen 生成为
+   `mozilla::dom::IsSecureContextOrObjectIsFromSecureContext(cx, obj)`
+   （`dom/bindings/Codegen.py:4163-4170`）。
+2. 该 helper 的定义：
+   ```cpp
+   inline bool IsSecureContextOrObjectIsFromSecureContext(JSContext* aCx, JSObject* aObj) {
+     MOZ_ASSERT(!js::IsWrapper(aObj));
+     return JS::GetIsSecureContext(js::GetContextRealm(aCx)) ||
+            JS::GetIsSecureContext(js::GetNonCCWObjectRealm(aObj));
+   }
+   ```
+   （`dom/bindings/DOMJSClass.h:68-72`；`PreflableDisablers::isEnabled` 在 `:130` 调用它。）
+   即：**调用者 realm 是安全上下文，或对象来自安全上下文，二者之一成立就暴露**。注释明确
+   写道：暴露取决于**运行代码的权限**，系统主体可在非安全 realm 上访问 secure API；并特别
+   说明“对访问安全网页的 expanded principal globals（如 frame scripts），检查 context realm
+   不适用，因此回退检查对象是否来自安全上下文”。
+3. Xray 路径传的 `obj` 是**目标（页面）对象**，不是 Xray wrapper：
+   `XrayResolveOwnProperty(cx, wrapper, obj, ...)` → `XrayResolveProperty` →
+   `pref.isEnabled(cx, obj)`（`dom/bindings/BindingUtils.cpp:1634-1640, 1752-1789, 1829-1874`），
+   且 helper 内含 `MOZ_ASSERT(!js::IsWrapper(aObj))`。所以 `GetNonCCWObjectRealm(obj)` = 页面 realm。
+4. 内容脚本 sandbox 的 realm 是否安全？`CreateSandboxObject` 只在
+   **系统主体**或**以安全上下文窗口作为 SOP/global 创建**时才 `setSecureContext(true)`
+   （`js/xpconnect/src/Sandbox.cpp:1287-1338`）；realm 标志默认 false
+   （`js/public/RealmOptions.h:242`）。`ExtensionContent.sys.mjs` 的常规内容脚本用
+   `Cu.Sandbox([contentPrincipal, extensionPrincipal], { sandboxPrototype: contentWindow,
+   wantXrays: true, isWebExtensionContentScript: true, ... })` 创建
+   （`toolkit/components/extensions/ExtensionContent.sys.mjs:1077` 起）：第一个参数是
+   **expanded principal**，不是系统主体也不是窗口，因此 sandbox realm **不会**被标记为
+   安全上下文。
 
-未扩大权限、未改 CSP/协议/ownership/取消语义、未删除任何检查、未新增注释或 mock。
-未改 manifest 版本（按分工由协调者递增）。
+**据此的推断**：内容脚本在普通 http 页面上访问页面 `crypto.randomUUID` 时，
+调用者 realm（sandbox，非安全）与对象 realm（页面，非安全）都为 false ⇒ **不暴露**；
+在 https 页面上对象 realm 为安全 ⇒ 暴露，与用户实机 https PASS 一致。
 
-**回归**：`extension/tests/firefox-dom.test.ts` 新增
-`derives document and snapshot identities from page crypto without the secure-context-only randomUUID`：
-断言 snapshotId 匹配 `firefox:<v4>:<v4>`、两次 snapshot 的 document 段稳定而 snapshot
-段不同。该用例走的就是 http 页面会走的同一条 `getRandomValues` 路径（无分支），
-因此该路径被完全覆盖。
+**残余不确定性（因此只定级为代码风险）**：
 
-**未覆盖的边界**：JSDOM 的 `crypto` 与 driver 同 realm，不能复现 Firefox 内容脚本里
-“页面 realm 的 ArrayBufferView 传入页面 Crypto”的 Xray 细节；也未用伪造/删除浏览器
-API 的方式模拟非安全上下文（按约束不新增 mock/伪造 API）。需实机在真实 http 页面复验
-（见下）。
+- 上述第 4 点由源码推断，未在真实非可信 HTTP 页面上观测。
+- 未排除某些 Firefox 版本/路径以其他方式把扩展内容脚本 sandbox 标为安全上下文。
+- 因此结论是“高置信代码风险，等待真实 HTTP 基线”，不是“已确认缺陷”。
 
-## P2（未修：需实机验证或低频/边界）
+**修复与当前状态**：修改为用 `view.crypto.getRandomValues(new Uint8Array(16))` 生成
+v4 UUID（`getRandomValues` 不受安全上下文限制，且跨文档/调用者语义一致）。该改法在
+“randomUUID 可用”与“不可用”两种结论下都正确：可用时仅换一种取随机数方式，不可用时
+才真正避免初始化失败。**尚未集成、未在真实 HTTP 复验**；若基线证明 `randomUUID` 实际可用，
+此改动可按需回退（无行为损失）。
 
-- **P2-1 输入类命令未在真实 Firefox 实测（需实机）**。`fill` 依赖页面原型原生 value
-  setter（`firefox-dom-input.ts:153-160`），`click/dblclick/hover/type/press/check/
-  selectOption` 依赖页面 realm 的合成鼠标/指针/键盘/输入事件。realm 与原型均取自元素
-  自身文档，代码层正确，但用户只验过 snapshot/screenshot/title。需实机验证
-  `fill`/`type`/`press`/`check`/`selectOption`/`hover` 与遮挡命中检查。
-- **P2-2 `error instanceof Error` 的跨 realm 兜底（低风险）**。
-  `firefox-dom.ts` 错误映射用 `error instanceof Error`/`instanceof FirefoxDomError`。
-  0.0.136 实机证明 Firefox 绑定层抛出的 TypeError 在此为真，故当前不构成 bug；
-  仅当错误来自另一个 compartment 的 evaluator 且未跨世界包装时才会退化为
-  `String(error)`。未改。
-- **P2-3 仅按 display/visibility 判定隐藏，未覆盖 `content-visibility`（需实机，低置信）**。
-  `ariaVisible` 依赖 `isInaccessible` 的 `display:none`/`visibility:hidden`/
-  `aria-hidden`/`hidden` 与 `inert`。若某浏览器用 `content-visibility: hidden`（而非
-  `display:none`）隐藏子树（例如折叠的 `<details>` 内容），snapshot 可能包含不可见节点。
-  属“隐藏节点可能存在差异”的声明范围，未证实 Firefox 当前如此，未改。实机应检查
-  折叠 `<details>` 内内容是否进入 snapshot。
-- **P2-4 `frame.check`/frame 内动作依赖 `getBoxQuads`（平台边界，非缺陷）**。
-  已核对 Firefox `GeometryUtils.webidl`：`getBoxQuads` 为 `[Throws,
-  Func="nsINode::HasBoxQuadsSupport", NeedsCallerType]`，**非** `ChromeOnly`、**非**
-  Pref 门控，内容脚本可见；代码在缺失或非轴对齐时给出明确 `unsupported-capability`。
-  iframe 内输入仍需实机验证。
+## P2——未修的代码风险（低频/边界，均未实测为缺陷）
+
+- **`error instanceof Error` 的跨 realm 兜底（低风险）**：错误映射依赖
+  `error instanceof Error` / `instanceof FirefoxDomError`（`firefox-dom.ts` catch 分支）。
+  0.0.136 实机证明 Firefox 绑定层抛出的 TypeError 在此为真；仅当错误来自另一
+  compartment 且未跨世界包装时才会退化为 `String(error)`。未改。
+- **`ariaVisible` 的隐藏语义可能窄于 UA 实现（低置信，未证实）**：`isInaccessible` 依据
+  `display:none`/`visibility:hidden`/`aria-hidden`/`hidden`，并叠加我们的 `inert` 检查。
+  若某浏览器以 `content-visibility: hidden`（而非 `display:none`）隐藏子树，snapshot 可能
+  包含不可见节点。属“隐藏节点可能存在差异”的声明范围，未证实 Firefox 当前如此，未改。
+
+## 待实机验证（覆盖缺口，不是缺陷）
+
+以下功能**尚未**在真实 Firefox 跑过，只记录待办，不据此判定有 bug：
+
+- 输入类命令的真实语义与效果：`fill`/`type`/`press`/`check`/`uncheck`/`setChecked`/
+  `selectOption`/`hover`/`focus`/`blur`（代码层 realm 与原语选择正确，未实测）。
+- iframe/frame 相关：`frameLocator`、role/ref 在 iframe 内定位、frame 内点击
+  （`getBoxQuads` 路径）。
+- 真实页面的隐藏/aria-hidden/inert 子树过滤（0.0.136 仅覆盖 JSDOM 语义）。
+- 截图 `labels`、logs、network 等（多数属其他 owner 的文件）。
+- **非可信 HTTP 页面**的 driver 初始化（P1 的定级依据）。注意反例必须是**非可能可信
+  origin**：`127.0.0.1`/`localhost`/`*.localhost` 本身是潜在可信 origin（安全上下文），
+  不能用作 http 反例；应使用如局域网 IP 的 `http://<lan-ip>/` 或公网明文 HTTP 主机。
 
 ## 平台已声明限制（非缺陷，不回退）
 
-- 不产生可信原生输入：DOM 合成事件的 `isTrusted=false`；`hover` 不改原生 `:hover`；
+- 不产生可信原生输入：DOM 合成事件 `isTrusted=false`；`hover` 不改原生 `:hover`；
   浏览器快捷键与系统剪贴板明确拒绝（`firefox-dom-input.ts:308-317`）。
 - closed shadow DOM 不可读；跨源 iframe 走扩展 frame 身份；`about:`/特权页/受限域不可控。
 - snapshot 是 DOM/ARIA 而非 Chrome 原生 AX 树，隐藏节点与名称可能有差异。
 - evaluate 需 Firefox 153+ 与可选 userScripts 权限；ref 不可跨执行世界。
+- frame 检查依赖 `getBoxQuads`：已核对 Gecko `dom/webidl/GeometryUtils.webidl` 中
+  `getBoxQuads` 为 `[Throws, Func="nsINode::HasBoxQuadsSupport", NeedsCallerType]`，
+  **非** `ChromeOnly`、**非** Pref 门控，内容脚本可见；缺失或非轴对齐时给出明确
+  `unsupported-capability`。
+
+## 逐类核对：未发现其它已确认问题
+
+| 审计类别 | 结论 | 关键证据 |
+| --- | --- | --- |
+| DOM/WebIDL 方法提取丢 `this` | 未发现其它问题 | 0.0.136 的 `getComputedStyle` 是唯一一处；全文件扫描无未被调用的 DOM 方法引用，3 处 `getComputedStyle` 均为方法调用或已绑定 helper |
+| 第三方库默认回调 | 未发现其它问题 | `dom-accessibility-api@0.7.1` 仅 `isInaccessible` 有默认解构（`is-inaccessible.mjs:17/48`）；`computeAccessibleName` 默认 `safeWindow(root).getComputedStyle.bind(window)`（`accessible-name-and-description.mjs:226/232`、`util.mjs:25-32`）；`getRole` 不用 computed style |
+| 跨 iframe/Window realm 构造器 | 未发现其它问题 | DOM 构造器全部为 `view.X`/元素自身 `defaultView`；`XMLSerializer`、`MutationObserver`、`PointerEvent`、`MouseEvent`、`KeyboardEvent`、`InputEvent`、`Event` 均按元素所在文档取 realm |
+| 跨 realm `instanceof`/原型/setter | 未发现其它确认问题 | 无 `instanceof HTML*`；元素判定用 `localName`；`setNativeValue` 用 `element.ownerDocument.defaultView.HTMLInputElement.prototype` 的原生 setter 并 `.call(element)` |
+| Shadow DOM | 未发现其它问题 | `composedParent` 走 `assignedSlot`/`parentElement`/ShadowRoot.host；`allElements`、snapshot 递归 shadowRoot，slot 用 `assignedNodes({flatten:true})` |
+| 可见性/ARIA 语义 | 见 P2 第二条 | `isVisible` 逐 composed 祖先查 display/visibility + 包围盒；`ariaVisible` 逐 composed 祖先 `isInaccessible`（own-document view）+ `inert`；role options 与协议一致 |
+| input 语义 | 未发现其它问题（未实测） | Enter/Space/Tab/方向键分支；`input[type=number]` 等 `selectionStart` 返回 null 时提前给出 `unsupported-capability`，不触发 `setSelectionRange` 的 `InvalidStateError` |
 
 ## 跨边界（只读核对，无改动）
 
 - `firefox-resources.ts:60` 的 `firefoxId()` 用**扩展 realm** 的 `crypto.randomUUID`；
-  扩展页是 `moz-extension:` 安全上下文，不存在 P1-1 问题。
+  扩展页是 `moz-extension:` 安全上下文，不受本 P1 影响。
 - 其它 `firefox-*.ts` 未见 WebIDL 方法裸提取、realm 错用构造器或跨 realm `instanceof`
-  元素判定；`firefox-popup.ts:10-11` 的 `instanceof HTMLButtonElement` 作用于同文档元素，
-  安全。
+  元素判定；`firefox-popup.ts:10-11` 的 `instanceof HTMLButtonElement` 作用于同文档元素。
 - manifest 版本与 changeset 版本递增按分工由协调者处理。
 
 ## 验证
@@ -121,17 +150,31 @@ API 的方式模拟非安全上下文（按约束不新增 mock/伪造 API）。
 | 检查 | 实际结果 |
 | --- | --- |
 | 扩展 TypeScript（`mcp-extension exec tsc --project .`） | PASS |
-| 扩展测试（`mcp-extension test --run`） | PASS，101 tests / 6 files（新增 1） |
+| 扩展测试（`mcp-extension test --run`） | PASS，101 tests / 6 files（相对基线新增 1） |
 
 未运行默认会启动 Chrome 的 `pnpm test`，未运行 runtime 端口/进程套件，未启动浏览器或
-后台服务，未加载/重载扩展，未改用户配置。日志：`tmp/logs/tsc-fix.log`、`tmp/logs/test-fix.log`。
+后台服务，未加载/重载扩展，未改用户配置。日志：`tmp/logs/tsc-final.log`、`tmp/logs/test-final.log`。
 
-## 需实机复验场景
+## 参考来源（Firefox 实现，只读核查）
 
-1. **P1-1（最高优先）**：加载含本修复的构建，attach 一个非 loopback 的纯 `http:`
-   页面，确认 profile/tab 连接与 snapshot 成功；修复前该场景应整体失败。
-2. `fill`/`type`/`press`/`check`/`selectOption`/`hover` 在真实页面（普通表单、
-   contenteditable、`input[type=number]`）的实际效果与事件语义。
-3. 折叠 `<details>` 与 `content-visibility: hidden` 内容是否被 snapshot 排除（P2-3）。
-4. iframe 内 role/ref 定位、`frameLocator` 与 frame 内点击（`getBoxQuads` 路径）。
-5. 真实页面隐藏/aria-hidden/inert 子树过滤（0.0.136 仅覆盖 JSDOM 语义）。
+取值自 `mozilla/gecko-dev` 与 `mozilla-firefox/firefox` 的 raw 内容，本地工作副本在
+`tmp/research/`（已 gitignore）：
+
+- `dom/webidl/Crypto.webidl`：`[SecureContext] UTF8String randomUUID();`（`getRandomValues` 无 `SecureContext`）。
+- `dom/bindings/Codegen.py:4133-4180`：`[SecureContext]` 生成 `IsSecureContextOrObjectIsFromSecureContext(cx, obj)`。
+- `dom/bindings/DOMJSClass.h:43-72,130`：helper 实现与注释（调用者 realm 或对象 realm）。
+- `dom/bindings/BindingUtils.cpp:1634-1640, 1752-1789, 1829-1874`：Xray 解析把目标对象作为 `obj`。
+- `js/xpconnect/src/Sandbox.cpp:1287-1338`：仅系统主体/安全 SOP 窗口才 `setSecureContext(true)`。
+- `js/public/RealmOptions.h:197-242`：realm 安全标志默认 false。
+- `toolkit/components/extensions/ExtensionContent.sys.mjs:1077-1084`：内容脚本 sandbox 以 expanded principal 创建。
+
+## 需实机复验场景（优先级排序）
+
+1. **P1（最高优先）**：加载含本修复的构建，attach 一个**非可能可信**的明文 HTTP 页面
+   （如 `http://<lan-ip>/` 或公网 http 主机；不要用 127.0.0.1/localhost），观察
+   `snapshot`/driver 是否初始化成功。同时（在修复前后的构建上）读取
+   `'randomUUID' in pageWindow.crypto` 与 `pageWindow.isSecureContext` 作为直接证据；
+   这能一次定论 P1。
+2. `fill`/`type`/`press`/`check`/`selectOption`/`hover` 的真实事件语义与效果。
+3. iframe 内 role/ref、`frameLocator`、frame 内点击（`getBoxQuads` 路径）。
+4. 真实页面隐藏/aria-hidden/inert 过滤，以及折叠 `<details>` 内容是否进入 snapshot。
