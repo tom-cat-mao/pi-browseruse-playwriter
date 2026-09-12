@@ -369,6 +369,7 @@ export type BrowserDomCommand =
   | { method: 'locator'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[] }
   | { method: 'page'; action: 'title' | 'url' | 'content' | 'readyState' }
   | { method: 'frame.resolve'; locator: BrowserDomLocator }
+  | { method: 'frame.check'; locator: BrowserDomLocator; point: { x: number; y: number } }
   | { method: 'invalidate' | 'dispose' }
   | { method: 'screenshot.prepare'; fullPage?: boolean; labels?: boolean }
   | { method: 'screenshot.cleanup' }
