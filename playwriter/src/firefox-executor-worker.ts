@@ -89,8 +89,12 @@ export function startFirefoxExecutorWorker(): void {
   const context = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } })
   const realmFile = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '../dist/firefox-executor-realm-bundle.js')
   new vm.Script(fs.readFileSync(realmFile, 'utf8'), { filename: realmFile }).runInContext(context, { timeout: 5_000 })
-  const factory = context.__createFirefoxExecutorRealm as (bridge: RealmBridge) => RealmController
-  delete context.__createFirefoxExecutorRealm
+  const factory = new vm.Script(`(() => {
+    const create = globalThis.__createFirefoxExecutorRealm;
+    globalThis.__createFirefoxExecutorRealm = undefined;
+    delete globalThis.__createFirefoxExecutorRealm;
+    return create;
+  })()`).runInContext(context, { timeout: 5_000 }) as (bridge: RealmBridge) => RealmController
   const realm = factory((options) => {
     if (!runBridge) return JSON.stringify({ ok: false, error: { code: 'cancelled', message: 'Firefox execution is inactive' } })
     return runBridge(options)
