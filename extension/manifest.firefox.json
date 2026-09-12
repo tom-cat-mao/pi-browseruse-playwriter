@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Browser Use",
-  "version": "0.0.132",
+  "version": "0.0.133",
   "description": "Connect Pi Browser Use to your existing Firefox tabs for local Pi agent browser automation.",
   "browser_specific_settings": {
     "gecko": {
@@ -22,6 +22,9 @@
   ],
   "host_permissions": ["<all_urls>"],
   "optional_permissions": ["userScripts"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
+  },
   "background": {
     "scripts": ["firefox-background.js"]
   },

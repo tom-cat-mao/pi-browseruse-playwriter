@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { JSDOM } from 'jsdom'
+import fs from 'node:fs'
+import path from 'node:path'
+import url from 'node:url'
+import childProcess from 'node:child_process'
 import type {
   BrowserDomCommand,
   BrowserDomLocator,
@@ -19,6 +23,87 @@ import {
 } from '../src/firefox-dom-locators'
 import { checkedState, clickElement, fillElement, pressKey, selectOptions, setChecked } from '../src/firefox-dom-input'
 import { assertFrameTransform, checkFramePoint, mapFramePoint } from '../src/firefox-dom-frame'
+import { assertFirefoxCsp } from '../../scripts/firefox-csp.mjs'
+
+const repoRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '../..')
+
+describe('Firefox distribution CSP', () => {
+  function packageFixture(policy?: { extension_pages: string } | null) {
+    const tempRoot = path.join(repoRoot, 'tmp')
+    fs.mkdirSync(tempRoot, { recursive: true })
+    const root = fs.mkdtempSync(path.join(tempRoot, 'firefox-csp-'))
+    const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, 'extension/manifest.firefox.json'), 'utf8'))
+    manifest.content_security_policy = policy
+    const bundle = path.join(root, 'playwriter/dist/extension-firefox')
+    fs.mkdirSync(bundle, { recursive: true })
+    fs.mkdirSync(path.join(root, 'extension/scripts'), { recursive: true })
+    fs.mkdirSync(path.join(root, 'scripts'))
+    fs.symlinkSync(path.join(repoRoot, 'node_modules'), path.join(root, 'node_modules'), 'dir')
+    for (const script of ['package-extension.mjs', 'firefox-csp.mjs']) {
+      fs.copyFileSync(path.join(repoRoot, 'scripts', script), path.join(root, 'scripts', script))
+    }
+    fs.copyFileSync(
+      path.join(repoRoot, 'extension/scripts/build-firefox.mjs'),
+      path.join(root, 'extension/scripts/build-firefox.mjs'),
+    )
+    fs.copyFileSync(path.join(repoRoot, 'playwriter/package.json'), path.join(root, 'playwriter/package.json'))
+    fs.copyFileSync(path.join(repoRoot, 'extension/manifest.json'), path.join(root, 'extension/manifest.json'))
+    fs.writeFileSync(path.join(root, 'extension/manifest.firefox.json'), JSON.stringify(manifest))
+    fs.writeFileSync(path.join(bundle, 'manifest.json'), JSON.stringify(manifest))
+    fs.cpSync(path.join(repoRoot, 'extension/icons'), path.join(bundle, 'icons'), { recursive: true })
+    fs.copyFileSync(path.join(repoRoot, 'extension/src/firefox-popup.html'), path.join(bundle, 'firefox-popup.html'))
+    fs.writeFileSync(path.join(bundle, 'firefox-build.json'), JSON.stringify({ host: '127.0.0.1', port: 19989 }))
+    fs.writeFileSync(path.join(bundle, 'firefox-background.js'), 'const PORT = 19989;')
+    fs.writeFileSync(path.join(bundle, 'firefox-dom.js'), '')
+    fs.writeFileSync(path.join(bundle, 'firefox-popup.js'), '')
+    return root
+  }
+
+  test('packages the real explicit script policy and verifies the generated ZIP/XPI', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, 'extension/manifest.firefox.json'), 'utf8'))
+    expect(() => {
+      assertFirefoxCsp(manifest)
+    }).not.toThrow()
+    const root = packageFixture(manifest.content_security_policy)
+    try {
+      const result = childProcess.spawnSync(process.execPath, ['scripts/package-extension.mjs', '--firefox'], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+      expect(result.stderr).toBe('')
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('-unsigned.xpi.sha256')
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    undefined,
+    null,
+    { extension_pages: '' },
+    { extension_pages: "script-src 'self'; upgrade-insecure-requests;" },
+    { extension_pages: "script-src 'self'; object-src 'self'; upgrade-insecure-requests;" },
+    { extension_pages: "script-src 'self' 'unsafe-eval'; object-src 'self';" },
+    { extension_pages: "script-src 'self' 'unsafe-inline'; object-src 'self';" },
+    { extension_pages: "script-src 'self' https://example.com; object-src 'self';" },
+    { extension_pages: "script-src 'self'; object-src 'self'; script-src-elem *;" },
+  ])('build and package reject missing, upgrading or unsafe CSP: %j', (policy) => {
+    const root = packageFixture(policy)
+    try {
+      for (const args of [['extension/scripts/build-firefox.mjs'], ['scripts/package-extension.mjs', '--firefox']]) {
+        const result = childProcess.spawnSync(process.execPath, args, { cwd: root, encoding: 'utf8', timeout: 5000 })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('Firefox extension CSP must explicitly use')
+        expect(fs.existsSync(path.join(root, 'dist-release'))).toBe(false)
+        expect(fs.existsSync(path.join(root, 'extension/dist-firefox'))).toBe(false)
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
 
 let driver: FirefoxDomDriver
 let requestSequence = 0

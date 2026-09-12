@@ -3,6 +3,7 @@ import path from 'node:path'
 import url from 'node:url'
 import childProcess from 'node:child_process'
 import { build } from 'vite'
+import { assertFirefoxCsp } from '../../scripts/firefox-csp.mjs'
 
 const extensionDir = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..')
 const outDirName = process.env.PI_BROWSER_FIREFOX_DIST || 'dist-firefox'
@@ -19,6 +20,14 @@ if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
   throw new Error('PI_BROWSER_PORT must be an integer between 1 and 65535')
 }
 
+const runtimePackage = JSON.parse(fs.readFileSync(path.join(extensionDir, '../playwriter/package.json'), 'utf8'))
+const manifest = JSON.parse(fs.readFileSync(path.join(extensionDir, 'manifest.firefox.json'), 'utf8'))
+const chromeManifest = JSON.parse(fs.readFileSync(path.join(extensionDir, 'manifest.json'), 'utf8'))
+assertFirefoxCsp(manifest)
+if (manifest.version !== chromeManifest.version) {
+  throw new Error('Firefox and Chrome extension manifest versions must match')
+}
+
 const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
 const typecheck = childProcess.spawnSync(pnpmCommand, ['exec', 'tsc', '--project', '.'], {
   cwd: extensionDir,
@@ -26,13 +35,6 @@ const typecheck = childProcess.spawnSync(pnpmCommand, ['exec', 'tsc', '--project
 })
 if (typecheck.status !== 0) {
   process.exit(typecheck.status ?? 1)
-}
-
-const runtimePackage = JSON.parse(fs.readFileSync(path.join(extensionDir, '../playwriter/package.json'), 'utf8'))
-const manifest = JSON.parse(fs.readFileSync(path.join(extensionDir, 'manifest.firefox.json'), 'utf8'))
-const chromeManifest = JSON.parse(fs.readFileSync(path.join(extensionDir, 'manifest.json'), 'utf8'))
-if (manifest.version !== chromeManifest.version) {
-  throw new Error('Firefox and Chrome extension manifest versions must match')
 }
 
 fs.rmSync(outDir, { recursive: true, force: true })

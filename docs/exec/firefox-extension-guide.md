@@ -71,7 +71,7 @@ profile、group、tab、snapshot 都使用既有资源模型。Firefox 的原生
 
 evaluate 世界可读取和修改页面 DOM，但不等价于 Chrome 主世界：页面自己定义的全局变量、框架内部对象
 不一定可见，也不能调用扩展的 `browser.*` API。代码需要显式 `return` 返回 JSON 可序列化结果。
-扩展不会通过 MAIN-world 注入、打开用户脚本消息通道、放宽 CSP 或 `unsafe-eval` 绕过这一边界。
+扩展不会通过 MAIN-world 注入、打开用户脚本消息通道、放宽脚本执行 CSP 或 `unsafe-eval` 绕过这一边界。
 
 ## 与 Chrome 的差异
 

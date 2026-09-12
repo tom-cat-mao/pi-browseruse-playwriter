@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import url from 'node:url'
 import zlib from 'node:zlib'
+import { assertFirefoxCsp } from './firefox-csp.mjs'
 
 const repoRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..')
 const firefoxBuild = process.argv.includes('--firefox')
@@ -120,6 +121,7 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
     throw new Error('Built extension manifest has no version')
   }
   if (firefoxBuild) {
+    assertFirefoxCsp(manifest)
     if (manifest.manifest_version !== 3 || manifest.browser_specific_settings?.gecko?.id !== firefoxExtensionId) {
       throw new Error('Firefox package must contain the ordinary MV3 manifest and its stable Gecko identity')
     }
