@@ -1,4 +1,21 @@
 import { FirefoxDomError, composedParent, isDisabled, isEditable, isVisible } from './firefox-dom-locators'
+import { checkFramePoint } from './firefox-dom-frame'
+import type { FramePoint } from './firefox-dom-frame'
+
+const IMPLICIT_SUBMIT_TYPES = new Set([
+  'text',
+  'search',
+  'url',
+  'tel',
+  'email',
+  'password',
+  'date',
+  'month',
+  'week',
+  'time',
+  'datetime-local',
+  'number',
+])
 
 export function controlForElement(element: Element): Element {
   return element.localName === 'label' ? ((element as HTMLLabelElement).control ?? element) : element
@@ -9,6 +26,19 @@ export function focusElement(element: Element): void {
   if (typeof target.focus !== 'function')
     throw new FirefoxDomError({ message: 'The selected element cannot receive focus.' })
   target.focus({ preventScroll: true })
+}
+
+export function elementActionPoint(element: Element): FramePoint {
+  const rect = element.getBoundingClientRect()
+  const view = element.ownerDocument.defaultView
+  if (!view) throw new FirefoxDomError({ message: 'The selected document has no active window.' })
+  const left = Math.max(rect.left, 0)
+  const top = Math.max(rect.top, 0)
+  const right = Math.min(rect.right, view.innerWidth)
+  const bottom = Math.min(rect.bottom, view.innerHeight)
+  if (left >= right || top >= bottom)
+    throw new FirefoxDomError({ message: 'The selected element is outside the viewport.' })
+  return { x: (left + right) / 2, y: (top + bottom) / 2 }
 }
 
 function composedContains(options: { ancestor: Element; element: Element }): boolean {
@@ -34,44 +64,26 @@ export function assertActionable(options: {
   if (!options.force && !isVisible(element))
     throw new FirefoxDomError({ message: 'The selected element is not visible.' })
   if (!options.receivesEvents || options.force) return
-  let target = element
-  let point: { x: number; y: number } | undefined
-  while (true) {
-    const rect = target.getBoundingClientRect()
-    const view = target.ownerDocument.defaultView
-    if (!view) throw new FirefoxDomError({ message: 'The selected document has no active window.' })
-    const left = Math.max(rect.left, 0)
-    const top = Math.max(rect.top, 0)
-    const right = Math.min(rect.right, view.innerWidth)
-    const bottom = Math.min(rect.bottom, view.innerHeight)
-    if (left >= right || top >= bottom)
-      throw new FirefoxDomError({ message: 'The selected element is outside the viewport.' })
-    const x = point?.x ?? (left + right) / 2
-    const y = point?.y ?? (top + bottom) / 2
-    if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight)
-      throw new FirefoxDomError({ message: 'The selected element is outside an ancestor frame viewport.' })
-    let hit = target.ownerDocument.elementFromPoint(x, y)
-    while (hit?.shadowRoot) {
-      const inner = hit.shadowRoot.elementFromPoint(x, y)
-      if (!inner || inner === hit) break
-      hit = inner
-    }
-    if (!hit || !composedContains({ ancestor: target, element: hit })) {
-      throw new FirefoxDomError({
-        message: `The selected element is covered by ${hit ? `<${hit.localName}>` : 'another surface'}.`,
-      })
-    }
-    const frame = view.frameElement
-    if (!frame) break
-    const frameRect = frame.getBoundingClientRect()
-    const scaleX = frameRect.width / ((frame as HTMLElement).offsetWidth || frameRect.width)
-    const scaleY = frameRect.height / ((frame as HTMLElement).offsetHeight || frameRect.height)
-    point = { x: frameRect.left + (frame.clientLeft + x) * scaleX, y: frameRect.top + (frame.clientTop + y) * scaleY }
-    target = frame
+  let point = elementActionPoint(element)
+  let hit = element.ownerDocument.elementFromPoint(point.x, point.y)
+  while (hit?.shadowRoot) {
+    const inner = hit.shadowRoot.elementFromPoint(point.x, point.y)
+    if (!inner || inner === hit) break
+    hit = inner
+  }
+  if (!hit || !composedContains({ ancestor: element, element: hit })) {
+    throw new FirefoxDomError({
+      message: `The selected element is covered by ${hit ? `<${hit.localName}>` : 'another surface'}.`,
+    })
+  }
+  let frame = element.ownerDocument.defaultView?.frameElement
+  while (frame) {
+    point = checkFramePoint({ frame, point })
+    frame = frame.ownerDocument.defaultView?.frameElement
   }
 }
 
-function mouseEvent(options: { element: Element; name: string; detail?: number }): boolean {
+function mouseEvent(options: { element: Element; name: string; detail?: number; point?: FramePoint }): boolean {
   const { element, name } = options
   const view = element.ownerDocument.defaultView
   if (!view) throw new FirefoxDomError({ message: 'The document has no active window.' })
@@ -84,8 +96,8 @@ function mouseEvent(options: { element: Element; name: string; detail?: number }
     detail: options.detail ?? 1,
     button: 0,
     buttons: name.endsWith('down') ? 1 : 0,
-    clientX: rect.left + rect.width / 2,
-    clientY: rect.top + rect.height / 2,
+    clientX: options.point?.x ?? rect.left + rect.width / 2,
+    clientY: options.point?.y ?? rect.top + rect.height / 2,
   }
   const event = name.startsWith('pointer')
     ? new view.PointerEvent(name, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })
@@ -93,28 +105,30 @@ function mouseEvent(options: { element: Element; name: string; detail?: number }
   return element.dispatchEvent(event)
 }
 
-export function clickElement(options: { element: Element; double?: boolean }): void {
+export function clickElement(options: { element: Element; double?: boolean; point?: FramePoint }): void {
   const { element } = options
   const count = options.double ? 2 : 1
   for (let i = 0; i < count; i += 1) {
-    mouseEvent({ element, name: 'pointerover' })
-    mouseEvent({ element, name: 'mouseover' })
-    const pointerAllowed = mouseEvent({ element, name: 'pointerdown', detail: i + 1 })
-    const mouseAllowed = pointerAllowed && mouseEvent({ element, name: 'mousedown', detail: i + 1 })
+    mouseEvent({ element, name: 'pointerover', point: options.point })
+    mouseEvent({ element, name: 'mouseover', point: options.point })
+    const pointerAllowed = mouseEvent({ element, name: 'pointerdown', detail: i + 1, point: options.point })
+    const mouseAllowed =
+      pointerAllowed && mouseEvent({ element, name: 'mousedown', detail: i + 1, point: options.point })
     if (mouseAllowed && typeof (element as HTMLElement).focus === 'function') focusElement(element)
-    mouseEvent({ element, name: 'pointerup', detail: i + 1 })
-    if (pointerAllowed) mouseEvent({ element, name: 'mouseup', detail: i + 1 })
-    if (typeof (element as HTMLElement).click === 'function' && !options.double) (element as HTMLElement).click()
-    else mouseEvent({ element, name: 'click', detail: i + 1 })
+    mouseEvent({ element, name: 'pointerup', detail: i + 1, point: options.point })
+    if (pointerAllowed) mouseEvent({ element, name: 'mouseup', detail: i + 1, point: options.point })
+    if (typeof (element as HTMLElement).click === 'function' && !options.double && !options.point)
+      (element as HTMLElement).click()
+    else mouseEvent({ element, name: 'click', detail: i + 1, point: options.point })
   }
-  if (options.double) mouseEvent({ element, name: 'dblclick', detail: 2 })
+  if (options.double) mouseEvent({ element, name: 'dblclick', detail: 2, point: options.point })
 }
 
-export function hoverElement(element: Element): void {
-  mouseEvent({ element, name: 'pointerover' })
-  mouseEvent({ element, name: 'mouseover' })
-  mouseEvent({ element, name: 'pointermove' })
-  mouseEvent({ element, name: 'mousemove' })
+export function hoverElement(options: { element: Element; point?: FramePoint }): void {
+  mouseEvent({ ...options, name: 'pointerover' })
+  mouseEvent({ ...options, name: 'mouseover' })
+  mouseEvent({ ...options, name: 'pointermove' })
+  mouseEvent({ ...options, name: 'mousemove' })
 }
 
 function inputEvent(options: {
@@ -180,12 +194,12 @@ export function checkedState(element: Element): boolean {
   throw new FirefoxDomError({ message: 'The selected element is not a checkbox or radio control.' })
 }
 
-export function setChecked(options: { element: Element; checked: boolean }): void {
+export function setChecked(options: { element: Element; checked: boolean; point?: FramePoint }): void {
   const element = controlForElement(options.element)
   if (checkedState(element) === options.checked) return
   if (element.localName === 'input' && (element as HTMLInputElement).type === 'radio' && !options.checked)
     throw new FirefoxDomError({ message: 'A radio button cannot be unchecked by clicking it.' })
-  clickElement({ element })
+  clickElement({ element, point: options.point })
   if (checkedState(element) !== options.checked)
     throw new FirefoxDomError({
       message:
@@ -331,9 +345,29 @@ export function pressKey(options: { element: Element; key: string }): void {
         (isEditable(element) && !['input', 'textarea'].includes(element.localName))
       )
         replaceSelection({ element, text: '\n' })
-      else if (element.localName === 'input' && (element as HTMLInputElement).form)
-        (element as HTMLInputElement).form?.requestSubmit()
-      else if (element.matches('button,a[href],input[type=submit],input[type=button]')) clickElement({ element })
+      else if (
+        element.matches('button,a[href],input[type=submit],input[type=button],input[type=reset],input[type=image]')
+      )
+        clickElement({ element })
+      else if (element.localName === 'input' && IMPLICIT_SUBMIT_TYPES.has((element as HTMLInputElement).type)) {
+        const form = (element as HTMLInputElement).form
+        const submitter =
+          form &&
+          Array.from(form.elements).find((control) => {
+            return (
+              (control.localName === 'button' && (control as HTMLButtonElement).type === 'submit') ||
+              (control.localName === 'input' && ['submit', 'image'].includes((control as HTMLInputElement).type))
+            )
+          })
+        if (submitter) {
+          if (!isDisabled(submitter)) clickElement({ element: submitter })
+        } else if (form) {
+          const blocking = Array.from(form.elements).filter((control) => {
+            return control.localName === 'input' && IMPLICIT_SUBMIT_TYPES.has((control as HTMLInputElement).type)
+          })
+          if (blocking.length === 1) form.requestSubmit()
+        }
+      }
     } else if (normalizedKey === ' ' && element.matches('button,input[type=checkbox],input[type=radio]'))
       clickElement({ element })
     else if (key === 'Tab') {

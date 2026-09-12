@@ -38,6 +38,21 @@ describe('Firefox DOM command boundary', () => {
     expect(parseBrowserDomCommand({ method: 'evaluate', code: 'return 1', world: 'MAIN' })).toBeNull()
   })
 
+  test('validates prepared frame action points, tokens, and strict parent locator scope', () => {
+    const locator = { steps: [{ kind: 'selector', engine: 'css', value: 'iframe.payment' }] }
+    const point = { x: 24, y: 32 }
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point })).toEqual({ method: 'frame.check', locator, point })
+    expect(parseBrowserDomCommand({ method: 'frame.actionPoint', locator, action: 'fill', args: ['value'] })).not.toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.actionPoint', locator, action: 'count' })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point: { x: -1, y: 2 } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point: { x: 1, y: Number.NaN } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point: { x: 1, y: 2, tabId: 'other' } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point, frameId: 42 })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', locator, action: 'click', expectedPoint: point, preparationId: 'prepared' })).not.toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', locator, action: 'click', expectedPoint: point })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', locator, action: 'click', preparationId: 'prepared' })).toBeNull()
+  })
+
   test('rejects cyclic, oversized and malformed locator programs', () => {
     const cycle: Record<string, unknown> = { method: 'evaluate', code: 'return 1' }
     cycle.self = cycle

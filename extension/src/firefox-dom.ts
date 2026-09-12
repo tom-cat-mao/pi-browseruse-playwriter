@@ -25,6 +25,7 @@ import {
   checkedState,
   clickElement,
   controlForElement,
+  elementActionPoint,
   fillElement,
   focusElement,
   hoverElement,
@@ -32,12 +33,22 @@ import {
   selectOptions,
   setChecked,
 } from './firefox-dom-input'
+import { checkFramePoint } from './firefox-dom-frame'
+import type { FramePoint } from './firefox-dom-frame'
 
 type Evaluator = (element?: Element) => unknown | Promise<unknown>
 type SnapshotRef = { ref: string; role: string; name: string; element: Element }
 type Snapshot = { id: string; url: string; refs: Map<string, SnapshotRef> }
 type Execution = { request: BrowserDomRequest; deadline: number; signal: AbortSignal; started: boolean }
 type ActionOptions = { timeout?: number; force?: boolean; trial?: boolean; delay?: number }
+type PreparedAction = {
+  element: Element
+  actionElement: Element
+  requestId: string
+  signature: string
+  point: FramePoint
+  expiresAt: number
+}
 
 export interface FirefoxDomDriver {
   readonly version: 1
@@ -189,6 +200,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
   const cleanups: Array<() => void> = []
   const overlayNodes = new WeakSet<Node>()
   const logs: string[] = []
+  const preparations = new Map<string, PreparedAction>()
   let binding: { sessionId: string; tabId: string; browserEpoch: string } | undefined
   let snapshot: Snapshot | undefined
   let overlay: HTMLElement | undefined
@@ -197,6 +209,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
 
   const invalidate = (): void => {
     snapshot = undefined
+    preparations.clear()
   }
   const checkActive = (execution: Execution): void => {
     if (execution.signal.aborted)
@@ -558,11 +571,49 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     action: BrowserDomLocatorAction
     args: BrowserJson[]
     resolve?: () => Element[]
+    prepareOnly?: boolean
+    expectedPoint?: FramePoint
+    preparationId?: string
   }): Promise<BrowserResultData> => {
     const { action, args, execution } = options
+    const signature = JSON.stringify({ locator: options.locator, action, args })
+    let prepared: PreparedAction | undefined
+    if (options.preparationId) {
+      prepared = preparations.get(options.preparationId)
+      preparations.delete(options.preparationId)
+      if (
+        !prepared ||
+        prepared.expiresAt <= Date.now() ||
+        prepared.requestId !== execution.request.requestId ||
+        prepared.signature !== signature ||
+        !options.expectedPoint ||
+        options.expectedPoint.x !== prepared.point.x ||
+        options.expectedPoint.y !== prepared.point.y
+      ) {
+        throw new FirefoxDomError({
+          message: 'The prepared Firefox frame action is expired, stale, or belongs to another request.',
+        })
+      }
+    }
+    if (options.expectedPoint && !prepared)
+      throw new FirefoxDomError({
+        code: 'invalid-request',
+        message: 'A checked frame action point requires its preparationId.',
+      })
+    if (options.prepareOnly && READ_ACTIONS.has(action))
+      throw new FirefoxDomError({
+        code: 'invalid-request',
+        message: 'Frame action preparation requires an input or focus action.',
+      })
+    const first = options.locator.steps[0]
+    const referenceProgram =
+      first?.kind === 'selector' &&
+      first.engine === 'css' &&
+      (first.value.startsWith('@') || first.value.startsWith('aria-ref='))
     const resolve =
       options.resolve ??
       (() => {
+        if (prepared && referenceProgram) return [prepared.element]
         return resolveProgram(options.locator)
       })
     if (action === 'count') return { value: resolve().length }
@@ -625,6 +676,14 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     })
     const control = controlForElement(element)
     const actionElement = retargetControl ? control : element
+    if (
+      prepared &&
+      (prepared.element !== element ||
+        prepared.actionElement !== actionElement ||
+        !element.isConnected ||
+        element.ownerDocument !== document)
+    )
+      throw new FirefoxDomError({ message: 'The prepared frame action no longer identifies the same live element.' })
     if (action === 'textContent') return { value: element.textContent }
     if (action === 'innerText') return { value: (element as HTMLElement).innerText ?? element.textContent ?? '' }
     if (action === 'innerHTML') return { value: element.innerHTML }
@@ -670,8 +729,35 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
         force: settings.force,
       })
     }
+    const point =
+      options.prepareOnly ||
+      prepared ||
+      ['click', 'dblclick', 'check', 'uncheck', 'setChecked', 'hover'].includes(action)
+        ? elementActionPoint(actionElement)
+        : undefined
+    if (prepared && (!point || point.x !== prepared.point.x || point.y !== prepared.point.y))
+      throw new FirefoxDomError({
+        message: 'The prepared Firefox frame action point moved before dispatch; take a fresh action preparation.',
+      })
+    if (options.prepareOnly) {
+      if (!point) throw new FirefoxDomError({ message: 'The Firefox frame action has no visible input point.' })
+      const preparationId = view.crypto.randomUUID()
+      for (const [id, record] of preparations) {
+        if (record.expiresAt <= Date.now()) preparations.delete(id)
+      }
+      if (preparations.size >= 32) preparations.delete(preparations.keys().next().value!)
+      preparations.set(preparationId, {
+        element,
+        actionElement,
+        requestId: execution.request.requestId,
+        signature,
+        point,
+        expiresAt: Date.now() + 5000,
+      })
+      return { value: { point: { x: point.x, y: point.y }, preparationId } }
+    }
     if (settings.trial) return { text: 'DOM actionability checks passed.', value: null }
-    if (action === 'click' || action === 'dblclick') clickElement({ element, double: action === 'dblclick' })
+    if (action === 'click' || action === 'dblclick') clickElement({ element, double: action === 'dblclick', point })
     else if (action === 'fill') fillElement({ element: control, value: stringArg({ args, name: 'Fill value' }) })
     else if (action === 'press') pressKey({ element: control, key: stringArg({ args, name: 'Key' }) })
     else if (action === 'type') {
@@ -684,7 +770,11 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     } else if (action === 'check' || action === 'uncheck' || action === 'setChecked') {
       if (action === 'setChecked' && typeof args[0] !== 'boolean')
         throw new FirefoxDomError({ code: 'invalid-request', message: 'setChecked requires a boolean.' })
-      setChecked({ element: control, checked: action === 'setChecked' ? (args[0] as boolean) : action === 'check' })
+      setChecked({
+        element: control,
+        checked: action === 'setChecked' ? (args[0] as boolean) : action === 'check',
+        point,
+      })
     } else if (action === 'selectOption') {
       const values = args[0] === null ? [] : Array.isArray(args[0]) ? args[0] : [args[0]]
       const parsed = values.map((value) => {
@@ -712,7 +802,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
         return value as { value?: string; label?: string; index?: number }
       })
       return { value: selectOptions({ element: control, values: parsed }) }
-    } else if (action === 'hover') hoverElement(element)
+    } else if (action === 'hover') hoverElement({ element, point })
     else if (action === 'focus') focusElement(control)
     else if (action === 'blur') (control as HTMLElement).blur()
     else if (action !== 'scrollIntoViewIfNeeded')
@@ -729,6 +819,43 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
   }): Promise<BrowserResultData> => {
     const { execution, evaluator } = options
     const command = execution.request.command
+    if (command.method === 'frame.check') {
+      if (!options.frameIdForElement)
+        throw new FirefoxDomError({
+          code: 'unsupported-capability',
+          message: 'Parent frame checks require the trusted Firefox extension world.',
+        })
+      const frame = await waitElement({
+        execution,
+        resolve: () => {
+          return resolveProgram(command.locator)
+        },
+      })
+      if (!['iframe', 'frame'].includes(frame.localName))
+        throw new FirefoxDomError({ message: 'The frame selector does not refer to an iframe or frame element.' })
+      const frameId = options.frameIdForElement(frame)
+      if (!Number.isInteger(frameId) || frameId <= 0)
+        throw new FirefoxDomError({
+          code: 'resource-not-found',
+          message: 'The ancestor iframe no longer has a live Firefox frame identity.',
+        })
+      const point = checkFramePoint({ frame, point: command.point })
+      return { value: { frameId, x: point.x, y: point.y } }
+    }
+    if (command.method === 'frame.actionPoint') {
+      if (!options.frameIdForElement)
+        throw new FirefoxDomError({
+          code: 'unsupported-capability',
+          message: 'Frame action preparation requires the trusted Firefox extension world.',
+        })
+      return performLocator({
+        execution,
+        locator: command.locator,
+        action: command.action,
+        args: command.args ?? [],
+        prepareOnly: true,
+      })
+    }
     if (command.method === 'frame.resolve') {
       if (!options.frameIdForElement)
         throw new FirefoxDomError({
@@ -739,7 +866,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       const frame = await waitElement({
         execution,
         resolve: () => {
-          return resolveLocator({ root: document, locator: command.locator })
+          return resolveProgram(command.locator)
         },
       })
       if (!['iframe', 'frame'].includes(frame.localName))
@@ -832,7 +959,14 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       }
     }
     if (command.method === 'locator')
-      return performLocator({ execution, locator: command.locator, action: command.action, args: command.args ?? [] })
+      return performLocator({
+        execution,
+        locator: command.locator,
+        action: command.action,
+        args: command.args ?? [],
+        expectedPoint: command.expectedPoint,
+        preparationId: command.preparationId,
+      })
     if (command.method === 'click' || command.method === 'fill') {
       const selector = command.selector
       return performLocator({

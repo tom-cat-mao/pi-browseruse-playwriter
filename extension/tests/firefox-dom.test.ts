@@ -18,6 +18,7 @@ import {
   strictElement,
 } from '../src/firefox-dom-locators'
 import { checkedState, clickElement, fillElement, pressKey, selectOptions, setChecked } from '../src/firefox-dom-input'
+import { assertFrameTransform, checkFramePoint, mapFramePoint } from '../src/firefox-dom-frame'
 
 let driver: FirefoxDomDriver
 let requestSequence = 0
@@ -397,6 +398,45 @@ describe('Firefox DOM input logic with real document fixtures', () => {
     clickElement({ element: checkbox.parentElement! })
     expect(checkbox.checked).toBe(true)
   })
+
+  test('prepared pointer coordinates are used by click events and retain checkbox activation', () => {
+    const checkbox = element('#notifications') as HTMLInputElement
+    const points: Array<{ x: number; y: number }> = []
+    checkbox.addEventListener('click', (event) => {
+      points.push({ x: event.clientX, y: event.clientY })
+    })
+    clickElement({ element: checkbox, point: { x: 24, y: 36 } })
+    expect(points).toEqual([{ x: 24, y: 36 }])
+    expect(checkbox.checked).toBe(true)
+  })
+
+  test('Enter activates the selected input button/reset/submit before considering implicit form submission', () => {
+    const form = document.createElement('form')
+    form.innerHTML =
+      '<input id="enter-text" value="original"><input id="enter-button" type="button"><input id="enter-reset" type="reset"><input id="enter-submit" type="submit">'
+    document.body.append(form)
+    const clicked: string[] = []
+    const submitted: string[] = []
+    form.addEventListener('click', (event) => {
+      clicked.push((event.target as Element).id)
+    })
+    form.addEventListener('submit', (event) => {
+      event.preventDefault()
+      submitted.push((event.submitter as Element).id)
+    })
+    pressKey({ element: element('#enter-button'), key: 'Enter' })
+    expect(clicked).toEqual(['enter-button'])
+    expect(submitted).toEqual([])
+    const input = element('#enter-text') as HTMLInputElement
+    input.value = 'changed'
+    pressKey({ element: element('#enter-reset'), key: 'Enter' })
+    expect(input.value).toBe('original')
+    expect(submitted).toEqual([])
+    pressKey({ element: element('#enter-submit'), key: 'Enter' })
+    expect(submitted).toEqual(['enter-submit'])
+    pressKey({ element: input, key: 'Enter' })
+    expect(submitted).toEqual(['enter-submit', 'enter-submit'])
+  })
 })
 
 describe('Firefox DOM JSON response serialization', () => {
@@ -419,5 +459,103 @@ describe('Firefox DOM JSON response serialization', () => {
     expect(() => {
       browserJson('x'.repeat(1_000_001))
     }).toThrow('exceeds 1 MB')
+  })
+})
+
+describe('Firefox frame action point mapping', () => {
+  test('frame checks/preparation are unavailable without the trusted callback and forged preparation IDs cannot act', async () => {
+    const locator = locatorForSelector('#same-origin')
+    expect(await driver.run(request({ method: 'frame.check', locator, point: { x: 1, y: 1 } }))).toMatchObject({
+      ok: false,
+      error: { code: 'unsupported-capability', outcome: 'not-started' },
+    })
+    expect(await driver.run(request({ method: 'frame.actionPoint', locator, action: 'click' }))).toMatchObject({
+      ok: false,
+      error: { code: 'unsupported-capability', outcome: 'not-started' },
+    })
+    expect(
+      await driver.run(
+        request({
+          method: 'locator',
+          locator,
+          action: 'click',
+          expectedPoint: { x: 1, y: 1 },
+          preparationId: 'invented',
+        }),
+      ),
+    ).toMatchObject({ ok: false, error: { code: 'execution-failed', outcome: 'not-started' } })
+  })
+  test('maps a child viewport point through the actual content quad with border offsets and positive scales', () => {
+    expect(
+      mapFramePoint({
+        point: { x: 25, y: 40 },
+        viewport: { width: 300, height: 100 },
+        quad: { p1: { x: 110, y: 220 }, p2: { x: 710, y: 220 }, p3: { x: 710, y: 420 }, p4: { x: 110, y: 420 } },
+      }),
+    ).toEqual({ x: 160, y: 300 })
+  })
+
+  test('carries the actual child point through multiple ancestors instead of checking their centers', () => {
+    const intermediate = mapFramePoint({
+      point: { x: 8, y: 12 },
+      viewport: { width: 100, height: 100 },
+      quad: { p1: { x: 20, y: 30 }, p2: { x: 120, y: 30 }, p3: { x: 120, y: 130 }, p4: { x: 20, y: 130 } },
+    })
+    expect(
+      mapFramePoint({
+        point: intermediate,
+        viewport: { width: 200, height: 200 },
+        quad: { p1: { x: 200, y: 100 }, p2: { x: 600, y: 100 }, p3: { x: 600, y: 500 }, p4: { x: 200, y: 500 } },
+      }),
+    ).toEqual({ x: 256, y: 184 })
+  })
+
+  test('rejects invalid viewport points and non-axis-aligned quads without approximating them', () => {
+    const quad = { p1: { x: 0, y: 0 }, p2: { x: 100, y: 0 }, p3: { x: 100, y: 100 }, p4: { x: 0, y: 100 } }
+    const viewport = { width: 100, height: 100 }
+    expect(() => {
+      mapFramePoint({ point: { x: -1, y: 2 }, quad, viewport })
+    }).toThrow('outside the child')
+    expect(() => {
+      mapFramePoint({ point: { x: 100, y: 2 }, quad, viewport })
+    }).toThrow('outside the child')
+    expect(() => {
+      mapFramePoint({ point: { x: Number.NaN, y: 2 }, quad, viewport })
+    }).toThrow('outside the child')
+    expect(() => {
+      mapFramePoint({ point: { x: 2, y: 2 }, quad: { ...quad, p2: { x: 100, y: 3 } }, viewport })
+    }).toThrow('rotated, skewed')
+    expect(() => {
+      mapFramePoint({
+        point: { x: 2, y: 2 },
+        quad: { ...quad, p2: { x: -100, y: 0 }, p3: { x: -100, y: 100 } },
+        viewport,
+      })
+    }).toThrow('reflected')
+  })
+
+  test('rejects rotation, skew, 3D transforms and motion paths and permits positive axis scaling', () => {
+    const style = { transform: 'none', rotate: 'none', perspective: 'none', offsetPath: 'none' }
+    expect(() => {
+      assertFrameTransform({ ...style, transform: 'matrix(2, 0, 0, 3, 40, 50)' })
+    }).not.toThrow()
+    expect(() => {
+      assertFrameTransform({ ...style, transform: 'matrix(1, 0.2, 0, 1, 0, 0)' })
+    }).toThrow('skew')
+    expect(() => {
+      assertFrameTransform({ ...style, transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)' })
+    }).toThrow('3D')
+    expect(() => {
+      assertFrameTransform({ ...style, rotate: '10deg' })
+    }).toThrow('rotation')
+    expect(() => {
+      assertFrameTransform({ ...style, perspective: '1000px' })
+    }).toThrow('perspective')
+    expect(() => {
+      assertFrameTransform({ ...style, offsetPath: 'path("M0 0 L10 10")' })
+    }).toThrow('motion paths')
+    expect(() => {
+      checkFramePoint({ frame: element('#name'), point: { x: 1, y: 1 } })
+    }).toThrow('iframe or frame')
   })
 })

@@ -33,12 +33,21 @@ export function parseBrowserDomCommand(value: unknown): BrowserDomCommand | null
         value.code.length <= MAX_CODE_LENGTH && (value.locator === undefined || validLocator({ value: value.locator, depth: 0 }))
       break
     case 'locator':
-      valid = fields({ value, keys: ['method', 'locator', 'action', 'args'] }) &&
+      valid = fields({ value, keys: ['method', 'locator', 'action', 'args', 'expectedPoint', 'preparationId'] }) &&
         typeof value.action === 'string' && LOCATOR_ACTIONS.has(value.action) && validLocator({ value: value.locator, depth: 0 }) &&
-        validLocatorArgs({ action: value.action, args: value.args })
+        validLocatorArgs({ action: value.action, args: value.args }) &&
+        ((value.expectedPoint === undefined && value.preparationId === undefined) || (validPoint(value.expectedPoint) && identifier(value.preparationId)))
       break
     case 'frame.resolve':
       valid = fields({ value, keys: ['method', 'locator'] }) && validLocator({ value: value.locator, depth: 0 })
+      break
+    case 'frame.check':
+      valid = fields({ value, keys: ['method', 'locator', 'point'] }) && validLocator({ value: value.locator, depth: 0 }) && validPoint(value.point)
+      break
+    case 'frame.actionPoint':
+      valid = fields({ value, keys: ['method', 'locator', 'action', 'args'] }) && validLocator({ value: value.locator, depth: 0 }) &&
+        typeof value.action === 'string' && ['click', 'dblclick', 'fill', 'type', 'press', 'check', 'uncheck', 'setChecked', 'selectOption', 'hover', 'focus', 'blur', 'scrollIntoViewIfNeeded'].includes(value.action) &&
+        validLocatorArgs({ action: value.action, args: value.args })
       break
     case 'page':
       valid = fields({ value, keys: ['method', 'action'] }) && ['title', 'url', 'content', 'readyState'].includes(String(value.action))
@@ -59,6 +68,12 @@ export function parseBrowserDomCommand(value: unknown): BrowserDomCommand | null
       break
   }
   return valid ? value as unknown as BrowserDomCommand : null
+}
+
+function validPoint(value: unknown): boolean {
+  return isRecord(value) && fields({ value, keys: ['x', 'y'] }) &&
+    typeof value.x === 'number' && Number.isFinite(value.x) && value.x >= 0 && value.x <= 1_000_000 &&
+    typeof value.y === 'number' && Number.isFinite(value.y) && value.y >= 0 && value.y <= 1_000_000
 }
 
 export function parseBrowserDomRequest(value: unknown): BrowserDomRequest | null {
