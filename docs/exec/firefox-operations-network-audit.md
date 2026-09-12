@@ -54,3 +54,45 @@ JSON.stringify、TextDecoder、拼接和结果序列化过程中的临时副本�
 | 网络预算与资源纯逻辑测试 | PASS，2 文件 / 50 tests（预算 9、资源 41） |
 | git diff --check / 修改 TS 文件格式 | PASS |
 | runtime unit/integration、真实 Firefox、独立验收 | SKIP，按协调分工 |
+
+## 第三批：navigate/back 响应旧 URL
+
+独立基线报告 `../acceptance/acceptance/firefox-swarm/report-2026-09-13-baseline-0.0.136.md`
+记录：back 的 pageInfo.url 仍为 `?history=next`，稍后 page.url() 才正确。P2 根因是旧
+waitNavigation 在 goBack Promise 完成后直接轮询 tabs.get；动作尚未开始、旧页状态仍
+complete 时直接返回。此缺陷有真实基线证据，本批不宣称修复后已实测。
+
+最小修复路径改为动作派发前注册同一 native tab / frameId=0 的 webNavigation 监听：
+
+- 过滤派发前的 timeStamp；跨文档要求 committed 后 completed，存在 documentId 时要求
+  一致；缺少 documentId 时核对 commit/completed URL。commit 后又开始新导航则失败，
+  不跟随新导航冒充原动作。history/fragment 无需 URL 改变即可确认同文档变化。只看到旧 completed、子 frame
+  或其它 tab 的事件不能确认本次动作。完整加载期间的 history/fragment 不提前结束加载。
+- 同 URL reload 有 commit/completed 时正常完成；无事件的同 URL history/no-op 在 5s
+  预算后返回 timeout + outcome unknown，明确不重放。已在 loading 的 tab 在派发前拒绝，
+  避免将既有导航混作本次操作。
+- 收到信号后读取 getFrame 与 tabs.get，核对完成 URL、可用的 documentId 和非 loading
+  状态。不一致时返回 outcome unknown，不返回旧页信息；title 是此次 tabs.get 的当前值，
+  不承诺之后不再异步改变。
+- deadline 和取消覆盖 API action、事件等待以及事实读取全过程。超时、断线、用户释放/
+  关闭会结束等待；晚返回的 API Promise 在下一步前检查等待是否结束，不重派导航。所有
+  路径 finally 清理注册的监听、timer 与请求取消回调。导航成功不再额外等待 DOM 注入，
+  既有 onUpdated 可选预热及后续正式页面操作注入仍保留。
+
+本机 Firefox `/Applications/Firefox.app/Contents/Resources/omni.ja` 只读核对：
+`modules/WebNavigation.sys.mjs` 的 STATE_STOP 成功发 onCompleted、onDocumentChange 发
+onCommitted、onHistoryChange 分派 fragment/history；`ext-webNavigation.js` 用 Date.now()
+生成事件 timeStamp。摘录仅保存在本 worktree `tmp/webnavigation-*`，未改浏览器文件或设置。
+线上 MDN 本轮读取超时，未用未取得的网页内容作证据。
+
+纯逻辑导航测试直接执行生产状态模块，覆盖旧完成/派发前信号、tab/frame 隔离、同 URL
+reload、同 URL history、fragment、文档恢复、重定向、documentId 不匹配、加载期间 history
+及错误终态。它不伪造 Firefox API，也不执行真实监听注册/清理；接线与取消路径为代码审查。
+真实 navigate/back 响应、BFCache、同文档历史事件、取消与释放仍需独立验收复验。
+WebExtension 没有本工具的动作关联 ID；用户/页面同时发起的新导航不能保证归因，本实现
+对可观察到的不匹配保守失败，不声称浏览器事务隔离或所有同 URL 场景都可确认。
+
+第三批最终检查：扩展 TypeScript PASS；导航/预算/资源目标测试 PASS，3 文件 / 60 tests
+（导航 10、预算 9、资源 41）；Prettier 与 git diff --check PASS。日志为
+`tmp/logs/navigation-typecheck.log`、`tmp/logs/navigation-tests.log`。runtime 整套与真实
+浏览器 SKIP，仍由协调者/验收 owner 执行。

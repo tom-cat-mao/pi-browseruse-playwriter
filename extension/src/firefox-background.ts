@@ -17,9 +17,11 @@ import type {
 } from 'playwriter/src/browser-protocol'
 import { parseBrowserDomRequest } from 'playwriter/src/browser-dom-validation'
 import { getFirefoxApi } from './firefox-api'
-import type { FirefoxApi, FirefoxTab } from './firefox-api'
+import type { FirefoxApi, FirefoxTab, FirefoxNavigationDetails } from './firefox-api'
 import { keepFirefoxBackgroundActive } from './firefox-keepalive'
 import { KeyedSerialQueue } from './keyed-queue'
+import { FirefoxNavigationState } from './firefox-navigation'
+import type { FirefoxNavigationSignal } from './firefox-navigation'
 import { FirefoxNetwork } from './firefox-network'
 import { parseFirefoxBrowserRequest } from './firefox-request-validation'
 import {
@@ -75,6 +77,7 @@ interface RequestContext {
   browserTabId?: number
   tabId?: string
   frameId?: number
+  checkNavigation?: () => void
 }
 
 interface FrameAncestor {
@@ -201,6 +204,7 @@ class FirefoxBackground {
         return
       const browserTabId = Number(message.browserTabId)
       this.revoked.add(browserTabId)
+      for (const active of this.active.values()) active.context.checkNavigation?.()
       return this.queue.run('resources', async () => {
         try {
           await this.initialized
@@ -504,6 +508,7 @@ class FirefoxBackground {
   }
 
   private cancelDom(context: RequestContext): void {
+    context.checkNavigation?.()
     if (context.browserTabId === undefined) return
     void this.api.scripting
       .executeScript({
@@ -971,9 +976,7 @@ class FirefoxBackground {
       context.started = true
       await this.invalidate(tab)
       this.assertContinue(context)
-      if (op.kind === 'page.navigate') await this.api.tabs.update(tab.browserTabId!, { url: op.url })
-      else await this.api.tabs.goBack(tab.browserTabId!)
-      const actual = await this.waitNavigation({ tab, context })
+      const actual = await this.waitNavigation({ tab, context, operation: op })
       return {
         text: op.kind === 'page.navigate' ? 'Navigated' : 'Went back in Firefox history',
         pageInfo: { tabId: tab.tabId, url: actual.url ?? '', title: actual.title },
@@ -1733,25 +1736,140 @@ class FirefoxBackground {
     }
   }
 
-  private async waitNavigation(options: { tab: BrowserTab; context: RequestContext }): Promise<FirefoxTab> {
-    const deadline = Date.now() + DOM_TIMEOUT
-    let actual = await this.api.tabs.get(options.tab.browserTabId!)
-    while (actual.status === 'loading' && Date.now() < deadline) {
-      this.assertContinue(options.context)
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 50)
-      })
-      actual = await this.api.tabs.get(options.tab.browserTabId!)
+  private async waitNavigation(options: {
+    tab: BrowserTab
+    context: RequestContext
+    operation: Extract<BrowserRequest['operation'], { kind: 'page.navigate' | 'page.back' }>
+  }): Promise<FirefoxTab> {
+    const { tab, context, operation } = options
+    const browserTabId = tab.browserTabId!
+    const state = new FirefoxNavigationState(browserTabId)
+    const cleanups: Array<() => void> = []
+    let resolveNavigation: (details: FirefoxNavigationDetails) => void = () => {}
+    let rejectNavigation: (error: unknown) => void = () => {}
+    const navigation = new Promise<FirefoxNavigationDetails>((resolve) => {
+      resolveNavigation = resolve
+    })
+    const interrupted = new Promise<never>((_, reject) => {
+      rejectNavigation = reject
+    })
+    void interrupted.catch(() => {})
+    let waiting = true
+    const assertWaiting = (): void => {
+      this.assertContinue(context)
+      if (!waiting)
+        throw new FirefoxResourceError({
+          code: 'cancelled',
+          message: 'Firefox navigation observation ended',
+          outcome: 'unknown',
+        })
     }
-    this.assertContinue(options.context)
-    if (actual.status === 'loading')
-      throw new FirefoxResourceError({
-        code: 'timeout',
-        message: 'Navigation started, but Firefox has not finished loading',
-        outcome: 'unknown',
+    const check = (): void => {
+      try {
+        this.assertContinue(context)
+      } catch (error) {
+        rejectNavigation(error)
+      }
+    }
+    const signals = {
+      before: this.api.webNavigation.onBeforeNavigate,
+      committed: this.api.webNavigation.onCommitted,
+      completed: this.api.webNavigation.onCompleted,
+      history: this.api.webNavigation.onHistoryStateUpdated,
+      fragment: this.api.webNavigation.onReferenceFragmentUpdated,
+      error: this.api.webNavigation.onErrorOccurred,
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      for (const signal of Object.keys(signals) as FirefoxNavigationSignal[]) {
+        const event = signals[signal]
+        const listener = (details: FirefoxNavigationDetails): void => {
+          check()
+          state.observe({ signal, details })
+          if (state.result?.status === 'complete') resolveNavigation(state.result.details)
+          else if (state.result?.status === 'failed')
+            rejectNavigation(
+              new FirefoxResourceError({
+                code: 'execution-failed',
+                message: state.result.message,
+                outcome: 'unknown',
+              }),
+            )
+        }
+        event.addListener(listener)
+        cleanups.push(() => {
+          event.removeListener(listener)
+        })
+      }
+      const checkTab = (id: number): void => {
+        if (id === browserTabId) check()
+      }
+      this.api.tabs.onUpdated.addListener(checkTab)
+      cleanups.push(() => {
+        this.api.tabs.onUpdated.removeListener(checkTab)
       })
-    if (firefoxPageSupported(actual.url)) await this.inject({ tab: { ...options.tab, url: actual.url ?? '' } })
-    return actual
+      this.api.tabs.onRemoved.addListener(checkTab)
+      cleanups.push(() => {
+        this.api.tabs.onRemoved.removeListener(checkTab)
+      })
+      context.checkNavigation = check
+      this.assertContinue(context)
+      timer = setTimeout(() => {
+        rejectNavigation(
+          new FirefoxResourceError({
+            code: 'timeout',
+            message:
+              'Firefox did not confirm navigation completion. Same-URL history or a no-op without navigation events cannot be confirmed; the action will not be replayed.',
+            outcome: 'unknown',
+          }),
+        )
+      }, DOM_TIMEOUT)
+      const work = async (): Promise<FirefoxTab> => {
+        const initial = await this.api.tabs.get(browserTabId)
+        assertWaiting()
+        if (initial.status === 'loading')
+          throw new FirefoxResourceError({
+            code: 'execution-failed',
+            message:
+              'Firefox is already loading this tab. This navigation was not dispatched; wait for the existing navigation to settle.',
+          })
+        state.arm(Date.now())
+        const action =
+          operation.kind === 'page.navigate'
+            ? this.api.tabs.update(browserTabId, { url: operation.url })
+            : this.api.tabs.goBack(browserTabId)
+        const [completed] = await Promise.all([navigation, action])
+        assertWaiting()
+        const frame = await this.api.webNavigation.getFrame({ tabId: browserTabId, frameId: 0 })
+        assertWaiting()
+        const actual = await this.api.tabs.get(browserTabId)
+        assertWaiting()
+        ownedFirefoxTab({ registry: this.registry, sessionId: context.sessionId, tabId: tab.tabId })
+        if (
+          !frame ||
+          frame.errorOccurred ||
+          frame.url !== completed.url ||
+          actual.status === 'loading' ||
+          actual.url !== completed.url ||
+          (completed.documentId !== undefined &&
+            frame.documentId !== undefined &&
+            completed.documentId !== frame.documentId)
+        )
+          throw new FirefoxResourceError({
+            code: 'outcome-unknown',
+            message:
+              'Firefox navigation was observed, but the current main frame and tab metadata do not match its completion; the action will not be replayed.',
+            outcome: 'unknown',
+          })
+        return actual
+      }
+      return await Promise.race([work(), interrupted])
+    } finally {
+      if (timer) clearTimeout(timer)
+      waiting = false
+      context.checkNavigation = undefined
+      for (const cleanup of cleanups) cleanup()
+    }
   }
 
   private async screenshot(options: {
