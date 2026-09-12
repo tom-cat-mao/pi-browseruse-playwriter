@@ -32,6 +32,7 @@ export const FIREFOX_CAPABILITIES: BrowserCapabilities = {
     'CSS matching is native within each document or shadow root; use chained locators or role/label/text across open shadow hosts, not a single cross-shadow compound CSS selector.',
     'Without getBoxQuads, frame actions require untransformed, unambiguous content-box geometry; uncertain fractional dimensions or transforms are refused.',
     'Firefox may block popup or target=_blank effects of synthetic clicks; browser popup settings are not bypassed.',
+    'Navigation completion uses browser events; already-loading tabs are refused before dispatch, and same-URL/no-op navigation without a confirming event times out without replay.',
   ],
 }
 

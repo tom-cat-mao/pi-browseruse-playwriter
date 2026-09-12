@@ -87,6 +87,10 @@ evaluate 世界可读取和修改页面 DOM，但不等价于 Chrome 主世界�
 | logs | 已接管后可采集的 console/error/rejection；接管前日志不回填，缺少日志不能证明页面没有错误 |
 | execute | Node 隔离 worker 提供 page/locator 的 DOM 兼容接口；不是完整的 Chromium Playwright/CDP 对象模型 |
 
+navigate/back 通过派发后的主 frame 事件确认完成，并核对当前 frame 与标签信息；会跟随后续导航链，
+但 WebExtension 没有本工具的 actionId，不能完备区分用户或网页并发触发的导航。标签已在加载时会
+在派发前拒绝；同 URL/no-op 若没有确认事件，会返回 timeout / outcome unknown，不重放动作。
+
 Firefox 的输入事件来自 DOM API。通常的链接、表单和内容编辑可以使用这一路径，但依赖
 `Event.isTrusted`、真实键盘/指针、系统选择器或浏览器内置交互的页面可能拒绝动作。
 工具不会通过伪造信任、扩大权限或切换到另一个浏览器掩盖失败；应观察结果后决定下一步。
