@@ -29,6 +29,9 @@ export const FIREFOX_CAPABILITIES: BrowserCapabilities = {
     'Evaluate runs in an isolated content-script world; page globals are not ordinary globals.',
     'Execute supports the documented page/locator subset; CDP and browser/context control are unavailable.',
     'Network capture starts on request and retains bounded text bodies; console capture begins after attachment.',
+    'CSS matching is native within each document or shadow root; use chained locators or role/label/text across open shadow hosts, not a single cross-shadow compound CSS selector.',
+    'Without getBoxQuads, frame actions require untransformed, unambiguous content-box geometry; uncertain fractional dimensions or transforms are refused.',
+    'Firefox may block popup or target=_blank effects of synthetic clicks; browser popup settings are not bypassed.',
   ],
 }
 

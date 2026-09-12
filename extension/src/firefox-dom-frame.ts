@@ -139,7 +139,12 @@ function isIdentityMatrix(value: string): boolean {
     const entries = matrix3d[1].split(',').map((entry) => {
       return Number(entry.trim())
     })
-    return entries.length === 16 && entries.every((entry, index) => entry === identity[index])
+    return (
+      entries.length === 16 &&
+      entries.every((entry, index) => {
+        return entry === identity[index]
+      })
+    )
   }
   return false
 }
@@ -148,14 +153,24 @@ function isNeutralLengths(value: string): boolean {
   const normalized = value.trim()
   if (normalized === 'none') return true
   const parts = normalized.split(/\s+/)
-  return parts.length > 0 && parts.every((part) => /^0(?:px|%)?$/.test(part))
+  return (
+    parts.length > 0 &&
+    parts.every((part) => {
+      return /^0(?:px|%)?$/.test(part)
+    })
+  )
 }
 
 function isNeutralScale(value: string): boolean {
   const normalized = value.trim()
   if (normalized === 'none') return true
   const parts = normalized.split(/\s+/)
-  return parts.length > 0 && parts.every((part) => part === '1')
+  return (
+    parts.length > 0 &&
+    parts.every((part) => {
+      return part === '1'
+    })
+  )
 }
 
 function isNeutralZoom(value: string): boolean {
@@ -298,7 +313,6 @@ export function untransformedFrameContentBox(options: { frame: Element }): {
     },
   })
 }
-
 
 function composedContains(options: { element: Element; ancestor: Element }): boolean {
   for (let current: Element | null = options.element; current; current = composedParent(current)) {
