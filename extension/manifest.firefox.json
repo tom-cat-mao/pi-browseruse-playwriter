@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Browser Use",
-  "version": "0.0.133",
+  "version": "0.0.134",
   "description": "Connect Pi Browser Use to your existing Firefox tabs for local Pi agent browser automation.",
   "browser_specific_settings": {
     "gecko": {

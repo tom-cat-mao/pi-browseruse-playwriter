@@ -18,6 +18,7 @@ import type {
 import { parseBrowserDomRequest } from 'playwriter/src/browser-dom-validation'
 import { getFirefoxApi } from './firefox-api'
 import type { FirefoxApi, FirefoxTab } from './firefox-api'
+import { keepFirefoxBackgroundActive } from './firefox-keepalive'
 import { KeyedSerialQueue } from './keyed-queue'
 import { FirefoxNetwork } from './firefox-network'
 import { parseFirefoxBrowserRequest } from './firefox-request-validation'
@@ -444,7 +445,9 @@ class FirefoxBackground {
     }
     if (!isFirefoxRecord(message)) return
     if (message.method === 'ping') {
-      if (options.socket.readyState === WebSocket.OPEN) options.socket.send(JSON.stringify({ method: 'pong' }))
+      void keepFirefoxBackgroundActive(this.api)
+      if (options.socket === this.socket && options.socket.readyState === WebSocket.OPEN)
+        options.socket.send(JSON.stringify({ method: 'pong' }))
       return
     }
     if (!Number.isSafeInteger(message.id) || Number(message.id) < 0) return

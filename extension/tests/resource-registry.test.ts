@@ -192,6 +192,50 @@ describe('managed resource registry ownership', () => {
     }).toThrow('restarted')
   })
 
+  test('Firefox background suspension keeps ownership while a lost session epoch still rebinds', () => {
+    const registry = firefoxFixture()
+    const observedTabs = [
+      {
+        id: 42,
+        windowId: 1,
+        active: false,
+        incognito: false,
+        url: 'https://example.com',
+        title: 'Example',
+      },
+    ]
+    const woken = reconcileFirefoxRegistry({
+      registry,
+      browserEpoch: registry.browserEpoch,
+      observedTabs,
+    })
+    expect(woken.browserEpoch).toBe(registry.browserEpoch)
+    expect(woken.tabs[0]).toMatchObject({
+      state: 'ready',
+      browserTabId: 42,
+      browserEpoch: registry.browserEpoch,
+    })
+    expect(woken.groups[0].state).toBe('ready')
+    expect(
+      ownedFirefoxTab({
+        registry: woken,
+        sessionId: 'session-1',
+        tabId: 'firefox-tab',
+        browserEpoch: woken.browserEpoch,
+      }).tabId,
+    ).toBe('firefox-tab')
+    const restarted = reconcileFirefoxRegistry({
+      registry: woken,
+      browserEpoch: 'firefox-epoch-after-restart',
+      observedTabs,
+    })
+    expect(restarted.tabs[0].state).toBe('needs-rebind')
+    expect(restarted.groups[0].state).toBe('needs-rebind')
+    expect(() => {
+      ownedFirefoxTab({ registry: restarted, sessionId: 'session-1', tabId: 'firefox-tab' })
+    }).toThrow('restarted')
+  })
+
   test('Firefox session and execution epoch are checked independently', () => {
     const registry = firefoxFixture()
     expect(() => {
