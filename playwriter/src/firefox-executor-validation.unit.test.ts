@@ -1,0 +1,66 @@
+import { describe, expect, test } from 'vitest'
+import { parseBrowserDomCommand, parseBrowserDomRequest } from './browser-dom-validation.js'
+
+describe('Firefox DOM command boundary', () => {
+  test('accepts a nested locator and preserves explicit tab identity', () => {
+    const command = {
+      method: 'locator',
+      action: 'fill',
+      locator: { steps: [
+        { kind: 'selector', engine: 'css', value: 'form' },
+        { kind: 'filter', has: { steps: [{ kind: 'selector', engine: 'text', value: 'Shipping', exact: true }] } },
+        { kind: 'selector', engine: 'label', value: 'Name' },
+      ] },
+      args: ['Example', { timeout: 500 }],
+    }
+    const request = { requestId: 'request', sessionId: 'session', tabId: 'tab', browserEpoch: 'epoch', command, timeoutMs: 1000 }
+    expect(parseBrowserDomRequest(request)).toEqual(request)
+    expect(parseBrowserDomCommand(command)).toEqual(command)
+  })
+
+  test('validates frame lookup locators without accepting another page identity', () => {
+    const command = { method: 'frame.resolve', locator: { steps: [{ kind: 'selector', engine: 'css', value: 'iframe.payment' }] } }
+    expect(parseBrowserDomCommand(command)).toEqual(command)
+    expect(parseBrowserDomCommand({ method: 'page', action: 'readyState' })).toEqual({ method: 'page', action: 'readyState' })
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'inputValue', locator: { steps: [{ kind: 'selector', engine: 'css', value: 'aria-ref=e1' }], snapshotId: 'snapshot-1' } })).not.toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'fill', locator: command.locator, args: [42] })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'click', locator: command.locator, args: [{ timeout: -1 }] })).toBeNull()
+    expect(parseBrowserDomCommand({ ...command, tabId: 'other' })).toBeNull()
+    expect(parseBrowserDomCommand({ ...command, locator: { steps: [{ kind: 'nth', index: NaN }] } })).toBeNull()
+  })
+
+  test('rejects scope-changing fields, unknown commands and cross-tab nested operations', () => {
+    const base = { requestId: 'r', sessionId: 's', tabId: 'tab', browserEpoch: 'e' }
+    expect(parseBrowserDomRequest({ ...base, command: { method: 'operation', operation: { kind: 'page.back', tabId: 'other' } } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'operation', operation: { kind: 'page.execute', tabId: 'tab', code: 'return 1' } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'page', action: 'url', tabId: 'other' })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'closeBrowser' })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'evaluate', code: 'return 1', world: 'MAIN' })).toBeNull()
+  })
+
+  test('validates prepared frame action points, tokens, and strict parent locator scope', () => {
+    const locator = { steps: [{ kind: 'selector', engine: 'css', value: 'iframe.payment' }] }
+    const point = { x: 24, y: 32 }
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point })).toEqual({ method: 'frame.check', locator, point })
+    expect(parseBrowserDomCommand({ method: 'frame.actionPoint', locator, action: 'fill', args: ['value'] })).not.toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.actionPoint', locator, action: 'count' })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point: { x: -1, y: 2 } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point: { x: 1, y: Number.NaN } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point: { x: 1, y: 2, tabId: 'other' } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'frame.check', locator, point, frameId: 42 })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', locator, action: 'click', expectedPoint: point, preparationId: 'prepared' })).not.toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', locator, action: 'click', expectedPoint: point })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', locator, action: 'click', preparationId: 'prepared' })).toBeNull()
+  })
+
+  test('rejects cyclic, oversized and malformed locator programs', () => {
+    const cycle: Record<string, unknown> = { method: 'evaluate', code: 'return 1' }
+    cycle.self = cycle
+    expect(parseBrowserDomCommand(cycle)).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'evaluate', code: 'a'.repeat(1_000_001) })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'count', locator: { steps: [] } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'count', locator: { steps: [{ kind: 'nth', index: -2 }] } })).toBeNull()
+    expect(parseBrowserDomCommand({ method: 'locator', action: 'count', locator: { steps: [{ kind: 'selector', engine: 'css', value: 'input', options: { unsupported: true } }] } })).toBeNull()
+    expect(parseBrowserDomRequest({ requestId: 'r', sessionId: 's', tabId: 't', browserEpoch: 'e', command: { method: 'invalidate' }, timeoutMs: 0 })).toBeNull()
+  })
+})

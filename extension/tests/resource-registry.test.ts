@@ -1,3 +1,16 @@
+import {
+  activeFirefoxTab,
+  emptyFirefoxRegistry,
+  firefoxInventory,
+  firefoxPageSupported,
+  firefoxRequestFingerprint,
+  ownedFirefoxTab,
+  parseFirefoxRegistry,
+  reconcileFirefoxRegistry,
+  releaseFirefoxTabs,
+} from '../src/firefox-resources'
+import type { FirefoxRegistry } from '../src/firefox-resources'
+import { parseFirefoxBrowserRequest } from '../src/firefox-request-validation'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { CoalescedPublisher, compareDiscoveredTabs } from '../src/managed-groups'
 import type { DiscoverySortableTab } from '../src/managed-groups'
@@ -65,6 +78,278 @@ function observedTab(options: { chromeTabId: number; chromeGroupId: number }): O
 }
 
 describe('managed resource registry ownership', () => {
+  function firefoxFixture(): FirefoxRegistry {
+    const registry = emptyFirefoxRegistry({ profileId: 'firefox-profile', browserEpoch: 'firefox-epoch' })
+    registry.revision = 1
+    registry.groups.push({
+      groupId: 'firefox-group',
+      sessionId: 'session-1',
+      profileId: registry.profileId,
+      name: 'Existing tab',
+      browserEpoch: registry.browserEpoch,
+      revision: 1,
+      state: 'ready',
+      origin: 'existing',
+    })
+    registry.tabs.push({
+      tabId: 'firefox-tab',
+      groupId: 'firefox-group',
+      sessionId: 'session-1',
+      profileId: registry.profileId,
+      browserEpoch: registry.browserEpoch,
+      revision: 1,
+      state: 'ready',
+      chromeTabId: -1,
+      browserTabId: 42,
+      url: 'https://example.com',
+      title: 'Example',
+      origin: 'existing',
+    })
+    return registry
+  }
+
+  test('Firefox persisted identity roundtrips without inventing CDP bindings', () => {
+    const registry = firefoxFixture()
+    expect(parseFirefoxRegistry(JSON.parse(JSON.stringify(registry)))).toEqual(registry)
+    expect(firefoxInventory(registry).tabs[0]).toMatchObject({ chromeTabId: -1, browserTabId: 42 })
+    expect(firefoxInventory(registry)).not.toHaveProperty('ledger')
+    expect(
+      parseFirefoxRegistry({ ...registry, tabs: [{ ...registry.tabs[0], targetId: 'fake-cdp-target' }] }),
+    ).toBeNull()
+    expect(parseFirefoxRegistry({ ...registry, tabs: [{ ...registry.tabs[0], chromeTabId: 42 }] })).toBeNull()
+    expect(
+      parseFirefoxRegistry({ ...registry, tabs: [{ ...registry.tabs[0], sessionId: 'other-session' }] }),
+    ).toBeNull()
+    expect(
+      parseFirefoxRegistry({
+        ...registry,
+        tabs: [registry.tabs[0], { ...registry.tabs[0], tabId: 'duplicate-physical' }],
+      }),
+    ).toBeNull()
+  })
+
+  test('Firefox attach-in-place mappings survive same-epoch reconnect without group inference', () => {
+    const registry = firefoxFixture()
+    const restored = reconcileFirefoxRegistry({
+      registry,
+      browserEpoch: registry.browserEpoch,
+      observedTabs: [
+        {
+          id: 42,
+          windowId: 999,
+          active: false,
+          incognito: false,
+          groupId: 731,
+          url: 'https://example.com/changed',
+          title: 'Changed',
+        },
+      ],
+    })
+    expect(restored.tabs[0]).toMatchObject({ state: 'ready', browserTabId: 42, url: 'https://example.com/changed' })
+    expect(restored.groups[0]).not.toHaveProperty('browserGroupId')
+    expect(ownedFirefoxTab({ registry: restored, sessionId: 'session-1', tabId: 'firefox-tab' }).tabId).toBe(
+      'firefox-tab',
+    )
+  })
+
+  test('Firefox release tombstones survive reconnect even when the physical tab still exists', () => {
+    const released = releaseFirefoxTabs({ registry: firefoxFixture(), tabIds: ['firefox-tab'] })
+    const restored = reconcileFirefoxRegistry({
+      registry: released,
+      browserEpoch: released.browserEpoch,
+      observedTabs: [
+        { id: 42, windowId: 1, active: true, incognito: false, url: 'https://example.com', title: 'Example' },
+      ],
+    })
+    expect(restored.tabs[0].state).toBe('released')
+    expect(activeFirefoxTab({ registry: restored, browserTabId: 42 })).toBeUndefined()
+    expect(() => {
+      ownedFirefoxTab({ registry: restored, sessionId: 'session-1', tabId: 'firefox-tab' })
+    }).toThrow('released')
+  })
+
+  test('Firefox browser restart never adopts a reused physical ID', () => {
+    const registry = firefoxFixture()
+    const restarted = reconcileFirefoxRegistry({
+      registry,
+      browserEpoch: 'new-firefox-epoch',
+      observedTabs: [
+        {
+          id: 42,
+          windowId: 1,
+          active: true,
+          incognito: false,
+          url: registry.tabs[0].url,
+          title: registry.tabs[0].title,
+        },
+      ],
+    })
+    expect(restarted.tabs[0].state).toBe('needs-rebind')
+    expect(restarted.groups[0].state).toBe('needs-rebind')
+    expect(activeFirefoxTab({ registry: restarted, browserTabId: 42 })).toBeUndefined()
+    expect(() => {
+      ownedFirefoxTab({ registry: restarted, sessionId: 'session-1', tabId: 'firefox-tab' })
+    }).toThrow('restarted')
+  })
+
+  test('Firefox background suspension keeps ownership while a lost session epoch still rebinds', () => {
+    const registry = firefoxFixture()
+    const observedTabs = [
+      {
+        id: 42,
+        windowId: 1,
+        active: false,
+        incognito: false,
+        url: 'https://example.com',
+        title: 'Example',
+      },
+    ]
+    const woken = reconcileFirefoxRegistry({
+      registry,
+      browserEpoch: registry.browserEpoch,
+      observedTabs,
+    })
+    expect(woken.browserEpoch).toBe(registry.browserEpoch)
+    expect(woken.tabs[0]).toMatchObject({
+      state: 'ready',
+      browserTabId: 42,
+      browserEpoch: registry.browserEpoch,
+    })
+    expect(woken.groups[0].state).toBe('ready')
+    expect(
+      ownedFirefoxTab({
+        registry: woken,
+        sessionId: 'session-1',
+        tabId: 'firefox-tab',
+        browserEpoch: woken.browserEpoch,
+      }).tabId,
+    ).toBe('firefox-tab')
+    const restarted = reconcileFirefoxRegistry({
+      registry: woken,
+      browserEpoch: 'firefox-epoch-after-restart',
+      observedTabs,
+    })
+    expect(restarted.tabs[0].state).toBe('needs-rebind')
+    expect(restarted.groups[0].state).toBe('needs-rebind')
+    expect(() => {
+      ownedFirefoxTab({ registry: restarted, sessionId: 'session-1', tabId: 'firefox-tab' })
+    }).toThrow('restarted')
+  })
+
+  test('Firefox session and execution epoch are checked independently', () => {
+    const registry = firefoxFixture()
+    expect(() => {
+      ownedFirefoxTab({ registry, sessionId: 'session-2', tabId: 'firefox-tab' })
+    }).toThrow('another Pi session')
+    expect(() => {
+      ownedFirefoxTab({ registry, sessionId: 'session-1', tabId: 'firefox-tab', browserEpoch: 'stale-epoch' })
+    }).toThrow('earlier Firefox run')
+    const released = releaseFirefoxTabs({ registry, tabIds: [], groupIds: ['firefox-group'] })
+    expect(() => {
+      ownedFirefoxTab({ registry: released, sessionId: 'session-1', tabId: 'firefox-tab' })
+    }).toThrow('owning group')
+  })
+
+  test('Firefox empty task groups discard stale native bindings before another create', () => {
+    const registry = firefoxFixture()
+    registry.groups[0] = { ...registry.groups[0], origin: 'task', browserGroupId: 17, windowId: 3 }
+    const released = releaseFirefoxTabs({ registry, tabIds: ['firefox-tab'] })
+    expect(released.groups[0].state).toBe('ready')
+    expect(released.groups[0]).not.toHaveProperty('browserGroupId')
+    expect(released.groups[0]).not.toHaveProperty('windowId')
+  })
+
+  test('Firefox task tabs moved out of a native group become tombstones', () => {
+    const registry = firefoxFixture()
+    registry.groups[0] = { ...registry.groups[0], origin: 'task', browserGroupId: 17 }
+    const restored = reconcileFirefoxRegistry({
+      registry,
+      browserEpoch: registry.browserEpoch,
+      observedTabs: [
+        {
+          id: 42,
+          windowId: 1,
+          groupId: 18,
+          active: false,
+          incognito: false,
+          url: 'https://example.com',
+          title: 'Example',
+        },
+      ],
+    })
+    expect(restored.tabs[0].state).toBe('released')
+    expect(restored.groups[0]).not.toHaveProperty('browserGroupId')
+  })
+
+  test('Firefox browser request parser rejects missing identity, unknown fields and invalid ranges', () => {
+    const request = {
+      requestId: 'request',
+      sessionId: 'session',
+      operation: { kind: 'page.fill', tabId: 'tab', selector: '#name', value: '' },
+    }
+    expect(parseFirefoxBrowserRequest(request)).toEqual(request)
+    expect(parseFirefoxBrowserRequest({ ...request, operation: { ...request.operation, force: true } })).toBeNull()
+    expect(
+      parseFirefoxBrowserRequest({ ...request, operation: { kind: 'page.fill', selector: '#name', value: '' } }),
+    ).toBeNull()
+    expect(
+      parseFirefoxBrowserRequest({ ...request, operation: { kind: 'page.logs', tabId: 'tab', limit: 0 } }),
+    ).toBeNull()
+    expect(
+      parseFirefoxBrowserRequest({
+        ...request,
+        operation: { kind: 'page.network', tabId: 'tab', action: 'dump-all-tabs' },
+      }),
+    ).toBeNull()
+    expect(parseFirefoxBrowserRequest({ ...request, timeoutMs: Infinity })).toBeNull()
+    expect(parseFirefoxBrowserRequest({ ...request, browserEpoch: 'spoofed' })).toBeNull()
+  })
+
+  test('Firefox dedup fingerprints bind operation and tab while ignoring object property order', () => {
+    const request = {
+      requestId: 'request',
+      sessionId: 'session',
+      operation: { kind: 'tabs.create' as const, groupId: 'group', url: 'https://example.com' },
+    }
+    expect(firefoxRequestFingerprint(request)).toBe(
+      firefoxRequestFingerprint({
+        ...request,
+        operation: { url: 'https://example.com', groupId: 'group', kind: 'tabs.create' },
+      }),
+    )
+    expect(firefoxRequestFingerprint(request)).not.toBe(
+      firefoxRequestFingerprint({ ...request, operation: { ...request.operation, groupId: 'other' } }),
+    )
+    expect(
+      firefoxRequestFingerprint({
+        sessionId: 'session',
+        tabId: 'tab-a',
+        browserEpoch: 'epoch',
+        command: { method: 'page', action: 'title' },
+      }),
+    ).not.toBe(
+      firefoxRequestFingerprint({
+        sessionId: 'session',
+        tabId: 'tab-b',
+        browserEpoch: 'epoch',
+        command: { method: 'page', action: 'title' },
+      }),
+    )
+  })
+
+  test('Firefox rejects privileged URLs before page execution', () => {
+    for (const url of [
+      'about:config',
+      'file:///etc/passwd',
+      'moz-extension://other/popup.html',
+      'https://addons.mozilla.org/',
+      'javascript:alert(1)',
+    ])
+      expect(firefoxPageSupported(url)).toBe(false)
+    expect(firefoxPageSupported('https://example.com/')).toBe(true)
+    expect(firefoxPageSupported('http://127.0.0.1:12345/fixture')).toBe(true)
+  })
+
   test('a transport disconnect keeps ownership without tombstones', () => {
     const attached = createRegistryWithGroup()
     const disconnected = clearTabAttachment(attached, 'pt-1')

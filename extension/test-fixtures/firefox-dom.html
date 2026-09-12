@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Firefox DOM driver fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Account settings</h1>
+      <form id="settings">
+        <label for="name">Display name</label><input id="name" value="Existing form value" />
+        <label for="bio">Biography</label><textarea id="bio">Existing description</textarea>
+        <label><input id="notifications" type="checkbox" />Email notifications</label>
+        <label for="theme">Theme</label>
+        <select id="theme">
+          <option value="light">Light mode</option>
+          <option value="dark">Dark mode</option>
+          <option disabled value="locked">Locked</option>
+        </select>
+        <select id="tags" multiple>
+          <option value="one">One</option>
+          <option value="two">Two</option>
+          <option value="three">Three</option>
+        </select>
+        <div id="draft" contenteditable="true" role="textbox" aria-label="Draft">Existing draft</div>
+        <button id="save" type="button" aria-labelledby="save-label">
+          <span aria-hidden="true">Wrong visual name</span>
+        </button>
+        <span id="save-label" hidden>Save profile</span>
+        <button type="button" class="repeated">Same action</button
+        ><button type="button" class="repeated">Same action</button>
+        <fieldset disabled>
+          <legend><input id="legend-input" aria-label="Legend exception" /></legend>
+          <input id="disabled-input" aria-label="Disabled field" />
+        </fieldset>
+      </form>
+      <ul>
+        <li data-testid="first-item">Alpha <button type="button">Open</button></li>
+        <li data-testid="second-item">Beta <button type="button">Open</button></li>
+      </ul>
+      <img id="logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="Company logo" />
+      <input id="search" placeholder="Search records" title="Record search" />
+      <div id="shadow-host"></div>
+      <iframe id="same-origin" title="Same origin fixture"></iframe>
+      <div id="dynamic"></div>
+    </main>
+  </body>
+</html>

@@ -1,7 +1,7 @@
 {
   "name": "@tom-cat/pi-browser-use-extension",
   "version": "0.1.0",
-  "description": "pi package: drive the user's real Chrome (their login sessions) via the Playwriter relay + browser extension, with 9 typed tools + a browser_execute escape hatch and a distilled usage skill.",
+  "description": "Pi tools for the user's existing Chrome or Firefox tabs and login sessions through a local managed runtime and browser extension.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -14,7 +14,8 @@
     "browser automation",
     "playwright",
     "playwriter",
-    "chrome"
+    "chrome",
+    "firefox"
   ],
   "pi": {
     "extensions": [

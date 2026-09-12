@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pi Browser Use · Firefox</title>
+    <style>
+      :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
+      body { width: 320px; margin: 0; padding: 20px; background: light-dark(#faf9f6, #202322); color: light-dark(#18251f, #ecf2ed); }
+      h1 { margin: 0; font-size: 20px; letter-spacing: -0.4px; }
+      h2 { margin: 0 0 8px; font-size: 14px; }
+      p { margin: 8px 0; }
+      .subtitle, .hint { color: light-dark(#596860, #a9b8b0); }
+      .subtitle { margin-top: 2px; font-size: 12px; }
+      section { border-top: 1px solid light-dark(#d9e1db, #435249); margin-top: 18px; padding-top: 16px; }
+      button { width: 100%; border: 0; border-radius: 7px; padding: 10px 12px; margin-top: 8px; font: inherit; font-weight: 600; cursor: pointer; background: light-dark(#236344, #9adbb6); color: light-dark(#fff, #153222); }
+      button:focus-visible { outline: 3px solid light-dark(#306dcc, #9abfff); outline-offset: 3px; }
+      button:disabled { opacity: 0.55; cursor: default; }
+      .secondary { background: light-dark(#e7ece7, #34473b); color: inherit; }
+      .hint, [role="status"] { font-size: 12px; }
+      [role="status"] { min-height: 18px; overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Pi Browser Use</h1>
+      <p class="subtitle">Firefox · 使用当前标签和登录状态</p>
+    </header>
+    <p>在 Pi 中选择 Firefox，再接管你已经打开的标签。页面会保留在原来的窗口中。</p>
+    <section aria-labelledby="javascript-heading">
+      <h2 id="javascript-heading">页面 JavaScript</h2>
+      <p class="hint">允许 Pi 在已接管的页面上执行 JavaScript，用于复杂读取和交互。需要 Firefox 153 或更新版本。</p>
+      <button id="enable-javascript" type="button" disabled>启用页面 JavaScript</button>
+      <p id="javascript-status" role="status" aria-live="polite">正在检查…</p>
+      <p class="hint">未启用时，标签管理、快照、点击和填写仍可使用。</p>
+    </section>
+    <section aria-labelledby="release-heading">
+      <h2 id="release-heading">结束当前标签的控制</h2>
+      <button id="release-tab" class="secondary" type="button">释放当前标签</button>
+      <p id="release-status" role="status" aria-live="polite">释放后页面保持打开，Pi 不再控制它。</p>
+    </section>
+    <p class="hint">Firefox 通过网页 DOM 完成交互。少数网站可能要求真实键盘或鼠标输入。</p>
+    <script src="firefox-popup.js"></script>
+  </body>
+</html>

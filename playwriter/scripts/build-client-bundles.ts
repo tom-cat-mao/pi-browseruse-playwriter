@@ -41,6 +41,7 @@ interface WrapperBundle {
 type BundleConfig = SourceBundle | WrapperBundle
 
 const BUNDLES: BundleConfig[] = [
+  { name: 'firefox-executor-realm-bundle', type: 'source', entry: 'firefox-executor-realm.ts' },
   // Source file bundles
   {
     name: 'a11y-client',
