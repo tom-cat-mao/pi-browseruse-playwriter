@@ -1838,7 +1838,7 @@ class FirefoxBackground {
           operation.kind === 'page.navigate'
             ? this.api.tabs.update(browserTabId, { url: operation.url })
             : this.api.tabs.goBack(browserTabId)
-        const [completed] = await Promise.all([navigation, action])
+        const [completed] = await Promise.race([Promise.all([navigation, action]), interrupted])
         assertWaiting()
         const frame = await this.api.webNavigation.getFrame({ tabId: browserTabId, frameId: 0 })
         assertWaiting()

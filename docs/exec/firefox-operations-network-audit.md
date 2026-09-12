@@ -65,8 +65,8 @@ complete 时直接返回。此缺陷有真实基线证据，本批不宣称修�
 最小修复路径改为动作派发前注册同一 native tab / frameId=0 的 webNavigation 监听：
 
 - 过滤派发前的 timeStamp；跨文档要求 committed 后 completed，存在 documentId 时要求
-  一致；缺少 documentId 时核对 commit/completed URL。commit 后又开始新导航则失败，
-  不跟随新导航冒充原动作。history/fragment 无需 URL 改变即可确认同文档变化。只看到旧 completed、子 frame
+  一致；缺少 documentId 时核对 commit/completed URL。最初版本将 commit 后新导航拒绝，
+  此策略已由第四批修正为继续观察导航链。history/fragment 无需 URL 改变即可确认同文档变化。只看到旧 completed、子 frame
   或其它 tab 的事件不能确认本次动作。完整加载期间的 history/fragment 不提前结束加载。
 - 同 URL reload 有 commit/completed 时正常完成；无事件的同 URL history/no-op 在 5s
   预算后返回 timeout + outcome unknown，明确不重放。已在 loading 的 tab 在派发前拒绝，
@@ -96,3 +96,28 @@ WebExtension 没有本工具的动作关联 ID；用户/页面同时发起的新
 （导航 10、预算 9、资源 41）；Prettier 与 git diff --check PASS。日志为
 `tmp/logs/navigation-typecheck.log`、`tmp/logs/navigation-tests.log`。runtime 整套与真实
 浏览器 SKIP，仍由协调者/验收 owner 执行。
+
+## 第四批：独立 CodeBuddy14 导航复审修正
+
+- P1：原 committed(A) → before(B) 一律失败，会拒绝 location.replace、meta refresh 和
+  登录页 JS 跳转。现重置当前 commit，继续观察后续主 frame 导航，仍在末尾核对 frame/tab
+  事实；这种核对不能证明因果归属，WebExtension 无 actionId 的并发边界保持不变。
+- 后续 before 保存已被替代文档的 ID/URL，重置当前 commit；旧 completion 在新 commit
+  前不能完成新链，旧文档 abort 不杀死新链。新 commit 后优先用 documentId 排除旧事件，
+  无 ID 时核对当前完成 URL，并过滤已替代 URL 的歧义 abort。缺少身份且旧/新 URL
+  完全相同的事件无法证明归因；匹配的完成仍须通过末尾事实核对，不能将该核对当作 actionId。
+- before(A) → committed(A) → history/fragment(A?changed) 现在更新已 commit 的 URL，
+  仍等待 completed。无 documentId 时可匹配更新后的完成 URL；有 ID 时拒绝旧文档的
+  history/fragment，避免污染新文档事实。
+- 内层 Promise.all 同样 race interrupted，使导航事件等待在取消/超时后收敛；不将此前
+  无根 pending Promise 描述为确定内存泄漏。不更改原生浏览器 Promise 的实现或重放动作。
+
+保留刻意边界：已 loading 的 tab 派发前拒绝；无事件 no-op 返回 timeout/outcome unknown。
+此批只改导航状态、导航等待的一行中断接线、测试与发行/审查记录，没有改其他模块行为。
+新增回归直接运行生产状态逻辑，覆盖有/无 documentId 的导航链、旧 abort/完成、同 URL
+替代、加载期间 history/fragment URL 变化、旧文档 history 干扰。真实 location.replace、
+load 时 replaceState/fragment 及最终构建由独立验收 owner 复验。
+
+第四批最终检查：扩展 TypeScript PASS；3 文件 / 64 tests PASS（导航 14、预算 9、资源 41）；
+修改文件格式与 git diff --check PASS。日志为 `tmp/logs/navigation-chain-typecheck.log` 与
+`tmp/logs/navigation-chain-tests.log`。runtime unit/integration、真实浏览器 SKIP；未 push。

@@ -88,13 +88,84 @@ describe('Firefox navigation observation', () => {
     expect(state.result).toBeUndefined()
   })
 
-  test('another navigation after commit is not silently adopted as this action', () => {
+  test('navigation chains follow a later main-frame commit without accepting old aborts or completion', () => {
+    for (const withDocumentIds of [false, true]) {
+      const state = new FirefoxNavigationState(42)
+      state.arm(100)
+      const old = event({ ...(withDocumentIds ? { documentId: 'old' } : {}) })
+      const next = event({ url: 'https://example.com/next', ...(withDocumentIds ? { documentId: 'next' } : {}) })
+      state.observe({ signal: 'before', details: old })
+      state.observe({ signal: 'committed', details: { ...old, timeStamp: 101 } })
+      state.observe({ signal: 'before', details: { ...next, timeStamp: 102 } })
+      state.observe({ signal: 'error', details: { ...old, timeStamp: 103, error: 'old document aborted' } })
+      state.observe({ signal: 'completed', details: { ...old, timeStamp: 104 } })
+      expect(state.result).toBeUndefined()
+      state.observe({ signal: 'committed', details: { ...next, timeStamp: 105 } })
+      state.observe({ signal: 'error', details: { ...old, timeStamp: 106, error: 'old document aborted' } })
+      state.observe({ signal: 'completed', details: { ...old, timeStamp: 107 } })
+      expect(state.result).toBeUndefined()
+      const completed = { ...next, timeStamp: 108 }
+      state.observe({ signal: 'completed', details: completed })
+      expect(state.result).toEqual({ status: 'complete', details: completed })
+    }
+  })
+
+  test('history and fragment update the committed URL but do not finish its load', () => {
+    for (const signal of ['history', 'fragment'] as const) {
+      const state = new FirefoxNavigationState(42)
+      state.arm(100)
+      state.observe({ signal: 'before', details: event() })
+      state.observe({ signal: 'committed', details: event({ timeStamp: 101 }) })
+      const changed = event({ url: 'https://example.com/same?changed#fragment', timeStamp: 102 })
+      state.observe({ signal, details: changed })
+      expect(state.result).toBeUndefined()
+      state.observe({ signal: 'completed', details: event({ timeStamp: 103 }) })
+      expect(state.result).toBeUndefined()
+      const completed = { ...changed, timeStamp: 104 }
+      state.observe({ signal: 'completed', details: completed })
+      expect(state.result).toEqual({ status: 'complete', details: completed })
+    }
+  })
+
+  test('an old document history event cannot change the current committed document URL', () => {
     const state = new FirefoxNavigationState(42)
     state.arm(100)
-    state.observe({ signal: 'committed', details: event() })
+    state.observe({ signal: 'committed', details: event({ documentId: 'current' }) })
+    state.observe({
+      signal: 'history',
+      details: event({ documentId: 'old', url: 'https://example.com/old', timeStamp: 101 }),
+    })
+    const completed = event({ documentId: 'current', timeStamp: 102 })
+    state.observe({ signal: 'completed', details: completed })
+    expect(state.result).toEqual({ status: 'complete', details: completed })
+  })
+
+  test('same-URL replacement ignores the retired document abort before the next commit', () => {
+    const state = new FirefoxNavigationState(42)
+    state.arm(100)
+    state.observe({ signal: 'committed', details: event({ documentId: 'old' }) })
     state.observe({ signal: 'before', details: event({ timeStamp: 101 }) })
-    state.observe({ signal: 'completed', details: event({ timeStamp: 102 }) })
-    expect(state.result?.status).toBe('failed')
+    state.observe({ signal: 'error', details: event({ documentId: 'old', timeStamp: 102, error: 'aborted' }) })
+    expect(state.result).toBeUndefined()
+    state.observe({ signal: 'committed', details: event({ documentId: 'new', timeStamp: 103 }) })
+    state.observe({ signal: 'completed', details: event({ documentId: 'old', timeStamp: 104 }) })
+    expect(state.result).toBeUndefined()
+    const completed = event({ documentId: 'new', timeStamp: 105 })
+    state.observe({ signal: 'completed', details: completed })
+    expect(state.result).toEqual({ status: 'complete', details: completed })
+  })
+
+  test('a known retired document cannot complete a same-URL commit with missing identity', () => {
+    const state = new FirefoxNavigationState(42)
+    state.arm(100)
+    state.observe({ signal: 'committed', details: event({ documentId: 'retired' }) })
+    state.observe({ signal: 'before', details: event({ timeStamp: 101 }) })
+    state.observe({ signal: 'committed', details: event({ timeStamp: 102 }) })
+    state.observe({ signal: 'completed', details: event({ documentId: 'retired', timeStamp: 103 }) })
+    expect(state.result).toBeUndefined()
+    const completed = event({ timeStamp: 104 })
+    state.observe({ signal: 'completed', details: completed })
+    expect(state.result).toEqual({ status: 'complete', details: completed })
   })
 
   test('missing document IDs require matching committed and completed URLs', () => {
