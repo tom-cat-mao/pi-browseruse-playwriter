@@ -53,6 +53,7 @@ const RETEST_WATCH_ITEMS = [
   'open shadow DOM: compound cross-shadow CSS is an explicit non-goal this round (per-root native CSS; cross-host via chained/role/label/text). Chained traversal is required and must actually succeed; the two are asserted separately',
   'non-secure HTTP origin: DOM driver must not depend on view.crypto.randomUUID (SecureContext) — owner switching to getRandomValues',
   'page.back response pageInfo.url must equal the completed navigation URL (Codex fix); re-check returned data against page.url()',
+  'navigation chain: page.navigate must follow post-commit meta refresh / location.replace to the final document and return the real final pageInfo.url; load-time history.replaceState or hash change must settle (no wait on a load that already fired); same-document fragment and back included',
   'network: page realm must confirm complete original receipt (large body + UTF-8); retained capture bytes do not prove the in-flight memory budget, which is pure-logic provable only',
   'transient new-tab injection race (about:blank/document swap during create) — NOT RUN unless a real deterministic trigger exists',
 ]
@@ -341,6 +342,39 @@ const SECURE_PROBE_HTML = `<!doctype html>
     document.querySelector('#probe-log').textContent += 'probe clicked; ';
   });
 </script>
+</body></html>`
+
+const NAV_META_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Meta refresh start</title>
+<meta http-equiv="refresh" content="0; url=/nav/final.html?via=meta"></head>
+<body><h1 id="start-heading">Meta refresh start</h1></body></html>`
+
+const NAV_LOCATION_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Location replace start</title></head>
+<body><h1 id="start-heading">Location replace start</h1>
+<script>location.replace('/nav/final.html?via=location')</script></body></html>`
+
+const NAV_FINAL_HTML = (via) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Final page via ${via}</title></head>
+<body><h1 id="final-heading">Final page</h1><p id="final-via">via=${via}</p></body></html>`
+
+const NAV_REPLACE_STATE_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Replace state</title></head>
+<body><h1 id="rs-heading">Replace state</h1>
+<script>history.replaceState(null, '', '/nav/replace-state.html?replaced=1'); document.title = 'Replace state replaced'</script></body></html>`
+
+const NAV_HASH_CHANGE_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Hash change</title></head>
+<body><h1 id="hc-heading">Hash change</h1>
+<script>location.hash = '#frag'; document.title = 'Hash change frag'</script></body></html>`
+
+const NAV_HASH_TARGET_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Hash target</title></head>
+<body>
+<h1 id="ht-heading">Hash target</h1>
+<a id="section2-link" href="#section2">Go to section 2</a>
+<div style="height:1400px"></div>
+<h2 id="section2">Section 2</h2>
 </body></html>`
 
 function startServer(handler) {
@@ -904,6 +938,85 @@ async function areaNavigateBack() {
     await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: `${state.baseUrl}/index.html` })
     await waitForTabUrl(state.tabId, (currentUrl) => currentUrl.endsWith('/index.html'))
   }
+}
+
+async function areaNavigationChain() {
+  const area = 'navigation-chain'
+
+  const redirects = [
+    { id: 'meta-refresh', start: '/nav/meta-refresh.html', final: '/nav/final.html?via=meta' },
+    { id: 'location-replace', start: '/nav/location-replace.html', final: '/nav/final.html?via=location' },
+  ]
+  for (const item of redirects) {
+    const nav = await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: `${state.baseUrl}${item.start}` }, { area })
+    const reported = nav.json?.data?.pageInfo?.url ?? null
+    check(area, `page.navigate follows a ${item.id} redirect and returns the final URL`, nav.json?.ok === true && typeof reported === 'string' && reported.endsWith(item.final), {
+      expected: `${state.baseUrl}${item.final}`,
+      actual: nav.json?.ok === true ? { reported } : nav.json?.error ?? nav.networkError,
+      request: { kind: 'page.navigate', url: `${state.baseUrl}${item.start}` },
+    })
+    const observed = await execute(`return page.url()`, { area })
+    check(area, `final document really loaded for the ${item.id} redirect`, observed.ok === true && String(observed.value).endsWith(item.final), {
+      expected: `${state.baseUrl}${item.final}`,
+      actual: observed.value ?? observed.raw,
+    })
+  }
+
+  const replaceStateUrl = `${state.baseUrl}/nav/replace-state.html`
+  const replaceState = await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: replaceStateUrl }, { area })
+  const replaceStateReported = replaceState.json?.data?.pageInfo?.url ?? null
+  check(area, 'page.navigate settles after history.replaceState on load', replaceState.json?.ok === true && typeof replaceStateReported === 'string' && replaceStateReported.endsWith('/nav/replace-state.html?replaced=1'), {
+    expected: `${replaceStateUrl}?replaced=1`,
+    actual: replaceState.json?.ok === true ? { reported: replaceStateReported } : replaceState.json?.error ?? replaceState.networkError,
+    request: { kind: 'page.navigate' },
+  })
+  const replaceStateActual = await execute(`return page.url()`, { area })
+  check(area, 'replaceState URL matches the final document', replaceStateActual.ok === true && String(replaceStateActual.value).endsWith('/nav/replace-state.html?replaced=1'), {
+    actual: replaceStateActual.value ?? replaceStateActual.raw,
+  })
+
+  const hashChangeUrl = `${state.baseUrl}/nav/hash-change.html`
+  const hashChange = await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: hashChangeUrl }, { area })
+  const hashChangeReported = hashChange.json?.data?.pageInfo?.url ?? null
+  check(area, 'page.navigate settles after a load-time hash change', hashChange.json?.ok === true && typeof hashChangeReported === 'string' && hashChangeReported.endsWith('#frag'), {
+    expected: `${hashChangeUrl}#frag`,
+    actual: hashChange.json?.ok === true ? { reported: hashChangeReported } : hashChange.json?.error ?? hashChange.networkError,
+    request: { kind: 'page.navigate' },
+  })
+  const hashChangeActual = await execute(`return page.url()`, { area })
+  check(area, 'hash-change URL matches the final document', hashChangeActual.ok === true && String(hashChangeActual.value).endsWith('#frag'), {
+    actual: hashChangeActual.value ?? hashChangeActual.raw,
+  })
+
+  const hashTargetUrl = `${state.baseUrl}/nav/hash-target.html`
+  await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: hashTargetUrl }, { area })
+  const fragment = await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: `${hashTargetUrl}#section2` }, { area })
+  const fragmentReported = fragment.json?.data?.pageInfo?.url ?? null
+  check(area, 'same-document fragment navigation returns the fragment URL', fragment.json?.ok === true && typeof fragmentReported === 'string' && fragmentReported.endsWith('#section2'), {
+    expected: `${hashTargetUrl}#section2`,
+    actual: fragment.json?.ok === true ? { reported: fragmentReported } : fragment.json?.error ?? fragment.networkError,
+    request: { kind: 'page.navigate' },
+  })
+  const fragmentActual = await execute(`return page.url()`, { area })
+  check(area, 'fragment URL matches the final document', fragmentActual.ok === true && String(fragmentActual.value).endsWith('#section2'), {
+    actual: fragmentActual.value ?? fragmentActual.raw,
+  })
+
+  const back = await send(sessionId, { kind: 'page.back', tabId: state.tabId }, { area })
+  const backReported = back.json?.data?.pageInfo?.url ?? null
+  const backActual = await execute(`return page.url()`, { area })
+  check(area, 'page.back after a same-document fragment returns the base URL', back.json?.ok === true && backActual.ok === true && String(backActual.value).endsWith('/nav/hash-target.html'), {
+    expected: hashTargetUrl,
+    actual: { reported: backReported, actual: backActual.value ?? backActual.raw },
+  })
+  check(area, 'page.back response matches the completed fragment navigation', backReported === backActual.value, {
+    expected: backActual.value,
+    actual: backReported,
+    request: { kind: 'page.back' },
+  })
+
+  await send(sessionId, { kind: 'page.navigate', tabId: state.tabId, url: `${state.baseUrl}/index.html` }, { area })
+  await waitForTabUrl(state.tabId, (currentUrl) => currentUrl.endsWith('/index.html'))
 }
 
 async function areaTargetBlank() {
@@ -1504,6 +1617,36 @@ try {
       response.end('X'.repeat(kb * 1024) + '-END-中文')
       return
     }
+    if (requestUrl.pathname === '/nav/meta-refresh.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(NAV_META_HTML)
+      return
+    }
+    if (requestUrl.pathname === '/nav/location-replace.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(NAV_LOCATION_HTML)
+      return
+    }
+    if (requestUrl.pathname === '/nav/final.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(NAV_FINAL_HTML(requestUrl.searchParams.get('via') ?? ''))
+      return
+    }
+    if (requestUrl.pathname === '/nav/replace-state.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(NAV_REPLACE_STATE_HTML)
+      return
+    }
+    if (requestUrl.pathname === '/nav/hash-change.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(NAV_HASH_CHANGE_HTML)
+      return
+    }
+    if (requestUrl.pathname === '/nav/hash-target.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(NAV_HASH_TARGET_HTML)
+      return
+    }
     if (requestUrl.pathname === '/secure-probe.html') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       response.end(SECURE_PROBE_HTML)
@@ -1535,6 +1678,7 @@ try {
       await areaCrossOriginFrame()
       await areaIframeGeometry()
       await areaNavigateBack()
+      await areaNavigationChain()
       await areaTargetBlank()
       await areaScreenshot()
       await areaNetwork()

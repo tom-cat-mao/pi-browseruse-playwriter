@@ -70,7 +70,8 @@ non-zero when any assertion fails or the run is blocked.
 
 `preflight`, `session-isolation`, `create`, `snapshot-ref`, `role-forms`,
 `hidden-filtering`, `shadow-dom`, `iframe-same-origin`, `iframe-cross-origin`,
-`iframe-geometry`, `navigate-back`, `target-blank`, `screenshot`, `network`,
+`iframe-geometry`, `navigate-back`, `navigation-chain`, `target-blank`,
+`screenshot`, `network`,
 `network-filter`, `logs`, `execute-reads`, `unsupported`, `locator-strictness`,
 `insecure-context`, `release-isolation`, `idle`, `cleanup`.
 
@@ -108,6 +109,21 @@ truncated. Six bounded concurrent fetches verify the wiring. The capture record'
 retained bytes are bounded and are **not** proof of the in-flight memory budget:
 that budget unit is raw in-flight bytes + retained UTF-8 bytes and is provable
 only in pure logic.
+
+### navigation-chain
+
+Covers post-commit URL changes that previously stalled navigation:
+
+- a committed document that redirects with `<meta http-equiv="refresh">` or
+  `location.replace` — `page.navigate` must follow it and return the **real final**
+  `pageInfo.url`, matching `page.url()`;
+- a load callback that calls `history.replaceState` or changes `location.hash` —
+  navigation must settle on the final document URL instead of waiting for a load
+  event that already fired;
+- same-document fragment (`#section2`) and the following `page.back`, including
+  the returned-vs-actual URL check.
+
+All requests use runtime 3000 / HTTP 5000; a genuine timeout is reported as-is.
 
 `page.back` is asserted so its returned `pageInfo.url` must equal the URL after
 the navigation completes.

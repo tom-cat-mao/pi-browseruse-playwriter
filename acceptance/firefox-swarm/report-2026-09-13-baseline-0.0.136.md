@@ -134,7 +134,11 @@ FAIL 2/3 与 4/5 已分别由平台 owner 接手（iframe 严格边界、无变�
    role/label/text），最终报告单列限制、不称已修；**链式必须实际成功**，两者分别断言、分别结论。
 9. 非安全 HTTP origin：DOM driver 不得依赖 `view.crypto.randomUUID`，改用 `getRandomValues`。
 10. `page.back` 响应 `pageInfo.url` 需等于已完成导航的 URL（Codex）。
-11. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：无可可靠构造的真实触发前记为 **NOT RUN**，
+11. 导航链（Codex 已返修）：主文档 commit 后用 `meta refresh` / `location.replace` 跳转，
+    `page.navigate` 必须跟随并返回**真实最终** `pageInfo.url`（与 `page.url()` 一致）；load 回调里
+    `history.replaceState` 或 hash 变化必须能 settle，不能等一个已触发的 load；补充同文档 fragment
+    与 back 常规案例。新增 `navigation-chain` area 覆盖。
+12. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：无可可靠构造的真实触发前记为 **NOT RUN**，
     不用 API 替身冒充。
 
 ## 本轮变更（2026-09-13 后续，仅离线测试/报告）
@@ -149,6 +153,9 @@ FAIL 2/3 与 4/5 已分别由平台 owner 接手（iframe 严格边界、无变�
   隐式默认）；缺失时在任何浏览器动作前清楚退出；README 已同步。
 - 依据：协调者要求暂停真实浏览器动作，只完善测试/报告，等通知新版本加载后再复验。最终复验时由协调者
   明确提供 19991 与新版号。
+- 追加 `navigation-chain` area（Codex 导航链返修的最终复验）：meta refresh / location.replace 跟随到
+  最终文档并核对 `pageInfo.url` 与 `page.url()`；load 回调 replaceState / hash 变化需能 settle；
+  同文档 fragment 与 back 常规案例。仍只用自带 fixture 与稳定 ID，未运行。
 
 ## 范围与限制
 
