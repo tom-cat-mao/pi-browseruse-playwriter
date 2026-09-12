@@ -1,63 +1,60 @@
-# Playwriter MCP
+# Pi Browser Use browser extensions
 
-Control your Chrome browser via Model Context Protocol (MCP) using Chrome DevTools Protocol (CDP) events.
+The browser extension connects the user's existing tabs and login sessions to
+the local Pi Browser Use runtime. It never launches another browser. This is a
+maintained fork of [remorses/playwriter](https://github.com/remorses/playwriter),
+with the repository's [MIT license and attribution](../LICENSE).
 
-[**Install from Chrome Web Store**](https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe)
+Chrome uses `chrome.debugger` and CDP. Firefox uses an ordinary WebExtension and
+DOM operations; it needs no remote-debugging flag. Firefox DOM input cannot
+provide trusted native input events, its snapshot comes from DOM/ARIA, and its
+evaluate world is isolated from page JavaScript globals. See the
+[Firefox capability and loading guide](../docs/exec/firefox-extension-guide.md).
 
-## What is Playwriter MCP?
+## Build
 
-Playwriter MCP is a Chrome extension that enables Playwright to connect to your existing Chrome instance without spawning a new browser or requiring Chrome to be started in CDP mode. This allows AI assistants and automation tools to interact with your browser seamlessly through the Model Context Protocol.
+Complete `pnpm bootstrap` and the initial runtime build at the repository root.
+Then build either browser extension without loading it:
 
-## Key Features
+```bash
+pnpm --filter mcp-extension build
+pnpm --filter mcp-extension build:firefox
+```
 
-- **No new Chrome instances**: Works with your current browser session
-- **No CDP mode required**: No need to restart Chrome with special flags
-- **MCP integration**: Exposes browser control through the Model Context Protocol
-- **CDP events**: Full access to Chrome DevTools Protocol capabilities
-- **Playwright compatible**: Connect Playwright directly to your running Chrome
+| Browser | Output | Local loading | Identity |
+| --- | --- | --- | --- |
+| Chrome | `extension/dist` | `chrome://extensions` → Load unpacked | `eeklahpecooapnailfaebkjjembkjhhg` |
+| Firefox 139+ | `extension/dist-firefox` | `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → `manifest.json` | `pi-browser-use@tom-cat-mao.github.io` |
 
-## How it Works
+The default connection is `127.0.0.1:19989`. Firefox accepts `PI_BROWSER_HOST`
+(loopback only) and `PI_BROWSER_PORT` at build time. Its output stays in a
+separate directory and cannot overwrite the Chrome bundle. No token is read
+from the build environment or compiled into the add-on.
 
-1. Install the extension in your Chrome browser
-2. Click the extension icon to attach the debugger to the current tab
-3. The extension creates a relay connection using CDP
-4. Connect your MCP client (like Playwright) to control the browser
-5. The icon changes color to indicate connection status:
-   - Gray: Not connected
-   - Green: Successfully connected
+`pnpm build:firefox` at the repository root additionally copies the Firefox
+bundle into the runtime package. `pnpm package:firefox` validates that bundle
+and creates local unsigned ZIP/XPI files with SHA256 checksums in `dist-release`.
+`pnpm package:extension` produces the Chrome ZIP. These commands do not publish.
 
-## Use Cases
+Neither Chrome Web Store nor Firefox/AMO publication is available. Firefox
+temporary loading is for development, expires at browser restart, and does not
+replace the signing required for ordinary permanent installation. Do not
+disable signing checks as an installation workaround.
 
-- Browser automation without disrupting your workflow
-- AI-assisted web browsing and testing
-- Debugging and development with MCP-enabled tools
-- Remote browser control for various applications
+## Firefox permissions
 
-## Permissions
+| Permission | Use |
+| --- | --- |
+| `tabs` | Enumerate and manage explicit browser tabs |
+| `tabGroups` | Use native Firefox groups for task-created tabs when the API is available |
+| `storage` | Persist the installed profile and managed resource ownership |
+| `webNavigation` | Track document navigation and tab lifecycle |
+| `scripting` | Run the bundled DOM driver in an explicitly controlled tab |
+| `webRequest`, `webRequestBlocking`, `webRequestFilterResponse` | Capture requests and bounded response text for explicitly controlled tabs |
+| `<all_urls>` | Inject the DOM driver into ordinary user-selected pages and capture their content |
+| Optional `userScripts` | Firefox 153+ can run dynamic page JavaScript in an isolated user-script world after the user enables it in the popup |
 
-This extension requires the following permissions:
-
-- **debugger**: To access Chrome DevTools Protocol
-- **activeTab**: To interact with the current tab
-- **tabs**: To manage browser tabs
-- **all_urls**: To work with any website
-
-## Getting Started
-
-1. [Install the extension from the Chrome Web Store](https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe)
-2. Navigate to any webpage
-3. Click the Playwriter MCP extension icon
-4. The debugger will attach and the icon will turn green when connected
-5. Connect your MCP client to start controlling the browser
-
-## Privacy & Security
-
-Playwriter MCP runs locally in your browser and does not send any data to external servers. All browser control happens through the standard Chrome DevTools Protocol on your machine.
-
-## Support
-
-For issues, feature requests, or contributions, visit the [GitHub repository](https://github.com/remorses/playwriter).
-
-## License
-
-Apache-2.0
+Firefox refuses extension access to browser-internal and other protected pages.
+The add-on reports unsupported operations instead of requesting debugger or
+remote-agent access. Existing-tab discovery reads metadata; attach preserves
+the tab's window, form values, and scrolling.

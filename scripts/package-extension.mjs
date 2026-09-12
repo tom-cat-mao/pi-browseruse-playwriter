@@ -5,10 +5,13 @@ import url from 'node:url'
 import zlib from 'node:zlib'
 
 const repoRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..')
-const sourceDir = path.join(repoRoot, 'playwriter', 'dist', 'extension')
+const firefoxBuild = process.argv.includes('--firefox')
+const bundleName = firefoxBuild ? 'extension-firefox' : 'extension'
+const sourceDir = path.join(repoRoot, 'playwriter', 'dist', bundleName)
 const outputDir = path.join(repoRoot, 'dist-release')
 const tempDir = path.join(repoRoot, 'tmp')
 const forkExtensionId = 'eeklahpecooapnailfaebkjjembkjhhg'
+const firefoxExtensionId = 'pi-browser-use@tom-cat-mao.github.io'
 
 const crcTable = Uint32Array.from(
   Array.from({ length: 256 }, (_value, index) => {
@@ -116,20 +119,57 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
   if (typeof manifest.version !== 'string' || manifest.version.length === 0) {
     throw new Error('Built extension manifest has no version')
   }
-  if (typeof manifest.key !== 'string' || manifest.key.length === 0) {
+  if (firefoxBuild) {
+    if (manifest.manifest_version !== 3 || manifest.browser_specific_settings?.gecko?.id !== firefoxExtensionId) {
+      throw new Error('Firefox package must contain the ordinary MV3 manifest and its stable Gecko identity')
+    }
+    if (
+      manifest.key !== undefined ||
+      manifest.background?.service_worker !== undefined ||
+      !Array.isArray(manifest.background?.scripts) ||
+      manifest.background.scripts.length !== 1 ||
+      manifest.background.scripts[0] !== 'firefox-background.js' ||
+      manifest.permissions?.includes('debugger')
+    ) {
+      throw new Error('Firefox package contains a Chrome background, debugger permission, or Chrome identity')
+    }
+    if (!files.includes('firefox-dom.js') || !files.includes('firefox-popup.js')) {
+      throw new Error('Firefox package is missing its bundled DOM content script or permission popup')
+    }
+    if (
+      !manifest.permissions?.includes('scripting') ||
+      !manifest.optional_permissions?.includes('userScripts') ||
+      manifest.permissions?.includes('userScripts') ||
+      /unsafe-eval/.test(JSON.stringify(manifest.content_security_policy))
+    ) {
+      throw new Error('Firefox package must use static scripting and optional userScripts without unsafe-eval')
+    }
+  } else if (typeof manifest.key !== 'string' || manifest.key.length === 0) {
     throw new Error('Fork release package must contain its stable development manifest key')
   }
-  const extensionId = extensionIdFromKey(manifest.key)
-  if (extensionId !== expectedExtensionId) {
-    throw new Error(`Expected extension ID ${expectedExtensionId}, got ${extensionId}`)
+  if (!firefoxBuild) {
+    const extensionId = extensionIdFromKey(manifest.key)
+    if (extensionId !== expectedExtensionId) {
+      throw new Error(`Expected extension ID ${expectedExtensionId}, got ${extensionId}`)
+    }
   }
 
-  const backgroundPath = 'background.js'
+  const backgroundPath = firefoxBuild ? 'firefox-background.js' : 'background.js'
   if (!files.includes(backgroundPath)) {
-    throw new Error('Built extension is missing background.js')
+    throw new Error(`Built extension is missing ${backgroundPath}`)
   }
   const background = fs.readFileSync(path.join(bundleDir, backgroundPath), 'utf8')
-  if (!/\b(?:var|let|const)\s+RELAY_PORT\s*=\s*19989\s*;/.test(background)) {
+  if (firefoxBuild) {
+    const configuration = JSON.parse(fs.readFileSync(path.join(bundleDir, 'firefox-build.json'), 'utf8'))
+    if (
+      !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(configuration.host) ||
+      !Number.isInteger(configuration.port) || configuration.port < 1 || configuration.port > 65535 ||
+      !background.includes(String(configuration.port)) ||
+      /process\.env\.PI_BROWSER_(?:HOST|PORT)/.test(background)
+    ) {
+      throw new Error('Firefox package does not contain a compiled, valid loopback runtime configuration')
+    }
+  } else if (!/\b(?:var|let|const)\s+RELAY_PORT\s*=\s*19989\s*;/.test(background)) {
     throw new Error('Built extension does not target the managed runtime port 19989')
   }
   const builtText = files
@@ -140,14 +180,17 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
       return fs.readFileSync(path.join(bundleDir, ...fileName.split('/')), 'utf8')
     })
     .join('\n')
-  if (/\b(?:19987|19991)\b|PLAYWRITER_PORT=|TESTING=1/i.test(builtText)) {
+  if ((!firefoxBuild && /\b(?:19987|19991)\b/.test(builtText)) || /PLAYWRITER_PORT=|TESTING=1/i.test(builtText)) {
     throw new Error('Development environment marker found in extension package')
   }
 
   const manifestReferences = [
     manifest.background?.service_worker,
+    ...(manifest.background?.scripts || []),
+    manifest.action?.default_popup,
     ...Object.values(manifest.icons || {}),
     ...Object.values(manifest.action?.default_icon || {}),
+    ...Object.values(manifest.browser_action?.default_icon || {}),
   ].filter((reference) => {
     return typeof reference === 'string'
   })
@@ -175,7 +218,7 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
     throw new Error('Unable to validate HTML references')
   }
 
-  if (!files.includes('src/prism.min.js') || !files.includes('src/prism-bash.min.js')) {
+  if (!firefoxBuild && (!files.includes('src/prism.min.js') || !files.includes('src/prism-bash.min.js'))) {
     throw new Error('Built extension is missing offline Prism assets')
   }
 
@@ -332,7 +375,7 @@ function verifyArchive({ zipPath, checksumPath, expectedExtensionId, expectedVer
 
 function main() {
   if (!fs.existsSync(sourceDir)) {
-    throw new Error('Missing playwriter/dist/extension; build the runtime package before packaging the extension')
+    throw new Error(`Missing playwriter/dist/${bundleName}; build the runtime package before packaging the extension`)
   }
 
   fs.mkdirSync(tempDir, { recursive: true })
@@ -347,7 +390,7 @@ function main() {
         `Built extension ${version} is stale; rebuild extension ${sourceManifest.version} before packaging`,
       )
     }
-    const zipName = `pi-browser-use-extension-${version}.zip`
+    const zipName = `pi-browser-use-${firefoxBuild ? 'firefox-' : ''}extension-${version}.zip`
     const zipPath = path.join(outputDir, zipName)
     const checksumPath = `${zipPath}.sha256`
 
@@ -365,6 +408,20 @@ function main() {
     console.log(`Created ${zipPath}`)
     console.log(`Created ${checksumPath}`)
     console.log(`SHA256 ${digest}`)
+    if (firefoxBuild) {
+      const xpiPath = zipPath.replace(/\.zip$/, '-unsigned.xpi')
+      const xpiChecksumPath = `${xpiPath}.sha256`
+      fs.copyFileSync(zipPath, xpiPath)
+      fs.writeFileSync(xpiChecksumPath, `${digest}  ${path.basename(xpiPath)}\n`)
+      verifyArchive({
+        zipPath: xpiPath,
+        checksumPath: xpiChecksumPath,
+        expectedVersion: version,
+      })
+      console.log(`Created ${xpiPath}`)
+      console.log(`Created ${xpiChecksumPath}`)
+      console.log('Firefox ZIP/XPI are unsigned development artifacts; permanent installation requires AMO signing.')
+    }
   } finally {
     fs.rmSync(stagingDir, { recursive: true, force: true })
   }
