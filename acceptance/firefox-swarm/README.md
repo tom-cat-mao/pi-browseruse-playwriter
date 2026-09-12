@@ -55,6 +55,20 @@ non-zero when any assertion fails or the run is blocked.
   client-side abort.
 - Assertions never wait longer than 5 s; the whole script has no fixed timeout.
 
+## Areas
+
+`preflight`, `session-isolation`, `create`, `snapshot-ref`, `role-forms`,
+`hidden-filtering`, `shadow-dom`, `iframe-same-origin`, `iframe-cross-origin`,
+`iframe-geometry`, `navigate-back`, `target-blank`, `screenshot`, `network`,
+`network-filter`, `logs`, `execute-reads`, `unsupported`, `locator-strictness`,
+`insecure-context`, `release-isolation`, `idle`, `cleanup`.
+
+`iframe-geometry` and `network-filter` were added for the next integrated build
+(no-transform frame actions with border/padding coordinates, occlusion refusal,
+scale/rotate/perspective refusal; bounded concurrency, UTF-8, large body, and
+stop/restart for the response filter). `page.back` is asserted so its returned
+`pageInfo.url` must equal the URL after the navigation completes.
+
 ## Statuses
 
 - **PASS** — the declared capability worked.

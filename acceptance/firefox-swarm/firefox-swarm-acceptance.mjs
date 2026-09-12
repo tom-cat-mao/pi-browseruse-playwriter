@@ -70,11 +70,13 @@ const RETEST_WATCH_ITEMS = [
   'frame routing/injection wait paths must observe cancellation after the wait',
   'tab resolve/persist path must observe cancellation after persistence',
   'tabs.create must persist the native tabId in the request context so the post-create release check is not weakened',
-  'network concurrent in-flight chunks are not counted against the 2 MiB total budget (owner is fixing the real budget logic) — construct a bounded concurrent-transfer check',
-  'iframe getBoxQuads: platform owner adding a strictly bounded no-transform frame fallback (baseline refuses frame actions)',
+  'network concurrent in-flight chunks are not counted against the 2 MiB total budget; budget unit is raw in-flight bytes + retained UTF-8 bytes, not an OS memory cap (owner is fixing the real logic)',
+  'network response filter forwarding must be complete even when the recorded body is truncated — covered by the network-filter suite (bounded concurrency, UTF-8, large body, stop/restart)',
+  'iframe getBoxQuads: platform owner adding a strictly bounded no-transform frame fallback; iframe-geometry suite re-checks bordered/padded, occlusion, and scale/rotate/perspective refusal',
   'console bridge: firefox-dom.ts original.apply(pageView.console, args) with a content-script rest array (platform owner)',
-  'open shadow DOM: compound and chained locators must traverse the root shadowRoot (baseline misses it; role/label works)',
+  'open shadow DOM: compound CSS and explicit chained locators are asserted separately — a chained fix must not be reported as also fixing the compound selector',
   'non-secure HTTP origin: DOM driver must not depend on view.crypto.randomUUID (SecureContext) — owner switching to getRandomValues',
+  'page.back response pageInfo.url must equal the completed navigation URL (Codex fix); re-check returned data against page.url()',
   'transient new-tab injection race (about:blank/document swap during create) — NOT RUN unless a real deterministic trigger exists',
 ]
 const evidence = {
@@ -246,6 +248,12 @@ function indexHtml({ crossOrigin }) {
  <h2>Frames and shadow DOM</h2>
  <iframe id="local-frame" title="Local frame" src="/frame.html"></iframe>
  <iframe id="cross-frame" title="Cross-origin frame" src="${crossOrigin}/child.html"></iframe>
+ <iframe id="padded-frame" title="Padded frame" src="/frame2.html" style="border:12px solid #333;padding:18px;width:320px;height:170px"></iframe>
+ <span id="occluded-wrap" style="position:relative;display:inline-block">
+  <iframe id="occluded-frame" title="Occluded frame" src="/frame3.html" style="width:320px;height:160px"></iframe>
+  <span id="occluder" style="position:absolute;inset:0;background:#0009;z-index:5"></span>
+ </span>
+ <iframe id="scaled-frame" title="Scaled frame" src="/frame2.html" style="width:320px;height:170px;transform:perspective(420px) scale(1.3) rotate(7deg);transform-origin:top left"></iframe>
  <div id="shadow-host"></div>
 </section>
 
@@ -313,6 +321,28 @@ const CROSS_CHILD_HTML = `<!doctype html>
 <button id="xo-button">Cross origin action</button>
 <script>
  document.querySelector('#xo-button').addEventListener('click', () => { document.querySelector('#xo-heading').textContent = 'Cross-origin clicked'; });
+</script>
+</body></html>`
+
+const FRAME2_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Padded frame</title>
+<style>body{margin:0;padding:24px}</style></head>
+<body>
+<h2 id="padded-heading">Padded frame heading</h2>
+<input id="padded-input" value="Inside padded">
+<button id="padded-button">Padded action</button>
+<script>
+ document.querySelector('#padded-button').addEventListener('click', () => { document.querySelector('#padded-heading').textContent = 'Padded clicked'; });
+</script>
+</body></html>`
+
+const FRAME3_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Occluded frame</title></head>
+<body>
+<h2 id="occluded-heading">Occluded frame heading</h2>
+<button id="occluded-button">Occluded action</button>
+<script>
+ document.querySelector('#occluded-button').addEventListener('click', () => { document.querySelector('#occluded-heading').textContent = 'Occluded clicked'; });
 </script>
 </body></html>`
 
@@ -823,6 +853,54 @@ async function areaCrossOriginFrame() {
   }
 }
 
+async function areaIframeGeometry() {
+  const area = 'iframe-geometry'
+
+  // No-transform same-origin frame wrapped in border+padding: a click must map
+  // coordinates through the frame offset and hit the intended element.
+  const padded = await execute(`
+    const frame = page.frameLocator('#padded-frame');
+    await frame.getByRole('button', { name: 'Padded action' }).click();
+    return await frame.locator('#padded-heading').textContent();
+  `, { area })
+  check(area, 'click in a bordered/padded no-transform frame hits the target', padded.ok === true && padded.value === 'Padded clicked', {
+    actual: padded.ok === true ? padded.value : padded.error ?? padded.networkError,
+    request: { code: "frameLocator('#padded-frame').getByRole('button',{name:'Padded action'}).click()" },
+  })
+
+  // Scale/rotate/perspective frame: geometry is uncertain, so an action must be
+  // explicitly refused, never approximated to a bounding box.
+  const transformed = await execute(`
+    const frame = page.frameLocator('#scaled-frame');
+    await frame.getByRole('button', { name: 'Padded action' }).click();
+    return await frame.locator('#padded-heading').textContent();
+  `, { area })
+  check(area, 'transformed frame action is explicitly refused (no approximation)', transformed.ok === false && transformed.error?.code === 'unsupported-capability', {
+    expected: 'unsupported-capability',
+    actual: transformed.ok === true ? { heading: transformed.value } : transformed.error ?? transformed.networkError,
+    request: { code: "frameLocator('#scaled-frame').getByRole('button',{name:'Padded action'}).click()" },
+  })
+
+  // Occluded frame: a parent-level overlay must block the action.
+  const occluded = await execute(`
+    const frame = page.frameLocator('#occluded-frame');
+    await frame.getByRole('button', { name: 'Occluded action' }).click();
+    return await frame.locator('#occluded-heading').textContent();
+  `, { area })
+  check(area, 'occluded frame action is refused or does not activate the target', occluded.ok === false || occluded.value === 'Occluded frame heading', {
+    expected: 'refused, or the target is not activated',
+    actual: occluded.ok === true ? { heading: occluded.value } : occluded.error ?? occluded.networkError,
+    request: { code: "frameLocator('#occluded-frame').getByRole('button',{name:'Occluded action'}).click()" },
+  })
+  if (occluded.ok === true && occluded.value === 'Occluded clicked') {
+    finding(area, 'occluded frame action clicked through a parent overlay', {
+      expected: 'parent-level occlusion must block frame actions',
+      actual: { heading: occluded.value },
+      minimalRepro: "frameLocator('#occluded-frame').getByRole('button',{name:'Occluded action'}).click() under a full-cover overlay",
+    })
+  }
+}
+
 async function areaNavigateBack() {
   const area = 'navigate-back'
   const target = `${state.baseUrl}/index.html?history=next`
@@ -845,13 +923,23 @@ async function areaNavigateBack() {
     expected: `${state.baseUrl}/index.html`,
     actual: afterBack.value ?? afterBack.raw,
   })
-  if (typeof back.json?.data?.pageInfo?.url === 'string' && back.json.data.pageInfo.url.includes('history=next')) {
+  // The returned pageInfo must describe the completed navigation, not the URL
+  // the tab was on before going back. (Handed to Codex on .136.)
+  const backReported = back.json?.data?.pageInfo?.url
+  if (back.json?.ok === true && afterBack.ok === true) {
+    check(area, 'page.back response URL matches the completed navigation', backReported === afterBack.value, {
+      expected: afterBack.value,
+      actual: backReported,
+      request: { kind: 'page.back' },
+    })
+  }
+  if (typeof backReported === 'string' && backReported !== afterBack.value) {
     finding(area, 'page.back response reports the pre-navigation URL', {
-      expected: 'pageInfo.url should reflect the URL after going back',
-      actual: back.json.data.pageInfo.url,
+      expected: 'pageInfo.url should equal the URL after going back',
+      actual: { responseUrl: backReported, actualUrl: afterBack.value },
       request: { kind: 'page.back' },
       minimalRepro: 'navigate to ?history=next then page.back; response pageInfo.url still contains ?history=next',
-      note: 'page.url() afterwards is correct; only the back response metadata is stale.',
+      note: 'page.url() afterwards is correct; only the back response metadata is stale. Handed to Codex for the fix; re-check the returned data matches the completed navigation.',
     })
   }
   // Restore a clean base page for later areas.
@@ -978,6 +1066,110 @@ async function areaNetwork() {
   check(area, 'network rows are retained after stop', after.json?.ok === true && afterRows.some((row) => typeof row.url === 'string' && row.url.includes('capture=fixture')), {
     actual: { retainedCount: after.json?.data?.networkCapture?.retainedCount, rows: afterRows.length },
   })
+}
+
+async function areaNetworkFilter() {
+  const area = 'network-filter'
+  const listRows = async () => {
+    const listed = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'list' }, { area })
+    const rows = Array.isArray(listed.json?.data?.value) ? listed.json.data.value : []
+    return { rows, meta: listed.json?.data?.networkCapture }
+  }
+
+  const start = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'start' }, { area })
+  check(area, 'capture starts for the filter suite', start.json?.ok === true && start.json.data?.networkCapture?.status === 'active', {
+    actual: start.json?.ok === true ? start.json.data?.networkCapture : start.json?.error ?? start.networkError,
+  })
+
+  // Bounded concurrency (6 in-flight fetches) with UTF-8 JSON payloads.
+  const concurrent = await execute(`
+    const results = await Promise.all([0, 1, 2, 3, 4, 5].map(async (i) => {
+      const r = await fetch('/api/echo?n=' + i);
+      return { i, text: await r.text() };
+    }));
+    return results.map((entry) => ({ i: entry.i, length: entry.text.length }));
+  `, { area })
+  check(area, 'six concurrent fetches complete', concurrent.ok === true && Array.isArray(concurrent.value) && concurrent.value.length === 6, {
+    actual: concurrent.ok === true ? concurrent.value : concurrent.raw,
+  })
+
+  const captured = await waitFor(async () => {
+    const { rows, meta } = await listRows()
+    const echo = rows.filter((row) => typeof row.url === 'string' && row.url.includes('/api/echo'))
+    return echo.length >= 6 ? { done: true, echo, rows, meta } : { done: false, echo, rows, meta }
+  })
+  check(area, 'all concurrent requests are captured', captured.done === true && (captured.echo?.length ?? 0) >= 6, {
+    actual: { echoRows: captured.echo?.length ?? 0, meta: captured.meta },
+  })
+
+  // Forwarded/recorded UTF-8 JSON must decode to the exact payload. A recorded
+  // body may be explicitly truncated, but then it must say so.
+  const details = []
+  let utf8Ok = true
+  for (const row of captured.echo ?? []) {
+    const match = /[?&]n=(\d+)/.exec(row.url ?? '')
+    if (!match) continue
+    if (row.bodyTruncated === true) {
+      details.push({ n: match[1], truncated: true, recordedChars: row.responseBody?.length ?? 0 })
+      continue
+    }
+    try {
+      const parsed = JSON.parse(row.responseBody ?? '')
+      if (String(parsed.n) !== match[1] || !String(parsed.text).includes('中文-✓-😀')) {
+        utf8Ok = false
+        details.push({ n: match[1], parsed })
+      }
+    } catch {
+      utf8Ok = false
+      details.push({ n: match[1], raw: (row.responseBody ?? '').slice(0, 80), bodyUnavailable: row.bodyUnavailable })
+    }
+  }
+  check(area, 'recorded UTF-8 JSON bodies are complete (or explicitly truncated) and decode exactly', utf8Ok, {
+    actual: details,
+    note: 'Budget unit is raw in-flight bytes + retained UTF-8 bytes, not an OS memory cap.',
+  })
+
+  // Large body: either complete or explicitly truncated, and retained bytes are
+  // counted in UTF-8 bytes.
+  const bigTrigger = await execute(`const r = await fetch('/api/big?kb=3072'); return (await r.text()).length`, { area })
+  check(area, 'large-body fetch completes', bigTrigger.ok === true && typeof bigTrigger.value === 'number' && bigTrigger.value > 0, {
+    actual: bigTrigger.ok === true ? bigTrigger.value : bigTrigger.raw,
+  })
+  const big = await waitFor(async () => {
+    const { rows, meta } = await listRows()
+    const row = rows.find((entry) => typeof entry.url === 'string' && entry.url.includes('/api/big'))
+    return row ? { done: true, row, meta } : { done: false, meta }
+  })
+  const expectedFullBytes = 3072 * 1024 + Buffer.byteLength('-END-中文', 'utf8')
+  check(area, 'large body is complete or explicitly truncated', big.done === true && (big.row?.bodyTruncated === true || Buffer.byteLength(big.row?.responseBody ?? '', 'utf8') === expectedFullBytes || big.row?.bodyUnavailable !== undefined), {
+    actual: big.row ? { bodyChars: big.row.responseBody?.length, utf8Bytes: Buffer.byteLength(big.row.responseBody ?? '', 'utf8'), truncated: big.row.bodyTruncated, unavailable: big.row.bodyUnavailable, expectedFullBytes } : big.meta,
+  })
+
+  // stop -> restart: a new request must be captured, and earlier rows must not
+  // be silently lost (a bounded drop with metadata is acceptable).
+  const stop = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'stop' }, { area })
+  check(area, 'capture stops before restart', stop.json?.ok === true && ['stopped', 'interrupted'].includes(stop.json.data?.networkCapture?.status), {
+    actual: stop.json?.data?.networkCapture ?? stop.json?.error ?? stop.networkError,
+  })
+  const restart = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'start' }, { area })
+  check(area, 'capture restarts after stop', restart.json?.ok === true && restart.json.data?.networkCapture?.status === 'active', {
+    actual: restart.json?.data?.networkCapture ?? restart.json?.error ?? restart.networkError,
+  })
+  const afterRestartTrigger = await execute(`const r = await fetch('/api/echo?n=100'); return (await r.text()).length`, { area })
+  check(area, 'post-restart fetch completes', afterRestartTrigger.ok === true, { actual: afterRestartTrigger.ok === true ? afterRestartTrigger.value : afterRestartTrigger.raw })
+  const afterRestart = await waitFor(async () => {
+    const { rows, meta } = await listRows()
+    return rows.some((row) => (row.url ?? '').includes('n=100')) ? { done: true, rows, meta } : { done: false, rows, meta }
+  })
+  check(area, 'requests after restart are captured', afterRestart.done === true, {
+    actual: { retainedCount: afterRestart.meta?.retainedCount, meta: afterRestart.meta },
+  })
+  const earlierEcho = (afterRestart.rows ?? []).filter((row) => (row.url ?? '').includes('/api/echo')).length
+  check(area, 'stop/restart does not silently drop earlier captured rows', earlierEcho >= 6 || (afterRestart.meta?.droppedCount ?? 0) > 0 || typeof afterRestart.meta?.reason === 'string', {
+    actual: { echoRows: earlierEcho, meta: afterRestart.meta },
+  })
+
+  await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'stop' }, { area })
 }
 
 async function areaLogs() {
@@ -1342,6 +1534,28 @@ try {
       response.end(FRAME_HTML)
       return
     }
+    if (requestUrl.pathname === '/frame2.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(FRAME2_HTML)
+      return
+    }
+    if (requestUrl.pathname === '/frame3.html') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.end(FRAME3_HTML)
+      return
+    }
+    if (requestUrl.pathname === '/api/echo') {
+      const n = Number(requestUrl.searchParams.get('n') || '0')
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      response.end(JSON.stringify({ n, text: `payload-${n}-中文-✓-😀` }))
+      return
+    }
+    if (requestUrl.pathname === '/api/big') {
+      const kb = Math.min(Number(requestUrl.searchParams.get('kb') || '3072'), 8192)
+      response.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
+      response.end('X'.repeat(kb * 1024) + '-END-中文')
+      return
+    }
     if (requestUrl.pathname === '/secure-probe.html') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       response.end(SECURE_PROBE_HTML)
@@ -1371,10 +1585,12 @@ try {
       await areaShadowDom()
       await areaSameOriginFrame()
       await areaCrossOriginFrame()
+      await areaIframeGeometry()
       await areaNavigateBack()
       await areaTargetBlank()
       await areaScreenshot()
       await areaNetwork()
+      await areaNetworkFilter()
       await areaLogs()
       await areaExecuteReads()
       await areaUnsupported()
