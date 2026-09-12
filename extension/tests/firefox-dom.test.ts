@@ -16,6 +16,7 @@ import { firefoxScreenshotCleanupRequest } from '../src/firefox-resources'
 import type { FirefoxDomDriver } from '../src/firefox-dom'
 import {
   accessibleName,
+  ariaVisible,
   isDisabled,
   locatorForSelector,
   resolveLocator,
@@ -236,6 +237,54 @@ describe('Firefox DOM locator and accessible name logic', () => {
     expect(
       select({ steps: [{ kind: 'selector', engine: 'role', value: 'textbox', options: { disabled: true } }] }),
     ).toContain(element('#disabled-input'))
+  })
+})
+
+describe('Firefox DOM ARIA visibility from the element own document', () => {
+  test('excludes display:none, visibility:hidden, aria-hidden ancestors and inert subtrees', () => {
+    const host = document.createElement('div')
+    host.innerHTML = [
+      '<div id="vis">Visible</div>',
+      '<div id="none" style="display:none">Display none</div>',
+      '<div id="invisible" style="visibility:hidden">Visibility hidden</div>',
+      '<div id="aria" aria-hidden="true">Aria hidden<button id="aria-child">Inside</button></div>',
+      '<div id="inert" inert><button id="inert-child">Inside</button></div>',
+    ].join('')
+    document.body.append(host)
+    expect(ariaVisible(document.getElementById('vis')!)).toBe(true)
+    expect(ariaVisible(document.getElementById('none')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('invisible')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('aria')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('aria-child')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('inert')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('inert-child')!)).toBe(false)
+  })
+
+  test('resolves computed style through the element own same-origin iframe document', () => {
+    const iframe = document.createElement('iframe')
+    document.body.append(iframe)
+    const frameDocument = iframe.contentDocument
+    expect(frameDocument).not.toBeNull()
+    expect(frameDocument!.defaultView).not.toBe(window)
+    frameDocument!.body.innerHTML =
+      '<div id="frame-visible">Visible</div><div id="frame-hidden" style="display:none">Hidden</div>'
+    expect(ariaVisible(frameDocument!.getElementById('frame-visible')!)).toBe(true)
+    expect(ariaVisible(frameDocument!.getElementById('frame-hidden')!)).toBe(false)
+  })
+
+  test('role locators apply the same aria visibility filter', () => {
+    const host = document.createElement('div')
+    host.innerHTML = [
+      '<button id="shown" aria-label="Shown">A</button>',
+      '<div aria-hidden="true"><button id="buried" aria-label="Buried">B</button></div>',
+    ].join('')
+    document.body.append(host)
+    expect(
+      select({ steps: [{ kind: 'selector', engine: 'role', value: 'button', name: 'Shown', exact: true }] }),
+    ).toEqual([document.getElementById('shown')])
+    expect(
+      select({ steps: [{ kind: 'selector', engine: 'role', value: 'button', name: 'Buried', exact: true }] }),
+    ).toEqual([])
   })
 })
 

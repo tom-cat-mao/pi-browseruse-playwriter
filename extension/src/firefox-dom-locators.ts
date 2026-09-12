@@ -75,9 +75,15 @@ export function isVisible(element: Element): boolean {
   return rect.width > 0 && rect.height > 0
 }
 
+function computedStyleOf(element: Element): CSSStyleDeclaration {
+  const view = element.ownerDocument.defaultView
+  if (!view) throw new TypeError('Owner document of the element needs to have an associated window.')
+  return view.getComputedStyle(element)
+}
+
 export function ariaVisible(element: Element): boolean {
   for (let current: Element | null = element; current; current = composedParent(current)) {
-    if (isInaccessible(current) || current.hasAttribute('inert')) return false
+    if (isInaccessible(current, { getComputedStyle: computedStyleOf }) || current.hasAttribute('inert')) return false
   }
   return true
 }
