@@ -1,6 +1,6 @@
 # Firefox swarm 修复与验收
 
-当前状态：0.0.137 已完成真实 Firefox 复验，结果为 **114 PASS / 6 FAIL / 2 SKIP**，尚未通过最终验收。后续导航修复、严格不变的 stale-ref 原因诊断和显式 network start 契约校正已纳入 0.0.138 候选；**0.0.138 实机复验尚未执行**。原 PR #6 仍待最终验收后更新，不合并到 dev/main。
+当前状态：0.0.138 已由独立外部验收完成真实 Firefox 复验，结果为 **126 PASS / 0 FAIL / 2 SKIP**，全部非边界项通过。SKIP 仅两项既定边界（跨 shadow 复合 CSS、`target=_blank` 的 sourceTabId）。原 PR #6 分支已可更新；不合并到 dev/main。
 
 ## 基线
 
@@ -37,9 +37,7 @@
 
 最终只读 reviewer 未发现 P0/P1 阻断，允许进入真实验收；这不替代浏览器测试。
 
-## 0.0.137 浏览器无关检查
-
-以下为 0.0.137 集成版的历史检查。协调者在集成 worktree 中串行运行，未运行会启动 Chrome 并更新快照的默认 `pnpm test`。
+## 0.0.137 实机结果
 
 | 检查 | 结果 |
 | --- | --- |
@@ -65,11 +63,13 @@
 
 复验使用 [独立 harness](../../acceptance/firefox-swarm/README.md)，明确提供 runtime URL 与已加载版本，只操作独立 session 新建的 fixture/group/tab，完成后清理。不会修改用户权限、浏览器偏好、既有标签或重启共享 runtime。
 
-0.0.137 已由独立外部验收覆盖上述范围，完整记录见 [0.0.137 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.137.md)。iframe、console、HTTP driver、完整网络转发、取消与保活均已通过；剩余四项稳定导航链失败，以及一次 stale-ref 导致的两项失败。
+0.0.137 独立实机结果为 **114 PASS / 6 FAIL / 2 SKIP**：iframe、console、HTTP driver、完整网络转发、取消与保活已通过，剩余四项稳定导航链失败与一次 stale-ref 导致的两项失败，详见 [0.0.137 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.137.md)。
 
-0.0.138 候选针对导航继续更新完成候选，并在原期限内重复核对当前 frame/tab 事实；只受控暂存精确的导航 abort 事件，有替代证据且事实验证成功才允许恢复，不吞 API 异常。stale-ref 18 个定向样本未复现，根因仍未确定，因此仅增加与确切 snapshotId 关联的有界原因，不削弱拒绝、不自动重试。另校正 active capture 上的显式 start，使其按已有契约替换前次 capture。
+0.0.138 针对导航继续更新完成候选并重复核对 frame/tab 事实，仅受控暂存精确 NS_BINDING_ABORTED 且要求替代证据；stale-ref 改为精确关联的有界原因诊断（不削弱拒绝）；active network start 按契约替换前次 capture。0.0.138 离线 574 项 PASS、交叉复核无阻断后，由独立验收在真实 Firefox 复验。
 
-0.0.138 仍需用户加载后由独立验收重跑导航、stale 原因、active network restart 与完整矩阵。源码交叉复核已通过，不代表这些实机项目已通过。
+## 0.0.138 最终实机结果
+
+0.0.138 独立实机复验结果为 **126 PASS / 0 FAIL / 2 SKIP**，完整逐条记录见 [0.0.138 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)。上一轮六项失败全部转 PASS：四项导航链返回真实最终 URL（meta `?via=meta`、location.replace `?via=location`、载入期 replaceState `?replaced=1`、载入期 hash `#frag`），`outcome-unknown` 与 `Error code 2152398850` 均未再出现；stale-ref 未复现，权威路径 `page.fill(aria-ref=e10)` 通过，负向用例正确带 `reason:"invalidated:action"`；active→start 网络替换契约 PASS。SKIP 仅两项既定边界。全矩阵 cleanup 两项 PASS，`tabs.discover` 无 fixture 残留。
 
 明确保留的边界：
 
