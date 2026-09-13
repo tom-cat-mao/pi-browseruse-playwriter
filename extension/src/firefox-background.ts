@@ -1745,11 +1745,7 @@ class FirefoxBackground {
     const browserTabId = tab.browserTabId!
     const state = new FirefoxNavigationState(browserTabId)
     const cleanups: Array<() => void> = []
-    let resolveNavigation: (details: FirefoxNavigationDetails) => void = () => {}
     let rejectNavigation: (error: unknown) => void = () => {}
-    const navigation = new Promise<FirefoxNavigationDetails>((resolve) => {
-      resolveNavigation = resolve
-    })
     const interrupted = new Promise<never>((_, reject) => {
       rejectNavigation = reject
     })
@@ -1786,8 +1782,7 @@ class FirefoxBackground {
         const listener = (details: FirefoxNavigationDetails): void => {
           check()
           state.observe({ signal, details })
-          if (state.result?.status === 'complete') resolveNavigation(state.result.details)
-          else if (state.result?.status === 'failed')
+          if (state.result?.status === 'failed')
             rejectNavigation(
               new FirefoxResourceError({
                 code: 'execution-failed',
@@ -1838,35 +1833,39 @@ class FirefoxBackground {
           operation.kind === 'page.navigate'
             ? this.api.tabs.update(browserTabId, { url: operation.url })
             : this.api.tabs.goBack(browserTabId)
-        const [completed] = await Promise.race([Promise.all([navigation, action]), interrupted])
-        assertWaiting()
-        const frame = await this.api.webNavigation.getFrame({ tabId: browserTabId, frameId: 0 })
-        assertWaiting()
-        const actual = await this.api.tabs.get(browserTabId)
-        assertWaiting()
-        ownedFirefoxTab({ registry: this.registry, sessionId: context.sessionId, tabId: tab.tabId })
-        if (
-          !frame ||
-          frame.errorOccurred ||
-          frame.url !== completed.url ||
-          actual.status === 'loading' ||
-          actual.url !== completed.url ||
-          (completed.documentId !== undefined &&
-            frame.documentId !== undefined &&
-            completed.documentId !== frame.documentId)
-        )
-          throw new FirefoxResourceError({
-            code: 'outcome-unknown',
-            message:
-              'Firefox navigation was observed, but the current main frame and tab metadata do not match its completion; the action will not be replayed.',
-            outcome: 'unknown',
-          })
-        return actual
+        await Promise.race([action, interrupted])
+        while (true) {
+          assertWaiting()
+          const candidate = state.result
+          if (candidate?.status === 'complete') {
+            const frame = await Promise.race([
+              this.api.webNavigation.getFrame({ tabId: browserTabId, frameId: 0 }),
+              interrupted,
+            ])
+            assertWaiting()
+            const actual = await Promise.race([this.api.tabs.get(browserTabId), interrupted])
+            assertWaiting()
+            ownedFirefoxTab({ registry: this.registry, sessionId: context.sessionId, tabId: tab.tabId })
+            if (state.confirm({ candidate, frame, tab: actual, timeStamp: performance.now() })) return actual
+          }
+          let recheck: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([
+              new Promise<void>((resolve) => {
+                recheck = setTimeout(resolve, 25)
+              }),
+              interrupted,
+            ])
+          } finally {
+            if (recheck) clearTimeout(recheck)
+          }
+        }
       }
       return await Promise.race([work(), interrupted])
     } finally {
       if (timer) clearTimeout(timer)
       waiting = false
+      state.stop()
       context.checkNavigation = undefined
       for (const cleanup of cleanups) cleanup()
     }

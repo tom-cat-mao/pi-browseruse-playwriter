@@ -121,3 +121,45 @@ load 时 replaceState/fragment 及最终构建由独立验收 owner 复验。
 第四批最终检查：扩展 TypeScript PASS；3 文件 / 64 tests PASS（导航 14、预算 9、资源 41）；
 修改文件格式与 git diff --check PASS。日志为 `tmp/logs/navigation-chain-typecheck.log` 与
 `tmp/logs/navigation-chain-tests.log`。runtime unit/integration、真实浏览器 SKIP；未 push。
+
+## 第五批：0.0.137 实机导航候选过早锁定
+
+分支 `fix/firefox-navigation-settle`，基线 `0d91d79`。读取独立完整证据
+`../acceptance/tmp/firefox-swarm-acceptance/evidence-2026-09-13T04-18-13-683Z/`
+及最终 `.137` 报告：四种导航链 4/4 稳定失败，随后读取已到最终 URL。
+
+确定根因范围：完成 result 阻止后续事件，单次 resolve 锁定旧 URL，随后一次 metadata
+不一致立即失败。现完成仅为候选，before/commit 撤销候选，完成后的 history/fragment
+更新候选；同 documentId 的 completed 携带旧请求 URL 时保留已观测的 history URL。
+原期限内每 25ms 重查，连续两次同候选、同可用 documentId、frame/tab URL 一致且 tab
+complete 才返回。25ms 是重查间隔与最小观测跨度，不是 sleep 后直接成功；不一致继续
+观察，超时仍 outcome unknown。无法保证返回后永远没有导航或识别未来延迟 meta refresh。
+
+数值 abort 的源码定位：只读本机 Firefox omni.ja 中 `modules/WebNavigation.sys.mjs`
+第 287–296 行，STATE_STOP 非成功分支生成 `Error code ${status}` 并发 onErrorOccurred；
+`ext-webNavigation.js` 第 133–134 行原样传递。本机 getFrame 从 BrowsingContext 同步取
+frame 事实，并非查询旧 actor 的 Promise；tabs.update 派发 load 后 convert，goBack
+直接调用原生方法。原始证据没有 API 调用栈，不能把该次失败绝对归因到具体调用，但
+精确文案有明确的事件生成路径，不应臆测为 getFrame actor 错误。
+
+仅暂存已选 tab 主 frame、当前导航匹配的 `Error code 2152398850` 事件。后续 before
+或 commit 必须证明 URL 或可用 documentId 不同，才能解除待定 abort；再经完成候选和
+重复事实核对才成功。仅 completed、同 URL 且缺身份、没有替代导航均不能洗掉 abort，
+最终超时。action/getFrame/tabs.get Promise 异常没有新增 catch，权限、非法 URL、无
+history 等 API 错误保持传播；没有未经证据支持的 actor-error 吞错规则。
+
+生产状态测试覆盖完成后 history/hash、meta refresh、abort 先于替代事件、缺少替代证据、
+读事实期间替代文档、旧文档事实、元数据尚未收敛、超时/取消 stop 后的晚事件，以及其它
+错误保持终态。没有新增 mockFirefoxAPI。停止状态由 finally 调用；action、读取、重查
+均 race 同一 interrupted，重查 timer 在局部 finally 清理，外层清理监听与原 timer。
+API Promise 异常传播和原生监听清理属于代码审查，纯状态测试不冒称执行真实 actor/API。
+
+本批本地验证：extension tsc PASS；导航/网络预算/资源无端口测试 PASS（3 文件 / 73 tests：导航 23、预算 9、资源 41）；无代码注释、公共协议/权限/CSP/manifest/DOM/网络源码改动。完整 runtime 套件
+SKIP，由协调者串行；真实 Firefox SKIP，只交 CodeBuddy15 复验。遵照本次“不再委派”，
+本 owner 未安排新 agent；最终独立 review/验收由协调者安排，未 push 或合并。
+
+`.138` 定向复验：四项稳定失败各重复运行，并核对返回 URL 与紧随的 page.url；普通
+navigate/back、fragment/back 回归；meta/location 的旧 abort 先于/晚于替代开始；取消/
+释放中断后无迟发动作；无事件 no-op、正在 loading 拒绝和非法请求错误边界。若仍有
+数值 abort，需带同 tab 主 frame 事件顺序及 action/getFrame 调用阶段的定向证据，不能
+仅凭最终页面已到达就扩大忽略规则。
