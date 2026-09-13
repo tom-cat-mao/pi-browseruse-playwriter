@@ -488,6 +488,101 @@ describe('Firefox DOM snapshot lifetime and isolation', () => {
   })
 })
 
+describe('Firefox DOM stale snapshot diagnostics', () => {
+  function staleMessage(response: BrowserResponse): string {
+    if (response.ok) throw new Error('expected a stale-snapshot rejection')
+    expect(response.error).toMatchObject({ code: 'stale-snapshot', outcome: 'not-started' })
+    return response.error.message
+  }
+
+  async function snapshotRef(): Promise<{ snapshotId: string; ref: string }> {
+    const result = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    const refs = (result.value as { refs: Array<{ ref: string }> }).refs
+    return { snapshotId: result.snapshotId!, ref: refs[0].ref }
+  }
+
+  test('reports a missing snapshotId without weakening the stale-snapshot rejection', async () => {
+    const { ref } = await snapshotRef()
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}` }))
+    expect(staleMessage(response)).toContain('reason: missing-snapshot-id')
+  })
+
+  test('reports a ref that the current snapshot does not contain', async () => {
+    const first = await snapshotRef()
+    const second = success(await driver.run(request({ method: 'snapshot', search: 'definitely absent text' })))
+    const response = await driver.run(
+      request({ method: 'click', selector: `@${first.ref}`, snapshotId: second.snapshotId }),
+    )
+    expect(staleMessage(response)).toContain('reason: ref-not-in-snapshot')
+  })
+
+  test('reports a snapshot replaced by a newer snapshot', async () => {
+    const first = await snapshotRef()
+    const second = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    expect(second.snapshotId).not.toBe(first.snapshotId)
+    const response = await driver.run(
+      request({ method: 'click', selector: `@${first.ref}`, snapshotId: first.snapshotId }),
+    )
+    expect(staleMessage(response)).toContain('reason: snapshot-replaced')
+  })
+
+  test('reports the DOM mutation that invalidated the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    element('#save').setAttribute('data-changed', 'yes')
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:dom-mutation')
+  })
+
+  test('reports the navigation event that invalidated the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    window.dispatchEvent(new window.Event('hashchange'))
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:navigation')
+  })
+
+  test('reports the explicit invalidate command that cleared the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    success(await driver.run(request({ method: 'invalidate' })))
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:explicit-invalidate')
+  })
+
+  test('reports the evaluation that invalidated the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    expect(success(await driver.run(request({ method: 'evaluate', code: 'return 1' }), async () => 1)).value).toBe(1)
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:evaluate')
+  })
+
+  test('reports the action that invalidated the requested snapshot and still refuses the reused ref', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    const locator: BrowserDomLocator = {
+      steps: [{ kind: 'selector', engine: 'css', value: `aria-ref=${ref}` }],
+      snapshotId,
+    }
+    success(await driver.run(request({ method: 'locator', locator, action: 'blur' })))
+    const response = await driver.run(request({ method: 'locator', locator, action: 'blur' }))
+    expect(staleMessage(response)).toContain('reason: invalidated:action')
+  })
+
+  test('reports a snapshotId owned by another document driver as different-document', async () => {
+    const otherDom = new JSDOM(fixture, { url: 'https://fixture.test/' })
+    const otherWindow = otherDom.window as unknown as Window & typeof globalThis
+    const otherDriver = createFirefoxDomDriver(otherWindow.document)
+    try {
+      const other = success(await otherDriver.run(request({ method: 'snapshot', search: 'Save profile' })))
+      const otherRef = (other.value as { refs: Array<{ ref: string }> }).refs[0].ref
+      const response = await driver.run(
+        request({ method: 'click', selector: `@${otherRef}`, snapshotId: other.snapshotId }),
+      )
+      expect(staleMessage(response)).toContain('reason: different-document')
+    } finally {
+      if (!otherDriver.disposed) await otherDriver.run(request({ method: 'dispose' }))
+      otherDom.window.close()
+    }
+  })
+})
+
 describe('Firefox DOM input logic with real document fixtures', () => {
   test('fills a native input and notifies actual input/change listeners', () => {
     const input = element('#name') as HTMLInputElement

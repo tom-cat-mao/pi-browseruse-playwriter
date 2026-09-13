@@ -49,6 +49,22 @@ type PreparedAction = {
   point: FramePoint
   expiresAt: number
 }
+type SnapshotInvalidationReason =
+  | 'dom-mutation'
+  | 'navigation'
+  | 'explicit-invalidate'
+  | 'action'
+  | 'evaluate'
+  | 'dispose'
+type StaleRefReason =
+  | 'missing-snapshot-id'
+  | 'snapshot-replaced'
+  | 'ref-not-in-snapshot'
+  | 'different-document'
+  | 'element-detached'
+  | 'element-document-changed'
+  | `invalidated:${SnapshotInvalidationReason}`
+  | 'unknown'
 
 export interface FirefoxDomDriver {
   readonly version: 1
@@ -213,11 +229,13 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
   const preparations = new Map<string, PreparedAction>()
   let binding: { sessionId: string; tabId: string; browserEpoch: string } | undefined
   let snapshot: Snapshot | undefined
+  let lastInvalidation: { snapshotId: string; reason: SnapshotInvalidationReason } | undefined
   let overlay: HTMLElement | undefined
   let disposed = false
   let consoleAvailable = false
 
-  const invalidate = (): void => {
+  const invalidate = (reason: SnapshotInvalidationReason): void => {
+    if (snapshot) lastInvalidation = { snapshotId: snapshot.id, reason }
     snapshot = undefined
     preparations.clear()
   }
@@ -249,7 +267,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
           return !mutationIsOurs(mutation)
         })
       )
-        invalidate()
+        invalidate('dom-mutation')
     })
     observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true })
     observers.set(root, observer)
@@ -261,9 +279,9 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
           return !mutationIsOurs(mutation)
         })
       )
-        invalidate()
+        invalidate('dom-mutation')
     }
-    if (snapshot && snapshot.url !== document.URL) invalidate()
+    if (snapshot && snapshot.url !== document.URL) invalidate('navigation')
   }
   observe(document)
   const recordLog = (line: string): void => {
@@ -286,15 +304,18 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
   }
   view.addEventListener('error', onError)
   view.addEventListener('unhandledrejection', onRejection)
-  view.addEventListener('pagehide', invalidate)
-  view.addEventListener('popstate', invalidate)
-  view.addEventListener('hashchange', invalidate)
+  const onNavigation = (): void => {
+    invalidate('navigation')
+  }
+  view.addEventListener('pagehide', onNavigation)
+  view.addEventListener('popstate', onNavigation)
+  view.addEventListener('hashchange', onNavigation)
   cleanups.push(() => {
     view.removeEventListener('error', onError)
     view.removeEventListener('unhandledrejection', onRejection)
-    view.removeEventListener('pagehide', invalidate)
-    view.removeEventListener('popstate', invalidate)
-    view.removeEventListener('hashchange', invalidate)
+    view.removeEventListener('pagehide', onNavigation)
+    view.removeEventListener('popstate', onNavigation)
+    view.removeEventListener('hashchange', onNavigation)
   })
   const pageView = (view as Window & { wrappedJSObject?: Window & typeof globalThis }).wrappedJSObject
   if (pageView && typeof exportFunction === 'function') {
@@ -333,10 +354,33 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     })
     checkActive(options.execution)
   }
-  const startAction = (execution: Execution): void => {
+  const startAction = (execution: Execution, reason: SnapshotInvalidationReason = 'action'): void => {
     checkActive(execution)
     execution.started = true
-    invalidate()
+    invalidate(reason)
+  }
+  const snapshotDocumentId = (snapshotId: string): string | undefined => {
+    return /^firefox:([^:]+):/.exec(snapshotId)?.[1]
+  }
+  const staleRefReason = (options: { ref: string; snapshotId?: string }): StaleRefReason | undefined => {
+    const requested = options.snapshotId
+    if (!requested) return 'missing-snapshot-id'
+    const requestedDocumentId = snapshotDocumentId(requested)
+    if (requestedDocumentId !== undefined && requestedDocumentId !== documentId) return 'different-document'
+    if (!snapshot || snapshot.id !== requested) {
+      if (lastInvalidation?.snapshotId === requested) return `invalidated:${lastInvalidation.reason}`
+      return snapshot ? 'snapshot-replaced' : 'unknown'
+    }
+    const entry = snapshot.refs.get(options.ref)
+    if (!entry) return 'ref-not-in-snapshot'
+    if (!entry.element.isConnected) return 'element-detached'
+    let currentDocument: Document | undefined
+    try {
+      currentDocument = entry.element.ownerDocument.defaultView?.document
+    } catch {
+      /* A frame may have navigated to another origin since the snapshot. */
+    }
+    return currentDocument === entry.element.ownerDocument ? undefined : 'element-document-changed'
   }
   const resolveRef = (options: { selector: string; snapshotId?: string }): Element[] | null => {
     const selector = options.selector.trim()
@@ -347,27 +391,13 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
         : null
     if (ref === null) return null
     flushMutations()
-    const entry = snapshot?.refs.get(ref)
-    let currentDocument: Document | undefined
-    try {
-      currentDocument = entry?.element.ownerDocument.defaultView?.document
-    } catch {
-      /* A frame may have navigated to another origin since the snapshot. */
-    }
-    if (
-      !options.snapshotId ||
-      !snapshot ||
-      snapshot.id !== options.snapshotId ||
-      !entry ||
-      !entry.element.isConnected ||
-      currentDocument !== entry.element.ownerDocument
-    ) {
+    const reason = staleRefReason({ ref, snapshotId: options.snapshotId })
+    if (reason !== undefined)
       throw new FirefoxDomError({
         code: 'stale-snapshot',
-        message: `Snapshot ref ${selector} is missing or stale. Take a fresh snapshot and pass its snapshotId with a ref shown in that snapshot.`,
+        message: `Snapshot ref ${selector} is missing or stale (reason: ${reason}). Take a fresh snapshot and pass its snapshotId with a ref shown in that snapshot.`,
       })
-    }
-    return [entry.element]
+    return [snapshot!.refs.get(ref)!.element]
   }
   const locate = (options: { selector: string; snapshotId?: string }): Element[] => {
     return resolveRef(options) ?? resolveLocator({ root: document, locator: locatorForSelector(options.selector) })
@@ -897,12 +927,12 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       return { value: null }
     }
     if (command.method === 'invalidate') {
-      invalidate()
+      invalidate('explicit-invalidate')
       return { value: null }
     }
     if (command.method === 'dispose') {
       disposed = true
-      invalidate()
+      invalidate('dispose')
       overlay?.remove()
       for (const observer of observers.values()) observer.disconnect()
       for (const cleanup of cleanups) cleanup()
@@ -958,14 +988,14 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
             },
           })
         : undefined
-      startAction(execution)
+      startAction(execution, 'evaluate')
       try {
         return {
           value: browserJson(await evaluator(element)),
           text: 'Evaluated in the Firefox isolated USER_SCRIPT world without extension APIs.',
         }
       } finally {
-        invalidate()
+        invalidate('evaluate')
       }
     }
     if (command.method === 'locator')
