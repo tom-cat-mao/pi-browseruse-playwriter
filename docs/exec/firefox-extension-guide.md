@@ -87,6 +87,10 @@ evaluate 世界可读取和修改页面 DOM，但不等价于 Chrome 主世界�
 | logs | 已接管后可采集的 console/error/rejection；接管前日志不回填，缺少日志不能证明页面没有错误 |
 | execute | Node 隔离 worker 提供 page/locator 的 DOM 兼容接口；不是完整的 Chromium Playwright/CDP 对象模型 |
 
+navigate/back 通过派发后的主 frame 事件确认完成，并核对当前 frame 与标签信息；会跟随后续导航链，
+但 WebExtension 没有本工具的 actionId，不能完备区分用户或网页并发触发的导航。标签已在加载时会
+在派发前拒绝；同 URL/no-op 若没有确认事件，会返回 timeout / outcome unknown，不重放动作。
+
 Firefox 的输入事件来自 DOM API。通常的链接、表单和内容编辑可以使用这一路径，但依赖
 `Event.isTrusted`、真实键盘/指针、系统选择器或浏览器内置交互的页面可能拒绝动作。
 工具不会通过伪造信任、扩大权限或切换到另一个浏览器掩盖失败；应观察结果后决定下一步。
@@ -96,9 +100,18 @@ Firefox 的输入事件来自 DOM API。通常的链接、表单和内容编辑�
 不要认为所有 Gecko 浏览器、所有站点都已通过兼容性验证。
 
 DOM locator 可遍历同源 iframe 与 open shadow DOM；跨源 iframe 由扩展按实际 frame 身份定向执行，
-仍要求相应的网站权限。closed shadow DOM 不可读取。`hover` 只派发 DOM 事件，不改变浏览器原生
-CSS `:hover` 状态；浏览器快捷键、系统剪贴板快捷键等会明确拒绝。console bridge 无法建立时，
-日志结果说明采集不完整。对 ref 使用 evaluate 时无法跨执行世界传递元素句柄，应改用 CSS/role locator。
+仍要求相应的网站权限。closed shadow DOM 不可读取。CSS 使用各文档或 ShadowRoot 内的原生匹配；
+跨 shadow host 应用 `page.locator('#host').locator('input')` 显式链式写法或 role/label/text，
+单条复合 CSS `#host input` 不会跨 shadow 边界，不能假定与完整 Playwright CSS 引擎等价。
+
+当 Firefox 未暴露 `getBoxQuads` 时，frame 动作只接受可严格确认的无变换 content box，继续检查
+每级父页面遮挡与边界。变换、缩放、透视或 client/边框/实际矩形不一致的几何会明确拒绝，包括
+部分分数尺寸或百分比布局的舍入情况，不用不可靠的矩形近似代替校验。
+
+`hover` 只派发 DOM 事件，不改变浏览器原生 CSS `:hover` 状态；浏览器快捷键、系统剪贴板快捷键
+等会明确拒绝。合成点击的 popup/`target=_blank` 效果可能被 Firefox 拦截，不修改浏览器弹窗设置
+绕过；只有真实产生新标签时才能验证其 `sourceTabId`。console bridge 无法建立时，日志结果说明
+采集不完整。对 ref 使用 evaluate 时无法跨执行世界传递元素句柄，应改用 CSS/role locator。
 
 snapshot 的 ref 绑定具体文档和元素；导航、元素变化或任何 evaluate/execute 之后，需要重新 snapshot。
 CSS/role selector 零个或多个匹配都报错，不使用 `.first()` 猜测。超时或取消不重放；已经开始的动作可能

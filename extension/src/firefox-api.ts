@@ -23,6 +23,15 @@ export interface FirefoxWindow {
   type?: string
 }
 
+export interface FirefoxNavigationDetails {
+  tabId: number
+  frameId: number
+  url: string
+  timeStamp: number
+  documentId?: string
+  error?: string
+}
+
 export interface FirefoxStorageArea {
   get(key: string): Promise<Record<string, unknown>>
   set(values: Record<string, unknown>): Promise<void>
@@ -117,6 +126,12 @@ export interface FirefoxApi {
     setTitle(details: { title: string; tabId?: number }): Promise<void>
   }
   webNavigation: {
+    onBeforeNavigate: FirefoxEvent<(details: FirefoxNavigationDetails) => void>
+    onCommitted: FirefoxEvent<(details: FirefoxNavigationDetails) => void>
+    onCompleted: FirefoxEvent<(details: FirefoxNavigationDetails) => void>
+    onHistoryStateUpdated: FirefoxEvent<(details: FirefoxNavigationDetails) => void>
+    onReferenceFragmentUpdated: FirefoxEvent<(details: FirefoxNavigationDetails) => void>
+    onErrorOccurred: FirefoxEvent<(details: FirefoxNavigationDetails) => void>
     getFrame(details: {
       tabId: number
       frameId: number

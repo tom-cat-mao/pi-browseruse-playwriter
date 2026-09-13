@@ -16,13 +16,21 @@ import { firefoxScreenshotCleanupRequest } from '../src/firefox-resources'
 import type { FirefoxDomDriver } from '../src/firefox-dom'
 import {
   accessibleName,
+  ariaVisible,
   isDisabled,
   locatorForSelector,
   resolveLocator,
   strictElement,
 } from '../src/firefox-dom-locators'
 import { checkedState, clickElement, fillElement, pressKey, selectOptions, setChecked } from '../src/firefox-dom-input'
-import { assertFrameTransform, checkFramePoint, mapFramePoint } from '../src/firefox-dom-frame'
+import {
+  assertFrameTransform,
+  assertStaticFrameTransform,
+  checkFramePoint,
+  frameContentQuad,
+  mapFramePoint,
+  untransformedFrameContentBox,
+} from '../src/firefox-dom-frame'
 import { assertFirefoxCsp } from '../../scripts/firefox-csp.mjs'
 
 const repoRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '../..')
@@ -213,6 +221,28 @@ describe('Firefox DOM locator and accessible name logic', () => {
     ])
   })
 
+  test('resolves a chained locator into the root element own open shadow root', () => {
+    const host = element('#shadow-host')
+    const shadow = host.attachShadow({ mode: 'open' })
+    shadow.innerHTML = '<input id="shadow-input" aria-label="Shadow field" /><button>Shadow action</button>'
+    expect(
+      select({
+        steps: [
+          { kind: 'selector', engine: 'css', value: '#shadow-host' },
+          { kind: 'selector', engine: 'css', value: 'input' },
+        ],
+      }),
+    ).toEqual([shadow.querySelector('input')])
+    expect(
+      select({
+        steps: [
+          { kind: 'selector', engine: 'css', value: '#shadow-host' },
+          { kind: 'selector', engine: 'role', value: 'textbox', name: 'Shadow field', exact: true },
+        ],
+      }),
+    ).toEqual([shadow.querySelector('input')])
+  })
+
   test('enters explicit same-origin frames and keeps parent queries outside frames', () => {
     const frame = element('#same-origin') as HTMLIFrameElement
     frame.contentDocument!.body.innerHTML = '<button>Frame action</button>'
@@ -239,7 +269,66 @@ describe('Firefox DOM locator and accessible name logic', () => {
   })
 })
 
+describe('Firefox DOM ARIA visibility from the element own document', () => {
+  test('excludes display:none, visibility:hidden, aria-hidden ancestors and inert subtrees', () => {
+    const host = document.createElement('div')
+    host.innerHTML = [
+      '<div id="vis">Visible</div>',
+      '<div id="none" style="display:none">Display none</div>',
+      '<div id="invisible" style="visibility:hidden">Visibility hidden</div>',
+      '<div id="aria" aria-hidden="true">Aria hidden<button id="aria-child">Inside</button></div>',
+      '<div id="inert" inert><button id="inert-child">Inside</button></div>',
+    ].join('')
+    document.body.append(host)
+    expect(ariaVisible(document.getElementById('vis')!)).toBe(true)
+    expect(ariaVisible(document.getElementById('none')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('invisible')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('aria')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('aria-child')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('inert')!)).toBe(false)
+    expect(ariaVisible(document.getElementById('inert-child')!)).toBe(false)
+  })
+
+  test('resolves computed style through the element own same-origin iframe document', () => {
+    const iframe = document.createElement('iframe')
+    document.body.append(iframe)
+    const frameDocument = iframe.contentDocument
+    expect(frameDocument).not.toBeNull()
+    expect(frameDocument!.defaultView).not.toBe(window)
+    frameDocument!.body.innerHTML =
+      '<div id="frame-visible">Visible</div><div id="frame-hidden" style="display:none">Hidden</div>'
+    expect(ariaVisible(frameDocument!.getElementById('frame-visible')!)).toBe(true)
+    expect(ariaVisible(frameDocument!.getElementById('frame-hidden')!)).toBe(false)
+  })
+
+  test('role locators apply the same aria visibility filter', () => {
+    const host = document.createElement('div')
+    host.innerHTML = [
+      '<button id="shown" aria-label="Shown">A</button>',
+      '<div aria-hidden="true"><button id="buried" aria-label="Buried">B</button></div>',
+    ].join('')
+    document.body.append(host)
+    expect(
+      select({ steps: [{ kind: 'selector', engine: 'role', value: 'button', name: 'Shown', exact: true }] }),
+    ).toEqual([document.getElementById('shown')])
+    expect(
+      select({ steps: [{ kind: 'selector', engine: 'role', value: 'button', name: 'Buried', exact: true }] }),
+    ).toEqual([])
+  })
+})
+
 describe('Firefox DOM snapshot lifetime and isolation', () => {
+  test('derives document and snapshot identities from page crypto without the secure-context-only randomUUID', async () => {
+    const shape =
+      /^firefox:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
+    const first = success(await driver.run(request({ method: 'snapshot' })))
+    const second = success(await driver.run(request({ method: 'snapshot' })))
+    expect(first.snapshotId).toMatch(shape)
+    expect(second.snapshotId).toMatch(shape)
+    expect(first.snapshotId).not.toBe(second.snapshotId)
+    expect(first.snapshotId!.split(':')[1]).toBe(second.snapshotId!.split(':')[1])
+  })
+
   test('snapshot refs have correct names and are invalidated after dynamic replacement', async () => {
     const first = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
     expect(first.text).toContain('button "Save profile"')
@@ -396,6 +485,127 @@ describe('Firefox DOM snapshot lifetime and isolation', () => {
     expect(result.logs).toHaveLength(1)
     expect(result.logs![0]).toContain('fixture failure fixture.js:7')
     expect(result.text).toContain('console bridge is unavailable')
+  })
+})
+
+describe('Firefox DOM stale snapshot diagnostics', () => {
+  function staleMessage(response: BrowserResponse): string {
+    if (response.ok) throw new Error('expected a stale-snapshot rejection')
+    expect(response.error).toMatchObject({ code: 'stale-snapshot', outcome: 'not-started' })
+    return response.error.message
+  }
+
+  async function snapshotRef(): Promise<{ snapshotId: string; ref: string }> {
+    const result = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    const refs = (result.value as { refs: Array<{ ref: string }> }).refs
+    return { snapshotId: result.snapshotId!, ref: refs[0].ref }
+  }
+
+  test('reports a missing snapshotId without weakening the stale-snapshot rejection', async () => {
+    const { ref } = await snapshotRef()
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}` }))
+    expect(staleMessage(response)).toContain('reason: missing-snapshot-id')
+  })
+
+  test('reports a ref that the current snapshot does not contain', async () => {
+    const first = await snapshotRef()
+    const second = success(await driver.run(request({ method: 'snapshot', search: 'definitely absent text' })))
+    const response = await driver.run(
+      request({ method: 'click', selector: `@${first.ref}`, snapshotId: second.snapshotId }),
+    )
+    expect(staleMessage(response)).toContain('reason: ref-not-in-snapshot')
+  })
+
+  test('reports a snapshot replaced by a newer snapshot', async () => {
+    const first = await snapshotRef()
+    const second = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    expect(second.snapshotId).not.toBe(first.snapshotId)
+    const response = await driver.run(
+      request({ method: 'click', selector: `@${first.ref}`, snapshotId: first.snapshotId }),
+    )
+    expect(staleMessage(response)).toContain('reason: snapshot-replaced')
+  })
+
+  test('reports unknown when the supersede record was overwritten by another snapshot', async () => {
+    const first = await snapshotRef()
+    success(await driver.run(request({ method: 'invalidate' })))
+    const second = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    expect(second.snapshotId).not.toBe(first.snapshotId)
+    success(await driver.run(request({ method: 'invalidate' })))
+    success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    const response = await driver.run(
+      request({ method: 'click', selector: `@${first.ref}`, snapshotId: first.snapshotId }),
+    )
+    expect(staleMessage(response)).toContain('reason: unknown')
+  })
+
+  test('reports unknown for a snapshotId this driver never generated', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    const unseen = `${snapshotId.split(':').slice(0, 2).join(':')}:00000000-0000-4000-8000-000000000000`
+    expect(unseen).not.toBe(snapshotId)
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId: unseen }))
+    expect(staleMessage(response)).toContain('reason: unknown')
+  })
+
+  test('reports the DOM mutation that invalidated the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    element('#save').setAttribute('data-changed', 'yes')
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:dom-mutation')
+  })
+
+  test('reports the navigation event that invalidated the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    window.dispatchEvent(new window.Event('hashchange'))
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:navigation')
+  })
+
+  test('reports the explicit invalidate command that cleared the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    success(await driver.run(request({ method: 'invalidate' })))
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:explicit-invalidate')
+  })
+
+  test('reports the evaluation that invalidated the requested snapshot', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    const evaluated = success(
+      await driver.run(request({ method: 'evaluate', code: 'return 1' }), async () => {
+        return 1
+      }),
+    )
+    expect(evaluated.value).toBe(1)
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
+    expect(staleMessage(response)).toContain('reason: invalidated:evaluate')
+  })
+
+  test('reports the action that invalidated the requested snapshot and still refuses the reused ref', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    const locator: BrowserDomLocator = {
+      steps: [{ kind: 'selector', engine: 'css', value: `aria-ref=${ref}` }],
+      snapshotId,
+    }
+    success(await driver.run(request({ method: 'locator', locator, action: 'blur' })))
+    const response = await driver.run(request({ method: 'locator', locator, action: 'blur' }))
+    expect(staleMessage(response)).toContain('reason: invalidated:action')
+  })
+
+  test('reports a snapshotId owned by another document driver as different-document', async () => {
+    const otherDom = new JSDOM(fixture, { url: 'https://fixture.test/' })
+    const otherWindow = otherDom.window as unknown as Window & typeof globalThis
+    const otherDriver = createFirefoxDomDriver(otherWindow.document)
+    try {
+      const other = success(await otherDriver.run(request({ method: 'snapshot', search: 'Save profile' })))
+      const otherRef = (other.value as { refs: Array<{ ref: string }> }).refs[0].ref
+      const response = await driver.run(
+        request({ method: 'click', selector: `@${otherRef}`, snapshotId: other.snapshotId }),
+      )
+      expect(staleMessage(response)).toContain('reason: different-document')
+    } finally {
+      if (!otherDriver.disposed) await otherDriver.run(request({ method: 'dispose' }))
+      otherDom.window.close()
+    }
   })
 })
 
@@ -642,5 +852,93 @@ describe('Firefox frame action point mapping', () => {
     expect(() => {
       checkFramePoint({ frame: element('#name'), point: { x: 1, y: 1 } })
     }).toThrow('iframe or frame')
+  })
+
+  test('derives an untransformed frame content quad from provable border/client geometry', () => {
+    expect(
+      frameContentQuad({
+        box: { left: 100, top: 50, width: 320, height: 220 },
+        client: { left: 2, top: 3, width: 316, height: 217 },
+        border: { left: 2, right: 2, top: 3, bottom: 0 },
+        padding: { left: 8, right: 6, top: 4, bottom: 5 },
+      }),
+    ).toEqual({
+      quad: {
+        p1: { x: 110, y: 57 },
+        p2: { x: 412, y: 57 },
+        p3: { x: 412, y: 265 },
+        p4: { x: 110, y: 265 },
+      },
+      viewport: { width: 302, height: 208 },
+    })
+  })
+
+  test('rejects frame boxes that cannot be proven exact without getBoxQuads', () => {
+    const base = {
+      box: { left: 100, top: 50, width: 320, height: 220 },
+      client: { left: 2, top: 3, width: 316, height: 217 },
+      border: { left: 2, right: 2, top: 3, bottom: 0 },
+      padding: { left: 8, right: 6, top: 4, bottom: 5 },
+    }
+    expect(() => {
+      frameContentQuad({ ...base, box: { ...base.box, width: 0 } })
+    }).toThrow('non-degenerate')
+    expect(() => {
+      frameContentQuad({ ...base, box: { ...base.box, left: Number.NaN } })
+    }).toThrow('non-degenerate')
+    expect(() => {
+      frameContentQuad({ ...base, border: { ...base.border, left: 2.5 } })
+    }).toThrow('rounded client offset')
+    expect(() => {
+      frameContentQuad({ ...base, box: { ...base.box, width: 321 } })
+    }).toThrow('disagree')
+    expect(() => {
+      frameContentQuad({ ...base, padding: { ...base.padding, right: 316 } })
+    }).toThrow('positive content box')
+  })
+
+  test('requires a strictly untransformed frame chain for the getBoxQuads-free path', () => {
+    const neutral = {
+      transform: 'none',
+      rotate: 'none',
+      scale: 'none',
+      translate: 'none',
+      zoom: '1',
+      perspective: 'none',
+      offsetPath: 'none',
+    }
+    for (const style of [
+      neutral,
+      { ...neutral, transform: '' },
+      { ...neutral, transform: 'matrix(1, 0, 0, 1, 0, 0)' },
+      { ...neutral, transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)' },
+      { ...neutral, rotate: '0deg', scale: '1 1', translate: '0px 0px', zoom: '100%' },
+      { ...neutral, rotate: '', scale: '', translate: '', zoom: '' },
+    ]) {
+      expect(() => {
+        assertStaticFrameTransform(style)
+      }).not.toThrow()
+    }
+    for (const style of [
+      { ...neutral, transform: 'matrix(2, 0, 0, 2, 0, 0)' },
+      { ...neutral, transform: 'matrix(1, 0, 0, 1, 40, 0)' },
+      { ...neutral, transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1.5)' },
+      { ...neutral, rotate: '45deg' },
+      { ...neutral, scale: '2' },
+      { ...neutral, translate: '10px' },
+      { ...neutral, zoom: '1.5' },
+      { ...neutral, perspective: '1000px' },
+      { ...neutral, offsetPath: 'path("M0 0 L10 10")' },
+    ]) {
+      expect(() => {
+        assertStaticFrameTransform(style)
+      }).toThrow('without getBoxQuads')
+    }
+  })
+
+  test('refuses a frame action when the frame has no provable layout box without getBoxQuads', () => {
+    expect(() => {
+      untransformedFrameContentBox({ frame: element('#same-origin') })
+    }).toThrow('single unfragmented frame box')
   })
 })

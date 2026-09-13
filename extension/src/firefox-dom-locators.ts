@@ -75,9 +75,15 @@ export function isVisible(element: Element): boolean {
   return rect.width > 0 && rect.height > 0
 }
 
+function computedStyleOf(element: Element): CSSStyleDeclaration {
+  const view = element.ownerDocument.defaultView
+  if (!view) throw new TypeError('Owner document of the element needs to have an associated window.')
+  return view.getComputedStyle(element)
+}
+
 export function ariaVisible(element: Element): boolean {
   for (let current: Element | null = element; current; current = composedParent(current)) {
-    if (isInaccessible(current) || current.hasAttribute('inert')) return false
+    if (isInaccessible(current, { getComputedStyle: computedStyleOf }) || current.hasAttribute('inert')) return false
   }
   return true
 }
@@ -90,6 +96,8 @@ export function allElements(root: QueryRoot): Element[] {
       if (element.shadowRoot) visit(element.shadowRoot)
     }
   }
+  const rootShadow = root.nodeType === 1 ? (root as Element).shadowRoot : null
+  if (rootShadow) visit(rootShadow)
   visit(root)
   return result
 }
@@ -183,6 +191,8 @@ function selectElements(options: {
     }
     try {
       query(root)
+      const rootShadow = root.nodeType === 1 ? (root as Element).shadowRoot : null
+      if (rootShadow) query(rootShadow)
       for (const element of elements) {
         if (element.shadowRoot) query(element.shadowRoot)
       }

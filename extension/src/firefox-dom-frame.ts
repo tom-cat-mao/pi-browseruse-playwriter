@@ -98,6 +98,222 @@ export function assertFrameTransform(options: {
   }
 }
 
+const USED_LENGTH = /^(?:\d+|\d*\.\d+)px$/
+
+function usedLengthPixels(options: { value: string; label: string }): number {
+  const value = options.value.trim()
+  if (!USED_LENGTH.test(value))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: `Firefox frame actions without getBoxQuads need a resolvable used ${options.label}; got ${JSON.stringify(options.value)}.`,
+    })
+  const pixels = Number.parseFloat(value)
+  if (!Number.isFinite(pixels) || pixels < 0)
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: `Firefox frame actions without getBoxQuads need a finite non-negative ${options.label}.`,
+    })
+  return pixels
+}
+
+function isIdentityMatrix(value: string): boolean {
+  const normalized = value.trim()
+  const matrix = /^matrix\(([^)]*)\)$/.exec(normalized)
+  if (matrix) {
+    const entries = matrix[1].split(',').map((entry) => {
+      return Number(entry.trim())
+    })
+    return (
+      entries.length === 6 &&
+      entries[0] === 1 &&
+      entries[1] === 0 &&
+      entries[2] === 0 &&
+      entries[3] === 1 &&
+      entries[4] === 0 &&
+      entries[5] === 0
+    )
+  }
+  const matrix3d = /^matrix3d\(([^)]*)\)$/.exec(normalized)
+  if (matrix3d) {
+    const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    const entries = matrix3d[1].split(',').map((entry) => {
+      return Number(entry.trim())
+    })
+    return (
+      entries.length === 16 &&
+      entries.every((entry, index) => {
+        return entry === identity[index]
+      })
+    )
+  }
+  return false
+}
+
+function isNeutralLengths(value: string): boolean {
+  const normalized = value.trim()
+  if (normalized === 'none') return true
+  const parts = normalized.split(/\s+/)
+  return (
+    parts.length > 0 &&
+    parts.every((part) => {
+      return /^0(?:px|%)?$/.test(part)
+    })
+  )
+}
+
+function isNeutralScale(value: string): boolean {
+  const normalized = value.trim()
+  if (normalized === 'none') return true
+  const parts = normalized.split(/\s+/)
+  return (
+    parts.length > 0 &&
+    parts.every((part) => {
+      return part === '1'
+    })
+  )
+}
+
+function isNeutralZoom(value: string): boolean {
+  const normalized = value.trim()
+  if (normalized === '' || normalized === 'normal') return true
+  if (normalized.endsWith('%')) return Number.parseFloat(normalized) === 100
+  return Number.parseFloat(normalized) === 1
+}
+
+export function assertStaticFrameTransform(options: {
+  transform: string
+  rotate: string
+  scale: string
+  translate: string
+  zoom: string
+  perspective: string
+  offsetPath: string
+}): void {
+  const transform = options.transform.trim()
+  if (transform !== '' && transform !== 'none' && !isIdentityMatrix(transform))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message:
+        'Firefox frame actions without getBoxQuads cannot prove an axis-aligned frame under a non-identity transform.',
+    })
+  if (options.perspective && options.perspective !== 'none')
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads cannot map perspective transforms.',
+    })
+  if (options.offsetPath && options.offsetPath !== 'none')
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads cannot map motion paths.',
+    })
+  if (options.rotate && options.rotate !== 'none' && !/^0(?:deg|grad|rad|turn)?$/.test(options.rotate.trim()))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads cannot map an independent rotation.',
+    })
+  if (options.scale && !isNeutralScale(options.scale))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads cannot map an independent scale.',
+    })
+  if (options.translate && !isNeutralLengths(options.translate))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads cannot map an independent translation.',
+    })
+  if (options.zoom && !isNeutralZoom(options.zoom))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads cannot map page zoom.',
+    })
+}
+
+export function frameContentQuad(options: {
+  box: { left: number; top: number; width: number; height: number }
+  client: { left: number; top: number; width: number; height: number }
+  border: { left: number; right: number; top: number; bottom: number }
+  padding: { left: number; right: number; top: number; bottom: number }
+}): { quad: FrameContentQuad; viewport: { width: number; height: number } } {
+  const { box, client, border, padding } = options
+  if (
+    ![box.left, box.top, box.width, box.height].every((entry) => {
+      return Number.isFinite(entry)
+    }) ||
+    box.width <= 0 ||
+    box.height <= 0
+  )
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads require a finite, non-degenerate frame box.',
+    })
+  if (client.left !== border.left || client.top !== border.top)
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message:
+        'Firefox frame actions without getBoxQuads cannot prove the frame border because the rounded client offset disagrees with the used border width.',
+    })
+  if (
+    box.width !== border.left + client.width + border.right ||
+    box.height !== border.top + client.height + border.bottom
+  )
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message:
+        'Firefox frame actions without getBoxQuads cannot prove the frame content box because the border box, client box, and used borders disagree.',
+    })
+  const contentWidth = client.width - padding.left - padding.right
+  const contentHeight = client.height - padding.top - padding.bottom
+  if (!(contentWidth > 0) || !(contentHeight > 0))
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads require a provable positive content box.',
+    })
+  const left = box.left + border.left + padding.left
+  const top = box.top + border.top + padding.top
+  return {
+    quad: {
+      p1: { x: left, y: top },
+      p2: { x: left + contentWidth, y: top },
+      p3: { x: left + contentWidth, y: top + contentHeight },
+      p4: { x: left, y: top + contentHeight },
+    },
+    viewport: { width: contentWidth, height: contentHeight },
+  }
+}
+
+export function untransformedFrameContentBox(options: { frame: Element }): {
+  quad: FrameContentQuad
+  viewport: { width: number; height: number }
+} {
+  const { frame } = options
+  const view = frame.ownerDocument.defaultView
+  if (!view) throw new FirefoxDomError({ message: 'The ancestor frame has no active parent document.' })
+  const rects = frame.getClientRects()
+  if (rects.length !== 1)
+    throw new FirefoxDomError({
+      code: 'unsupported-capability',
+      message: 'Firefox frame actions without getBoxQuads require a single unfragmented frame box.',
+    })
+  const rect = rects[0]
+  const style = view.getComputedStyle(frame)
+  return frameContentQuad({
+    box: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+    client: { left: frame.clientLeft, top: frame.clientTop, width: frame.clientWidth, height: frame.clientHeight },
+    border: {
+      left: usedLengthPixels({ value: style.borderLeftWidth, label: 'border-left-width' }),
+      right: usedLengthPixels({ value: style.borderRightWidth, label: 'border-right-width' }),
+      top: usedLengthPixels({ value: style.borderTopWidth, label: 'border-top-width' }),
+      bottom: usedLengthPixels({ value: style.borderBottomWidth, label: 'border-bottom-width' }),
+    },
+    padding: {
+      left: usedLengthPixels({ value: style.paddingLeft, label: 'padding-left' }),
+      right: usedLengthPixels({ value: style.paddingRight, label: 'padding-right' }),
+      top: usedLengthPixels({ value: style.paddingTop, label: 'padding-top' }),
+      bottom: usedLengthPixels({ value: style.paddingBottom, label: 'padding-bottom' }),
+    },
+  })
+}
+
 function composedContains(options: { element: Element; ancestor: Element }): boolean {
   for (let current: Element | null = options.element; current; current = composedParent(current)) {
     if (current === options.ancestor) return true
@@ -112,36 +328,48 @@ export function checkFramePoint(options: { frame: Element; point: FramePoint }):
   if (!isVisible(frame)) throw new FirefoxDomError({ message: 'The ancestor frame is detached or not visible.' })
   const view = frame.ownerDocument.defaultView
   if (!view) throw new FirefoxDomError({ message: 'The ancestor frame has no active parent document.' })
-  for (let current: Element | null = frame; current; current = composedParent(current)) {
-    const style = view.getComputedStyle(current)
-    assertFrameTransform({
-      transform: style.transform,
-      rotate: style.rotate,
-      perspective: style.perspective,
-      offsetPath: style.offsetPath,
-    })
-  }
   const geometry = frame as Element & { getBoxQuads?: (options: { box: 'content' }) => FrameContentQuad[] }
-  if (!geometry.getBoxQuads)
-    throw new FirefoxDomError({
-      code: 'unsupported-capability',
-      message:
-        'Firefox getBoxQuads is required to verify the frame content box; no bounding-box approximation is used.',
-    })
-  const quads = geometry.getBoxQuads({ box: 'content' })
-  if (quads.length !== 1)
-    throw new FirefoxDomError({
-      code: 'unsupported-capability',
-      message: 'The ancestor frame does not have exactly one content quad.',
-    })
-  const style = view.getComputedStyle(frame)
-  const paddingX = Number.parseFloat(style.paddingLeft || '0') + Number.parseFloat(style.paddingRight || '0')
-  const paddingY = Number.parseFloat(style.paddingTop || '0') + Number.parseFloat(style.paddingBottom || '0')
-  const point = mapFramePoint({
-    point: options.point,
-    quad: quads[0],
-    viewport: { width: frame.clientWidth - paddingX, height: frame.clientHeight - paddingY },
-  })
+  let quad: FrameContentQuad
+  let viewport: { width: number; height: number }
+  if (typeof geometry.getBoxQuads === 'function') {
+    for (let current: Element | null = frame; current; current = composedParent(current)) {
+      const style = view.getComputedStyle(current)
+      assertFrameTransform({
+        transform: style.transform,
+        rotate: style.rotate,
+        perspective: style.perspective,
+        offsetPath: style.offsetPath,
+      })
+    }
+    const quads = geometry.getBoxQuads({ box: 'content' })
+    if (quads.length !== 1)
+      throw new FirefoxDomError({
+        code: 'unsupported-capability',
+        message: 'The ancestor frame does not have exactly one content quad.',
+      })
+    const style = view.getComputedStyle(frame)
+    const paddingX = Number.parseFloat(style.paddingLeft || '0') + Number.parseFloat(style.paddingRight || '0')
+    const paddingY = Number.parseFloat(style.paddingTop || '0') + Number.parseFloat(style.paddingBottom || '0')
+    quad = quads[0]
+    viewport = { width: frame.clientWidth - paddingX, height: frame.clientHeight - paddingY }
+  } else {
+    for (let current: Element | null = frame; current; current = composedParent(current)) {
+      const style = view.getComputedStyle(current)
+      assertStaticFrameTransform({
+        transform: style.transform,
+        rotate: style.rotate,
+        scale: style.scale,
+        translate: style.translate,
+        zoom: style.zoom,
+        perspective: style.perspective,
+        offsetPath: style.offsetPath,
+      })
+    }
+    const box = untransformedFrameContentBox({ frame })
+    quad = box.quad
+    viewport = box.viewport
+  }
+  const point = mapFramePoint({ point: options.point, quad, viewport })
   if (point.x < 0 || point.y < 0 || point.x >= view.innerWidth || point.y >= view.innerHeight)
     throw new FirefoxDomError({ message: 'The prepared action point is outside an ancestor frame viewport.' })
   let hit = frame.ownerDocument.elementFromPoint(point.x, point.y)
