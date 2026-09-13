@@ -127,6 +127,14 @@ that `stop` retains the earlier rows and that a later explicit `start` is
 reported as the documented replacement rather than a silent loss (a later
 `start` replaces the previous capture by contract).
 
+The suite also covers an explicit `start` **while the capture is already
+active** — a new requestId, not an idempotent retry of the previous request. The
+runtime must replace the previous capture: a new `captureId`, an empty new
+capture with no carried-over rows, and the new `filter` applied to recording —
+so only matching requests are recorded, a non-matching request is excluded, and
+the page realm still receives the complete original response. `stop` on its own
+still retains the earlier rows.
+
 ### navigation-chain
 
 Covers post-commit URL changes that previously stalled navigation:

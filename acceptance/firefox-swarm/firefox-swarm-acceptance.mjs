@@ -242,11 +242,15 @@ function indexHtml({ crossOrigin }) {
  <button id="run-utf8">Run UTF-8 fetch</button>
  <button id="run-big">Run large fetch</button>
  <button id="run-restart">Run restart probe</button>
+ <button id="run-filter-match">Run filtered match fetch</button>
+ <button id="run-filter-big">Run filtered large fetch</button>
  <pre id="event-log" aria-label="Observed events"></pre>
  <pre id="net-concurrent-result" aria-label="Concurrent fetch result"></pre>
  <pre id="net-utf8-result" aria-label="UTF-8 fetch result"></pre>
  <pre id="net-big-result" aria-label="Large fetch result"></pre>
  <pre id="net-restart-result" aria-label="Restart probe result"></pre>
+ <pre id="net-filter-match-result" aria-label="Filtered match fetch result"></pre>
+ <pre id="net-filter-big-result" aria-label="Filtered large fetch result"></pre>
 </section>
 
 <section id="cancel-section">
@@ -308,6 +312,16 @@ function indexHtml({ crossOrigin }) {
    const r = await fetch('/api/echo?n=100');
    const text = await r.text();
    document.querySelector('#net-restart-result').textContent = JSON.stringify({ n: JSON.parse(text).n, length: text.length });
+ });
+ document.querySelector('#run-filter-match').addEventListener('click', async () => {
+   const r = await fetch('/api/echo?n=42');
+   const text = await r.text();
+   document.querySelector('#net-filter-match-result').textContent = JSON.stringify({ n: JSON.parse(text).n, text, utf8Bytes: new TextEncoder().encode(text).length });
+ });
+ document.querySelector('#run-filter-big').addEventListener('click', async () => {
+   const r = await fetch('/api/big?kb=3072');
+   const text = await r.text();
+   document.querySelector('#net-filter-big-result').textContent = JSON.stringify({ chars: text.length, tail: text.slice(-7), utf8Bytes: new TextEncoder().encode(text).length });
  });
  let cancelCount = 0;
  document.querySelector('#cancel-counter').addEventListener('click', () => { cancelCount += 1; document.querySelector('#cancel-count').textContent = String(cancelCount); });
@@ -1296,6 +1310,54 @@ async function areaNetworkFilter() {
   check(area, 'restart is reported as a documented replacement, not a silent loss', afterRestart.meta?.status === 'active' && afterRestart.meta?.retainedCount === restartRows && typeof afterRestart.meta?.droppedCount === 'number', {
     actual: { rows: restartRows, meta: afterRestart.meta },
     note: 'An explicit start replaces the previous capture per the contract; earlier rows were already verified to survive stop before the restart.',
+  })
+
+  const activeCaptureId = afterRestart.meta?.captureId ?? null
+  const filteredStart = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'start', filter: '/api/' }, { area })
+  const filteredCaptureId = filteredStart.json?.data?.networkCapture?.captureId ?? null
+  check(area, 'a new explicit start while capture is active replaces the previous capture', filteredStart.json?.ok === true && filteredStart.json?.data?.networkCapture?.status === 'active' && typeof filteredCaptureId === 'string' && filteredCaptureId !== activeCaptureId, {
+    expected: { status: 'active', captureIdChanged: true, filter: '/api/' },
+    actual: filteredStart.json?.ok === true ? filteredStart.json.data?.networkCapture : filteredStart.json?.error ?? filteredStart.networkError,
+    request: { kind: 'page.network', action: 'start', filter: '/api/', requestId: filteredStart.requestId },
+    note: 'A distinct explicit start with a new requestId (not an idempotent retry of the previous request).',
+  })
+
+  const afterFilteredStart = await listRows()
+  check(area, 'the replaced capture starts empty (previous rows are not carried over)', afterFilteredStart.meta?.captureId === filteredCaptureId && (afterFilteredStart.rows?.length ?? 0) === 0, {
+    actual: { captureId: afterFilteredStart.meta?.captureId, rows: (afterFilteredStart.rows ?? []).map((row) => row.url) },
+  })
+
+  const filteredMatch = await runFixtureFetch('Run filtered match fetch', '#net-filter-match-result')
+  check(area, 'a matching request after the active start is captured (page realm received the full UTF-8 payload)', filteredMatch.ok === true && filteredMatch.value?.n === 42 && String(filteredMatch.value?.text).includes('中文-✓-😀') && filteredMatch.value?.utf8Bytes === Buffer.byteLength(String(filteredMatch.value?.text), 'utf8'), {
+    actual: filteredMatch.ok === true ? filteredMatch.value : filteredMatch.raw,
+    note: 'filter=/api/ — the request matches and must be recorded.',
+  })
+
+  const filteredBig = await runFixtureFetch('Run filtered large fetch', '#net-filter-big-result')
+  check(area, 'the page realm receives the complete original large response after the active start', filteredBig.ok === true && filteredBig.value?.chars === fullChars && filteredBig.value?.utf8Bytes === fullBytes && String(filteredBig.value?.tail).endsWith('-END-中文'), {
+    expected: { chars: fullChars, utf8Bytes: fullBytes, tail: '-END-中文' },
+    actual: filteredBig.ok === true ? filteredBig.value : filteredBig.raw,
+    note: 'Read in the page realm, not from the capture record.',
+  })
+
+  const missControl = await execute(`
+    await page.getByRole('button', { name: 'Fetch fixture' }).click();
+    return await page.locator('#event-log').textContent();
+  `, { area })
+  check(area, 'non-matching request completed in the page (filter control)', missControl.ok === true && typeof missControl.value === 'string' && missControl.value.includes('network status=200'), {
+    actual: missControl.ok === true ? missControl.value : missControl.raw,
+  })
+
+  const filteredList = await waitFor(async () => {
+    const { rows, meta } = await listRows()
+    const hasMatch = rows.some((row) => (row.url ?? '').includes('/api/echo?n=42'))
+    const hasBig = rows.some((row) => (row.url ?? '').includes('/api/big'))
+    return hasMatch && hasBig ? { done: true, rows, meta } : { done: false, rows, meta }
+  })
+  const filteredRows = filteredList.rows ?? []
+  check(area, 'only filter-matching requests are recorded into the new capture', filteredList.done === true && filteredRows.length > 0 && filteredRows.every((row) => (row.url ?? '').includes('/api/')) && filteredRows.every((row) => !(row.url ?? '').includes('n=100')) && filteredRows.every((row) => !(row.url ?? '').includes('capture=fixture')), {
+    actual: { captureId: filteredList.meta?.captureId, rows: filteredRows.map((row) => row.url) },
+    note: 'filter=/api/; the non-matching ?capture=fixture request and the previous capture rows must be absent.',
   })
 
   await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'stop' }, { area })
