@@ -9,9 +9,11 @@ A snapshot ref resolved with the wrong or missing `snapshotId` previously return
 the snapshot. `resolveRef` now appends one fixed enum reason: `missing-snapshot-id`,
 `snapshot-replaced`, `ref-not-in-snapshot`, `different-document`, `element-detached`,
 `element-document-changed`, `invalidated:<dom-mutation|navigation|explicit-invalidate|action|evaluate|dispose>`,
-or `unknown` when the driver cannot attribute it. The driver keeps only the most recent
-invalidated `snapshotId` plus its enum reason and stores no MutationRecord, DOM node, text,
-attribute value, or URL.
+or `unknown` when the driver cannot attribute it. `snapshot-replaced` is reported only when the requested
+`snapshotId` is the exact most recent ended snapshot this driver recorded, which `takeSnapshot` records
+when it overwrites an existing snapshot; any other unmatched id stays `unknown`. The driver keeps only
+that single most recent ended `snapshotId` plus its enum reason and stores no MutationRecord, DOM node,
+text, attribute value, or URL.
 
 The `stale-snapshot` code, the `not-started`/`unknown` outcome, and every rejection condition are
 unchanged; refs are still never refreshed, retried, or revived, and no snapshot lifetime,

@@ -56,6 +56,7 @@ type SnapshotInvalidationReason =
   | 'action'
   | 'evaluate'
   | 'dispose'
+type SnapshotEndReason = SnapshotInvalidationReason | 'snapshot-replaced'
 type StaleRefReason =
   | 'missing-snapshot-id'
   | 'snapshot-replaced'
@@ -229,7 +230,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
   const preparations = new Map<string, PreparedAction>()
   let binding: { sessionId: string; tabId: string; browserEpoch: string } | undefined
   let snapshot: Snapshot | undefined
-  let lastInvalidation: { snapshotId: string; reason: SnapshotInvalidationReason } | undefined
+  let lastInvalidation: { snapshotId: string; reason: SnapshotEndReason } | undefined
   let overlay: HTMLElement | undefined
   let disposed = false
   let consoleAvailable = false
@@ -354,10 +355,10 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     })
     checkActive(options.execution)
   }
-  const startAction = (execution: Execution, reason: SnapshotInvalidationReason = 'action'): void => {
-    checkActive(execution)
-    execution.started = true
-    invalidate(reason)
+  const startAction = (options: { execution: Execution; reason?: SnapshotInvalidationReason }): void => {
+    checkActive(options.execution)
+    options.execution.started = true
+    invalidate(options.reason ?? 'action')
   }
   const snapshotDocumentId = (snapshotId: string): string | undefined => {
     return /^firefox:([^:]+):/.exec(snapshotId)?.[1]
@@ -368,8 +369,10 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     const requestedDocumentId = snapshotDocumentId(requested)
     if (requestedDocumentId !== undefined && requestedDocumentId !== documentId) return 'different-document'
     if (!snapshot || snapshot.id !== requested) {
-      if (lastInvalidation?.snapshotId === requested) return `invalidated:${lastInvalidation.reason}`
-      return snapshot ? 'snapshot-replaced' : 'unknown'
+      if (lastInvalidation?.snapshotId !== requested) return 'unknown'
+      return lastInvalidation.reason === 'snapshot-replaced'
+        ? 'snapshot-replaced'
+        : `invalidated:${lastInvalidation.reason}`
     }
     const entry = snapshot.refs.get(options.ref)
     if (!entry) return 'ref-not-in-snapshot'
@@ -513,6 +516,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
     }
     if (count >= 20000 || lines.length >= MAX_SNAPSHOT_LINES || output.length < selected.length)
       output.push('[Snapshot truncated; narrow selector/search to inspect additional content.]')
+    if (snapshot) lastInvalidation = { snapshotId: snapshot.id, reason: 'snapshot-replaced' }
     snapshot = { id: `firefox:${documentId}:${randomId()}`, refs, url: document.URL }
     return {
       text: output.join('\n') || '(No matching accessible content.)',
@@ -742,7 +746,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       const rect = element.getBoundingClientRect()
       return { value: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } }
     }
-    startAction(execution)
+    startAction({ execution })
     if (!['focus', 'blur'].includes(action)) {
       actionElement.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
       checkActive(execution)
@@ -988,7 +992,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
             },
           })
         : undefined
-      startAction(execution, 'evaluate')
+      startAction({ execution, reason: 'evaluate' })
       try {
         return {
           value: browserJson(await evaluator(element)),

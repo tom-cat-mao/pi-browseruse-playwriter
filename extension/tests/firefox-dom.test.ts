@@ -526,6 +526,27 @@ describe('Firefox DOM stale snapshot diagnostics', () => {
     expect(staleMessage(response)).toContain('reason: snapshot-replaced')
   })
 
+  test('reports unknown when the supersede record was overwritten by another snapshot', async () => {
+    const first = await snapshotRef()
+    success(await driver.run(request({ method: 'invalidate' })))
+    const second = success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    expect(second.snapshotId).not.toBe(first.snapshotId)
+    success(await driver.run(request({ method: 'invalidate' })))
+    success(await driver.run(request({ method: 'snapshot', search: 'Save profile' })))
+    const response = await driver.run(
+      request({ method: 'click', selector: `@${first.ref}`, snapshotId: first.snapshotId }),
+    )
+    expect(staleMessage(response)).toContain('reason: unknown')
+  })
+
+  test('reports unknown for a snapshotId this driver never generated', async () => {
+    const { snapshotId, ref } = await snapshotRef()
+    const unseen = `${snapshotId.split(':').slice(0, 2).join(':')}:00000000-0000-4000-8000-000000000000`
+    expect(unseen).not.toBe(snapshotId)
+    const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId: unseen }))
+    expect(staleMessage(response)).toContain('reason: unknown')
+  })
+
   test('reports the DOM mutation that invalidated the requested snapshot', async () => {
     const { snapshotId, ref } = await snapshotRef()
     element('#save').setAttribute('data-changed', 'yes')
@@ -549,7 +570,12 @@ describe('Firefox DOM stale snapshot diagnostics', () => {
 
   test('reports the evaluation that invalidated the requested snapshot', async () => {
     const { snapshotId, ref } = await snapshotRef()
-    expect(success(await driver.run(request({ method: 'evaluate', code: 'return 1' }), async () => 1)).value).toBe(1)
+    const evaluated = success(
+      await driver.run(request({ method: 'evaluate', code: 'return 1' }), async () => {
+        return 1
+      }),
+    )
+    expect(evaluated.value).toBe(1)
     const response = await driver.run(request({ method: 'click', selector: `@${ref}`, snapshotId }))
     expect(staleMessage(response)).toContain('reason: invalidated:evaluate')
   })
