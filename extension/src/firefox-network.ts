@@ -282,7 +282,7 @@ export class FirefoxNetwork {
     const { tab, action } = options
     let capture = this.captures.get(tab.tabId)
     if (capture && capture.sessionId !== tab.sessionId) throw new Error('Network capture ownership mismatch')
-    if (action === 'start' && capture?.status !== 'active') {
+    if (action === 'start') {
       this.stopTab({ tabId: tab.tabId, release: true })
       capture = {
         tabId: tab.tabId,

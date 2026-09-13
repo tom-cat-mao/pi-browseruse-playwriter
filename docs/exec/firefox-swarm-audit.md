@@ -1,6 +1,6 @@
-# Firefox 0.0.137 swarm 修复与验收
+# Firefox swarm 修复与验收
 
-当前状态：代码已集成、浏览器无关检查通过、独立代码审查无 P0/P1 阻断；**0.0.137 的最终真实 Firefox 复验尚未执行**。原 PR #6 仍待最终验收后更新，不合并到 dev/main。
+当前状态：0.0.137 已完成真实 Firefox 复验，结果为 **114 PASS / 6 FAIL / 2 SKIP**，尚未通过最终验收。后续导航修复、严格不变的 stale-ref 原因诊断和显式 network start 契约校正已纳入 0.0.138 候选；**0.0.138 实机复验尚未执行**。原 PR #6 仍待最终验收后更新，不合并到 dev/main。
 
 ## 基线
 
@@ -37,9 +37,9 @@
 
 最终只读 reviewer 未发现 P0/P1 阻断，允许进入真实验收；这不替代浏览器测试。
 
-## 浏览器无关检查
+## 0.0.137 浏览器无关检查
 
-协调者在集成 worktree 中串行运行，未运行会启动 Chrome 并更新快照的默认 `pnpm test`。
+以下为 0.0.137 集成版的历史检查。协调者在集成 worktree 中串行运行，未运行会启动 Chrome 并更新快照的默认 `pnpm test`。
 
 | 检查 | 结果 |
 | --- | --- |
@@ -55,11 +55,21 @@
 
 四套测试合计 **554 项**。完整日志在集成 worktree 的 `tmp/logs/*-final.log`。新增纯逻辑/DOM 测试不是原生 Firefox WebIDL、布局或事件时序的替身。
 
+## 0.0.138 候选检查
+
+导航改动与 stale 原因诊断由不同实现者交叉只读复核；诊断中“未知 ID 被猜为 replaced”的 P2 已修为仅关联确切的单条记录。显式 active network start 的契约校正也经独立复核。均未发现 P0/P1 阻断，但不代表实机通过。
+
+协调者再次串行运行完整浏览器无关检查：runtime unit 293、integration 34、extension 150、Pi 97，合计 **574 项 PASS**；各包 TypeScript、Pi load-check、构建、Chrome/Firefox 归档 CRC 与 SHA256 均通过。日志在 `tmp/logs/138/`。新现场构建为 `extension/dist-firefox-swarm-138-localhost`；原已加载的 `extension/dist-firefox-swarm-localhost` 保持 0.0.137 未覆盖。
+
 ## 实机复验与边界
 
 复验使用 [独立 harness](../../acceptance/firefox-swarm/README.md)，明确提供 runtime URL 与已加载版本，只操作独立 session 新建的 fixture/group/tab，完成后清理。不会修改用户权限、浏览器偏好、既有标签或重启共享 runtime。
 
-0.0.137 复验至少覆盖 baseline 的实际失败、iframe 正负几何、console 后续页面执行、HTTP driver、完整响应转发、导航链/加载期 URL 变化、取消后不迟发和 96 秒连接保持。当前这些最终结果为 **NOT RUN**，等待用户加载新构建。
+0.0.137 已由独立外部验收覆盖上述范围，完整记录见 [0.0.137 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.137.md)。iframe、console、HTTP driver、完整网络转发、取消与保活均已通过；剩余四项稳定导航链失败，以及一次 stale-ref 导致的两项失败。
+
+0.0.138 候选针对导航继续更新完成候选，并在原期限内重复核对当前 frame/tab 事实；只受控暂存精确的导航 abort 事件，有替代证据且事实验证成功才允许恢复，不吞 API 异常。stale-ref 18 个定向样本未复现，根因仍未确定，因此仅增加与确切 snapshotId 关联的有界原因，不削弱拒绝、不自动重试。另校正 active capture 上的显式 start，使其按已有契约替换前次 capture。
+
+0.0.138 仍需用户加载后由独立验收重跑导航、stale 原因、active network restart 与完整矩阵。源码交叉复核已通过，不代表这些实机项目已通过。
 
 明确保留的边界：
 
