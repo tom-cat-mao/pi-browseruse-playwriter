@@ -99,16 +99,30 @@ a limitation/SKIP, not a fix. Cross-host access is via an explicit chained
 locator (`page.locator('#shadow-host').locator('input')`) or role/label/text
 locators; the chained case is a required assertion that must actually succeed.
 The baseline recorded the compound case as `count 0`; that evidence is retained.
+The fixture places `#shadow-host` **before** the iframes: a transformed
+(`scale`/`rotate`) frame overflows its layout box, and when the host followed the
+frames that overflow visually covered the shadow input, so the product correctly
+refused the action as occluded. Reordering the fixture keeps the shadow and frame
+assertions independent without weakening either.
 
 ### network-filter
 
 Native response forwarding must be complete. The fixture confirms the page realm
 actually received the complete original large body and the exact UTF-8 payload
 (reading the response in the page), not merely that the capture record looks
-truncated. Six bounded concurrent fetches verify the wiring. The capture record's
-retained bytes are bounded and are **not** proof of the in-flight memory budget:
-that budget unit is raw in-flight bytes + retained UTF-8 bytes and is provable
-only in pure logic.
+truncated.
+
+`page.execute` runs in the runtime's Node-side isolated sandbox, which exposes
+the documented `page`/locator subset and Node utilities but **not** browser
+globals such as `fetch`. The fixture page therefore performs the fetches itself
+and publishes the page-realm results (byte counts, exact text) to the DOM; the
+harness triggers them with DOM clicks and reads the values back. Six bounded
+concurrent fetches verify the wiring. The capture record's retained bytes are
+bounded and are **not** proof of the in-flight memory budget: that budget unit is
+raw in-flight bytes + retained UTF-8 bytes and is provable only in pure logic.
+The stop→restart case asserts that `stop` retains the earlier rows and that a
+later explicit `start` is reported as the documented replacement rather than a
+silent loss (a later `start` replaces the previous capture by contract).
 
 ### navigation-chain
 

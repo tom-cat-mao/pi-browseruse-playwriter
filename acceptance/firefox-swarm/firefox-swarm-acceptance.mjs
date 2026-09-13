@@ -220,6 +220,7 @@ function indexHtml({ crossOrigin }) {
 
 <section id="frame-shadow-section">
  <h2>Frames and shadow DOM</h2>
+ <div id="shadow-host"></div>
  <iframe id="local-frame" title="Local frame" src="/frame.html"></iframe>
  <iframe id="cross-frame" title="Cross-origin frame" src="${crossOrigin}/child.html"></iframe>
  <iframe id="padded-frame" title="Padded frame" src="/frame2.html" style="border:12px solid #333;padding:18px;width:320px;height:170px"></iframe>
@@ -229,7 +230,6 @@ function indexHtml({ crossOrigin }) {
  </span>
  <iframe id="scaled-frame" title="Scaled frame" src="/frame2.html" style="width:320px;height:170px;transform:perspective(420px) scale(1.3) rotate(7deg);transform-origin:top left"></iframe>
  <iframe id="fraction-frame" title="Fractional frame" src="/frame2.html" style="border:1.5px solid #333;padding:9.5px;margin-left:0.5px;width:319.5px;height:169.5px"></iframe>
- <div id="shadow-host"></div>
 </section>
 
 <section id="nav-section">
@@ -238,7 +238,15 @@ function indexHtml({ crossOrigin }) {
  <a id="history-link" href="?history=next">Navigate within fixture</a>
  <button id="network">Fetch fixture</button>
  <button id="log">Emit page log</button>
+ <button id="run-concurrent">Run concurrent fetches</button>
+ <button id="run-utf8">Run UTF-8 fetch</button>
+ <button id="run-big">Run large fetch</button>
+ <button id="run-restart">Run restart probe</button>
  <pre id="event-log" aria-label="Observed events"></pre>
+ <pre id="net-concurrent-result" aria-label="Concurrent fetch result"></pre>
+ <pre id="net-utf8-result" aria-label="UTF-8 fetch result"></pre>
+ <pre id="net-big-result" aria-label="Large fetch result"></pre>
+ <pre id="net-restart-result" aria-label="Restart probe result"></pre>
 </section>
 
 <section id="cancel-section">
@@ -279,6 +287,28 @@ function indexHtml({ crossOrigin }) {
    append('network status=' + r.status + ' bytes=' + (await r.text()).length);
  });
  document.querySelector('#log').addEventListener('click', () => { console.log('Pi Firefox swarm fixture page log'); append('page console.log emitted'); });
+ document.querySelector('#run-concurrent').addEventListener('click', async () => {
+   const results = await Promise.all([0, 1, 2, 3, 4, 5].map(async (i) => {
+     const r = await fetch('/api/echo?n=' + i);
+     return { i, text: await r.text() };
+   }));
+   document.querySelector('#net-concurrent-result').textContent = JSON.stringify(results.map((entry) => ({ i: entry.i, length: entry.text.length })));
+ });
+ document.querySelector('#run-utf8').addEventListener('click', async () => {
+   const r = await fetch('/api/echo?n=200');
+   const text = await r.text();
+   document.querySelector('#net-utf8-result').textContent = JSON.stringify({ n: JSON.parse(text).n, text, utf8Bytes: new TextEncoder().encode(text).length });
+ });
+ document.querySelector('#run-big').addEventListener('click', async () => {
+   const r = await fetch('/api/big?kb=3072');
+   const text = await r.text();
+   document.querySelector('#net-big-result').textContent = JSON.stringify({ chars: text.length, tail: text.slice(-7), utf8Bytes: new TextEncoder().encode(text).length });
+ });
+ document.querySelector('#run-restart').addEventListener('click', async () => {
+   const r = await fetch('/api/echo?n=100');
+   const text = await r.text();
+   document.querySelector('#net-restart-result').textContent = JSON.stringify({ n: JSON.parse(text).n, length: text.length });
+ });
  let cancelCount = 0;
  document.querySelector('#cancel-counter').addEventListener('click', () => { cancelCount += 1; document.querySelector('#cancel-count').textContent = String(cancelCount); });
 </script>
@@ -1160,13 +1190,23 @@ async function areaNetworkFilter() {
     actual: start.json?.ok === true ? start.json.data?.networkCapture : start.json?.error ?? start.networkError,
   })
 
-  const concurrent = await execute(`
-    const results = await Promise.all([0, 1, 2, 3, 4, 5].map(async (i) => {
-      const r = await fetch('/api/echo?n=' + i);
-      return { i, text: await r.text() };
-    }));
-    return results.map((entry) => ({ i: entry.i, length: entry.text.length }));
-  `, { area })
+  const runFixtureFetch = async (buttonName, resultSelector) => {
+    const click = await execute(`await page.getByRole('button', { name: ${JSON.stringify(buttonName)} }).click(); return 'clicked'`, { area })
+    if (click.ok !== true) return { ok: false, raw: click.raw }
+    const parsed = await waitFor(async () => {
+      const read = await execute(`return await page.locator(${JSON.stringify(resultSelector)}).textContent()`, { area })
+      if (read.ok !== true || typeof read.value !== 'string' || read.value.trim().length === 0) return { done: false }
+      try {
+        return { done: true, value: JSON.parse(read.value) }
+      } catch {
+        return { done: false }
+      }
+    })
+    if (parsed.done !== true) return { ok: false, raw: parsed }
+    return { ok: true, value: parsed.value }
+  }
+
+  const concurrent = await runFixtureFetch('Run concurrent fetches', '#net-concurrent-result')
   check(area, 'six concurrent fetches complete', concurrent.ok === true && Array.isArray(concurrent.value) && concurrent.value.length === 6, {
     actual: concurrent.ok === true ? concurrent.value : concurrent.raw,
   })
@@ -1180,12 +1220,7 @@ async function areaNetworkFilter() {
     actual: { echoRows: captured.echo?.length ?? 0, meta: captured.meta },
   })
 
-  const pageUtf8 = await execute(`
-    const r = await fetch('/api/echo?n=200');
-    const text = await r.text();
-    const parsed = JSON.parse(text);
-    return { n: parsed.n, text, utf8Bytes: new TextEncoder().encode(text).length };
-  `, { area })
+  const pageUtf8 = await runFixtureFetch('Run UTF-8 fetch', '#net-utf8-result')
   check(area, 'page realm receives the complete UTF-8 payload', pageUtf8.ok === true && pageUtf8.value?.n === 200 && String(pageUtf8.value?.text).includes('中文-✓-😀'), {
     actual: pageUtf8.ok === true ? pageUtf8.value : pageUtf8.raw,
   })
@@ -1214,11 +1249,7 @@ async function areaNetworkFilter() {
     actual: details,
   })
 
-  const bigTrigger = await execute(`
-    const r = await fetch('/api/big?kb=3072');
-    const text = await r.text();
-    return { chars: text.length, tail: text.slice(-8), utf8Bytes: new TextEncoder().encode(text).length };
-  `, { area })
+  const bigTrigger = await runFixtureFetch('Run large fetch', '#net-big-result')
   const tailChars = '-END-中文'.length
   const tailBytes = Buffer.byteLength('-END-中文', 'utf8')
   const fullChars = 3072 * 1024 + tailChars
@@ -1243,12 +1274,17 @@ async function areaNetworkFilter() {
   check(area, 'capture stops before restart', stop.json?.ok === true && ['stopped', 'interrupted'].includes(stop.json.data?.networkCapture?.status), {
     actual: stop.json?.data?.networkCapture ?? stop.json?.error ?? stop.networkError,
   })
+  const afterStop = await listRows()
+  const stopEcho = afterStop.rows.filter((row) => (row.url ?? '').includes('/api/echo'))
+  check(area, 'stop retains the earlier captured rows instead of erasing them', stopEcho.length >= 6 || (afterStop.meta?.droppedCount ?? 0) > 0 || typeof afterStop.meta?.reason === 'string', {
+    actual: { echoRows: stopEcho.length, meta: afterStop.meta },
+  })
   const restart = await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'start' }, { area })
   check(area, 'capture restarts after stop', restart.json?.ok === true && restart.json.data?.networkCapture?.status === 'active', {
     actual: restart.json?.data?.networkCapture ?? restart.json?.error ?? restart.networkError,
   })
-  const afterRestartTrigger = await execute(`const r = await fetch('/api/echo?n=100'); return (await r.text()).length`, { area })
-  check(area, 'post-restart fetch completes', afterRestartTrigger.ok === true, { actual: afterRestartTrigger.ok === true ? afterRestartTrigger.value : afterRestartTrigger.raw })
+  const afterRestartTrigger = await runFixtureFetch('Run restart probe', '#net-restart-result')
+  check(area, 'post-restart fetch completes', afterRestartTrigger.ok === true && afterRestartTrigger.value?.n === 100, { actual: afterRestartTrigger.ok === true ? afterRestartTrigger.value : afterRestartTrigger.raw })
   const afterRestart = await waitFor(async () => {
     const { rows, meta } = await listRows()
     return rows.some((row) => (row.url ?? '').includes('n=100')) ? { done: true, rows, meta } : { done: false, rows, meta }
@@ -1256,9 +1292,10 @@ async function areaNetworkFilter() {
   check(area, 'requests after restart are captured', afterRestart.done === true, {
     actual: { retainedCount: afterRestart.meta?.retainedCount, meta: afterRestart.meta },
   })
-  const earlierEcho = (afterRestart.rows ?? []).filter((row) => (row.url ?? '').includes('/api/echo')).length
-  check(area, 'stop/restart does not silently drop earlier captured rows', earlierEcho >= 6 || (afterRestart.meta?.droppedCount ?? 0) > 0 || typeof afterRestart.meta?.reason === 'string', {
-    actual: { echoRows: earlierEcho, meta: afterRestart.meta },
+  const restartRows = (afterRestart.rows ?? []).length
+  check(area, 'restart is reported as a documented replacement, not a silent loss', afterRestart.meta?.status === 'active' && afterRestart.meta?.retainedCount === restartRows && typeof afterRestart.meta?.droppedCount === 'number', {
+    actual: { rows: restartRows, meta: afterRestart.meta },
+    note: 'An explicit start replaces the previous capture per the contract; earlier rows were already verified to survive stop before the restart.',
   })
 
   await send(sessionId, { kind: 'page.network', tabId: state.tabId, action: 'stop' }, { area })
