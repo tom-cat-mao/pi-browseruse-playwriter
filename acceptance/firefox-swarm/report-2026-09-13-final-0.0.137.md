@@ -180,7 +180,7 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 
 结果：**18/18 样本 `page.fill` 成功，0 次 `stale-snapshot`**。
 
-| 条件 | 样本 | stale | fill ok | 窗口内有页面侧事件 |
+| 条件 | 样本 | stale | fill ok | 窗口内记录到页面侧事件（见不推断声明） |
 | --- | --- | --- | --- | --- |
 | static-url | 3 | 0 | 3 | 0 |
 | static-load | 3 | 0 | 3 | 1 |
@@ -189,10 +189,16 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 | complex-real-url（真实 index） | 3 | 0 | 3 | 3 |
 | complex-real-load（真实 index） | 3 | 0 | 3 | 3 |
 
+**窗口定义与不推断声明**：
+
+- 本文的“窗口”= [被测 snapshot 请求发出, `page.fill` 响应返回]；事件时间为 **Node fixture server 的接收时间**，`eventsInWindow` 只表示接收时间落在该区间（`[t0-20ms, t1]`）。
+- 窗口内记录的页面侧事件**不等价于**“快照有效期内被观察根发生了真实变化”。它们可能来自：① snapshot 计算期间；② `page.fill` 期间或之后（fill 会触发 fixture 的 `input` 监听，该监听向 `#event-log` 追加以致其自身产生主文档 childList 变更）；③ **当前未被产品 snapshot 观察**的文档（如 snapshot 时 `contentDocument` 尚不可用的同源 iframe、或跨源 iframe）。
+- 因此“窗口内有事件”**不能**推出“真实变化但未失效”，也**不能**推出“无变化而误失效”。本诊断**不对**每个事件归属上述哪一类做因果推断，只保留准确计数与时间。
+
 可直接读出的观测（fixture 页面侧，非产品内部）：
 
 - **URL 就绪时，第一次 snapshot 常常还不含目标 ref**（如 static-url #1 首帧 322ms 无 `Controlled name`，第二帧 67ms 才有）；复刻/真实 complex 同样。即 URL settle 早于“文档可快照”，这与被测 snapshot 通常是“轮询后的那一帧”一致。
-- 真实 index 的 `complex-real-url`：被测 snapshot 窗口内确有主文档 mutation 与多个 iframe 的 init/load；`complex-real-load`：三个样本窗口内均有 `real.html:mutation`。**这些样本仍全部 fill ok**。所以本诊断**没有**观测到“窗口内有页面侧变化就必然失效”，也**没有**观测到“无任何页面侧变化却失效”。
+- 真实 index 的 `complex-real-url` 与 `complex-real-load`：窗口内均记录到主文档 mutation 与若干 iframe 的 init/load；但这些仅为接收时间落在窗口内，按上方声明**不区分**是否由 fill 自身、snapshot 期间或未被观察文档产生。逐事件的接收时间与相对 snapshot 起点的偏移保存在原始 `diagnosis.json`。
 - 被测 snapshot 耗时 24–657ms，均未接近失败运行的 1118ms；环境全程 `epoch-34889599-…`/`connectionId=mtzap2md_q3to5z`/`0.0.137` 不变。
 
 结论（不夸大）：**根因未定（UNDETERMINED）**。固定 3 次/条件下的 18 次受控样本未能复现唯一一次 stale，因此无法据此判定它是真实变化引起的正确防护，还是无变化时的误失效。
@@ -200,8 +206,8 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 
 - **不修改 harness 前置条件**（无证据表明 `waitForLoadState('load')` 能消除它；也不加 retry）；
 - **不削弱产品 stale 校验**；
-- 保留原 FAIL 记录与原始 error，交协调者/产品 owner 用可观测内部状态（observer 命中、document/content-script 实例、snapshot 失效原因）定性。
-  可复现入口是完整 harness 的首次 snapshot 路径（4 次完整运行命中 1 次）。
+- 保留原 FAIL 记录与原始 error，交协调者/产品 owner 定性；产品 owner 正在加入**有界 stale 原因诊断（不改拒绝条件）**，
+  下一轮若再遇到即可分辨内部原因。可复现入口是完整 harness 的首次 snapshot 路径（4 次完整运行命中 1 次）。
 
 ## 复验关注项（本轮实测状态）
 
@@ -218,8 +224,9 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 11. 导航链（meta refresh / location.replace / replaceState / hash）：**本轮仍 FAIL**（见 FAIL #1–#4）。
 12. 真实取消后不迟发：本轮结构化取消 + 计数不变 + 正向对照全部 PASS（不宣称复现 frame 注入竞态）。
 13. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：完整运行命中 1 次（snapshot-ref 偶发 `stale-snapshot`，FAIL #5）；
-    随后按固定样本定向诊断 18 次**未复现**（见上节），且窗口内确有主文档/iframe 页面侧变化却未失效，
-    **根因未定**，不能据此称“已证实为注入竞态”，也不能称“误失效”。留待 owner 用内部可观测状态定性。
+    随后按固定样本定向诊断 18 次**未复现**（见上节）。**根因未定**：不能据此称“已证实为注入竞态”，也不能称“误失效”；
+    窗口内的事件不作为推断依据（见上节「不推断声明」）。留待 owner 定性；产品 owner 正在加入**有界 stale 原因诊断（不改拒绝条件）**，
+    下一轮若再遇到即可分辨内部原因。
 
 ## 范围与限制
 
