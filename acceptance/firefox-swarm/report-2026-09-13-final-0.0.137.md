@@ -102,15 +102,20 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 > `page.execute` 偶发返回 `Firefox page.execute: Missing host permission for the tab`（`execution-failed`），
 > 使 `final document really loaded for the meta-refresh redirect` 也 FAIL（4 次运行中 1 次）。属同一导航观测/@注入时序问题的另一症状。
 
-### 5. snapshot-ref：新建标签后按 ref `page.fill` 偶发 `stale-snapshot`（1/4）
+### 5. snapshot-ref：新建标签后按 ref `page.fill` 偶发 `stale-snapshot`（1/4，定向诊断未复现）
 
 | 项 | 内容 |
 | --- | --- |
 | 期望 | `page.snapshot` 返回的 ref（本例 `aria-ref=e10`，name `Controlled name`）+ 其 `snapshotId` 可 `page.fill` 成功，DOM value 变为 `RefAlice` |
-| 实际 | `page.fill` 返回 `ok:false` `stale-snapshot`（"Snapshot ref aria-ref=e10 is missing or stale"），DOM value 仍为 `Alice`；连带 `DOM value reflects the ref-based fill` FAIL |
-| 最小复现 | 新建 fixture 标签 → `waitForTabUrl` 等到目标 URL → 取一次 `page.snapshot`（本次实测该请求耗时 1118ms）→ 40ms 后按该 ref `page.fill`；`snapshotId` 已被判 stale |
-| 说明 | 4 次运行中 1 次（仅完整运行命中）；其余 3 次同一序列 PASS。命中点与协调者「瞬时新标签注入竞态（retest item 13，此前 NOT RUN）」一致：URL settle 后文档仍在切换，快照绑定到过渡期文档后失效。是否属产品侧竞态、还是调用方需等 load state，留待协调者/owner 判定；**未改 harness 去掩盖，也未被降级为 SKIP** |
-| 证据 | `evidence-2026-09-13T04-18-13-683Z/evidence.json` → results `snapshot-ref :: page.fill by snapshot ref succeeds`、`… DOM value reflects the ref-based fill`；原始请求 `requestId dc0c166a-…`（`page.fill`）、`requestId d6b3b7c0-…`（随后的 stale ref click） |
+| 实际 | `page.fill` 返回 `ok:false`，**原始 error**：`code:"stale-snapshot"`，`message:"Snapshot ref aria-ref=e10 is missing or stale. Take a fresh snapshot and pass its snapshotId with a ref shown in that snapshot."`，`outcome:"not-started"`；DOM value 仍为 `Alice`，连带 `DOM value reflects the ref-based fill` FAIL |
+| 最小复现 | 新建 fixture 标签 → `waitForTabUrl` 等到目标 URL → 取一次 `page.snapshot`（本次实测该请求耗时 1118ms）→ 40ms 后按该 ref `page.fill`；`snapshotId` 被判 stale |
+| 观测窗口已知量 | 仅：URL 已 settle、snapshot 耗时 1118ms、随后 fill 40ms 返 stale；`page.fill` 请求见 raw requests。**当时没有 MutationObserver/文档更替观测**，故**不能**断言“DOM 未变”或“就是注入竞态” |
+| 说明 | 4 次运行中 1 次（仅完整运行命中）。定向诊断（见下节）在 6 种条件下共 18 个固定样本**未复现** stale（0/18），既未观察到“无变化的误失效”，也未观察到“真实变化导致失效”。因此根因**未定**，需产品 owner 用更可观测的手段定性；**未改 harness 去掩盖，未加 retry，未削弱产品 stale 校验，也未降级为 SKIP** |
+| 证据 | `evidence-2026-09-13T04-18-13-683Z/evidence.json` → results `snapshot-ref :: page.fill by snapshot ref succeeds`、`… DOM value reflects the ref-based fill`；原始请求 `requestId dc0c166a-…`（`page.fill`，error.code=`stale-snapshot`）、`requestId d6b3b7c0-…`（随后的 stale ref click） |
+
+> 口径订正：本报告前一版把该 FAIL 的 `actual` 记成 `null`，是因为 harness 在该断言里误用 `fillByRef.error`（send 结果里错误在
+> `fillByRef.json.error`），已修正为 `.json?.error`（同处 `snap.error`、`attempt.error` 一并修正），并已把原始
+> `stale-snapshot` message 带进 results/report。该修正只改 `actual` 文本，不改判定逻辑。
 
 ## SKIP / 未交付限制（不称已修）
 
@@ -129,9 +134,11 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 
 1. **network-filter 误用浏览器 `fetch`（根因，harness 缺陷）**
    原始 FAIL：`Firefox page.execute: fetch is not defined`（连带 8 项 FAIL）。
-   根因：`page.execute` 运行在 runtime 的 **Node `vm` 隔离沙箱**（`firefox-executor-realm.ts` 仅暴露
-   `page`/`context`/`console`/`Buffer`/`TextEncoder`/`TextDecoder`/`URL`/`URLSearchParams`/`crypto.randomUUID`/`setTimeout` 等，
-   **无浏览器 `fetch`/`window`**）。原 harness 在 execute 里调 `fetch` 属错误假设，非产品缺陷。
+   根因：`page.execute` 运行在 runtime 的 **Node `vm` 隔离沙箱**。该 realm 以参数/shim 形式提供
+   `page`/`context`/`state`/`console`/`Buffer`/`TextEncoder`/`TextDecoder`/`URL`/`URLSearchParams`/`atob`/`btoa`/
+   `crypto.randomUUID`/`setTimeout`/`setInterval`/`process`（见 `firefox-executor-realm.ts`）。**缺的是浏览器网络全局
+   `fetch`**（以及 `window`/`document`——它们来自需要可选 userScripts 权限的 `page.evaluate`）；**不是**“所有浏览器全局都缺”，
+   `TextEncoder`/`TextDecoder`/`URL` 恰恰是可用的。原 harness 在 execute 里调 `fetch` 属错误假设，非产品缺陷。
    修正：由 **fixture 页面自身**发起 fetch 并把页面 realm 结果（字符数、字节数、精确文本/tail）写入 DOM，
    harness 用 DOM 点击触发、再读回 DOM 校验。这样仍是**页面 realm 真实收包**的证明，且符合契约。
 2. **shadow-dom 被 iframe 遮挡（根因，harness 缺陷）**
@@ -146,9 +153,55 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
    `stop` 后旧行仍可 list（已单独断言 PASS），显式 `start` 按契约替换并报告 `retainedCount`/`droppedCount`。
    修正：新增「`stop` 保留旧行」断言；把重启后的断言改为「重启被报告为契约化替换、非静默丢失」。
    这是产品**符合契约**的行为，不是把产品问题降 SKIP。
+4. **失败 `actual` 丢原始 error（harness 口径缺陷）**
+   `snapshot-ref` 的 fill 校验把错误读成 `fillByRef.error`，而 send 结果里错误在 `fillByRef.json.error`，导致 `actual` 为 `null`
+   （原始 requests 里确有 `stale-snapshot`）。已改为 `.json?.error`（同类 `snap.error`、`attempt.error` 一并修正），只影响 `actual` 文本，不改判定逻辑。
+
+**为一致性/可复现补充（不影响判定）**：新增定向诊断脚本 `acceptance/firefox-swarm/snapshot-ref-diagnosis.mjs`；README 同步执行沙箱与 fixture 布局说明。
 
 修正后 fast pass：`evidence-2026-09-13T04-15-58-873Z`（113/5/3）、`evidence-2026-09-13T04-17-13-668Z`（114/5/3）。
 除上述 navigation-chain 与偶发 snapshot-ref 外，其余全部 PASS。
+
+## snapshot-ref 定向诊断（固定样本，0/18 stale，根因未定）
+
+目的：在**不改产品**的前提下，区分“真实文档/DOM 变化导致（正确防护）”与“无变化的误失效”，并检查是否需要修 harness 前置条件。
+脚本：`acceptance/firefox-swarm/snapshot-ref-diagnosis.mjs`（只创建/清理自己的 session/group/tab；fixture 前台 bind 随机端口并在 `finally` 关闭）。
+原始证据：`tmp/firefox-swarm-acceptance/snapshot-ref-diagnosis-2026-09-13T04-38-27-096Z/`（复刻 complex，12 样本）、
+`…/snapshot-ref-diagnosis-2026-09-13T04-39-27-726Z/`（真实 harness index，6 样本）。
+
+设计（无 retry-until-pass，每条件固定 3 次）：
+
+| 维度 | 取值 |
+| --- | --- |
+| fixture | `static`：无 iframe、无异步 DOM 的最小页；`complex`：harness 帧/shadow 结构的复刻；`real`：**直接提取 harness 真实 `index.html`**（含 5 个同源 iframe、1 个跨源 iframe、open shadow） |
+| 就绪条件 | `url`：`tab.resolve` URL settle 后轮询 snapshot 直到出现 `Controlled name`（复刻 harness 原逻辑）；`load`：snapshot **之前**先执行一次 `await page.waitForURL(url); await page.waitForLoadState('load')` |
+| 测量 | 就绪后取**被测 snapshot（含其 snapshotId/ref 原值）**，紧接着 `page.fill(aria-ref=…)`；任何额外 execute/snapshot 都在被测 snapshot 之前 |
+| 观测 | 每个页面（含每个 frame，含跨源）注入 MutationObserver + load/DOMContentLoaded/pagehide 上报：**只把非敏感 tag/属性名/时间 POST 到 Node fixture server**，测量窗口内不写 DOM，避免自造失效 |
+
+结果：**18/18 样本 `page.fill` 成功，0 次 `stale-snapshot`**。
+
+| 条件 | 样本 | stale | fill ok | 窗口内有页面侧事件 |
+| --- | --- | --- | --- | --- |
+| static-url | 3 | 0 | 3 | 0 |
+| static-load | 3 | 0 | 3 | 1 |
+| complex-url（复刻） | 3 | 0 | 3 | 3 |
+| complex-load（复刻） | 3 | 0 | 3 | 0 |
+| complex-real-url（真实 index） | 3 | 0 | 3 | 3 |
+| complex-real-load（真实 index） | 3 | 0 | 3 | 3 |
+
+可直接读出的观测（fixture 页面侧，非产品内部）：
+
+- **URL 就绪时，第一次 snapshot 常常还不含目标 ref**（如 static-url #1 首帧 322ms 无 `Controlled name`，第二帧 67ms 才有）；复刻/真实 complex 同样。即 URL settle 早于“文档可快照”，这与被测 snapshot 通常是“轮询后的那一帧”一致。
+- 真实 index 的 `complex-real-url`：被测 snapshot 窗口内确有主文档 mutation 与多个 iframe 的 init/load；`complex-real-load`：三个样本窗口内均有 `real.html:mutation`。**这些样本仍全部 fill ok**。所以本诊断**没有**观测到“窗口内有页面侧变化就必然失效”，也**没有**观测到“无任何页面侧变化却失效”。
+- 被测 snapshot 耗时 24–657ms，均未接近失败运行的 1118ms；环境全程 `epoch-34889599-…`/`connectionId=mtzap2md_q3to5z`/`0.0.137` 不变。
+
+结论（不夸大）：**根因未定（UNDETERMINED）**。固定 3 次/条件下的 18 次受控样本未能复现唯一一次 stale，因此无法据此判定它是真实变化引起的正确防护，还是无变化时的误失效。
+因此：
+
+- **不修改 harness 前置条件**（无证据表明 `waitForLoadState('load')` 能消除它；也不加 retry）；
+- **不削弱产品 stale 校验**；
+- 保留原 FAIL 记录与原始 error，交协调者/产品 owner 用可观测内部状态（observer 命中、document/content-script 实例、snapshot 失效原因）定性。
+  可复现入口是完整 harness 的首次 snapshot 路径（4 次完整运行命中 1 次）。
 
 ## 复验关注项（本轮实测状态）
 
@@ -164,8 +217,9 @@ Harness：`acceptance/firefox-swarm/firefox-swarm-acceptance.mjs`（本次为修
 10. `page.back` 响应 URL：本轮与完成导航 URL 一致，PASS。
 11. 导航链（meta refresh / location.replace / replaceState / hash）：**本轮仍 FAIL**（见 FAIL #1–#4）。
 12. 真实取消后不迟发：本轮结构化取消 + 计数不变 + 正向对照全部 PASS（不宣称复现 frame 注入竞态）。
-13. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：本轮完整运行**命中 1 次**（snapshot-ref 偶发 `stale-snapshot`，FAIL #5），
-    与此前 NOT RUN 的状态不同，留待 owner 判定。
+13. 瞬时新标签注入竞态（create 期间 about:blank/文档切换）：完整运行命中 1 次（snapshot-ref 偶发 `stale-snapshot`，FAIL #5）；
+    随后按固定样本定向诊断 18 次**未复现**（见上节），且窗口内确有主文档/iframe 页面侧变化却未失效，
+    **根因未定**，不能据此称“已证实为注入竞态”，也不能称“误失效”。留待 owner 用内部可观测状态定性。
 
 ## 范围与限制
 

@@ -578,7 +578,7 @@ async function areaGroupAndTab() {
   const area = 'create'
   const groupResult = await createGroupWithRecovery(`swarm-acceptance ${runStamp}`)
   check(area, 'groups.create returns a groupId', typeof groupResult.groupId === 'string', {
-    actual: groupResult.attempt.json?.data ?? groupResult.attempt.error ?? groupResult.attempt.networkError,
+    actual: groupResult.attempt.json?.data ?? groupResult.attempt.json?.error ?? groupResult.attempt.networkError,
     request: { kind: 'groups.create' },
     note: groupResult.recovered ? 'recovered the group via groups.list after an unknown result' : undefined,
   })
@@ -587,7 +587,7 @@ async function areaGroupAndTab() {
 
   const tabResult = await createTabWithRecovery(state.groupId, `${state.baseUrl}/index.html`)
   check(area, 'tabs.create returns a tabId', typeof tabResult.tab?.tabId === 'string', {
-    actual: tabResult.attempt.json?.data ?? tabResult.attempt.error ?? tabResult.attempt.networkError,
+    actual: tabResult.attempt.json?.data ?? tabResult.attempt.json?.error ?? tabResult.attempt.networkError,
     request: { kind: 'tabs.create', groupId: state.groupId, url: `${state.baseUrl}/index.html` },
     note: tabResult.recovered ? 'recovered the tab via tabs.list after an unknown result' : undefined,
   })
@@ -621,7 +621,7 @@ async function areaSnapshotAndRef() {
       : { done: false }
   })
   check(area, 'page.snapshot returns snapshotId + refs', snap.json?.ok === true && typeof data?.snapshotId === 'string' && data.snapshotId.length > 0 && Array.isArray(data?.value?.refs) && data.value.refs.length > 0, {
-    actual: snap.json?.ok === true ? { snapshotId: data.snapshotId, refCount: data.value?.refs?.length, textLength: data.text?.length } : snap.error ?? snap.networkError,
+    actual: snap.json?.ok === true ? { snapshotId: data.snapshotId, refCount: data.value?.refs?.length, textLength: data.text?.length } : snap.json?.error ?? snap.networkError,
     request: { kind: 'page.snapshot', tabId: state.tabId },
   })
   if (snap.json?.ok !== true) return
@@ -641,7 +641,7 @@ async function areaSnapshotAndRef() {
   }
   const fillByRef = await send(sessionId, { kind: 'page.fill', tabId: state.tabId, selector: `aria-ref=${nameRef.ref}`, snapshotId: data.snapshotId, value: 'RefAlice' })
   check(area, 'page.fill by snapshot ref succeeds', fillByRef.json?.ok === true, {
-    actual: fillByRef.json?.ok === true ? fillByRef.json.data : fillByRef.error ?? fillByRef.networkError,
+    actual: fillByRef.json?.ok === true ? fillByRef.json.data : fillByRef.json?.error ?? fillByRef.networkError,
     request: { kind: 'page.fill', selector: `aria-ref=${nameRef.ref}`, snapshotId: data.snapshotId },
   })
 

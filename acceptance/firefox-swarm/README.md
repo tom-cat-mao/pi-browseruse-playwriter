@@ -112,17 +112,20 @@ actually received the complete original large body and the exact UTF-8 payload
 (reading the response in the page), not merely that the capture record looks
 truncated.
 
-`page.execute` runs in the runtime's Node-side isolated sandbox, which exposes
-the documented `page`/locator subset and Node utilities but **not** browser
-globals such as `fetch`. The fixture page therefore performs the fetches itself
-and publishes the page-realm results (byte counts, exact text) to the DOM; the
-harness triggers them with DOM clicks and reads the values back. Six bounded
-concurrent fetches verify the wiring. The capture record's retained bytes are
-bounded and are **not** proof of the in-flight memory budget: that budget unit is
-raw in-flight bytes + retained UTF-8 bytes and is provable only in pure logic.
-The stop→restart case asserts that `stop` retains the earlier rows and that a
-later explicit `start` is reported as the documented replacement rather than a
-silent loss (a later `start` replaces the previous capture by contract).
+`page.execute` runs in the runtime's Node-side isolated sandbox. It exposes the
+documented `page`/locator subset plus shims for `TextEncoder`/`TextDecoder`/
+`URL`/`URLSearchParams`/`crypto.randomUUID` and `setTimeout`, but it does **not**
+provide the browser network global `fetch` (nor `window`/`document`; those come
+from `page.evaluate`, which needs the optional userScripts permission). The
+fixture page therefore performs the fetches itself and publishes the page-realm
+results (byte counts, exact text) to the DOM; the harness triggers them with DOM
+clicks and reads the values back. Six bounded concurrent fetches verify the
+wiring. The capture record's retained bytes are bounded and are **not** proof of
+the in-flight memory budget: that budget unit is raw in-flight bytes + retained
+UTF-8 bytes and is provable only in pure logic. The stop→restart case asserts
+that `stop` retains the earlier rows and that a later explicit `start` is
+reported as the documented replacement rather than a silent loss (a later
+`start` replaces the previous capture by contract).
 
 ### navigation-chain
 
