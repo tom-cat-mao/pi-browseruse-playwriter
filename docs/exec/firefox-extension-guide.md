@@ -1,13 +1,16 @@
 # Firefox 普通扩展使用与能力边界
 
-当前为开发预览：生产代码审查、浏览器无关测试及打包已通过；真实 Firefox 验收按用户本轮决定保留待办。状态见[交付与验收记录](firefox-extension-acceptance.md)。
+0.0.138 已通过真实 Firefox 验收：**126 PASS / 0 FAIL / 2 SKIP**，SKIP 仅为下文列明的既定边界。
+逐项结果见 [swarm 审计](firefox-swarm-audit.md) 与 [0.0.138 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)；交付过程见[交付与验收记录](firefox-extension-acceptance.md)。
 
 本分支提供普通 Firefox WebExtension 后端，使用现有 Pi 包和本地 managed runtime。
 它接管已经打开的真实标签和登录态，不要求 Remote Agent、BiDi、Marionette 或调试启动参数。
 开发目标为桌面 Firefox 139+；其它 Firefox 衍生浏览器需分别验证。
 
-状态：本地开发构建，未申请 AMO 签名、未上架，也没有 npm 发布。真实浏览器验收仍需单独完成；
-能够构建、类型检查通过和浏览器中的实际兼容性是不同的验收项。
+状态：本地开发构建，未申请 AMO 签名、未上架，也没有 npm 发布。
+0.0.138 已发布 `extension@0.0.138` GitHub Release（含 Firefox ZIP 与未签名 XPI）；
+真实 Firefox 验收已完成（126 PASS / 0 FAIL / 2 SKIP），但验收覆盖的是受控 fixture 矩阵，
+不等于对所有网站的兼容性保证。
 
 ## 构建和临时加载
 
@@ -162,12 +165,13 @@ page/locator 句柄。await 每一个动作，不留下后台任务；需要动�
 ## 验证与维护
 
 浏览器无关检查包括 runtime 与 Pi 的 typecheck、真实 HTTP/WS/隔离进程逻辑测试、DOM fixture、
-Chrome 与 Firefox 构建及归档解压/校验。它们不替代在真实 Firefox 中验证受控输入、页面权限、
-跨源 frame、截图、网络正文、重连和可选权限弹窗。
+Chrome 与 Firefox 构建及归档解压/校验。0.0.138 另外完成了真实 Firefox 验收（126 PASS / 0 FAIL / 2 SKIP，
+见[实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)），覆盖受控输入、页面权限、
+跨源 frame、截图、网络正文、重连、导航链、stale-ref 诊断与 96 秒空闲保活。
 
-真实浏览器验收要由用户准备并加载扩展后再进行；只创建验收自己的 fixture 和标签。
-尚未运行的浏览器场景应记录为 SKIP，不能标记 PASS。执行计划与最终验收记录分别维护，
-本指南不把仍待验收的目标写成对所有网站的保证。
+后续改动仍需沿用同一纪律：真实浏览器验收由用户准备并加载扩展后再进行，只创建验收自己的 fixture 和标签；
+尚未运行的浏览器场景记录为 SKIP，不能标记 PASS。执行计划与最终验收记录分别维护，
+本指南不把验收范围外的目标写成对所有网站的保证。
 
 官方 API 依据：
 

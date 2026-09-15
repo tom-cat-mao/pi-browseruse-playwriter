@@ -2,7 +2,7 @@
 
 日期：2026-09-12。交付分支：`codex/firefox-extension`；PR base：`dev`。
 
-当前状态：**实现、全套浏览器无关检查、独立生产代码审查和打包验证已完成；真实浏览器验收按用户本轮选择保留待办。** PR 在真实 Firefox 验收完成前保持 Draft。本记录不是 Firefox 全功能已通过浏览器实测的声明。
+当前状态：**已完成。** 真实 Firefox 验收于 2026-09-13 以 0.0.138 通过（126 PASS / 0 FAIL / 2 SKIP，见 [swarm 审计](firefox-swarm-audit.md) 与 [实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)）；PR #6 已合入 `dev`，并发布 `extension@0.0.138` GitHub Release（含 Firefox ZIP 与未签名 XPI）。SKIP 两项为既定边界：跨 shadow 复合 CSS（用链式 locator）、`target=_blank` 的 sourceTabId。本记录仍不表示 Firefox 全功能在所有网站已实测。
 
 ## 实际交付
 

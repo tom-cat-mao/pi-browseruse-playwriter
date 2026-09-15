@@ -34,8 +34,10 @@ The default development build has extension ID
 
 ## Load the Firefox development extension
 
-The Firefox backend targets desktop Firefox 139+ and is pending real-browser
-acceptance. Other Firefox-derived browsers need their own compatibility check.
+The Firefox backend targets desktop Firefox 139+ and passed real-browser
+acceptance in 0.0.138 (126 PASS / 0 FAIL / 2 boundary SKIP; see the
+[Firefox guide](./docs/exec/firefox-extension-guide.md)). Other Firefox-derived
+browsers need their own compatibility check.
 There is no signed Firefox add-on yet; ordinary permanent installation requires
 Mozilla signing. The local unsigned ZIP/XPI is a development artifact.
 
