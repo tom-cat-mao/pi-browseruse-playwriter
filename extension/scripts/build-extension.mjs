@@ -9,6 +9,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -28,11 +29,17 @@ if (mode === 'fork') {
   env.PLAYWRITER_PORT = env.PLAYWRITER_PORT || '19988'
 }
 
+const outDirName = env.PLAYWRITER_EXTENSION_DIST || 'dist'
+if (!/^dist(?:-[a-z0-9]+)*$/.test(outDirName) || /^dist-firefox(?:-|$)/.test(outDirName)) {
+  throw new Error('PLAYWRITER_EXTENSION_DIST must be dist or a Chrome dist-<suffix> directory')
+}
+const outDir = path.join(extensionDir, outDirName)
+fs.rmSync(outDir, { recursive: true, force: true })
+
 const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
 const steps = [
   ['exec', 'tsc', '--project', '.'],
   ['exec', 'vite', 'build', '--config', 'vite.config.mts'],
-  ['exec', 'tsx', 'scripts/download-prism.ts'],
 ]
 
 for (const args of steps) {

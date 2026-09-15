@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Browser Use",
-  "version": "0.0.138",
+  "version": "0.0.139",
   "description": "Connect Pi Browser Use to your Chrome tabs for local Pi agent browser automation.",
   "permissions": [
     "debugger",
@@ -20,6 +20,10 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
+  },
+  "options_ui": {
+    "page": "src/tutorial.html",
+    "open_in_tab": true
   },
   "action": {
     "default_title": "Click to attach debugger",

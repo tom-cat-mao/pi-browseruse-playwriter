@@ -38,7 +38,7 @@ if (typecheck.status !== 0) {
 }
 
 fs.rmSync(outDir, { recursive: true, force: true })
-for (const entry of ['firefox-background', 'firefox-dom', 'firefox-popup']) {
+for (const entry of ['firefox-background', 'firefox-dom', 'firefox-popup', 'firefox-tutorial']) {
   await build({
     configFile: false,
     root: extensionDir,
@@ -69,6 +69,8 @@ for (const entry of ['firefox-background', 'firefox-dom', 'firefox-popup']) {
 fs.writeFileSync(path.join(outDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 fs.writeFileSync(path.join(outDir, 'firefox-build.json'), `${JSON.stringify({ host, port: Number(port) }, null, 2)}\n`)
 fs.copyFileSync(path.join(extensionDir, 'src/firefox-popup.html'), path.join(outDir, 'firefox-popup.html'))
+fs.copyFileSync(path.join(extensionDir, 'src/firefox-tutorial.html'), path.join(outDir, 'firefox-tutorial.html'))
+fs.copyFileSync(path.join(extensionDir, 'src/firefox-tutorial.css'), path.join(outDir, 'firefox-tutorial.css'))
 fs.cpSync(path.join(extensionDir, 'icons'), path.join(outDir, 'icons'), { recursive: true })
 console.log(`Built Firefox extension at ${outDir}`)
 console.log('Development loading: about:debugging#/runtime/this-firefox → Load Temporary Add-on → manifest.json')

@@ -45,6 +45,13 @@ Firefox Gecko 身份是 `pi-browser-use@tom-cat-mao.github.io`，不是 Chrome �
 标准 Firefox 的永久安装需要 Mozilla 签名；不能把这个未签名 XPI 当作已经发布的安装包。
 本项目不要求关闭签名检查或更改浏览器偏好。
 
+加载后可以打开仓库自带的本地入门页：在 `about:addons` 的附加组件详情里选择“选项/首选项”，
+或点扩展弹出页里的帮助链接。页面是随包打包的静态 HTML（`firefox-tutorial.html`，由
+`manifest.firefox.json` 的 `options_ui` 指向，`open_in_tab: true`），只用本地资源渲染，
+不新增权限、不放宽 CSP，也不会自动连接 runtime、接管标签或启动 runtime；它只说明本页描述的
+安装、配对与 discover/attach/snapshot/release 流程。Chrome 端对应的入口是
+`src/tutorial.html` 的扩展选项页，见[浏览器内置教程页](browser-tutorials.md)。
+
 默认连接 `127.0.0.1:19989`。需要连接另一套本地开发 runtime 时，在构建命令中设置
 `PI_BROWSER_HOST`（仅 loopback）和 `PI_BROWSER_PORT`；runtime 必须使用相同配置。
 只构建扩展时也可以用 `pnpm --filter mcp-extension build:firefox`。

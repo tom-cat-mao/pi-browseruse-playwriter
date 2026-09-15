@@ -1,6 +1,7 @@
 # 普通 Firefox 扩展交付与验收记录
 
-日期：2026-09-12。交付分支：`codex/firefox-extension`；PR base：`dev`。
+日期：2026-09-12（初版交付与浏览器无关检查记录）；2026-09-13 追加最终实机结论。
+交付分支：`codex/firefox-extension`；PR base：`dev`。下文标注为历史状态的小节保留 2026-09-12 原文。
 
 当前状态：**已完成。** 真实 Firefox 验收于 2026-09-13 以 0.0.138 通过（126 PASS / 0 FAIL / 2 SKIP，见 [swarm 审计](firefox-swarm-audit.md) 与 [实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)）；PR #6 已合入 `dev`，并发布 `extension@0.0.138` GitHub Release（含 Firefox ZIP 与未签名 XPI）。SKIP 两项为既定边界：跨 shadow 复合 CSS（用链式 locator）、`target=_blank` 的 sourceTabId。本记录仍不表示 Firefox 全功能在所有网站已实测。
 
@@ -55,9 +56,24 @@
 
 独立验收还读取了实际打包产物，验证 manifest、22 个归档文件与 bundle、CRC、SHA256、普通 MV3 权限、Gecko ID，以及 Chrome ID。独立报告保存在本地 `tmp/firefox-dom-independent-review.md`；前一份 runtime 审查记录在 `tmp/runtime-independent-review.md`。两次子 Agent 曾被自动内容审查中断，协调者保留其代码/报告并完成正常生产代码修复，再交给独立验收者复核。
 
-## 尚未完成的真实浏览器阶段
+## 尚未完成的真实浏览器阶段（2026-09-12 历史状态）
 
-用户已明确选择“本轮先保留浏览器验收待办”，因此未临时加载扩展、未启动隔离 runtime/fixture，也未改动已运行的浏览器。以下项目目前为 **NOT RUN**，不能由 JSDOM、协议 peer、源码或打包成功代替：
+> **这一节记录的是 2026-09-12 当时的阶段状态，不是 0.0.138 的最终结论。** 本节所有
+> **NOT RUN** 项目在 2026-09-13 由独立实机验收重新运行，结论为 **126 PASS / 0 FAIL / 2 SKIP**
+> （[swarm 审计](firefox-swarm-audit.md)、[0.0.138 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)）。
+> 该实机运行覆盖的是受控 fixture 矩阵，仍有明确未覆盖的部分：
+>
+> - **已授权可选权限后的动态 `userScripts` evaluate 路径未覆盖**：0.0.138 有意保持
+>   `userScripts` 未启用，只验收了“未授权时被显式拒绝并给出 `unsupported-capability`”这一侧
+>   （报告中的 `unsupported :: page.evaluate is refused without userScripts` 等用例）。用户真正授权
+>   可选权限后，USER_SCRIPT 世界的返回值、隔离与错误行为仍需单独实机验证。
+> - **真实业务网站未覆盖**：全部用例运行在本次验收自建的 `127.0.0.1` fixture 上，不构成对任何
+>   第三方站点的兼容性保证。
+> - 其余平台边界（跨 shadow 复合 CSS、`target=_blank` 的 sourceTabId）仍为 SKIP。
+>
+> 下面是当时的历史记录，保留原文以便追溯，不要把它当作当前状态。
+
+用户已明确选择“本轮先保留浏览器验收待办”，因此未临时加载扩展、未启动隔离 runtime/fixture，也未改动已运行的浏览器。以下项目在 2026-09-12 为 **NOT RUN**，不能由 JSDOM、协议 peer、源码或打包成功代替：
 
 - Firefox 临时加载、扩展权限弹窗、实际 WS Origin/握手与连接。
 - 真实已开页面的表单和滚动保持，原地 attach/release，新标签来源与真实历史。
@@ -76,6 +92,9 @@
 - execute 提供文档列出的常用接口，并非完整 Playwright/CDP。方法、选项或能力缺失明确报错；跨调用 page/locator 句柄不可沿用。
 - Firefox 网络缓存主要在扩展侧维护，断线时 runtime 没有完整镜像；断线期间的列表行为与 Chrome runtime 采集有差异。这是当前实现边界，而非声称平台永远做不到。
 - 现有 Firefox/ESR/Zen/LibreWolf 发行版未逐一实测，不能仅因同属 Gecko 就宣称全支持。
-- 当前 Firefox 产物未签名，正常长期安装需要签名；未发布 npm、AMO、Chrome Web Store、tag 或 GitHub Release。
+- 当前 Firefox 产物未签名，正常长期安装需要签名；没有 npm 发布，也没有 AMO 或 Chrome Web Store
+  上架。这里在 2026-09-12 写的“未发布 tag 或 GitHub Release”当时属实，但已被 2026-09-13 的
+  `extension@0.0.138` GitHub Release（含 Firefox ZIP 与未签名 XPI）取代，见
+  [0.0.138 实机报告](../../acceptance/firefox-swarm/report-2026-09-13-final-0.0.138.md)。
 
 Rust 未在本批次引入。Pi 与执行环境继续保留 JS/TS，后续可依据实际性能基线独立迁移本地 runtime 或计算热点。

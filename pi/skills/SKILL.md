@@ -5,6 +5,14 @@ the `browser_*` tools. These talk to a paired **managed browser runtime** over a
 local HTTP contract — no new browser is launched by you, and cookies/logins are
 the user's real ones. You only execute and report facts; you own every decision.
 
+Each browser build bundles a local getting-started page covering the source
+install, the paired runtime, and the profiles → discover/attach → snapshot →
+release flow. Point the user there instead of inventing setup steps: browser
+options (Chrome: extension options or the icon context menu; Firefox 139+:
+add-on options or the popup's Help link), or a Chrome development build's
+pre-existing idle-icon and install paths. The page never connects to the runtime
+or starts anything itself.
+
 ## Resource model: profiles → groups → tabs
 
 The runtime is explicit — there is **no implicit "current page"** and no matching
