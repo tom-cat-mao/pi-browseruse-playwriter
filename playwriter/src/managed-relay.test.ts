@@ -45,6 +45,8 @@ import {
 } from './managed-relay.js'
 import {
   buildTabCandidateId,
+  buildFirefoxTabCandidateId,
+  type BrowserDomRequest,
   type BrowserGroup,
   type BrowserInventory,
   type BrowserRequest,
@@ -57,6 +59,24 @@ import {
 } from './browser-protocol.js'
 
 const EXTENSION_ORIGIN = 'chrome-extension://pebbngnfojnignonigcnkdilknapkgid'
+const FIREFOX_ORIGIN = 'moz-extension://25702a91-8a38-4e41-bdf7-7e4e545e1246'
+
+function firefoxInventory(): BrowserInventory {
+  return {
+    protocolVersion: 1,
+    backend: 'webextension',
+    capabilities: {
+      protocolVersion: 1, managedGroups: true, persistentOwnership: true, explicitTabs: true,
+      isolatedExecution: true, existingTabControl: true, backend: 'webextension', inputMode: 'dom',
+      snapshotMode: 'dom-aria', executeMode: 'dom-compatible', evaluateWorld: 'isolated',
+      limitations: ['DOM input is not trusted browser input'],
+    },
+    profileId: 'profile-1', browserEpoch: 'epoch-1', revision: 1,
+    groups: [makeGroup({ groupId: 'firefox-group', sessionId: 'session-1', chromeGroupId: undefined })],
+    tabs: [makeTab({ tabId: 'firefox-tab', groupId: 'firefox-group', sessionId: 'session-1', chromeTabId: -1,
+      browserTabId: 401, targetId: undefined, cdpSessionId: undefined })],
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -385,10 +405,12 @@ type FakeExtensionOptions = {
   browser?: string
   email?: string
   origin?: string
+  firefox?: { ticket?: string; token?: string }
 }
 
 class FakeExtension {
   readonly received: BrowserRequest[] = []
+  readonly domRequests: BrowserDomRequest[] = []
   readonly forwardCommands: Array<{ method: string; params?: unknown; sessionId?: string }> = []
   readonly closed: Promise<{ code: number; reason: string }>
   readonly inventoryByGroup = new Map<string, BrowserGroup>()
@@ -396,6 +418,7 @@ class FakeExtension {
   holdResponses = false
   holdForwardCommands = false
   onRequest?: (request: BrowserRequest) => BrowserResponse | Promise<BrowserResponse>
+  onDomRequest?: (request: BrowserDomRequest) => BrowserResponse | Promise<BrowserResponse>
   private readonly ws: WebSocket
   private readonly held: Array<() => void> = []
   private readonly heldForwardCommands: Array<() => void> = []
@@ -410,14 +433,35 @@ class FakeExtension {
   }
 
   static async connect(options: FakeExtensionOptions): Promise<FakeExtension> {
+    const origin = options.origin ?? EXTENSION_ORIGIN
     const query = new URLSearchParams({
       browser: options.browser ?? 'Chrome',
       installId: options.installId,
       ...(options.email ? { email: options.email } : {}),
       v: 'test',
     })
+    if (options.firefox) {
+      let ticket = options.firefox.ticket
+      if (!ticket) {
+        const response = await fetch(`http://127.0.0.1:${options.port}/extension/firefox-handshake`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json', origin,
+            ...(options.firefox.token ? { authorization: `Bearer ${options.firefox.token}` } : {}),
+          },
+          body: JSON.stringify({ installId: options.installId }),
+        })
+        const body: unknown = await readResponseBody(response)
+        if (!response.ok || typeof body !== 'object' || body === null || !('ticket' in body) || typeof body.ticket !== 'string') {
+          throw new Error(`Firefox handshake failed: ${response.status}`)
+        }
+        ticket = body.ticket
+      }
+      query.set('backend', 'webextension')
+      query.set('ticket', ticket)
+    }
     const ws = new WebSocket(`ws://127.0.0.1:${options.port}/extension?${query.toString()}`, {
-      origin: options.origin ?? EXTENSION_ORIGIN,
+      origin,
     })
     const extension = new FakeExtension(ws)
     ws.on('message', (data) => {
@@ -446,6 +490,19 @@ class FakeExtension {
       return
     }
     if (message.id === undefined) {
+      return
+    }
+    if (message.method === 'browserDomRequest') {
+      const request = message.params as BrowserDomRequest
+      this.domRequests.push(request)
+      const result = this.onDomRequest ? await this.onDomRequest(request) : {
+        requestId: request.requestId,
+        ok: true,
+        data: { value: request.command.method === 'page' ? 'Firefox fixture' : null },
+      }
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ id: message.id, result }))
+      }
       return
     }
     if (message.method === 'browserRequest') {
@@ -1008,6 +1065,51 @@ describe('managed /browser/v1 HTTP surface', () => {
 // ---------------------------------------------------------------------------
 
 describe('extension origin allowlist', () => {
+  test('Firefox requires a local origin-bound single-use ticket and respects configured tokens', async () => {
+    const relay = await startTrackedRelay({ token: 'firefox-runtime-token' })
+    const handshake = async (options: { origin: string; token?: string }) => {
+      return await fetch(`http://127.0.0.1:${relay.port}/extension/firefox-handshake`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: options.origin,
+          ...(options.token ? { authorization: `Bearer ${options.token}` } : {}) },
+        body: JSON.stringify({ installId: 'profile-1' }),
+      })
+    }
+    expect((await handshake({ origin: FIREFOX_ORIGIN })).status).toBe(401)
+    const website = await handshake({ origin: 'https://example.com', token: 'firefox-runtime-token' })
+    expect(website.status).toBe(403)
+    expect(website.headers.get('access-control-allow-origin')).toBeNull()
+    await expect(FakeExtension.connect({ port: relay.port, installId: 'profile-1', origin: FIREFOX_ORIGIN })).rejects.toThrow()
+    const issued = await handshake({ origin: FIREFOX_ORIGIN, token: 'firefox-runtime-token' })
+    expect(issued.status).toBe(200)
+    expect(issued.headers.get('access-control-allow-origin')).toBe(FIREFOX_ORIGIN)
+    expect(issued.headers.get('cache-control')).toBe('no-store')
+    const body = await issued.json() as { ticket: string }
+    const extension = await FakeExtension.connect({
+      port: relay.port, installId: 'profile-1', origin: FIREFOX_ORIGIN, firefox: { ticket: body.ticket }, browser: 'Firefox',
+    })
+    extensions.push(extension)
+    await expect(FakeExtension.connect({
+      port: relay.port, installId: 'profile-1', origin: FIREFOX_ORIGIN, firefox: { ticket: body.ticket },
+    })).rejects.toThrow()
+    const ticketForOtherOrigin = await handshake({ origin: FIREFOX_ORIGIN, token: 'firefox-runtime-token' })
+    const otherBody = await ticketForOtherOrigin.json() as { ticket: string }
+    await expect(FakeExtension.connect({
+      port: relay.port, installId: 'profile-1', origin: 'moz-extension://25702a91-8a38-4e41-bdf7-7e4e545e1247',
+      firefox: { ticket: otherBody.ticket },
+    })).rejects.toThrow()
+  })
+
+  test('Firefox connections cannot publish CDP inventories', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({
+      port: relay.port, installId: 'profile-1', origin: FIREFOX_ORIGIN, firefox: {}, browser: 'Firefox',
+    })
+    extension.sendInventory(makeInventory({ groups: [], tabs: [] }))
+    const closed = await extension.closed
+    expect(closed.code).toBe(1008)
+    expect(closed.reason).toContain('backend')
+  })
   test('accepts the fork extension identity and rejects unknown origins', async () => {
     const relay = await startTrackedRelay()
     const forkExtension = await FakeExtension.connect({
@@ -1042,6 +1144,21 @@ describe('extension origin allowlist', () => {
 // ---------------------------------------------------------------------------
 
 describe('managed inventory registry', () => {
+  test('validates Firefox physical identities without weakening the Chrome ready checks', () => {
+    const inventory = firefoxInventory()
+    expect(parseBrowserInventory(JSON.parse(JSON.stringify(inventory))).ok).toBe(true)
+    expect(parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, inputMode: 'native' } }).ok).toBe(false)
+    expect(parseBrowserInventory({ ...inventory, backend: 'unrecognized' }).ok).toBe(false)
+    const state = noteManagedConnectionOpened(createManagedRelayState(), { connectionId: 'firefox-connection' })
+    const apply = (value: BrowserInventory) => {
+      return applyBrowserInventory(state, { connectionId: 'firefox-connection', info: { installId: 'profile-1' }, inventory: value }).result
+    }
+    expect(apply(inventory).accepted).toBe(true)
+    expect(apply({ ...inventory, tabs: [{ ...inventory.tabs[0], browserTabId: undefined }] }).accepted).toBe(false)
+    expect(apply({ ...inventory, tabs: [{ ...inventory.tabs[0], cdpSessionId: 'pretend-cdp' }] }).accepted).toBe(false)
+    expect(apply({ ...inventory, tabs: [...inventory.tabs, { ...inventory.tabs[0], tabId: 'duplicate-physical-id' }] }).accepted).toBe(false)
+    expect(apply({ ...inventory, backend: undefined }).accepted).toBe(false)
+  })
   test('profiles, groups and tabs come from the extension inventory and are session filtered', async () => {
     const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1', email: 'a@b.c' })
@@ -1889,6 +2006,149 @@ describe('managed control routing', () => {
 // ---------------------------------------------------------------------------
 
 describe('managed page execution', () => {
+  test('Firefox forwards structured page and network commands, preserving ownership and screenshot artifacts', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({
+      port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+    })
+    extension.sendInventory(firefoxInventory())
+    await waitForCondition(() => {
+      return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+    }, { message: 'Firefox inventory accepted' })
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j7AoAAAAASUVORK5CYII='
+    extension.onRequest = (request) => {
+      if (request.operation.kind === 'page.screenshot') {
+        return { requestId: request.requestId, ok: true, data: {
+          images: [{ mimeType: 'image/png', data: png }], artifacts: [{ path: '/untrusted-extension-path', mimeType: 'image/png' }],
+        } }
+      }
+      return defaultExtensionResponse({ request, inventoryByGroup: extension.inventoryByGroup, inventoryByTab: extension.inventoryByTab })
+    }
+    const directory = createExecutorTestDirectory('firefox-screenshot-')
+    const outputPath = path.join(directory, 'page.png')
+    try {
+      const screenshot = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-screenshot', sessionId: 'session-1', operation: { kind: 'page.screenshot', tabId: 'firefox-tab', path: outputPath },
+      } })
+      expect(screenshot.body).toMatchObject({ ok: true, data: { artifacts: [{ path: outputPath, mimeType: 'image/png' }] } })
+      expect(fs.readFileSync(outputPath).toString('base64')).toBe(png)
+      for (const action of ['start', 'list', 'stop'] as const) {
+        const network = await browserRequest({ port: relay.port, request: {
+          requestId: `firefox-network-${action}`, sessionId: 'session-1', operation: { kind: 'page.network', tabId: 'firefox-tab', action },
+        } })
+        expect(network.body).toMatchObject({ ok: true })
+      }
+      expect(extension.received.filter((request) => { return request.operation.kind === 'page.network' })).toHaveLength(3)
+      expect(extension.forwardCommands).toHaveLength(0)
+      const foreign = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-foreign', sessionId: 'another-session', operation: { kind: 'page.evaluate', tabId: 'firefox-tab', code: 'return document.title' },
+      } })
+      expect(foreign.body).toMatchObject({ ok: false, error: { code: 'ownership-mismatch', outcome: 'not-started' } })
+      const relative = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-relative', sessionId: 'session-1', operation: { kind: 'page.screenshot', tabId: 'firefox-tab', path: 'page.png' },
+      } })
+      expect(relative.body).toMatchObject({ ok: false, error: { code: 'invalid-request', outcome: 'not-started' } })
+      const profiles = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-profiles', sessionId: 'session-1', operation: { kind: 'profiles.list' },
+      } })
+      expect(profiles.body).toMatchObject({ ok: true, data: { profiles: [{ browser: 'Firefox', capabilities: {
+        backend: 'webextension', inputMode: 'dom', evaluateWorld: 'isolated', limitations: ['DOM input is not trusted browser input'],
+      } }] } })
+      const cdp = await connectTrackedCdpClient({ port: relay.port, query: 'browserSessionId=session-1&profileId=profile-1' })
+      expect((await cdp.waitForClose()).reason).toContain('CDP')
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('Firefox execute uses the real isolated worker and revokes an infinite loop without replay', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({
+      port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+    })
+    extension.sendInventory(firefoxInventory())
+    await waitForCondition(() => {
+      return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+    }, { message: 'Firefox inventory accepted' })
+    const result = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-execute-title', sessionId: 'session-1', timeoutMs: 4000,
+      operation: { kind: 'page.execute', tabId: 'firefox-tab', code: 'return await page.title()' },
+    } })
+    expect(result.body).toMatchObject({ ok: true, data: { value: 'Firefox fixture' } })
+    expect(extension.domRequests.every((request) => {
+      return request.tabId === 'firefox-tab' && request.sessionId === 'session-1' && request.browserEpoch === 'epoch-1'
+    })).toBe(true)
+    const loop = browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-infinite', sessionId: 'session-1', timeoutMs: 4000,
+      operation: { kind: 'page.execute', tabId: 'firefox-tab', code: 'await page.title(); while (true) {}' },
+    } })
+    await waitForCondition(() => {
+      return extension.domRequests.filter((request) => { return request.command.method === 'page' }).length >= 2
+    }, { message: 'Firefox loop worker started' })
+    const cancelled = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-cancel-loop', sessionId: 'session-1', operation: { kind: 'request.cancel', targetRequestId: 'firefox-infinite' },
+    } })
+    expect(cancelled.body).toMatchObject({ ok: true })
+    expect((await loop).body).toMatchObject({ ok: false, error: { code: 'cancelled', outcome: 'unknown' } })
+    await waitForCondition(() => {
+      return extension.received.some((request) => {
+        return request.operation.kind === 'request.cancel' && request.operation.targetRequestId === 'firefox-infinite'
+      })
+    }, { message: 'Firefox extension cancellation notice' })
+    const next = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-next', sessionId: 'session-1', timeoutMs: 4000,
+      operation: { kind: 'page.execute', tabId: 'firefox-tab', code: 'return 42' },
+    } })
+    expect(next.body).toMatchObject({ ok: true, data: { value: 42 } })
+    const released = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-session-release', sessionId: 'session-1', operation: { kind: 'session.release' },
+    } })
+    expect(released.body).toMatchObject({ ok: true })
+    expect(extension.received.some((request) => { return request.operation.kind === 'session.release' })).toBe(true)
+    const tabs = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-preserved-tabs', sessionId: 'session-1', operation: { kind: 'tabs.list' },
+    } })
+    expect(tabs.body).toMatchObject({ ok: true, data: { tabs: [{ tabId: 'firefox-tab', state: 'ready' }] } })
+    expect(extension.forwardCommands).toHaveLength(0)
+  })
+
+  test('Firefox release cancels started operations and drops queued actions before extension dispatch', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({
+      port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+    })
+    const inventory = firefoxInventory()
+    extension.sendInventory(inventory)
+    await waitForCondition(() => {
+      return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+    }, { message: 'Firefox inventory accepted' })
+    let completeEvaluation: (() => void) | undefined
+    extension.onRequest = async (request) => {
+      if (request.operation.kind === 'page.evaluate') {
+        await new Promise<void>((resolve) => { completeEvaluation = resolve })
+      }
+      return defaultExtensionResponse({ request, inventoryByGroup: extension.inventoryByGroup, inventoryByTab: extension.inventoryByTab })
+    }
+    const startedRequest: BrowserRequest = {
+      requestId: 'firefox-started-evaluate', sessionId: 'session-1', timeoutMs: 4000,
+      operation: { kind: 'page.evaluate', tabId: 'firefox-tab', code: 'return document.title' },
+    }
+    const started = browserRequest({ port: relay.port, request: startedRequest })
+    await waitForCondition(() => { return completeEvaluation !== undefined }, { message: 'Firefox evaluate dispatched' })
+    const queued = browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-queued-click', sessionId: 'session-1', timeoutMs: 4000,
+      operation: { kind: 'page.click', tabId: 'firefox-tab', selector: 'button' },
+    } })
+    extension.sendInventory({ ...inventory, revision: 2, tabs: [{ ...inventory.tabs[0], state: 'released', revision: 2 }] })
+    expect((await started).body).toMatchObject({ ok: false, error: { code: 'cancelled', outcome: 'unknown' } })
+    const queuedResponse = (await queued).body as BrowserResponse
+    expect(queuedResponse).toMatchObject({ ok: false, error: { outcome: 'not-started' } })
+    expect(extension.received.some((request) => { return request.operation.kind === 'page.click' })).toBe(false)
+    completeEvaluation?.()
+    const replay = await browserRequest({ port: relay.port, request: startedRequest })
+    expect(replay.body).toMatchObject({ ok: false, error: { outcome: 'unknown' } })
+    expect(extension.received.filter((request) => { return request.operation.kind === 'page.evaluate' })).toHaveLength(1)
+  })
   test('page operations resolve the tab, pass the scoped cdp url and serialize per profile', async () => {
     const pool = createTestPool()
     const relay = await startTrackedRelay({ poolFactory: async () => pool })
@@ -4559,6 +4819,50 @@ function makeCandidate(options: {
 }
 
 describe('existing tab discovery and in-place attach', () => {
+  test('Firefox discovery and attach bind the real browser tab and reject CDP or stale candidates', async () => {
+    const relay = await startTrackedRelay()
+    const extension = await connectTrackedExtension({
+      port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+    })
+    const inventory = firefoxInventory()
+    extension.sendInventory(inventory)
+    await waitForCondition(() => {
+      return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+    }, { message: 'Firefox inventory accepted' })
+    const candidateId = buildFirefoxTabCandidateId({ profileId: 'profile-1', browserEpoch: 'epoch-1', browserTabId: 401 })
+    extension.onRequest = (request) => {
+      if (request.operation.kind === 'tabs.discover') {
+        const candidate: BrowserTabCandidate = {
+          ...makeCandidate({ profileId: 'profile-1', browserEpoch: 'epoch-1', chromeTabId: 401,
+            windowId: 10, title: 'Firefox tab', url: 'https://example.com/' }),
+          candidateId, chromeTabId: -1, browserTabId: 401, backend: 'webextension',
+        }
+        return { requestId: request.requestId, ok: true, data: { candidates: [candidate,
+          { ...candidate, candidateId: buildFirefoxTabCandidateId({ profileId: 'foreign-profile', browserEpoch: 'epoch-1', browserTabId: 401 }) },
+        ] } }
+      }
+      return { requestId: request.requestId, ok: true, data: { tab: inventory.tabs[0] } }
+    }
+    const discovered = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-discover', sessionId: 'session-1', operation: { kind: 'tabs.discover' },
+    } })
+    expect((discovered.body as { data: BrowserResultData }).data.candidates).toHaveLength(1)
+    expect(discovered.body).toMatchObject({ data: { candidates: [{ candidateId, browserTabId: 401, chromeTabId: -1, browser: 'Firefox' }] } })
+    const attached = await browserRequest({ port: relay.port, request: {
+      requestId: 'firefox-attach', sessionId: 'session-1', operation: { kind: 'tabs.attach', candidateId },
+    } })
+    expect(attached.body).toMatchObject({ ok: true, data: { tab: { tabId: 'firefox-tab', browserTabId: 401 } } })
+    for (const [requestId, invalidCandidate, code] of [
+      ['firefox-attach-cdp', buildTabCandidateId({ profileId: 'profile-1', browserEpoch: 'epoch-1', chromeTabId: 401 }), 'invalid-request'],
+      ['firefox-attach-stale', buildFirefoxTabCandidateId({ profileId: 'profile-1', browserEpoch: 'old-epoch', browserTabId: 401 }), 'stale-snapshot'],
+    ]) {
+      const rejected = await browserRequest({ port: relay.port, request: {
+        requestId, sessionId: 'session-1', operation: { kind: 'tabs.attach', candidateId: invalidCandidate },
+      } })
+      expect(rejected.body).toMatchObject({ ok: false, error: { code, outcome: 'not-started' } })
+    }
+    expect(extension.received.filter((request) => { return request.operation.kind === 'tabs.attach' })).toHaveLength(1)
+  })
   test('discovery fans out to every connected profile and keeps real identifiers', async () => {
     const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const first = await connectTrackedExtension({ port: relay.port, installId: 'profile-1', email: 'work@example.com' })

@@ -18,6 +18,7 @@
   "scripts": {
     "build": "node scripts/build-extension.mjs --fork",
     "build:fork": "node scripts/build-extension.mjs --fork",
+    "build:firefox": "node scripts/build-firefox.mjs",
     "build:legacy": "node scripts/build-extension.mjs --legacy",
     "reload:fork": "pnpm build:fork && echo Reload the fork extension at chrome://extensions/?id=eeklahpecooapnailfaebkjjembkjhhg",
     "reload:legacy": "pnpm build:legacy && echo Reload the legacy extension at chrome://extensions/?id=pebbngnfojnignonigcnkdilknapkgid",
@@ -28,12 +29,14 @@
   "devDependencies": {
     "@types/chrome": "^0.0.315",
     "concurrently": "^8.2.2",
+    "jsdom": "^27.2.0",
     "typescript": "^5.8.2",
     "vite": "^8.0.13",
     "vite-plugin-static-copy": "^3.1.1",
     "vitest": "^4.0.8"
   },
   "dependencies": {
+    "dom-accessibility-api": "^0.7.1",
     "playwriter": "workspace:@tom-cat/pi-browser-runtime@*",
     "string-dedent": "^3.0.2",
     "zustand": "^5.0.8"

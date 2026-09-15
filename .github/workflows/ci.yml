@@ -48,6 +48,8 @@ jobs:
         run: pnpm --filter @tom-cat/pi-browser-runtime smoke
       - name: Package extension ZIP and verify checksum
         run: pnpm package:extension
+      - name: Package Firefox unsigned ZIP and XPI and verify checksums
+        run: pnpm package:firefox
       # Browser-free tests only. Chrome tests (including locator-selector,
       # which launches chromium) are a separate, user-authorized phase.
       - name: Runtime unit tests (no browser)
