@@ -59,11 +59,14 @@ describe('Firefox distribution CSP', () => {
     fs.writeFileSync(path.join(root, 'extension/manifest.firefox.json'), JSON.stringify(manifest))
     fs.writeFileSync(path.join(bundle, 'manifest.json'), JSON.stringify(manifest))
     fs.cpSync(path.join(repoRoot, 'extension/icons'), path.join(bundle, 'icons'), { recursive: true })
-    fs.copyFileSync(path.join(repoRoot, 'extension/src/firefox-popup.html'), path.join(bundle, 'firefox-popup.html'))
+    for (const page of ['firefox-popup.html', 'firefox-tutorial.html', 'firefox-tutorial.css']) {
+      fs.copyFileSync(path.join(repoRoot, 'extension/src', page), path.join(bundle, page))
+    }
     fs.writeFileSync(path.join(bundle, 'firefox-build.json'), JSON.stringify({ host: '127.0.0.1', port: 19989 }))
     fs.writeFileSync(path.join(bundle, 'firefox-background.js'), 'const PORT = 19989;')
     fs.writeFileSync(path.join(bundle, 'firefox-dom.js'), '')
     fs.writeFileSync(path.join(bundle, 'firefox-popup.js'), '')
+    fs.writeFileSync(path.join(bundle, 'firefox-tutorial.js'), '')
     return root
   }
 

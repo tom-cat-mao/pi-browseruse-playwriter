@@ -2,7 +2,7 @@ declare const process: { env: { PLAYWRITER_PORT: string } }
 // Injected by vite at build time from playwriter/package.json version.
 // CLI/MCP compare this against their own version to warn when the extension is outdated.
 declare const __PLAYWRITER_VERSION__: string
-// Bundled automation builds should not burn a tab on the welcome page, especially
+// Bundled automation builds should not burn a tab on the tutorial page, especially
 // in headless/VPS flows where the extension is installed only to attach to the relay.
 declare const __PLAYWRITER_OPEN_WELCOME_PAGE__: boolean
 
@@ -2199,7 +2199,7 @@ chrome.runtime.onInstalled.addListener((details) => {
   if (import.meta.env.TESTING) return
   if (!__PLAYWRITER_OPEN_WELCOME_PAGE__) return
   if (details.reason === 'install') {
-    void chrome.tabs.create({ url: 'src/welcome.html' })
+    void openTutorialPage()
   }
 })
 

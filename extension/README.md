@@ -41,6 +41,30 @@ temporary loading is for development, expires at browser restart, and does not
 replace the signing required for ordinary permanent installation. Do not
 disable signing checks as an installation workaround.
 
+## Tutorial pages
+
+Each browser build ships its own local static getting-started page. Both are
+plain bundled HTML with a bundled local stylesheet and script, no remote assets,
+no added permission and no CSP exception, and they never connect to the runtime,
+adopt or open a tab, or start the runtime. They describe the current flow only:
+source install of the Pi package plus the paired managed runtime, then
+`browser_profiles` → `browser_tabs discover` / `attach` → `browser_snapshot` →
+`browser_tabs release`.
+
+| Browser | Page | Entry |
+| --- | --- | --- |
+| Chrome | `src/tutorial.html` | `manifest.json` `options_ui` (`open_in_tab: true`) — extension options in `chrome://extensions`, or the icon context menu → Options |
+| Firefox 139+ | `firefox-tutorial.html` | `manifest.firefox.json` `options_ui` (`open_in_tab: true`) — options in `about:addons`, plus the Help link in the add-on popup |
+
+These manifest entries are the only new entry points. Chrome also keeps its
+pre-existing development paths, which only changed in which page they show: the
+idle-icon click already opened `src/tutorial.html`, and the install-time open
+that used to show the removed `welcome.html` now calls the same helper (packaged
+builds compile that open out). `scripts/package-extension.mjs` refuses to write a
+ZIP/XPI when a manifest entry page or a page asset is missing from the bundle, so
+a tutorial page cannot be left out of a release artifact. See the
+[browser tutorials record](../docs/exec/browser-tutorials.md).
+
 ## Firefox permissions
 
 | Permission | Use |

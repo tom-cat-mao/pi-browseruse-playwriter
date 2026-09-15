@@ -64,6 +64,31 @@ permission enabled in the add-on popup; basic DOM tools work without it.
 See the [Firefox guide](./docs/exec/firefox-extension-guide.md) for supported
 operations, development settings, and limits imposed by ordinary extensions.
 
+## Open the built-in tutorials
+
+Both builds ship a local static getting-started page. They are ordinary bundled
+pages: no remote assets, no extra permissions, no relaxed CSP. A tutorial page
+never connects to the runtime, adopts a tab, opens a tab, or starts the runtime
+by itself — it only describes the source install, the paired runtime, and the
+normal `browser_profiles` → `browser_tabs discover`/`attach` →
+`browser_snapshot` → `browser_tabs release` flow. The old `npx playwriter`
+commands are not part of it.
+
+| Build | Page | Entry point |
+| --- | --- | --- |
+| Chrome | `src/tutorial.html` | Extension options (`options_ui`, opens in a tab): the extension's options in `chrome://extensions`, or the icon's context menu → Options |
+| Firefox 139+ | `firefox-tutorial.html` | Add-on options (`options_ui`, opens in a tab) in `about:addons`, or the Help link in the add-on popup |
+
+No new automatic opening was added: the entries above are the only new entry
+points. Chrome keeps its pre-existing development paths, which changed only in
+which page they show — the idle-icon click already opened `src/tutorial.html`,
+and the install-time open that used to show the removed `welcome.html` now calls
+the same helper. Packaged builds compile that install-time open out
+(`PLAYWRITER_OPEN_WELCOME_PAGE=0`), and Firefox never opens a page by itself.
+See the [browser tutorials record](./docs/exec/browser-tutorials.md) for the
+design and for the packaging checks that keep a tutorial page from being left
+out of a ZIP.
+
 ## Build from source
 
 Clone this repository, then use Node.js, Bun and pnpm `10.18.1`:

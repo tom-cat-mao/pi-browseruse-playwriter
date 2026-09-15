@@ -19,6 +19,20 @@ There is no agent loop, HITL, captcha, or danger-confirmation logic here.
 - Firefox uses the ordinary add-on's DOM backend; development loading and its
   signing/compatibility status are described in the [Firefox guide](../docs/exec/firefox-extension-guide.md).
 
+## Pointing users at the setup tutorial
+
+Each browser build bundles a local static getting-started page covering this
+package's source install, the paired runtime, and the profiles → discover/attach
+→ snapshot → release flow. Point users there through the browser's own options
+entry (Chrome: extension options or the icon context menu; Firefox 139+: add-on
+options or the popup's Help link); a Chrome development build also shows it from
+its pre-existing idle-icon and install paths, which packaged builds compile out.
+The page never connects to the runtime, adopts a tab, or starts the runtime, and
+it adds no permission requirement. See the
+[browser tutorials record](../docs/exec/browser-tutorials.md) for the exact
+entries. There is still no npm release, so both the Pi package and the runtime
+are installed from a source checkout.
+
 ## Configuration
 
 | Env | Meaning | Default |
