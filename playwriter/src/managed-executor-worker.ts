@@ -23,7 +23,7 @@ import {
   type SnapshotOutputLine,
 } from './aria-snapshot.js'
 import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
-import { extractPageContent, windowExtractedText } from './page-extract.js'
+import { boundExtractArtifactText, extractPageContent, windowExtractedText, withExtractArtifactText } from './page-extract.js'
 import { getChromium } from './playwright-import.js'
 import { waitForPageLoad } from './wait-for-page-load.js'
 import { ManagedPlaywrightFacade } from './managed-executor-facade.js'
@@ -55,10 +55,6 @@ const MAX_NETWORK_ENTRIES = 500
 // Keep image payloads below the newline protocol's 8 MiB envelope budget.
 const MAX_INLINE_IMAGE_BASE64 = 4 * 1024 * 1024
 const MAX_EXECUTE_CODE_LENGTH = 1_000_000
-// An extraction the relay persists is not a preview, so it may exceed the
-// preview budget — but it still has to fit the 8 MiB worker message envelope.
-const MAX_EXTRACT_ARTIFACT_CHARS = 1_000_000
-const MAX_EXTRACT_ARTIFACT_BYTES = 2 * 1024 * 1024
 
 const SAFE_NODE_GLOBALS = {
   AbortController,
@@ -964,14 +960,14 @@ export class ManagedExecutorWorkerRuntime {
       const pageTitle = await page.title()
       return {
         text: preview.text,
-        value: withArtifactText({
+        value: withExtractArtifactText({
           value: {
             format,
             truncated: preview.truncated,
             totalBytes,
             ...(pageTitle ? { title: pageTitle } : {}),
           },
-          persisted: persist ? boundArtifactText({ text: html }) : undefined,
+          persisted: persist ? boundExtractArtifactText({ text: html }) : undefined,
         }),
       }
     }
@@ -987,7 +983,7 @@ export class ManagedExecutorWorkerRuntime {
     const preview = persist ? windowExtractedText({ text: extracted.text, search, offset, limit }) : extracted
     return {
       text: preview.text,
-      value: withArtifactText({
+      value: withExtractArtifactText({
         value: {
           format,
           truncated: preview.truncated,
@@ -995,7 +991,7 @@ export class ManagedExecutorWorkerRuntime {
           ...(extracted.title ? { title: extracted.title } : {}),
           ...(extracted.metadata ? { metadata: { ...extracted.metadata } } : {}),
         },
-        persisted: persist ? boundArtifactText({ text: extracted.text }) : undefined,
+        persisted: persist ? boundExtractArtifactText({ text: extracted.text }) : undefined,
       }),
     }
   }
@@ -1560,44 +1556,6 @@ function sliceUnicodeText({
     bytes += characterBytes
   }
   return result
-}
-
-/**
- * Bound the text that will be persisted by the relay. Unlike the preview it is
- * allowed to exceed the preview budget, but it must still fit the worker
- * message envelope, so an over-long extraction is cut and reported instead of
- * failing the whole request.
- */
-function boundArtifactText({ text }: { text: string }): { text: string; truncated: boolean } {
-  if (text.length <= MAX_EXTRACT_ARTIFACT_CHARS && Buffer.byteLength(text, 'utf8') <= MAX_EXTRACT_ARTIFACT_BYTES) {
-    return { text, truncated: false }
-  }
-  return {
-    text: sliceUnicodeText({
-      value: text,
-      maxChars: MAX_EXTRACT_ARTIFACT_CHARS,
-      maxBytes: MAX_EXTRACT_ARTIFACT_BYTES,
-    }),
-    truncated: true,
-  }
-}
-
-/**
- * `value.artifactText` is the full extraction the relay persists; it is only
- * added when the caller asked for a file and is removed again before the
- * response reaches the model.
- */
-function withArtifactText({
-  value,
-  persisted,
-}: {
-  value: Record<string, BrowserJson>
-  persisted?: { text: string; truncated: boolean }
-}): Record<string, BrowserJson> {
-  if (!persisted) {
-    return value
-  }
-  return { ...value, artifactText: persisted.text, ...(persisted.truncated ? { artifactTruncated: true } : {}) }
 }
 
 // A synthetic "No matches found" line carries no ref, so refs collapse to empty

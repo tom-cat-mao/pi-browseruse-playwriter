@@ -404,6 +404,25 @@ describe('Firefox DOM snapshot lifetime and isolation', () => {
     })
   })
 
+  test('serializes the whole document or exactly one DOM-side matched element for extraction', async () => {
+    const whole = success(await driver.run(request({ method: 'page', action: 'content' })))
+    const serialized = String(whole.value)
+    expect(serialized.toLowerCase()).toContain('<!doctype html>')
+    expect(serialized).toContain('<title>Firefox DOM driver fixture</title>')
+    expect(serialized).toContain('Account settings')
+
+    const scoped = success(await driver.run(request({ method: 'page', action: 'content', selector: '#settings' })))
+    expect(String(scoped.value)).toBe(element('#settings').outerHTML)
+
+    // A scoped extraction may never silently read the first of several matches.
+    for (const selector of ['.missing', '.repeated']) {
+      expect(await driver.run(request({ method: 'page', action: 'content', selector }))).toMatchObject({
+        ok: false,
+        error: { code: 'execution-failed', outcome: 'not-started' },
+      })
+    }
+  })
+
   test('cancellation wakes a pending locator wait before an action can start', async () => {
     const pendingRequest = request({
       method: 'locator',

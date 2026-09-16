@@ -1,7 +1,8 @@
 import type { BrowserOperation, BrowserRequest } from 'playwriter/src/browser-protocol'
 import { isFirefoxRecord } from './firefox-resources'
 
-const FIELDS: Record<BrowserOperation['kind'], string[]> = {
+/** Exported so the capability advertisement can be pinned to the operations this validator accepts. */
+export const FIELDS: Record<BrowserOperation['kind'], string[]> = {
   'profiles.list': [],
   'groups.list': ['profileId'],
   'groups.create': ['profileId', 'name'],

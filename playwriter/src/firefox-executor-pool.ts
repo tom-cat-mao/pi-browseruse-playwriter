@@ -312,11 +312,27 @@ export class FirefoxExecutorPool {
       return
     }
     const operation = task.execution.request.operation
-    if (operation.kind !== 'page.execute') {
+    if (operation.kind !== 'page.execute' && operation.kind !== 'page.extract') {
       return
     }
     worker.active = task
     task.started = true
+    if (operation.kind === 'page.extract') {
+      this.send({ worker, command: {
+        type: 'extract', id: task.id,
+        execution: {
+          requestId: task.execution.request.requestId,
+          tabId: task.execution.tab.tabId,
+          format: operation.format,
+          ...(operation.selector !== undefined ? { selector: operation.selector } : {}),
+          ...(operation.search !== undefined ? { search: operation.search } : {}),
+          ...(operation.offset !== undefined ? { offset: operation.offset } : {}),
+          ...(operation.limit !== undefined ? { limit: operation.limit } : {}),
+          persist: operation.path !== undefined,
+        },
+      } })
+      return
+    }
     this.send({ worker, command: {
       type: 'execute', id: task.id,
       execution: {
@@ -420,9 +436,14 @@ function validateExecution(execution: FirefoxExecution): BrowserResponse | null 
   const reject = (options: { code: BrowserErrorCode; message: string }): BrowserResponse => {
     return failure({ requestId: request.requestId, ...options })
   }
-  if (request.operation.kind !== 'page.execute' || request.operation.tabId !== tab.tabId ||
-    typeof request.operation.code !== 'string' || request.operation.code.length > 1_000_000) {
-    return reject({ code: 'invalid-request', message: 'Firefox executor requires page.execute for the explicit selected tab' })
+  if (request.operation.kind !== 'page.execute' && request.operation.kind !== 'page.extract') {
+    return reject({ code: 'invalid-request', message: 'Firefox executor requires page.execute or page.extract for the explicit selected tab' })
+  }
+  if (request.operation.tabId !== tab.tabId) {
+    return reject({ code: 'invalid-request', message: 'Firefox executor request must target the explicitly selected tab' })
+  }
+  if (request.operation.kind === 'page.execute' && (typeof request.operation.code !== 'string' || request.operation.code.length > 1_000_000)) {
+    return reject({ code: 'invalid-request', message: 'Firefox executor requires an executable page.execute program' })
   }
   if (!request.requestId || !request.sessionId || request.sessionId !== tab.sessionId) {
     return reject({ code: 'ownership-mismatch', message: 'Request session does not own the Firefox tab' })

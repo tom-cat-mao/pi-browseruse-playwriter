@@ -11,9 +11,11 @@ import {
   validateFirefoxMessageSize,
   type FirefoxWorkerCommand,
   type FirefoxWorkerExecution,
+  type FirefoxWorkerExtract,
   type FirefoxWorkerMessage,
 } from './firefox-executor-protocol.js'
 import { truncateString } from './managed-executor-protocol.js'
+import { boundExtractArtifactText, extractPageContent, windowExtractedText, withExtractArtifactText } from './page-extract.js'
 
 interface PendingDom {
   executionId: string
@@ -108,7 +110,7 @@ export function startFirefoxExecutorWorker(): void {
   let nextTimerId = 0
   const requestDom = (options: { id: string; command: BrowserDomCommand }): Promise<BrowserResultData> => {
     if (activeId !== options.id) {
-      return Promise.reject(new FirefoxCapabilityError('Firefox execute request has ended'))
+      return Promise.reject(new FirefoxCapabilityError('Firefox executor request has ended'))
     }
     const command = parseBrowserDomCommand(options.command)
     if (!command) {
@@ -123,37 +125,51 @@ export function startFirefoxExecutorWorker(): void {
     void promise.catch(() => {})
     return promise
   }
-  const execute = async (command: Extract<FirefoxWorkerCommand, { type: 'execute' }>): Promise<void> => {
+  /**
+   * A worker serves one command at a time, and every DOM RPC stays bound to
+   * that command's lease so a cancelled request can never be answered later.
+   */
+  const beginCommand = (id: string): {
+    lease: ExecutionLease
+    send: (command: BrowserDomCommand) => Promise<BrowserResultData>
+  } => {
     if (activeId) {
-      throw new Error('Firefox executor received concurrent execute commands')
+      throw new Error('Firefox executor received concurrent commands')
     }
-    activeId = command.id
+    activeId = id
     const lease = new ExecutionLease()
+    const send = async (domCommand: BrowserDomCommand): Promise<BrowserResultData> => {
+      lease.assertActive()
+      const promise = requestDom({ id, command: domCommand })
+      lease.requests.add(promise)
+      try {
+        return await promise
+      } finally {
+        lease.requests.delete(promise)
+      }
+    }
+    return { lease, send }
+  }
+  const execute = async (command: Extract<FirefoxWorkerCommand, { type: 'execute' }>): Promise<void> => {
+    const { lease, send: sendDom } = beginCommand(command.id)
     const logs: string[] = []
     const images: BrowserImage[] = []
     const artifacts: NonNullable<BrowserResultData['artifacts']> = []
     const timerIds = new Map<number, NodeJS.Timeout>()
     unhandledError = undefined
     const send = async (domCommand: BrowserDomCommand): Promise<BrowserResultData> => {
-      lease.assertActive()
-      const promise = requestDom({ id: command.id, command: domCommand })
-      lease.requests.add(promise)
-      try {
-        const data = await promise
-        if (data.images) {
-          const bytes = [...images, ...data.images].reduce((size, image) => { return size + image.data.length }, 0)
-          if (bytes > 6 * 1024 * 1024) {
-            throw new Error('Firefox execute image results exceed the 6 MiB output budget; capture fewer screenshots per request')
-          }
-          images.push(...data.images)
+      const data = await sendDom(domCommand)
+      if (data.images) {
+        const bytes = [...images, ...data.images].reduce((size, image) => { return size + image.data.length }, 0)
+        if (bytes > 6 * 1024 * 1024) {
+          throw new Error('Firefox execute image results exceed the 6 MiB output budget; capture fewer screenshots per request')
         }
-        if (data.artifacts) {
-          artifacts.push(...data.artifacts)
-        }
-        return data
-      } finally {
-        lease.requests.delete(promise)
+        images.push(...data.images)
       }
+      if (data.artifacts) {
+        artifacts.push(...data.artifacts)
+      }
+      return data
     }
     let response: BrowserResponse
     let started = false
@@ -271,6 +287,25 @@ export function startFirefoxExecutorWorker(): void {
     }
     sendMessage({ type: 'response', id: command.id, response })
   }
+  /**
+   * page.extract reads content, never page structure: the extension only
+   * serializes the document (or the one strictly matched element) and this
+   * worker runs the shared Node pipeline, so both backends extract identically
+   * and the relay never blocks on parsing.
+   */
+  const extract = async (command: Extract<FirefoxWorkerCommand, { type: 'extract' }>): Promise<void> => {
+    const { lease, send } = beginCommand(command.id)
+    let response: BrowserResponse
+    try {
+      response = { requestId: command.execution.requestId, ok: true, data: await extractionData({ execution: command.execution, send }) }
+    } catch (error) {
+      response = extractFailure({ execution: command.execution, error })
+    } finally {
+      lease.release()
+      activeId = null
+    }
+    sendMessage({ type: 'response', id: command.id, response })
+  }
   process.on('message', (value: unknown) => {
     try {
       validateFirefoxMessageSize(value)
@@ -291,7 +326,7 @@ export function startFirefoxExecutorWorker(): void {
         }
         return
       }
-      void execute(command).catch((error) => {
+      void (command.type === 'extract' ? extract(command) : execute(command)).catch((error) => {
         process.stderr.write(`Firefox executor failed: ${messageOf(error)}\n`)
         process.exit(1)
       })
@@ -380,6 +415,83 @@ function messageOf(error: unknown): string {
     return error.message
   }
   return String(error)
+}
+
+/**
+ * Extraction only reads the document, so a failure is reported as not-started
+ * unless the DOM transport itself could not tell whether the read happened.
+ */
+function extractFailure({ execution, error }: { execution: FirefoxWorkerExtract; error: unknown }): BrowserResponse {
+  return {
+    requestId: execution.requestId, ok: false,
+    error: {
+      code: readErrorCode(error),
+      message: truncateString({ value: `Firefox page.extract: ${messageOf(error)}`, maxLength: 20_000 }),
+      outcome: error instanceof FirefoxDomError && error.outcome === 'unknown' ? 'unknown' : 'not-started',
+    },
+  }
+}
+
+/** Serialized document plus one strictly matched element scope, run through the shared pipeline. */
+async function extractionData({ execution, send }: {
+  execution: FirefoxWorkerExtract
+  send: (command: BrowserDomCommand) => Promise<BrowserResultData>
+}): Promise<BrowserResultData> {
+  const { format, selector, search, offset, limit, persist } = execution
+  if (format === 'assets-manifest') {
+    // Assets are a later wave (docs/exec/content-extract-redesign-plan.md W7).
+    throw new FirefoxCapabilityError('page.extract format assets-manifest is not implemented on this backend yet')
+  }
+  const content = await send({ method: 'page', action: 'content', ...(selector ? { selector } : {}) })
+  if (typeof content.value !== 'string') {
+    throw new Error('Firefox returned no serialized document to extract')
+  }
+  const html = content.value
+  const totalBytes = Buffer.byteLength(html, 'utf8')
+  // The read reports the tab it came from; the Chrome worker attaches the same
+  // envelope to every result, so a consumer sees one response shape per backend.
+  const pageInfo = content.pageInfo
+
+  if (format === 'html') {
+    const preview = windowExtractedText({ text: html, search, offset, limit })
+    return {
+      text: preview.text,
+      value: withExtractArtifactText({
+        value: {
+          format,
+          truncated: preview.truncated,
+          totalBytes,
+          ...(pageInfo?.title ? { title: pageInfo.title } : {}),
+        },
+        persisted: persist ? boundExtractArtifactText({ text: html }) : undefined,
+      }),
+      ...(pageInfo ? { pageInfo } : {}),
+    }
+  }
+
+  const extracted = await extractPageContent({
+    html,
+    ...(pageInfo?.url ? { url: pageInfo.url } : {}),
+    format,
+    ...(persist ? { full: true } : { search, offset, limit }),
+  })
+  // A persisted extraction is complete; the model still gets the window it
+  // asked for, and never the whole document inline.
+  const preview = persist ? windowExtractedText({ text: extracted.text, search, offset, limit }) : extracted
+  return {
+    text: preview.text,
+    value: withExtractArtifactText({
+      value: {
+        format,
+        truncated: preview.truncated,
+        totalBytes: extracted.totalBytes,
+        ...(extracted.title ? { title: extracted.title } : {}),
+        ...(extracted.metadata ? { metadata: { ...extracted.metadata } } : {}),
+      },
+      persisted: persist ? boundExtractArtifactText({ text: extracted.text }) : undefined,
+    }),
+    ...(pageInfo ? { pageInfo } : {}),
+  }
 }
 
 function wrapExecutionCode(code: string): string {

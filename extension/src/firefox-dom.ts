@@ -960,10 +960,12 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       if (command.action === 'title') return { value: document.title }
       if (command.action === 'readyState') return { value: document.readyState }
       if (command.action === 'url') return { value: document.URL }
-      if (command.action === 'content')
+      if (command.action === 'content') {
+        if (command.selector) return { value: strictElement(locate({ selector: command.selector })).outerHTML }
         return {
           value: `${document.doctype ? new view.XMLSerializer().serializeToString(document.doctype) : ''}${document.documentElement.outerHTML}`,
         }
+      }
       throw new FirefoxDomError({ code: 'invalid-request', message: 'Unknown page read action.' })
     }
     if (command.method === 'evaluate') {

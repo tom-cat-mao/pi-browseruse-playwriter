@@ -23,6 +23,7 @@ import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
 import { ArtifactStore } from './artifact-store.js'
 import { ManagedExecutorPool } from './managed-executor-pool.js'
+import { extractPageContent, windowExtractedText } from './page-extract.js'
 import {
   RUNTIME_NETWORK_MAX_BYTES,
   RUNTIME_NETWORK_MAX_CAPTURES,
@@ -63,7 +64,17 @@ import {
 const EXTENSION_ORIGIN = 'chrome-extension://pebbngnfojnignonigcnkdilknapkgid'
 const FIREFOX_ORIGIN = 'moz-extension://25702a91-8a38-4e41-bdf7-7e4e545e1246'
 
-function firefoxInventory(): BrowserInventory {
+/**
+ * Page operations a current Firefox extension advertises. `advertiseOperations:
+ * false` keeps the deployed 0.0.139 shape, which reports no supportedOperations
+ * at all.
+ */
+const FIREFOX_ADVERTISED_OPERATIONS = [
+  'page.navigate', 'page.back', 'page.snapshot', 'page.click', 'page.fill', 'page.evaluate',
+  'page.screenshot', 'page.network', 'page.logs', 'page.execute', 'page.extract',
+] as const
+
+function firefoxInventory({ advertiseOperations = false }: { advertiseOperations?: boolean } = {}): BrowserInventory {
   return {
     protocolVersion: 1,
     backend: 'webextension',
@@ -71,6 +82,7 @@ function firefoxInventory(): BrowserInventory {
       protocolVersion: 1, managedGroups: true, persistentOwnership: true, explicitTabs: true,
       isolatedExecution: true, existingTabControl: true, backend: 'webextension', inputMode: 'dom',
       snapshotMode: 'dom-aria', executeMode: 'dom-compatible', evaluateWorld: 'isolated',
+      ...(advertiseOperations ? { supportedOperations: [...FIREFOX_ADVERTISED_OPERATIONS] } : {}),
       limitations: ['DOM input is not trusted browser input'],
     },
     profileId: 'profile-1', browserEpoch: 'epoch-1', revision: 1,
@@ -4255,6 +4267,149 @@ describe('managed page.extract artifacts', () => {
       expect(response).toMatchObject({ ok: false, error: { code: 'internal-error', outcome: 'unknown' } })
       const written = fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []
       expect(written).toEqual([])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Firefox page.extract
+// ---------------------------------------------------------------------------
+
+const FIREFOX_EXTRACT_URL = 'https://example.test/storage'
+const FIREFOX_EXTRACT_TITLE = 'Storage documentation'
+
+function firefoxExtractDocument(): string {
+  const paragraphs = Array.from({ length: 1_500 }, (_value, index) => {
+    return `<p>Retention detail ${index}: the export keeps every revision for thirty days before the purge.</p>`
+  }).join('')
+  return `<!doctype html><html lang="en"><head><title>${FIREFOX_EXTRACT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
+}
+
+/**
+ * The Firefox worker runs for real behind this relay; only the extension side of
+ * the transport is a peer that records what would have reached the browser.
+ */
+function startFirefoxExtractRelay({ artifactStore, documentHtml, inventory }: {
+  artifactStore: ArtifactStore
+  documentHtml: string
+  inventory: BrowserInventory
+}): { relay: ManagedRelay; domRequests: BrowserDomRequest[]; operations: string[] } {
+  const domRequests: BrowserDomRequest[] = []
+  const operations: string[] = []
+  const relay = new ManagedRelay({
+    host: '127.0.0.1',
+    port: 1,
+    artifactStore,
+    hasConnectedExtensions: () => {
+      return true
+    },
+    closeManagedClient: () => {},
+    transport: {
+      sendBrowserRequest: async ({ request }) => {
+        operations.push(request.operation.kind)
+        if (request.operation.kind === 'tab.resolve') {
+          return { requestId: request.requestId, ok: true, data: { tab: inventory.tabs[0] } }
+        }
+        return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+      },
+      sendBrowserDomRequest: async ({ request }) => {
+        domRequests.push(request)
+        if (request.command.method === 'page' && request.command.action === 'content') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: documentHtml,
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        return { requestId: request.requestId, ok: true, data: { value: null } }
+      },
+    },
+  })
+  relay.noteConnectionOpened({ connectionId: 'firefox-connection' })
+  const accepted = relay.handleInventory({
+    connectionId: 'firefox-connection',
+    info: { browser: 'Firefox', installId: 'profile-1', stableKey: 'install:Firefox:profile-1' },
+    inventory,
+  })
+  expect(accepted.accepted).toBe(true)
+  return { relay, domRequests, operations }
+}
+
+describe('managed Firefox page.extract', () => {
+  test('refuses page.extract for a profile that does not advertise it without reading the page', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-unadvertised-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, domRequests, operations } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxExtractDocument(),
+      inventory: firefoxInventory(),
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-unadvertised',
+        sessionId: 'session-1',
+        operation: {
+          kind: 'page.extract',
+          tabId: 'firefox-tab',
+          format: 'markdown',
+          path: path.join(artifactStore.getRootDir(), 'unadvertised.md'),
+        },
+      })
+
+      expect(response).toMatchObject({ ok: false, error: {
+        code: 'unsupported-capability',
+        message: 'Firefox profile does not advertise page.extract; update the browser extension',
+        outcome: 'not-started',
+      } })
+      // Only the ownership re-check reaches the extension: no page.extract, and no DOM read at all.
+      expect(operations).toEqual(['tab.resolve'])
+      expect(domRequests).toHaveLength(0)
+      expect(fs.existsSync(artifactStore.getRootDir())).toBe(false)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('extracts through the real Firefox worker and persists the whole document for the relay to write', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-artifacts-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'firefox-storage.md')
+    const html = firefoxExtractDocument()
+    const { relay, domRequests, operations } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: html,
+      inventory: firefoxInventory({ advertiseOperations: true }),
+    })
+    try {
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      expect(full.title).toBe(FIREFOX_EXTRACT_TITLE)
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-persist',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, offset: 0, limit: 40 },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful Firefox page.extract')
+      }
+      // The model keeps the bounded window; the file gets the whole extraction.
+      expect(response.data.text).toBe(windowExtractedText({ text: full.text, offset: 0, limit: 40 }).text)
+      expect(response.data.value).toMatchObject({ format: 'markdown', title: FIREFOX_EXTRACT_TITLE, truncated: true })
+      expect(JSON.stringify(response.data)).not.toContain('artifactText')
+      expect(response.data.artifacts).toEqual([{
+        path: outputPath,
+        mimeType: 'text/markdown',
+        bytes: Buffer.byteLength(full.text, 'utf8'),
+        label: FIREFOX_EXTRACT_TITLE,
+      }])
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(full.text)
+      expect(domRequests.map((request) => { return request.command })).toEqual([{ method: 'page', action: 'content' }])
+      expect(operations).not.toContain('page.extract')
     } finally {
       await relay.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
