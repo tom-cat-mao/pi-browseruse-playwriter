@@ -4,6 +4,7 @@ import { cors } from 'hono/cors'
 import { createAdaptorServer } from '@hono/node-server'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import { createNodeWebSocket } from '@hono/node-ws'
+import { FIREFOX_ASSET_REQUEST_METHOD } from './firefox-executor-protocol.js'
 import type { WSContext } from 'hono/ws'
 import type { Protocol } from './cdp-types.js'
 import type { CDPCommand, CDPResponseBase, CDPEventBase, CDPEventFor, RelayServerEvents } from './cdp-types.js'
@@ -657,6 +658,39 @@ export async function startPlayWriterCDPRelayServer({
           throw new ManagedTransportError({
             code: message.includes('timeout') ? 'timeout' : 'profile-disconnected',
             message: `browserDomRequest failed: ${message}`,
+            outcome: message.includes('not connected') || message.includes('send failed') ? 'not-started' : 'unknown',
+          }, { cause: error })
+        }
+      },
+      /**
+       * `images: 'save'` bytes, fetched by the extension background and answered
+       * as base64 on the same websocket. One answer may be far larger than any
+       * control message — the channel's own frame budget (96 MiB, see
+       * firefox-executor-protocol.ts) keeps it inside the 100 MiB ws default —
+       * and it is validated by the relay before anything is written, so an
+       * oversize or malformed answer is a clear failure, never a cut payload.
+       */
+      sendBrowserAssetRequest: async ({ profileId, stableKey, connectionId, request, timeoutMs }) => {
+        const conn = getExtensionConnection(stableKey)
+        if (!conn || conn.id !== connectionId || conn.stableKey !== stableKey) {
+          throw new ManagedTransportError({
+            code: 'profile-disconnected',
+            message: `Firefox connection for profile ${profileId} changed before the asset fetch`,
+            outcome: 'not-started',
+          })
+        }
+        try {
+          return await sendToExtension({
+            extensionId: connectionId,
+            method: FIREFOX_ASSET_REQUEST_METHOD,
+            params: request,
+            timeout: timeoutMs,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new ManagedTransportError({
+            code: message.includes('timeout') ? 'timeout' : 'profile-disconnected',
+            message: `${FIREFOX_ASSET_REQUEST_METHOD} failed: ${message}`,
             outcome: message.includes('not connected') || message.includes('send failed') ? 'not-started' : 'unknown',
           }, { cause: error })
         }
