@@ -128,6 +128,39 @@ page.snapshot 返回 text + snapshotId + value.refs:[{ref,role,name}]；ref 是
 click/fill 收到 aria-ref/@eN 必须带 snapshotId 并核验，无匹配不能 first()。
 普通明确 CSS/role locator 可以无 snapshotId，仍遵守严格匹配。
 
+# page.extract（内容产出，无 refs）
+
+操作族与 page.snapshot 分离：extract 只产出内容，不产出可点击结构，也不写
+snapshot；字段为 tabId / format / selector? / search? / offset? / limit? /
+path? / images?。format ∈ markdown | text | html | assets-manifest；
+images ∈ none | urls | save（缺省 none）。
+
+- format：markdown/text 由 runtime 侧共享管线从浏览器给的高保真 HTML 产出，
+  一端实现；html 直接给序列化文档，同样受窗口预算；assets-manifest 只给页面
+  图片清单，不产正文。selector 存在时只序列化严格匹配的单个元素。
+- 窗口与预算：search/offset/limit 只作用于模型可见窗口；带 path 时整篇经
+  value.artifactText 交给 relay 落盘，模型仍只看窗口。清单最多 200 条，
+  清单 JSON 与预览共用 40,000 字节预算，被截断时 value.assetsTruncated=true。
+- images：'urls' 在任意 format 上附 value.assets（assetCount + 每条
+  {src,currentSrc,srcset,alt,naturalWidth,naturalHeight}），零字节；'save' 先给同一
+  清单，再抓最多 20 张的字节。逐图独立：抓不到、超限或类型不可命名的进
+  value.failedAssets({src,reason})，20 张上限之外未尝试的张数进
+  value.assetsNotFetched。Chrome 先让页面自己抓（带 cookie），页面拒绝时才回退
+  runtime fetch，且只打公开地址——loopback、私网、链路本地字面量与 localhost
+  一律拒绝并计入 failedAssets。
+- 门禁：Chrome profile 由本 runtime 的 CDP executor 自己抓字节，直接允许；
+  WebExtension profile 必须在该 profile 的 capabilities.features.assets 里广告
+  对应模式，没有广告即 unsupported-capability，且在任何页面流量之前拒绝。
+- artifact：字节只走浏览器→runtime→磁盘，模型拿描述符 {path,mimeType,bytes,label,
+  sourceUrl}。save 的字节在 value.savedAssets 里到 relay，relay 写盘后把正文与
+  预览中这些图片的 URL（含 src 与 srcset 选中的那个）改成 artifact 路径，并在响应
+  离开 runtime 前剥掉 savedAssets 与 artifactText。
+- 双端差异：Chrome 的 savedAssets 走 worker→relay 8 MiB 控制报文，单请求图片负载
+  以 3 MiB 图字节（4 MiB base64）为界，超出按图失败；Firefox 的字节走扩展专属
+  base64 帧（96 MiB 帧、64 MiB/请求），同一请求能带走更多图片。
+- extract 只读页面：除 persist 的落盘外没有页面副作用；取消/超时不重放，DOM 读取
+  失败如实报 outcome unknown。
+
 # Pi 工具（D）
 
 建议名称，不使用同名新旧混合注册：

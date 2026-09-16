@@ -4,6 +4,7 @@ import type { BrowserDomRequest, BrowserExtractFormat, BrowserExtractImagesMode,
 import { parseBrowserDomRequest } from './browser-dom-validation.js'
 import {
   MAX_FIREFOX_ASSET_COUNT,
+  MAX_FIREFOX_ASSET_TOTAL_BYTES,
   parseFirefoxAssetFetchRequest,
   type FirefoxAssetFetchRequest,
   type FirefoxAssetFetchResponse,
@@ -25,16 +26,17 @@ function longDocumentHtml(): string {
 }
 
 /** One page image as the DOM evaluate command reports it. */
-function pageImage({ src, alt = '', width = 800, height = 600, currentSrc }: {
+function pageImage({ src, alt = '', width = 800, height = 600, currentSrc, srcset = '' }: {
   src: string
   alt?: string
   width?: number
   height?: number
   currentSrc?: string
+  srcset?: string
 }): Record<string, unknown> {
   // The page-side enumeration reports both fields the way the DOM driver sees them.
   const chosen = currentSrc ?? src
-  return { src: chosen || src, currentSrc: currentSrc ?? src, srcset: '', alt, naturalWidth: width, naturalHeight: height }
+  return { src: chosen || src, currentSrc: currentSrc ?? src, srcset, alt, naturalWidth: width, naturalHeight: height }
 }
 
 /** A real protocol peer that records wire commands without pretending to implement a browser DOM. */
@@ -734,6 +736,80 @@ describe('Firefox executor page.extract', () => {
       expect(value.savedAssets).toHaveLength(MAX_FIREFOX_ASSET_COUNT)
       expect(value.assetCount).toBe(MAX_FIREFOX_ASSET_COUNT + 4)
       expect(value.assetsNotFetched).toBe(4)
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('clamps the manifest fields and bounds the manifest by bytes, not only by its entry cap', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    const longSrcset = Array.from({ length: 300 }, (_value, index) => {
+      return `https://cdn.example.test/candidate-${index}.png ${index + 1}x`
+    }).join(', ')
+    peer.pageImages = Array.from({ length: 200 }, (_value, index) => {
+      return pageImage({ src: `https://cdn.example.test/${'deeply-nested-segment/'.repeat(8)}${index}.png`, alt: 'a'.repeat(2_000), srcset: longSrcset })
+    })
+    try {
+      const response = await pool.execute(extractExecution({ id: 'manifest-budget', peer, format: 'assets-manifest' }))
+      if (!response.ok) {
+        throw new Error(`expected a successful manifest, got ${JSON.stringify(response)}`)
+      }
+      const value = response.data.value
+      if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.assets)) {
+        throw new Error('expected a structured asset manifest')
+      }
+      const assets = value.assets as Array<Record<string, unknown>>
+      expect(assets.length).toBeGreaterThan(0)
+      expect(assets.length).toBeLessThan(200)
+      expect(value.assetCount).toBe(assets.length)
+      expect(value.assetsTruncated).toBe(true)
+      // The listing stays inside the same budget the Chrome backend applies.
+      expect(assets.reduce((total, asset) => { return total + Buffer.byteLength(JSON.stringify(asset), 'utf8') + 1 }, 0)).toBeLessThanOrEqual(40_000)
+      expect((assets[0].srcset as string)).toHaveLength(2_048)
+      expect((assets[0].alt as string)).toHaveLength(512)
+      expect(response.data.text).toContain('images found (listing the first ones)')
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('carries a full-budget asset batch without exhausting the worker heap', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    peer.pageImages = Array.from({ length: MAX_FIREFOX_ASSET_COUNT }, (_value, index) => {
+      return pageImage({ src: `https://cdn.example.test/big-${index}.png` })
+    })
+    const assetPeer = new AssetPeer()
+    // The channel's whole byte budget in one batch: 20 images of 3.2 MiB is
+    // 64 MiB of bytes, which arrives as roughly 85 MiB of base64 text in the
+    // single frame the worker has to parse, check and answer from.
+    const imageBase64 = Buffer.alloc(MAX_FIREFOX_ASSET_TOTAL_BYTES / MAX_FIREFOX_ASSET_COUNT, 7).toString('base64')
+    assetPeer.respond = async (request) => {
+      return {
+        requestId: request.requestId,
+        assets: request.targets.map((target) => {
+          return { src: target.src, ok: true, base64: imageBase64, mimeType: 'image/png' }
+        }),
+      }
+    }
+    try {
+      const response = await pool.execute(extractExecution({
+        id: 'assets-full-budget', peer, assetPeer, format: 'assets-manifest', images: 'save', timeoutMs: 30_000,
+      }))
+      if (!response.ok) {
+        throw new Error(`expected the full-budget batch to succeed, got ${JSON.stringify(response)}`)
+      }
+      const value = response.data.value
+      if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.savedAssets)) {
+        throw new Error('expected a structured extract value')
+      }
+      expect(value.savedAssets).toHaveLength(MAX_FIREFOX_ASSET_COUNT)
+      expect((value.savedAssets[0] as Record<string, unknown>).base64).toBe(imageBase64)
+      expect(value.failedAssets).toBeUndefined()
+      expect(value.assetsNotFetched).toBeUndefined()
     } finally {
       await pool.dispose()
     }
