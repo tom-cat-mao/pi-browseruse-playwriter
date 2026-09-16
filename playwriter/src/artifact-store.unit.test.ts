@@ -203,6 +203,90 @@ describe('ArtifactStore writes', () => {
   })
 })
 
+describe('ArtifactStore targetPath resolution', () => {
+  test('resolves a relative file name against the artifacts root, not the process cwd', () => {
+    const directory = createTempDir('artifact-store-')
+    const rootDir = path.join(directory, 'artifacts')
+    try {
+      const store = new ArtifactStore({ rootDir })
+      const artifact = store.write({
+        buffer: Buffer.from('# Notes\n', 'utf8'),
+        mimeType: 'text/markdown',
+        label: 'Notes',
+        targetPath: 'notes.md',
+      })
+
+      expect(artifact.path).toBe(path.join(rootDir, 'notes.md'))
+      expect(fs.readFileSync(artifact.path, 'utf8')).toBe('# Notes\n')
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('creates the subdirectory a relative target path names', () => {
+    const directory = createTempDir('artifact-store-')
+    const rootDir = path.join(directory, 'artifacts')
+    try {
+      const store = new ArtifactStore({ rootDir })
+      const artifact = store.write({
+        buffer: Buffer.from('<p>Body</p>', 'utf8'),
+        mimeType: 'text/html',
+        targetPath: path.join('a', 'b.html'),
+      })
+
+      expect(artifact.path).toBe(path.join(rootDir, 'a', 'b.html'))
+      expect(fs.readFileSync(artifact.path, 'utf8')).toBe('<p>Body</p>')
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a relative target path that climbs out of the root', () => {
+    const directory = createTempDir('artifact-store-')
+    const rootDir = path.join(directory, 'artifacts')
+    try {
+      const store = new ArtifactStore({ rootDir })
+      for (const targetPath of [path.join('..', 'escape.md'), path.join('a', '..', '..', 'escape.md')]) {
+        const error = captureArtifactStoreError({
+          run: () => {
+            store.write({ buffer: Buffer.from([1]), mimeType: 'image/png', targetPath })
+          },
+        })
+        expect(error.code).toBe('invalid-request')
+        expect(error.message).toContain('escapes the artifacts directory')
+      }
+      expect(fs.existsSync(path.join(directory, 'escape.md'))).toBe(false)
+      expect(fs.readdirSync(rootDir)).toEqual([])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('accepts an absolute target path inside the root and rejects one outside it', () => {
+    const directory = createTempDir('artifact-store-')
+    const rootDir = path.join(directory, 'artifacts')
+    try {
+      const store = new ArtifactStore({ rootDir })
+      const inside = path.join(rootDir, 'nested', 'page.html')
+      const artifact = store.write({ buffer: Buffer.from('<p>Page</p>', 'utf8'), mimeType: 'text/html', targetPath: inside })
+      expect(artifact.path).toBe(inside)
+      expect(fs.readFileSync(inside, 'utf8')).toBe('<p>Page</p>')
+
+      const outsidePath = path.join(directory, 'outside.md')
+      const error = captureArtifactStoreError({
+        run: () => {
+          store.write({ buffer: Buffer.from('# Outside\n', 'utf8'), mimeType: 'text/markdown', targetPath: outsidePath })
+        },
+      })
+      expect(error.code).toBe('invalid-request')
+      expect(error.message).toContain('escapes the artifacts directory')
+      expect(fs.existsSync(outsidePath)).toBe(false)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('ArtifactStore limits', () => {
   test('rejects a payload above the per-file limit', () => {
     const directory = createTempDir('artifact-store-')

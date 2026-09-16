@@ -65,9 +65,10 @@ export type WriteArtifactOptions = {
   sourceUrl?: string
   sessionId?: string
   /**
-   * Exact file for the artifact, when the caller asked for one. Still confined
-   * to the artifacts root: a caller-picked path is honored inside it and
-   * rejected outside it, exactly like a generated name.
+   * Exact file for the artifact, when the caller asked for one: a relative
+   * path resolves against the artifacts root, an absolute one is taken as is.
+   * Either way it stays confined to that root: a caller-picked path is honored
+   * inside it and rejected outside it, exactly like a generated name.
    */
   targetPath?: string
 }
@@ -233,12 +234,14 @@ export class ArtifactStore {
   }
 
   /**
-   * A caller-picked path is checked lexically before any directory is created,
-   * so a target outside the root can never make the store create directories
-   * outside it; the symlink-safe check runs again after the parent exists.
+   * A caller-picked path is resolved against the artifacts root — never the
+   * runtime process cwd — and checked lexically before any directory is
+   * created, so a target outside the root can never make the store create
+   * directories outside it; the symlink-safe check runs again after the parent
+   * exists. An absolute path keeps its meaning and must still land inside.
    */
   private resolveTargetPath(targetPath: string): string {
-    const resolved = path.resolve(targetPath)
+    const resolved = path.resolve(this.rootDir, targetPath)
     if (!isWithinDirectory({ directory: this.rootDir, candidate: resolved })) {
       throw createEscapeError(resolved)
     }

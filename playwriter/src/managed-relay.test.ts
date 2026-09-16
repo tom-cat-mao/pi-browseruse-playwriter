@@ -4195,6 +4195,50 @@ describe('managed page.extract artifacts', () => {
     }
   })
 
+  test('resolves a relative extract path under the artifacts root', async () => {
+    const directory = createExecutorTestDirectory('page-extract-relative-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const relativePath = path.join('exports', 'relative.md')
+    const outputPath = path.join(artifactStore.getRootDir(), relativePath)
+    const fullMarkdown = '# Relative\n\nBody\n'
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: '# Relative\n\nBody',
+            value: { format: request.operation.format, title: 'Relative', artifactText: fullMarkdown },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-relative-path',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: relativePath },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      expect(response.data.artifacts).toEqual([
+        { path: outputPath, mimeType: 'text/markdown', bytes: Buffer.byteLength(fullMarkdown, 'utf8'), label: 'Relative' },
+      ])
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(fullMarkdown)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test('writes html extractions as html and refuses a target outside the artifacts root', async () => {
     const directory = createExecutorTestDirectory('page-extract-html-')
     const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
