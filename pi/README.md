@@ -87,10 +87,15 @@ with a clear error instead of returning an empty extraction. The export path is
 confined to the runtime's artifacts directory; a path outside it is refused.
 
 Image handling is gated one level deeper, on `features.assets`. `images:"urls"`
-returns the page's image manifest (`src`/`alt`/`width`/`height`) without
-downloading anything, and `images:"save"` downloads the images through the
-runtime, saves them as artifacts and rewrites the saved Markdown image URLs to
-those local paths, reporting any image it could not fetch in `failedAssets`.
+returns the page's image manifest — one entry per image with `src`, `alt`,
+`naturalWidth` and `naturalHeight`, the intrinsic pixel size the runtime
+reports — without downloading anything, and `images:"save"` downloads the
+images through the runtime, saves them as artifacts and rewrites the saved
+Markdown image URLs to those local paths, reporting any image it could not
+fetch in `failedAssets`. The model-facing `assets:` line states when the runtime
+had to cut the listing short (`assetsTruncated`, next to the `assetCount` it
+carries) and, for `save`, how many images were left over the per-request fetch
+limit without ever being attempted (`assetsNotFetched`).
 Both modes need the target profile to advertise them: a Firefox (webextension)
 profile whose add-on does not advertise the matching asset mode is refused
 before anything is downloaded, while Chrome is served by the runtime and a peer

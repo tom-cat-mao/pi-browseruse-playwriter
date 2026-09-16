@@ -1803,9 +1803,27 @@ describe("tool execution shaping (real HTTP runtime)", () => {
                 format: "assets-manifest",
                 truncated: false,
                 totalBytes: 0,
+                assetCount: 2,
+                // The manifest entries carry the intrinsic size under the wire
+                // names both workers emit (collectPageAssets in the Chrome
+                // worker, readAssetManifest in the Firefox worker).
                 assets: [
-                  { src: "https://example.com/a.png", alt: "Chart", width: 640, height: 480 },
-                  { src: "https://example.com/b.png" },
+                  {
+                    src: "https://example.com/a.png",
+                    currentSrc: "https://example.com/a.png",
+                    srcset: "",
+                    alt: "Chart",
+                    naturalWidth: 640,
+                    naturalHeight: 480,
+                  },
+                  {
+                    src: "https://example.com/b.png",
+                    currentSrc: "",
+                    srcset: "",
+                    alt: "",
+                    naturalWidth: 0,
+                    naturalHeight: 0,
+                  },
                 ],
               },
             },
@@ -1822,8 +1840,9 @@ describe("tool execution shaping (real HTTP runtime)", () => {
               format: "markdown",
               truncated: false,
               totalBytes: 41,
+              assetCount: 8,
               assets: Array.from({ length: 8 }, (_, i) => {
-                return { src: `https://example.com/img-${i}.png` };
+                return { src: `https://example.com/img-${i}.png`, naturalWidth: 0, naturalHeight: 0 };
               }),
             },
           },
@@ -1844,6 +1863,10 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(manifestText).toContain(
       'assets: 2 image(s) · https://example.com/a.png alt="Chart" 640x480 · https://example.com/b.png',
     );
+    // naturalWidth/naturalHeight are what the runtime sends: reading width/height
+    // instead left every entry without a size. A zero pair means the image
+    // reported no loaded dimensions, so no size is printed at all.
+    expect(manifestText).not.toContain("0x0");
     const manifestRow = renderResultText(extract, manifest, {
       expanded: false,
       args: { tabId: "tab-1", format: "assets-manifest" },
@@ -1867,6 +1890,86 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(urlsRow).toContain("8 image(s)");
   });
 
+  it("says a truncated manifest is truncated instead of presenting the listing as the whole page", async () => {
+    runtimeHandler(() => ({
+      text: "3 images found (listing the first ones)",
+      value: {
+        format: "assets-manifest",
+        truncated: false,
+        totalBytes: 120,
+        assetCount: 3,
+        assetsTruncated: true,
+        assets: [
+          { src: "https://example.com/img-0.png", alt: "Hero", naturalWidth: 1200, naturalHeight: 630 },
+          { src: "https://example.com/img-1.png", alt: "", naturalWidth: 0, naturalHeight: 0 },
+          { src: "https://example.com/img-2.png", alt: "", naturalWidth: 0, naturalHeight: 0 },
+        ],
+      },
+    }));
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-truncated-manifest",
+      { tabId: "tab-1", format: "assets-manifest" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain(
+      'assets: 3 image(s) (manifest truncated at 3 — the page has more images than this listing) · ' +
+        'https://example.com/img-0.png alt="Hero" 1200x630 · https://example.com/img-1.png · https://example.com/img-2.png',
+    );
+    // The raw counters stay in the structured value for the model to read.
+    expect(JSON.stringify(result.details.value)).toContain('"assetsTruncated":true');
+
+    const row = renderResultText(extract, result, {
+      expanded: false,
+      args: { tabId: "tab-1", format: "assets-manifest" },
+    });
+    expect(row).toContain("manifest truncated at 3");
+  });
+
+  it("reports how many images a save run left over the per-request limit when it returns no manifest", async () => {
+    // The Chrome save shape: the relay writes the bytes, drops savedAssets and
+    // hands the model the counters only — no `assets` array to read.
+    runtimeHandler(() => ({
+      text: "# Example\n\n![Hero](/home/u/.pi-browser-use/artifacts/hero.png)",
+      value: {
+        format: "markdown",
+        truncated: false,
+        totalBytes: 60,
+        assetCount: 40,
+        assetsNotFetched: 20,
+      },
+      artifacts: [
+        {
+          path: "/home/u/.pi-browser-use/artifacts/hero.png",
+          mimeType: "image/png",
+          bytes: 1024,
+          label: "Hero",
+          sourceUrl: "https://example.com/img-0.png",
+        },
+      ],
+    }));
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-save-limit",
+      { tabId: "tab-1", images: "save" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain("images=save");
+    expect(text).toContain(
+      "assets: 40 image(s) (20 image(s) not attempted — over the per-request save limit)",
+    );
+    expect(text).not.toContain("failed assets");
+
+    const row = renderResultText(extract, result, { expanded: false, args: { tabId: "tab-1", images: "save" } });
+    expect(row).toContain("40 image(s)");
+  });
+
   it("lists saved image artifacts with their alt text and warns about failed images", async () => {
     server.setHandler((req) => {
       if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
@@ -1887,7 +1990,17 @@ describe("tool execution shaping (real HTTP runtime)", () => {
               format: "markdown",
               truncated: false,
               totalBytes: 120,
-              assets: [{ src: "https://example.com/a.png", alt: "Chart", width: 640, height: 480 }],
+              assetCount: 1,
+              assets: [
+                {
+                  src: "https://example.com/a.png",
+                  currentSrc: "https://example.com/a.png",
+                  srcset: "",
+                  alt: "Chart",
+                  naturalWidth: 640,
+                  naturalHeight: 480,
+                },
+              ],
               failedAssets: [{ src: "https://example.com/broken.png", reason: "HTTP 403" }],
             },
             artifacts: [
