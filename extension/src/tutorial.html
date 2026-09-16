@@ -1,160 +1,543 @@
-<!-- Tutorial page shown when the user clicks the extension icon before the daemon is running. -->
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Start the Playwriter daemon</title>
-    <style>
-      :root {
-        --color-bg: #ffffff;
-        --color-text: #262626;
-        --color-heading: #171717;
-        --color-border: #d4d4d4;
-        --color-link: #0969da;
-        --color-link-hover: #0550ae;
-        --max-width: 640px;
-      }
-
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --color-bg: #0a0a0a;
-          --color-text: #e5e5e5;
-          --color-heading: #fafafa;
-          --color-border: #404040;
-          --color-link: #4493f8;
-          --color-link-hover: #539bf5;
-        }
-      }
-
-      * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-      }
-
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
-        font-size: 16px;
-        line-height: 1.6;
-        color: var(--color-text);
-        background-color: var(--color-bg);
-        padding: 2rem 1rem;
-      }
-
-      main {
-        max-width: var(--max-width);
-        margin: 0 auto;
-      }
-
-      h2 {
-        font-size: 1.75rem;
-        font-weight: 600;
-        color: var(--color-heading);
-        margin-bottom: 1rem;
-        padding-bottom: 0.5rem;
-        border-bottom: 1px solid var(--color-border);
-      }
-
-      p {
-        margin-bottom: 1rem;
-        opacity: 0.8;
-      }
-
-      a {
-        color: var(--color-link);
-        text-decoration: none;
-      }
-
-      a:hover {
-        color: var(--color-link-hover);
-        text-decoration: underline;
-      }
-
-      code {
-        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
-        font-size: 0.875em;
-      }
-
-      pre {
-        background: transparent !important;
-        border: none !important;
-        padding: 0 !important;
-        margin-bottom: 1rem;
-        overflow: visible;
-        white-space: pre;
-      }
-
-      pre code {
-        background: transparent !important;
-        padding: 0 !important;
-        font-size: 0.875rem;
-        white-space: pre;
-      }
-
-      strong {
-        font-weight: 600;
-        color: var(--color-heading);
-      }
-
-      code[class*='language-'],
-      pre[class*='language-'] {
-        color: #8959a8;
-        text-shadow: none;
-      }
-      .token.comment {
-        color: #8e908c;
-      }
-      .token.function {
-        color: #f5871f;
-      }
-      .token.keyword {
-        color: #8959a8;
-      }
-      .token.string {
-        color: #718c00;
-      }
-
-      @media (prefers-color-scheme: dark) {
-        code[class*='language-'],
-        pre[class*='language-'] {
-          color: #b294bb;
-        }
-        .token.comment {
-          color: #969896;
-        }
-        .token.function {
-          color: #de935f;
-        }
-        .token.keyword {
-          color: #b294bb;
-        }
-        .token.string {
-          color: #b5bd68;
-        }
-      }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Pi Browser Use 中文上手指南（Chrome）</title>
+    <link rel="stylesheet" href="./chrome-tutorial.css" />
   </head>
   <body>
-    <main>
-      <h2>The Playwriter daemon is not running</h2>
+    <a class="skip-link" href="#main">跳到正文</a>
 
-      <p>
-        You clicked the Playwriter icon. It cannot turn <strong>green</strong> until a
-        <code>playwriter</code> command runs on this machine. That first command starts the daemon.
-      </p>
+    <div class="page">
+      <header class="page-header">
+        <p class="eyebrow">Chrome 版 · 中文上手指南</p>
+        <h1>让 Pi 操作你本机 Chrome 里的真实标签</h1>
+        <p class="lede">
+          Pi Browser Use 让 Pi agent 通过本机 Chrome 扩展，读取和操作你已经打开的标签页，包括你已登录的账号。
+          浏览器始终留在你的电脑上，没有云端浏览器。
+        </p>
+        <p class="static-note">
+          本页是静态说明，不会自动连接、不会接管或打开任何标签，也不会显示实时连接状态。下面所有需要你手动执行的东西，
+          都要你自己在终端或 Pi 里输入。
+        </p>
+      </header>
 
-      <pre><code class="language-bash">npx -y skills add https://playwriter.dev
+      <nav class="toc" aria-labelledby="toc-title">
+        <h2 id="toc-title">目录</h2>
+        <ol>
+          <li><a href="#quick-start">快速开始</a></li>
+          <li><a href="#install">安装</a></li>
+          <li><a href="#first-use">第一次使用</a></li>
+          <li><a href="#finish">结束控制</a></li>
+          <li><a href="#troubleshooting">排查</a></li>
+        </ol>
+      </nav>
 
-npx playwriter session new
-npx playwriter -s 1 -e "context.newPage().then((p) => p.goto('https://example.com'))"</code></pre>
+      <main id="main">
+        <section id="quick-start" aria-labelledby="quick-start-title">
+          <h2 id="quick-start-title">快速开始</h2>
 
-      <p>
-        Or ask your agent to use the browser. After that, click the icon on a normal website tab to let your agents
-        control an existing tab.
-      </p>
-    </main>
-    <script src="prism.min.js"></script>
-    <script src="prism-bash.min.js"></script>
+          <p>
+            这套东西由四部分组成，缺一不可。先建立这个整体概念，可以省掉后面一大半排查时间。
+          </p>
+
+          <div class="cards">
+            <article class="card">
+              <h3>本机 Chrome</h3>
+              <p>
+                就是你现在正在用的浏览器。扩展不会启动一个新的 Chrome，也不要求你用特殊参数重启浏览器。
+                你平时登录的账号、Cookie、表单内容都在这个浏览器里。
+              </p>
+            </article>
+            <article class="card">
+              <h3>Chrome 扩展</h3>
+              <p>
+                通过 Chrome 调试协议把某个标签交给 agent。新标签只有在你明确要求、或你自己点击工具栏图标时才会被接管；
+                重新连接时它只会恢复仍然受控的标签，已经释放的标签不会自己回来。
+              </p>
+            </article>
+            <article class="card">
+              <h3>配对 runtime</h3>
+              <p>
+                一个跑在你本机的本地服务（<code>@tom-cat/pi-browser-runtime</code>），默认监听
+                <code>127.0.0.1:19989</code>，数据目录 <code>~/.pi-browser-use</code>。
+                Pi 里的 <code>browser_*</code> 工具通过它和浏览器通信。
+              </p>
+            </article>
+            <article class="card">
+              <h3>Pi 包</h3>
+              <p>
+                <code>@tom-cat/pi-browser-use-extension</code>，提供 <code>browser_*</code> 工具和
+                <code>/browser-status</code> 命令。它只负责执行和汇报事实，具体怎么操作由模型决定。
+              </p>
+            </article>
+          </div>
+
+          <p class="callout">
+            <strong>登录态意味着隐私。</strong>
+            agent 看到的是你真实的页面，可能包含你的个人信息、邮件、后台数据。
+            只接管你愿意让它读取的标签，任务结束后及时释放。
+          </p>
+
+          <h3>三步跑通</h3>
+          <ol class="steps">
+            <li>
+              <span class="steps__index">1</span>
+              <span class="steps__body">
+                在源码检出里安装 Pi 包并构建 runtime（这一步必需，见
+                <a href="#install-pi">安装 Pi 包并构建 runtime</a>）。
+              </span>
+            </li>
+            <li>
+              <span class="steps__index">2</span>
+              <span class="steps__body">
+                加载 Chrome 扩展（GitHub Release 的 ZIP 需要手动加载，见
+                <a href="#install-extension">加载 Chrome 扩展</a>）。
+              </span>
+            </li>
+            <li>
+              <span class="steps__index">3</span>
+              <span class="steps__body">
+                在 Pi 里选 Chrome profile，再 discover / attach 你指定的标签（见
+                <a href="#first-use">第一次使用</a>）。
+              </span>
+            </li>
+          </ol>
+
+          <h3>现在的发布状态</h3>
+          <ul class="plain">
+            <li>没有 npm 发布：Pi 包和 runtime 目前要从源码本地安装。</li>
+            <li>没有上架 Chrome 应用商店：扩展只能以「加载已解压的扩展程序」的方式手动加载。</li>
+            <li>
+              官方下载入口是 GitHub Releases 里带版本号的
+              <code>pi-browser-use-extension-&lt;版本&gt;.zip</code>，不要用 GitHub 自动生成的源码压缩包。
+              <a
+                href="https://github.com/tom-cat-mao/pi-browseruse-playwriter/releases"
+                target="_blank"
+                rel="noopener noreferrer"
+                >打开 Releases 页面</a
+              >
+            </li>
+          </ul>
+
+          <h3>怎么再次打开本页</h3>
+          <p>
+            本页是扩展的选项页：到 <code>chrome://extensions</code> 找到 Pi Browser Use，在详情里点
+            「扩展程序选项」；或在工具栏图标上点右键，选择「选项」。
+          </p>
+        </section>
+
+        <section id="install" aria-labelledby="install-title">
+          <h2 id="install-title">安装</h2>
+
+          <p>
+            Pi 包、本机 runtime 和 Chrome 扩展是三个独立部分，都要各自装好：扩展的 ZIP 里没有另外两个，
+            <code>pi install</code> 也不会替你装浏览器扩展。
+          </p>
+
+          <section id="install-pi" aria-labelledby="install-pi-title">
+            <h3 id="install-pi-title">1. 安装 Pi 包并构建 runtime（必需）</h3>
+
+            <p>
+              前提是这台机器已经装好 Pi（<code>@earendil-works/pi-coding-agent</code>），终端里的 <code>pi</code>
+              命令可用。当前没有任何 npm 发布，所以 Pi 包和 runtime 只能从源码检出安装，
+              在检出目录里按顺序执行下面几条：
+            </p>
+
+            <div class="code-block">
+              <div class="code-block__head">
+                <span class="code-block__label">终端</span>
+                <button
+                  type="button"
+                  class="copy-button"
+                  data-copy-target="code-pi-install"
+                  aria-live="polite"
+                  hidden
+                >
+                  复制
+                </button>
+              </div>
+              <pre><code id="code-pi-install">git clone --branch dev https://github.com/tom-cat-mao/pi-browseruse-playwriter.git
+cd pi-browseruse-playwriter
+pnpm bootstrap
+pnpm --filter @tom-cat/pi-browser-runtime build
+pi install ./pi</code></pre>
+            </div>
+
+            <p>
+              这几条不是可选项，跳过就不会有可用的工具：<code>pnpm bootstrap</code> 初始化 playwright 子模块并构建本地
+              playwright-core；<code>pnpm --filter @tom-cat/pi-browser-runtime build</code> 产出 runtime 本体
+              （<code>playwriter/bin-runtime.js</code> 加载的 <code>dist/</code> 由它生成）与两个后端的扩展包。
+              <code>pi install ./pi</code> 装的是 Pi 侧的 <code>browser_*</code> 工具与 <code>/browser-status</code>，
+              它依赖同一检出里的 <code>@tom-cat/pi-browser-runtime</code>，所以必须排在构建之后。
+            </p>
+
+            <p>
+              装好后第一次在 Pi 里使用 <code>browser_*</code> 工具时，Pi 会自动启动配对的 runtime
+              （也可以手动跑 <code>node playwriter/bin-runtime.js</code>）。默认配置：
+            </p>
+
+            <ul class="plain">
+              <li>监听地址 <code>127.0.0.1:19989</code>（仅本机回环地址）。</li>
+              <li>数据目录 <code>~/.pi-browser-use</code>，日志默认写在 <code>relay-server.log</code> 与 <code>cdp.jsonl</code>。</li>
+              <li>
+                需要改地址或端口时用环境变量：<code>PI_BROWSER_HOST</code>、<code>PI_BROWSER_PORT</code>、
+                <code>PI_BROWSER_TOKEN</code>、<code>PI_BROWSER_DATA_DIR</code>。
+              </li>
+              <li>
+                如果 <code>PI_BROWSER_HOST</code> 指向非回环地址，Pi 工具包会把它当成远端 runtime，不会在本机自动拉起进程。
+              </li>
+            </ul>
+          </section>
+
+          <section id="install-extension" aria-labelledby="install-extension-title">
+            <h3 id="install-extension-title">2. 加载 Chrome 扩展</h3>
+
+            <ol class="steps">
+              <li>
+                <span class="steps__index">1</span>
+                <span class="steps__body">
+                  在 GitHub Releases 下载 <code>pi-browser-use-extension-&lt;版本&gt;.zip</code>。
+                </span>
+              </li>
+              <li>
+                <span class="steps__index">2</span>
+                <span class="steps__body">
+                  解压到一个你会长期保留的固定目录，例如
+                  <code>~/Applications/pi-browser-use-extension</code>。
+                </span>
+              </li>
+              <li>
+                <span class="steps__index">3</span>
+                <span class="steps__body">
+                  打开 <code>chrome://extensions</code>，打开右上角的<strong>开发者模式</strong>，点
+                  <strong>加载已解压的扩展程序</strong>，选择包含 <code>manifest.json</code> 的那个目录。
+                </span>
+              </li>
+              <li>
+                <span class="steps__index">4</span>
+                <span class="steps__body">
+                  加载完成后确认扩展 ID 是 <code>eeklahpecooapnailfaebkjjembkjhhg</code>（开发构建的固定身份）。
+                </span>
+              </li>
+            </ol>
+
+            <p class="callout callout--warn">
+              <strong>这个 ZIP 不是一键安装包。</strong>
+              桌面版 Chrome 上它必须配合「加载已解压的扩展程序」使用，Chrome 也不会自动更新它。
+              安装后不要删除或移动那个目录，否则扩展会立刻失效。真正的一键安装与自动更新要等应用商店上架。
+            </p>
+          </section>
+
+          <section id="install-source" aria-labelledby="install-source-title">
+            <h3 id="install-source-title">3. 可选：自己构建扩展</h3>
+
+            <p>
+              上面两步是必需的；只有「不用 Release 里的 ZIP、自己构建扩展」这一件事是可选的。
+              需要 Node.js 20 以上、pnpm 10.18.1 和 Bun，并且已经完成第 1 步的检出与构建。
+            </p>
+
+            <ul class="plain">
+              <li>
+                开发态扩展构建：<code>pnpm --filter mcp-extension build</code>，输出在
+                <code>extension/dist</code>，再用上面的「加载已解压的扩展程序」指向它。
+              </li>
+              <li>
+                本地打包：<code>pnpm package:extension</code>，产物（ZIP 与 <code>.sha256</code>）在
+                <code>dist-release/</code>。这只是本地打包，不会发布任何东西。
+              </li>
+              <li>构建与打包都不会安装扩展，也不会打开浏览器。</li>
+            </ul>
+          </section>
+        </section>
+
+        <section id="first-use" aria-labelledby="first-use-title">
+          <h2 id="first-use-title">第一次使用</h2>
+
+          <p>
+            典型请求是「看看我现在这个页面，接着往下做」。你不需要告诉 agent 网址，也不需要先建组：
+            让它先列出真实的标签，再原地接管你指定的那一个。
+          </p>
+
+          <ol class="steps">
+            <li>
+              <span class="steps__index">1</span>
+              <span class="steps__body">
+                <strong>准备一个普通网页标签。</strong>
+                用 http/https 页面，不要用 <code>chrome://</code>、Chrome 应用商店或其它扩展的页面（见
+                <a href="#troubleshoot-attach">无法接管某个标签</a>）。
+              </span>
+            </li>
+            <li>
+              <span class="steps__index">2</span>
+              <span class="steps__body">
+                <strong>让 Pi 选 profile。</strong>
+                先用 <code>browser_profiles</code> 列出浏览器身份，确认 Chrome 是 <code>connected</code>；
+                还没连上就先看 <a href="#troubleshoot-profile">profile 未连接</a>。
+              </span>
+            </li>
+            <li>
+              <span class="steps__index">3</span>
+              <span class="steps__body">
+                <strong>discover 再 attach。</strong>
+                <code>browser_tabs</code> 的 <code>discover</code> 会列出真实打开的标签（标题、网址、窗口、是否当前标签，
+                只读元数据）；挑中之后用 <code>attach</code> 加 <code>candidateId</code> 原地接管。
+                接管不会刷新页面、不会搬窗口，滚动位置和表单内容都会保留。
+              </span>
+            </li>
+            <li>
+              <span class="steps__index">4</span>
+              <span class="steps__body">
+                <strong>观察 → 操作 → 再观察。</strong>
+                <code>browser_snapshot</code> 返回 <code>aria-ref=eN</code> 引用和 <code>snapshotId</code>；
+                <code>browser_click</code> / <code>browser_fill</code> 用引用时必须同时带上 <code>snapshotId</code>。
+                每一步操作之后重新 snapshot 校验，不要连着盲操作。
+              </span>
+            </li>
+            <li>
+              <span class="steps__index">5</span>
+              <span class="steps__body">
+                <strong>页面变了就重新读。</strong>
+                任何 <code>browser_evaluate</code> 或 <code>browser_execute</code> 都会让最新 snapshot 失效——
+                即使那次调用只是读数据。旧引用会报 <code>stale-snapshot</code>，必须重新 snapshot，
+                不能假设「刚才只是只读」而跳过验证。
+              </span>
+            </li>
+          </ol>
+
+          <h3>工具栏图标怎么用</h3>
+          <p>
+            Chrome 版没有弹窗：点图标会直接对当前标签执行动作，不会弹出任何面板。要确认真实状态，请在 Pi 里运行
+            <code>/browser-status</code>，它会报告 runtime 是否可达以及有哪些已连接的 profile。
+          </p>
+          <ul class="plain">
+            <li>
+              <strong>在普通标签上点击 = 接管（attach）。</strong>
+              对还没被接管的 http/https 标签点图标，会把调试器接到这个标签上，之后 Pi 就能操作它。
+            </li>
+            <li>
+              <strong>在已受控标签上点击 = 取消控制并释放。</strong>
+              已经由 Pi 接管的标签，点图标等于释放：放弃控制，<strong>页面保持打开</strong>，
+              滚动位置和登录态都不动。
+            </li>
+            <li>
+              <strong>在已断开的受控标签上点击 = 恢复接管。</strong>
+              之前断开过的受控标签再点一次会重新接上，不需要重新 discover。
+            </li>
+            <li>
+              受保护的页面（<code>chrome://</code>、Chrome 应用商店、其它扩展的页面）点图标不会接管；
+              正在连接中的标签重复点击会被忽略。
+            </li>
+          </ul>
+
+          <h3>可以复制的中文任务示例</h3>
+          <p>
+            下面这些是给 Pi 的说话示例，复制后自己粘贴到 Pi 里。本页不会替你执行任何一条，
+            也不会预先指定标签——接管哪个标签由你在 Pi 里明确说清。
+          </p>
+
+          <div class="example">
+            <h4>读取当前页面</h4>
+            <div class="code-block">
+              <div class="code-block__head">
+                <span class="code-block__label">给 Pi 的话</span>
+                <button
+                  type="button"
+                  class="copy-button"
+                  data-copy-target="code-example-read"
+                  aria-live="polite"
+                  hidden
+                >
+                  复制
+                </button>
+              </div>
+              <pre><code id="code-example-read">接管我现在打开的这个标签。先做一次 snapshot 看清结构，然后用中文概括页面主要信息和可操作的按钮，先不要点击任何东西。</code></pre>
+            </div>
+          </div>
+
+          <div class="example">
+            <h4>填表并提交</h4>
+            <div class="code-block">
+              <div class="code-block__head">
+                <span class="code-block__label">给 Pi 的话</span>
+                <button
+                  type="button"
+                  class="copy-button"
+                  data-copy-target="code-example-fill"
+                  aria-live="polite"
+                  hidden
+                >
+                  复制
+                </button>
+              </div>
+              <pre><code id="code-example-fill">接管我打开的报名页面。snapshot 之后把姓名填成张三、邮箱填成 zhangsan@example.com。提交按钮先别点，把你准备点的按钮告诉我，我确认后你再点。</code></pre>
+            </div>
+          </div>
+
+          <div class="example">
+            <h4>核对列表数据</h4>
+            <div class="code-block">
+              <div class="code-block__head">
+                <span class="code-block__label">给 Pi 的话</span>
+                <button
+                  type="button"
+                  class="copy-button"
+                  data-copy-target="code-example-table"
+                  aria-live="polite"
+                  hidden
+                >
+                  复制
+                </button>
+              </div>
+              <pre><code id="code-example-table">在我打开的后台列表页里，把第一页所有订单号和状态读出来，用表格回复给我。如果需要翻页，先告诉我你打算怎么翻，等我同意再继续。</code></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="finish" aria-labelledby="finish-title">
+          <h2 id="finish-title">结束控制</h2>
+
+          <p>任务做完之后，用哪种方式收尾会直接影响你下次的体验，两者差别很大。</p>
+
+          <div class="cards">
+            <article class="card">
+              <h3>释放（release）</h3>
+              <p>
+                <code>browser_tabs</code> 的 <code>action: "release"</code>：放弃本会话对这个标签的控制，
+                <strong>页面保持打开</strong>，你的滚动位置和登录态都不动。
+                释放会留下记录，之后重连也不会把这个标签重新拉回本会话。
+              </p>
+            </article>
+            <article class="card">
+              <h3>关闭（close）</h3>
+              <p>
+                <code>browser_tabs</code> 的 <code>action: "close"</code>：真正关闭这个标签页。
+                只在确定不再需要该页面时使用。
+              </p>
+            </article>
+          </div>
+
+          <ul class="plain">
+            <li>点工具栏图标也能释放：对已接管的标签来说，点击等于「取消控制」，不会关页面。</li>
+            <li>
+              Pi 会话结束时，runtime 只会释放这个会话的 worker，<strong>不会</strong>删除你的组和标签，
+              也<strong>不会</strong>停止共享的 runtime。
+            </li>
+            <li>runtime 本身不会自己重新打开任何标签。</li>
+            <li>
+              推荐：任务结束后，把不再需要的标签 <code>release</code> 掉。这样即使后续沟通出错，
+              agent 也不会顺手操作一个你以为已经交出去的页面。
+            </li>
+          </ul>
+        </section>
+
+        <section id="troubleshooting" aria-labelledby="troubleshooting-title">
+          <h2 id="troubleshooting-title">排查</h2>
+
+          <section id="troubleshoot-runtime" aria-labelledby="troubleshoot-runtime-title">
+            <h3 id="troubleshoot-runtime-title">runtime 没运行 / 提示不可达</h3>
+            <ul class="plain">
+              <li>
+                先在 Pi 里跑 <code>/browser-status</code>。它是只读检查，会告诉你 runtime 是否可达、协议版本、
+                以及有几个 profile、其中几个已连接——不会创建任何资源。
+              </li>
+              <li>默认地址是 <code>127.0.0.1:19989</code>。地址不对时检查 <code>PI_BROWSER_HOST</code> / <code>PI_BROWSER_PORT</code>。</li>
+              <li>
+                第一次工具调用会自动启动配对 runtime。如果端口上已经有别的进程在监听、但它不是本产品的托管
+                runtime，Pi 会直接报错并说明「refusing to replace it」，<strong>不会</strong>覆盖或替换它。
+                请先确认那个进程是什么，再决定是否换端口。
+              </li>
+              <li>
+                手动启动路径是 <code>node playwriter/bin-runtime.js</code>（在源码检出目录里）。
+                也可以用 <code>PI_BROWSER_RUNTIME_PATH</code> 指定 runtime 入口。
+              </li>
+              <li>runtime 需要认证时设置 <code>PI_BROWSER_TOKEN</code>；token 不对会直接被拒绝。</li>
+            </ul>
+          </section>
+
+          <section id="troubleshoot-profile" aria-labelledby="troubleshoot-profile-title">
+            <h3 id="troubleshoot-profile-title">profile 未连接</h3>
+            <ul class="plain">
+              <li>确认 Chrome 正在运行，并且扩展在 <code>chrome://extensions</code> 里是启用状态（不是被禁用或移除）。</li>
+              <li>确认扩展目录还在原来的位置、没有被移动或删除。</li>
+              <li>确认 runtime 可达：runtime 没起来时，扩展无法建立连接。</li>
+              <li>
+                如果同一身份装了两份构建，会出现 <code>extension-replaced</code> 状态——同一时间只允许一份接管。
+                把多余的移除或禁用，再点一次图标重连。
+              </li>
+              <li>
+                <code>browser_profiles</code> 里只有 <code>connected</code> 的 profile 才能用来建组建标签；
+                没有可用的 Chrome profile 时，先解决上面几条，再看
+                <a href="#troubleshoot-runtime">runtime 不可达</a>。
+              </li>
+            </ul>
+          </section>
+
+          <section id="troubleshoot-attach" aria-labelledby="troubleshoot-attach-title">
+            <h3 id="troubleshoot-attach-title">无法接管某个标签</h3>
+            <ul class="plain">
+              <li>
+                受保护页面不能接管：<code>chrome://</code> 开头的页面、<code>devtools://</code>、
+                <code>edge://</code>、Chrome 应用商店（<code>chrome.google.com</code> /
+                <code>chromewebstore.google.com</code>）以及其它扩展的页面。换成普通 http/https 页面再试。
+              </li>
+              <li>已经被另一个 Pi 会话接管的标签会被拒绝；一次只接管你明确指定的那一个标签。</li>
+              <li>
+                discover 的结果可能被分页：回复里会给出 <code>total</code> / <code>returned</code> /
+                <code>nextOffset</code> / <code>truncated</code>。找不到你的标签时，按 <code>nextOffset</code>
+                继续往下读，而不是假定它不存在。
+              </li>
+              <li>新窗口打开的标签会关联到来源标签，用 <code>browser_tabs</code> 的 <code>sourceTabId</code> 去找，而不是靠网址或「最后一个标签」。</li>
+            </ul>
+          </section>
+
+          <section id="troubleshoot-limits" aria-labelledby="troubleshoot-limits-title">
+            <h3 id="troubleshoot-limits-title">能力与行为上的限制</h3>
+            <ul class="plain">
+              <li>
+                CSS / role 选择器是严格匹配：命中 0 个或多个都算错误，不会有自动的 <code>.first()</code> 回退。
+                要精确元素就用 snapshot 的引用。
+              </li>
+              <li><code>browser_snapshot</code> 的引用只在产生它的那次 snapshot 内有效，页面变化后必须重新 snapshot。</li>
+              <li><code>browser_evaluate</code> 里的代码必须显式 <code>return</code>，只写表达式会返回 undefined。</li>
+              <li>
+                取消或超时不会重放。结果里 <code>outcome</code> 为 <code>unknown</code> 时，说明动作可能已经部分发生——
+                先 snapshot 观察，不要重复点击。
+              </li>
+              <li><code>browser_execute</code> 在隔离沙箱里跑，每次调用相互独立，<code>page</code> / locator 句柄不能跨调用复用。</li>
+              <li>
+                <code>browser_execute</code> 里不要调用 <code>browser.close()</code> / <code>context.close()</code>；
+                关标签用 <code>browser_tabs</code>。Chrome 上 <code>mouse</code> / <code>touchscreen</code> 也不可用。
+              </li>
+              <li>没有导出 PDF 的工具（它在有界面的扩展会话里一直失败，已被移除）。</li>
+              <li>截图是可选的补充，读取页面内容用 <code>browser_snapshot</code> 更省也更准。</li>
+            </ul>
+          </section>
+
+          <section id="troubleshoot-privacy" aria-labelledby="troubleshoot-privacy-title">
+            <h3 id="troubleshoot-privacy-title">隐私</h3>
+            <p>
+              浏览器不会离开你的电脑：扩展通过本机调试协议与本机 runtime 通信，没有云端浏览器，数据目录也在本机。
+              但 agent 操作的是你真实的登录态页面，请只接管你愿意让它读取的标签。
+            </p>
+          </section>
+        </section>
+      </main>
+
+      <footer class="page-footer">
+        <p>
+          Pi Browser Use 是 <a href="https://github.com/remorses/playwriter" target="_blank" rel="noopener noreferrer">remorses/playwriter</a>
+          的维护 fork，保留 MIT 许可与上游署名。本页是扩展内的本地页面，离线可用，不加载外部脚本、字体或 CDN。
+        </p>
+        <p>
+          仓库与 Release：
+          <a href="https://github.com/tom-cat-mao/pi-browseruse-playwriter" target="_blank" rel="noopener noreferrer">tom-cat-mao/pi-browseruse-playwriter</a>
+        </p>
+      </footer>
+    </div>
+
+    <script type="module" src="./chrome-tutorial.ts"></script>
   </body>
 </html>

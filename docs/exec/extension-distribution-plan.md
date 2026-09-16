@@ -30,16 +30,25 @@ prompt: |
 
 3. `.github/workflows/extension-release.yml` 自动检出该 tag、构建并校验 ZIP，
    发布同名 Release，附版本 ZIP 与 `.sha256`。不触发 Chrome 商店或 npm 发布。
-4. 本地仅创建 tag 不触发；其他前缀的 tag 不触发；现有 tag 不会因 workflow
+   该 workflow 只跑 `pnpm package:extension`，**自动上传的只有 Chrome ZIP**；
+   它不含 `pnpm package:firefox`，因此 Firefox ZIP 与未签名 XPI 不会随 tag 自动
+   产出。需要 Firefox 归档时，在同一 tag 上手动 `pnpm package:firefox`，再把
+   `dist-release/pi-browser-use-firefox-extension-<版本>.zip`、`-unsigned.xpi`
+   及各自的 `.sha256` 补传到同一个 Release。
+4. 现有 Release 就体现了这一分工：`extension@0.0.138` 上既有自动上传的 Chrome
+   `pi-browser-use-extension-0.0.138.zip(.sha256)`，也有手动补传的 Firefox
+   `pi-browser-use-firefox-extension-0.0.138.zip(.sha256)` 与
+   `pi-browser-use-firefox-extension-0.0.138-unsigned.xpi(.sha256)`。
+5. 本地仅创建 tag 不触发；其他前缀的 tag 不触发；现有 tag 不会因 workflow
    合并而补跑。版本或 tag 所指提交不匹配时停止，避免打包错版本。
-5. Actions 重跑会更新该 Release 的同名附件，不重复创建 Release；同 tag
+6. Actions 重跑会更新该 Release 的同名附件，不重复创建 Release；同 tag
    串行执行。手工 dispatch 填写 ref/tag 时仍默认 Draft，便于提前检查。
 
 本地验证命令仍为 `pnpm --filter @tom-cat/pi-browser-runtime build` 后
 `pnpm package:extension`，产物位于 `dist-release/`。
 
-ZIP 必须把 `manifest.json` 放在根目录；扩展运行时 JavaScript、图标和 Prism
-资源全部随 ZIP 提供，不依赖远程脚本。
+ZIP 必须把 `manifest.json` 放在根目录；扩展运行时 JavaScript、页面、样式与图标
+全部随 ZIP 提供，不依赖远程脚本或 CDN。
 
 ## Chrome Web Store checklist
 

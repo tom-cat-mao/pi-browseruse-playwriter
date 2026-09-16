@@ -3,12 +3,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import url from 'node:url'
 import zlib from 'node:zlib'
+import { assertFirefoxCsp } from './firefox-csp.mjs'
 
 const repoRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..')
-const sourceDir = path.join(repoRoot, 'playwriter', 'dist', 'extension')
+const firefoxBuild = process.argv.includes('--firefox')
+const bundleName = firefoxBuild ? 'extension-firefox' : 'extension'
+const sourceDir = path.join(repoRoot, 'playwriter', 'dist', bundleName)
 const outputDir = path.join(repoRoot, 'dist-release')
 const tempDir = path.join(repoRoot, 'tmp')
 const forkExtensionId = 'eeklahpecooapnailfaebkjjembkjhhg'
+const firefoxExtensionId = 'pi-browser-use@tom-cat-mao.github.io'
 
 const crcTable = Uint32Array.from(
   Array.from({ length: 256 }, (_value, index) => {
@@ -83,11 +87,93 @@ function localReferencePath({ fileName, reference }) {
   return path.posix.normalize(path.posix.join(path.posix.dirname(fileName), cleanReference))
 }
 
-function htmlScriptReferences({ bundleDir, fileName }) {
+function htmlLocalReferences({ bundleDir, fileName }) {
   const html = fs.readFileSync(path.join(bundleDir, ...fileName.split('/')), 'utf8')
-  return Array.from(html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)).map((match) => {
-    return match[1]
+  const patterns = [
+    /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi,
+    /<link\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi,
+    /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi,
+    /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi,
+  ]
+  return patterns.flatMap((pattern) => {
+    return Array.from(html.matchAll(pattern)).map((match) => {
+      return match[1]
+    })
   })
+}
+
+function singleEntry({ field, value }) {
+  return value === undefined ? [] : [[field, value]]
+}
+
+function listEntries({ field, value }) {
+  if (value === undefined) {
+    return []
+  }
+  if (!Array.isArray(value)) {
+    return [[field, value]]
+  }
+  return value.map((reference, index) => {
+    return [`${field}[${String(index)}]`, reference]
+  })
+}
+
+function mapEntries({ field, value }) {
+  if (value === undefined) {
+    return []
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return [[field, value]]
+  }
+  return Object.entries(value).map(([key, reference]) => {
+    return [`${field}.${key}`, reference]
+  })
+}
+
+function manifestEntryReferences(manifest) {
+  return [
+    ...singleEntry({ field: 'background.service_worker', value: manifest.background?.service_worker }),
+    ...listEntries({ field: 'background.scripts', value: manifest.background?.scripts }),
+    ...singleEntry({ field: 'action.default_popup', value: manifest.action?.default_popup }),
+    ...singleEntry({ field: 'browser_action.default_popup', value: manifest.browser_action?.default_popup }),
+    ...singleEntry({ field: 'options_ui.page', value: manifest.options_ui?.page }),
+    ...singleEntry({ field: 'options_page', value: manifest.options_page }),
+    ...mapEntries({ field: 'icons', value: manifest.icons }),
+    ...mapEntries({ field: 'action.default_icon', value: manifest.action?.default_icon }),
+    ...mapEntries({ field: 'browser_action.default_icon', value: manifest.browser_action?.default_icon }),
+  ]
+}
+
+function assertOptionsUiShape(manifest) {
+  const optionsUi = manifest.options_ui
+  if (optionsUi === undefined) {
+    return
+  }
+  if (typeof optionsUi !== 'object' || optionsUi === null || Array.isArray(optionsUi)) {
+    throw new Error('manifest.json options_ui must be an object with a page')
+  }
+  if (optionsUi.page === undefined) {
+    throw new Error('manifest.json options_ui must declare a page')
+  }
+}
+
+function assertManifestEntriesExist({ files, manifest }) {
+  assertOptionsUiShape(manifest)
+  for (const [field, reference] of manifestEntryReferences(manifest)) {
+    if (typeof reference !== 'string' || reference.length === 0) {
+      throw new Error(`manifest.json ${field} must be a non-empty string`)
+    }
+    const relativePath = localReferencePath({ fileName: 'manifest.json', reference })
+    if (!relativePath) {
+      throw new Error(`manifest.json ${field} must be a packaged local file, got ${reference}`)
+    }
+    if (relativePath === '..' || relativePath.startsWith('../')) {
+      throw new Error(`manifest.json ${field} points outside the package: ${reference}`)
+    }
+    if (!files.includes(relativePath)) {
+      throw new Error(`manifest.json ${field} references missing packaged file ${relativePath}`)
+    }
+  }
 }
 
 function assertReferencesExist({ files, references, sourceName }) {
@@ -100,7 +186,7 @@ function assertReferencesExist({ files, references, sourceName }) {
   })
 }
 
-function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
+function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId, firefox = firefoxBuild }) {
   const files = collectFiles(bundleDir)
   const forbiddenPath =
     /(?:^|\/)(?:node_modules|test|tests|test-fixtures|private)(?:\/|$)|(?:^|\/)\.env(?:$|\.)|\.(?:map|pem)$/i
@@ -116,20 +202,58 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
   if (typeof manifest.version !== 'string' || manifest.version.length === 0) {
     throw new Error('Built extension manifest has no version')
   }
-  if (typeof manifest.key !== 'string' || manifest.key.length === 0) {
+  if (firefox) {
+    assertFirefoxCsp(manifest)
+    if (manifest.manifest_version !== 3 || manifest.browser_specific_settings?.gecko?.id !== firefoxExtensionId) {
+      throw new Error('Firefox package must contain the ordinary MV3 manifest and its stable Gecko identity')
+    }
+    if (
+      manifest.key !== undefined ||
+      manifest.background?.service_worker !== undefined ||
+      !Array.isArray(manifest.background?.scripts) ||
+      manifest.background.scripts.length !== 1 ||
+      manifest.background.scripts[0] !== 'firefox-background.js' ||
+      manifest.permissions?.includes('debugger')
+    ) {
+      throw new Error('Firefox package contains a Chrome background, debugger permission, or Chrome identity')
+    }
+    if (!files.includes('firefox-dom.js') || !files.includes('firefox-popup.js')) {
+      throw new Error('Firefox package is missing its bundled DOM content script or permission popup')
+    }
+    if (
+      !manifest.permissions?.includes('scripting') ||
+      !manifest.optional_permissions?.includes('userScripts') ||
+      manifest.permissions?.includes('userScripts') ||
+      /unsafe-eval/.test(JSON.stringify(manifest.content_security_policy))
+    ) {
+      throw new Error('Firefox package must use static scripting and optional userScripts without unsafe-eval')
+    }
+  } else if (typeof manifest.key !== 'string' || manifest.key.length === 0) {
     throw new Error('Fork release package must contain its stable development manifest key')
   }
-  const extensionId = extensionIdFromKey(manifest.key)
-  if (extensionId !== expectedExtensionId) {
-    throw new Error(`Expected extension ID ${expectedExtensionId}, got ${extensionId}`)
+  if (!firefox) {
+    const extensionId = extensionIdFromKey(manifest.key)
+    if (extensionId !== expectedExtensionId) {
+      throw new Error(`Expected extension ID ${expectedExtensionId}, got ${extensionId}`)
+    }
   }
 
-  const backgroundPath = 'background.js'
+  const backgroundPath = firefox ? 'firefox-background.js' : 'background.js'
   if (!files.includes(backgroundPath)) {
-    throw new Error('Built extension is missing background.js')
+    throw new Error(`Built extension is missing ${backgroundPath}`)
   }
   const background = fs.readFileSync(path.join(bundleDir, backgroundPath), 'utf8')
-  if (!/\b(?:var|let|const)\s+RELAY_PORT\s*=\s*19989\s*;/.test(background)) {
+  if (firefox) {
+    const configuration = JSON.parse(fs.readFileSync(path.join(bundleDir, 'firefox-build.json'), 'utf8'))
+    if (
+      !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(configuration.host) ||
+      !Number.isInteger(configuration.port) || configuration.port < 1 || configuration.port > 65535 ||
+      !background.includes(String(configuration.port)) ||
+      /process\.env\.PI_BROWSER_(?:HOST|PORT)/.test(background)
+    ) {
+      throw new Error('Firefox package does not contain a compiled, valid loopback runtime configuration')
+    }
+  } else if (!/\b(?:var|let|const)\s+RELAY_PORT\s*=\s*19989\s*;/.test(background)) {
     throw new Error('Built extension does not target the managed runtime port 19989')
   }
   const builtText = files
@@ -140,26 +264,17 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
       return fs.readFileSync(path.join(bundleDir, ...fileName.split('/')), 'utf8')
     })
     .join('\n')
-  if (/\b(?:19987|19991)\b|PLAYWRITER_PORT=|TESTING=1/i.test(builtText)) {
+  if ((!firefox && /\b(?:19987|19991)\b/.test(builtText)) || /PLAYWRITER_PORT=|TESTING=1/i.test(builtText)) {
     throw new Error('Development environment marker found in extension package')
   }
 
-  const manifestReferences = [
-    manifest.background?.service_worker,
-    ...Object.values(manifest.icons || {}),
-    ...Object.values(manifest.action?.default_icon || {}),
-  ].filter((reference) => {
-    return typeof reference === 'string'
-  })
-  if (!assertReferencesExist({ files, references: manifestReferences, sourceName: 'manifest.json' })) {
-    throw new Error('Unable to validate manifest references')
-  }
+  assertManifestEntriesExist({ files, manifest })
 
   const htmlFiles = files.filter((fileName) => {
     return fileName.endsWith('.html')
   })
   const htmlReferences = htmlFiles.flatMap((fileName) => {
-    return htmlScriptReferences({ bundleDir, fileName }).map((reference) => {
+    return htmlLocalReferences({ bundleDir, fileName }).map((reference) => {
       return { fileName, reference }
     })
   })
@@ -173,10 +288,6 @@ function validateBundle({ bundleDir, expectedExtensionId = forkExtensionId }) {
     })
   ) {
     throw new Error('Unable to validate HTML references')
-  }
-
-  if (!files.includes('src/prism.min.js') || !files.includes('src/prism-bash.min.js')) {
-    throw new Error('Built extension is missing offline Prism assets')
   }
 
   return { files, manifest }
@@ -332,7 +443,7 @@ function verifyArchive({ zipPath, checksumPath, expectedExtensionId, expectedVer
 
 function main() {
   if (!fs.existsSync(sourceDir)) {
-    throw new Error('Missing playwriter/dist/extension; build the runtime package before packaging the extension')
+    throw new Error(`Missing playwriter/dist/${bundleName}; build the runtime package before packaging the extension`)
   }
 
   fs.mkdirSync(tempDir, { recursive: true })
@@ -347,7 +458,7 @@ function main() {
         `Built extension ${version} is stale; rebuild extension ${sourceManifest.version} before packaging`,
       )
     }
-    const zipName = `pi-browser-use-extension-${version}.zip`
+    const zipName = `pi-browser-use-${firefoxBuild ? 'firefox-' : ''}extension-${version}.zip`
     const zipPath = path.join(outputDir, zipName)
     const checksumPath = `${zipPath}.sha256`
 
@@ -365,14 +476,32 @@ function main() {
     console.log(`Created ${zipPath}`)
     console.log(`Created ${checksumPath}`)
     console.log(`SHA256 ${digest}`)
+    if (firefoxBuild) {
+      const xpiPath = zipPath.replace(/\.zip$/, '-unsigned.xpi')
+      const xpiChecksumPath = `${xpiPath}.sha256`
+      fs.copyFileSync(zipPath, xpiPath)
+      fs.writeFileSync(xpiChecksumPath, `${digest}  ${path.basename(xpiPath)}\n`)
+      verifyArchive({
+        zipPath: xpiPath,
+        checksumPath: xpiChecksumPath,
+        expectedVersion: version,
+      })
+      console.log(`Created ${xpiPath}`)
+      console.log(`Created ${xpiChecksumPath}`)
+      console.log('Firefox ZIP/XPI are unsigned development artifacts; permanent installation requires AMO signing.')
+    }
   } finally {
     fs.rmSync(stagingDir, { recursive: true, force: true })
   }
 }
 
-try {
-  main()
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error))
-  process.exitCode = 1
+export { manifestEntryReferences, validateBundle }
+
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === url.fileURLToPath(import.meta.url)) {
+  try {
+    main()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+  }
 }

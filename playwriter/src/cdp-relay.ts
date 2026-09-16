@@ -30,6 +30,7 @@ Buffer.prototype[util.inspect.custom] = function () {
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { VERSION, ALLOWED_EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
 import { createCdpLogger, type CdpLogEntry, type CdpLogger } from './cdp-log.js'
@@ -153,6 +154,7 @@ export async function startPlayWriterCDPRelayServer({
 } = {}): Promise<RelayServer> {
   const emitter = new EventEmitter()
   const store = relayState.createRelayStore()
+  const firefoxConnections = new Set<string>()
   const extensionDownloadBehavior = new Map<string, Protocol.Browser.SetDownloadBehaviorRequest>()
 
   const resolvedCdpLogger = cdpLogger || createCdpLogger()
@@ -161,7 +163,10 @@ export async function startPlayWriterCDPRelayServer({
   }
 
   const getDefaultExtensionId = (): string | null => {
-    return store.getState().extensions.keys().next().value || null
+    for (const id of store.getState().extensions.keys()) {
+      if (!firefoxConnections.has(id)) return id
+    }
+    return null
   }
 
   /**
@@ -199,8 +204,11 @@ export async function startPlayWriterCDPRelayServer({
       return null
     }
 
-    // Single extension — use it directly
-    if (extensions.size === 1) {
+    const cdpExtensions = Array.from(extensions.values()).filter((extension) => {
+      return !firefoxConnections.has(extension.id)
+    })
+    // Firefox profiles are available through the managed API only.
+    if (cdpExtensions.length === 1) {
       const fallbackId = getDefaultExtensionId()
       if (fallbackId) {
         const ext = extensions.get(fallbackId)
@@ -213,8 +221,8 @@ export async function startPlayWriterCDPRelayServer({
     // Multiple extensions — auto-select if exactly one has active targets.
     // This handles the common case of multiple Chrome profiles with the extension
     // installed, where only one profile has playwriter-enabled tabs. (#52)
-    if (extensions.size > 1) {
-      const activeExtensions = Array.from(extensions.values()).filter((ext) => {
+    if (cdpExtensions.length > 1) {
+      const activeExtensions = cdpExtensions.filter((ext) => {
         return ext.connectedTargets.size > 0
       })
       if (activeExtensions.length === 1 && activeExtensions[0].ws) {
@@ -628,6 +636,31 @@ export async function startPlayWriterCDPRelayServer({
           )
         }
       },
+      sendBrowserDomRequest: async ({ profileId, stableKey, connectionId, request, timeoutMs }) => {
+        const conn = getExtensionConnection(stableKey)
+        if (!conn || conn.id !== connectionId || conn.stableKey !== stableKey) {
+          throw new ManagedTransportError({
+            code: 'profile-disconnected',
+            message: `Firefox connection for profile ${profileId} changed before DOM dispatch`,
+            outcome: 'not-started',
+          })
+        }
+        try {
+          return await sendToExtension({
+            extensionId: connectionId,
+            method: 'browserDomRequest',
+            params: request,
+            timeout: timeoutMs,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new ManagedTransportError({
+            code: message.includes('timeout') ? 'timeout' : 'profile-disconnected',
+            message: `browserDomRequest failed: ${message}`,
+            outcome: message.includes('not connected') || message.includes('send failed') ? 'not-started' : 'unknown',
+          }, { cause: error })
+        }
+      },
       sendCdpCommand: async ({ profileId, stableKey, connectionId, sessionId, method, params, timeoutMs }) => {
         const conn = getExtensionConnection(stableKey)
         if (!conn || conn.id !== connectionId || conn.stableKey !== stableKey) {
@@ -1002,6 +1035,9 @@ export async function startPlayWriterCDPRelayServer({
     managedScope?: ManagedConnectionScope | null
   }) {
     const conn = getExtensionConnection(extensionId)
+    if (conn && firefoxConnections.has(conn.id)) {
+      throw new Error('Firefox WebExtension profiles do not expose CDP; use the managed browser tools')
+    }
     const connectedTargets = conn?.connectedTargets || new Map<string, relayState.ConnectedTarget>()
     const resolvedExtensionId = conn?.id || extensionId
     const managedView = managedScope ? resolveManagedScopeView(managedScope) : null
@@ -1245,6 +1281,8 @@ export async function startPlayWriterCDPRelayServer({
   }
 
   const app = new Hono()
+  const firefoxTickets = new Map<string, { origin: string; installId: string; expiresAt: number }>()
+  const firefoxOriginPattern = /^moz-extension:\/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
   // Global error handler — ensures server errors are logged, not silently swallowed
   app.onError((err, c) => {
@@ -1259,7 +1297,10 @@ export async function startPlayWriterCDPRelayServer({
   app.use(
     '*',
     cors({
-      origin: (origin) => {
+      origin: (origin, c) => {
+        if (c.req.path === '/extension/firefox-handshake' && firefoxOriginPattern.test(origin)) {
+          return origin
+        }
         if (!origin.startsWith('chrome-extension://')) {
           return null
         }
@@ -1365,6 +1406,56 @@ export async function startPlayWriterCDPRelayServer({
   })
 
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app })
+
+  app.post(
+    '/extension/firefox-handshake',
+    requireTokenWhenConfigured,
+    bodyLimit({ maxSize: 4096 }),
+    async (c) => {
+      const address = getConnInfo(c).remote.address
+      const origin = c.req.header('origin') ?? ''
+      const hostname = parseHostname(c.req.header('host'))
+      if ((address !== '127.0.0.1' && address !== '::1') || !hostname || !ALLOWED_HOSTS.has(hostname)) {
+        return c.text('Forbidden - Firefox handshake must be local', 403)
+      }
+      if (!firefoxOriginPattern.test(origin)) {
+        return c.text('Forbidden - Firefox extension origin required', 403)
+      }
+      if (c.req.header('content-type')?.split(';')[0].trim() !== 'application/json') {
+        return c.text('Content-Type must be application/json', 415)
+      }
+      let body: unknown
+      try {
+        body = await c.req.json()
+      } catch {
+        return c.text('Invalid JSON', 400)
+      }
+      if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+        return c.text('installId required', 400)
+      }
+      const record = body as Record<string, unknown>
+      if (Object.keys(record).length !== 1 || typeof record.installId !== 'string' ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(record.installId)) {
+        return c.text('Invalid installId', 400)
+      }
+      const now = Date.now()
+      for (const [ticket, binding] of firefoxTickets) {
+        if (binding.expiresAt <= now || binding.origin === origin) {
+          firefoxTickets.delete(ticket)
+        }
+      }
+      if (firefoxTickets.size >= 128) {
+        return c.text('Too many pending Firefox handshakes', 429)
+      }
+      // Firefox assigns a random origin UUID per installation. This authenticates
+      // a local extension context, not an AMO signature or a fixed add-on id.
+      const ticket = crypto.randomBytes(32).toString('base64url')
+      const expiresAt = now + 30_000
+      firefoxTickets.set(ticket, { origin, installId: record.installId, expiresAt })
+      c.header('Cache-Control', 'no-store')
+      return c.json({ ticket, expiresAt })
+    },
+  )
 
   const getCdpWsUrl = (c: { req: { header: (name: string) => string | undefined } }) => {
     const hostHeader = c.req.header('host') || `${host}:${port}`
@@ -1920,6 +2011,20 @@ export async function startPlayWriterCDPRelayServer({
       // Browsers cannot spoof the Origin header, so this ensures the connection
       // is coming from our specific Chrome Extension, not a malicious website.
       const origin = c.req.header('origin')
+      if (origin && firefoxOriginPattern.test(origin)) {
+        const hostname = parseHostname(c.req.header('host'))
+        const ticket = c.req.query('ticket') ?? ''
+        const binding = firefoxTickets.get(ticket)
+        if (binding) {
+          firefoxTickets.delete(ticket)
+        }
+        if (!hostname || !ALLOWED_HOSTS.has(hostname) || c.req.query('backend') !== 'webextension' ||
+          !binding || binding.expiresAt <= Date.now() || binding.origin !== origin ||
+          binding.installId !== c.req.query('installId')) {
+          return c.text('Forbidden - Invalid Firefox handshake', 403)
+        }
+        return next()
+      }
       if (!origin || !origin.startsWith('chrome-extension://')) {
         logger?.log(
           pc.red(`Rejecting /extension WebSocket: origin must be chrome-extension://, got: ${origin || 'none'}`),
@@ -1936,10 +2041,17 @@ export async function startPlayWriterCDPRelayServer({
       return next()
     },
     upgradeWebSocket((c) => {
-      const incomingExtensionInfo = getExtensionInfoFromRequest(c)
+      const firefoxConnection = firefoxOriginPattern.test(c.req.header('origin') ?? '')
+      const incomingExtensionInfo = {
+        ...getExtensionInfoFromRequest(c),
+        ...(firefoxConnection ? { browser: 'Firefox' } : {}),
+      }
       const connectionId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       return {
         onOpen(_event, ws) {
+          if (firefoxConnection) {
+            firefoxConnections.add(connectionId)
+          }
           const stableKey = relayState.buildStableExtensionKey(incomingExtensionInfo, connectionId)
 
           // Check for existing connection with same stableKey and close it
@@ -2064,6 +2176,10 @@ export async function startPlayWriterCDPRelayServer({
                 logger?.log(pc.yellow(`[managed-relay] ignoring invalid browserInventory: ${inventoryMessage.message}`))
                 return
               }
+              if ((inventoryMessage.inventory.backend === 'webextension') !== firefoxConnection) {
+                ws.close(1008, 'Inventory backend does not match extension connection')
+                return
+              }
               const result = managedRelay.handleInventory({
                 connectionId,
                 info: {
@@ -2075,11 +2191,13 @@ export async function startPlayWriterCDPRelayServer({
                 inventory: inventoryMessage.inventory,
               })
               if (result.accepted) {
-                announceManagedTargetsForInventory({
-                  connectionId,
-                  profileId: result.profile.profileId,
-                  browserEpoch: result.profile.browserEpoch,
-                })
+                if (!firefoxConnection) {
+                  announceManagedTargetsForInventory({
+                    connectionId,
+                    profileId: result.profile.profileId,
+                    browserEpoch: result.profile.browserEpoch,
+                  })
+                }
                 logger?.log(
                   pc.magenta(
                     `[managed-relay] inventory profile=${result.profile.profileId} revision=${result.profile.revision} groups=${result.profile.groups.size} tabs=${result.profile.tabs.size}`,
@@ -2090,6 +2208,10 @@ export async function startPlayWriterCDPRelayServer({
             }
 
             const extensionEvent = message
+
+            if (firefoxConnection) {
+              return
+            }
 
             if (extensionEvent.method !== 'forwardCDPEvent') {
               return
@@ -2365,6 +2487,7 @@ export async function startPlayWriterCDPRelayServer({
         },
 
         onClose(event) {
+          firefoxConnections.delete(connectionId)
           logger?.log(`Extension disconnected: code=${event.code} reason=${event.reason || 'none'} (${connectionId})`)
 
           // Cancel recordings BEFORE removing extension state (cancelRecording checks isExtensionConnected)

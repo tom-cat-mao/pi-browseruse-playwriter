@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Firefox 使用教程 · Pi Browser Use</title>
+    <link rel="stylesheet" href="firefox-tutorial.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到正文</a>
+    <div class="page">
+      <header class="page-header">
+        <p class="eyebrow">Pi Browser Use · Firefox</p>
+        <h1>Firefox 中文使用教程</h1>
+        <p class="lede">
+          用普通 Firefox 扩展接管你已经打开的标签，让 Pi 在本机操作真实页面和登录状态。本页覆盖安装、第一次任务、
+          结束控制和分层排查。
+        </p>
+        <div class="callout">
+          <p class="callout-title">这是一份离线文档，不做任何自动化</p>
+          <p>
+            本页不会代你执行工具、不会开启权限、不会接管或导航标签，也不显示连接状态。所有步骤都需要你在
+            Firefox 和 Pi 会话里自己触发；页面内的复制按钮只使用浏览器本地剪贴板。
+          </p>
+        </div>
+      </header>
+
+      <div class="layout">
+        <nav class="toc" aria-labelledby="toc-heading">
+          <h2 id="toc-heading">教程目录</h2>
+          <ol>
+            <li><a href="#quickstart">快速开始</a></li>
+            <li><a href="#install">安装</a></li>
+            <li><a href="#first-task">第一次使用</a></li>
+            <li><a href="#ending">结束控制</a></li>
+            <li><a href="#troubleshooting">排查</a></li>
+          </ol>
+        </nav>
+
+        <main class="content" id="main" tabindex="-1">
+          <section class="section" id="quickstart" aria-labelledby="quickstart-heading">
+            <h2 id="quickstart-heading">快速开始</h2>
+            <p>
+              Pi Browser Use 的 Firefox 后端是一个普通 WebExtension，通过本机 managed runtime 与 Pi 通信。
+              它接管你已经打开的标签和登录态：不启动新浏览器、没有云端浏览器，浏览器不离开本机。
+            </p>
+            <p>这里不需要的东西同样重要：</p>
+            <ul>
+              <li>不需要调试启动参数，Remote Agent、BiDi、Marionette、<code>--start-debugger</code> 都不是必需。</li>
+              <li>不需要关闭签名校验，也不要用这种方式安装未签名产物。</li>
+              <li>不会把页面搬到新窗口或新标签：接管是原地生效的。</li>
+            </ul>
+            <p>整体只有三步：</p>
+            <ol>
+              <li>装好 Pi 包和本地 runtime（见<a href="#install">安装</a>）。</li>
+              <li>在 Firefox 里临时加载扩展（见<a href="#install">安装</a>）。</li>
+              <li>在 Pi 里选择 Firefox profile，发现并接管你要用的标签（见<a href="#first-task">第一次使用</a>）。</li>
+            </ol>
+            <div class="callout">
+              <p class="callout-title">基础工具不需要额外权限</p>
+              <p>
+                标签管理、快照、点击、填写等基础 DOM 工具使用扩展内置的静态脚本，不需要可选权限。只有动态页面
+                JavaScript 需要 Firefox 153+ 和你在扩展弹出页主动授权的可选权限。
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="install" aria-labelledby="install-heading">
+            <h2 id="install-heading">安装</h2>
+            <p>Pi 包、local runtime 和 Firefox 扩展是三个独立部分，都要各自装好。</p>
+
+            <h3>1. 准备环境</h3>
+            <p>
+              Node.js 20+ 与 pnpm 10.18.1；从源码构建还需要 Bun。浏览器侧使用桌面版 Firefox 139+，
+              本教程只针对标准 Firefox，Firefox 衍生浏览器请单独验证。
+            </p>
+
+            <h3>2. 安装 Pi 包并构建 runtime</h3>
+            <pre><code>git clone --branch dev https://github.com/tom-cat-mao/pi-browseruse-playwriter.git
+cd pi-browseruse-playwriter
+pnpm bootstrap
+pnpm --filter @tom-cat/pi-browser-runtime build
+pi install ./pi</code></pre>
+            <p>
+              <code>pi install ./pi</code> 装的是 Pi 侧的工具包；runtime 是独立的本地服务，默认监听
+              <code>127.0.0.1:19989</code>。第一次调用浏览器工具时才会启动配对 runtime；如果该端口被别的进程占用，
+              会直接报错，不会顶替它。任何时候都可以用 Pi 命令 <code>/browser-status</code> 查看可达性、
+              capabilities 和已连接的 profile。
+            </p>
+
+            <h3>3. 取得 Firefox 扩展</h3>
+            <ul>
+              <li>GitHub Release 的 Firefox 归档提供 ZIP，以及文件名中明确标注<strong>未签名</strong>的 XPI。</li>
+              <li>
+                当前没有 AMO 上架，也没有 npm 发布。标准 Firefox 的永久安装需要 Mozilla 签名，所以未签名 XPI
+                不是正式安装包，也不要靠关闭签名校验来绕过这一限制。
+              </li>
+              <li>
+                从源码构建：<code>pnpm build:firefox</code>，产物在 <code>extension/dist-firefox/</code>。
+              </li>
+            </ul>
+
+            <h3>4. 临时加载扩展</h3>
+            <ol>
+              <li>在 Firefox 打开 <code>about:debugging#/runtime/this-firefox</code>。</li>
+              <li>点击「加载临时附加组件」。</li>
+              <li>
+                选择扩展所在目录里的 <code>manifest.json</code>：源码构建用
+                <code>extension/dist-firefox/manifest.json</code>，用 Release ZIP 时先解压，再选解压目录里的
+                <code>manifest.json</code>。
+              </li>
+            </ol>
+            <p>
+              临时扩展会在 Firefox 重启后卸载，需要重新加载；这不影响 Pi 包和 runtime 的安装。加载后，
+              Firefox 的附加组件管理页也会出现这个扩展的选项入口，指向本教程页。
+            </p>
+          </section>
+
+          <section class="section" id="first-task" aria-labelledby="first-task-heading">
+            <h2 id="first-task-heading">第一次使用</h2>
+            <p>
+              资源模型是显式的：profile → group → tab，一切按 ID 寻址，没有隐式的「当前页面」。
+              下面的顺序就是这个顺序。
+            </p>
+
+            <ol class="steps">
+              <li class="step">
+                <h3>打开你要操作的页面</h3>
+                <p>
+                  普通 <code>http</code> / <code>https</code> 网站都可以。浏览器保护的页面例如
+                  <code>about:</code>、扩展管理页和 Firefox 禁止脚本注入的站点无法控制。
+                </p>
+              </li>
+              <li class="step">
+                <h3>在 Pi 中调用 <code>browser_profiles</code></h3>
+                <p>
+                  选择一个处于 <code>connected</code> 状态的 Firefox profile，记下 <code>profileId</code>。
+                  同时读它的 capabilities：Firefox profile 会报告 <code>backend: webextension</code>、
+                  <code>inputMode: dom</code>、<code>snapshotMode: dom-aria</code>、
+                  <code>executeMode: dom-compatible</code>、<code>evaluateWorld: isolated</code> 以及具体限制。
+                </p>
+              </li>
+              <li class="step">
+                <h3>用 <code>browser_tabs</code> 的 <code>discover</code> 找到目标标签</h3>
+                <p>
+                  它列出真实已打开标签的元数据（标题、URL、窗口、是否为活动标签），可用 <code>query</code> 过滤。
+                  请按标题/URL/窗口挑选，不要按列表顺序猜；结果按活动标签优先排序且分页，返回
+                  <code>truncated=true</code> 时用 <code>nextOffset</code> 继续读完。
+                </p>
+              </li>
+              <li class="step">
+                <h3>用 <code>attach</code> 原地接管</h3>
+                <p>
+                  传入上一步的 <code>candidateId</code>，拿到逻辑 <code>tabId</code>。接管不刷新页面、不搬窗口、
+                  不改变原生标签组，滚动位置和表单内容都会保留。之后所有页面工具都用这个 <code>tabId</code>。
+                </p>
+              </li>
+              <li class="step">
+                <h3>用 <code>browser_snapshot</code> 读取页面</h3>
+                <p>
+                  返回 <code>snapshotId</code> 和 <code>aria-ref=eN</code> 形式的 ref。默认输出是可读树
+                  （文本、标题、控件），页面大时用 <code>search</code> 或只匹配一个元素的严格
+                  <code>selector</code> 收窄。
+                </p>
+              </li>
+              <li class="step">
+                <h3>用 <code>browser_click</code> / <code>browser_fill</code> 操作</h3>
+                <p>
+                  用 ref 时必须带上产生它的 <code>snapshotId</code>（<code>@eN</code> 简写同样有效）。
+                  普通 CSS/role selector 严格匹配：零个或多个匹配都会报错，不会静默取第一个。
+                </p>
+              </li>
+              <li class="step">
+                <h3>每次动作后重新观察</h3>
+                <p>
+                  再取一次 snapshot 或用 evaluate 验证结果。任何 evaluate/execute 之后旧 ref 都会保守失效，
+                  需要重新 snapshot，而不是重复点击同一个元素。
+                </p>
+              </li>
+            </ol>
+
+            <p>
+              需要新标签时，先用 <code>browser_groups</code> 的 <code>create</code>（<code>name</code> +
+              <code>profileId</code>）建一个本会话的具名 group，再用 <code>browser_tabs</code> 的
+              <code>create</code>（<code>groupId</code> + <code>url</code>）打开标签。接管你已有的标签不需要先建组。
+            </p>
+
+            <h3>一个完整的首次任务例子</h3>
+            <p>你可以在 Pi 里直接这样描述任务：</p>
+            <pre><code>用 Firefox 接管我当前打开的 https://example.com 标签：
+读出页面标题，把 "Pi Browser Use" 填进页面上的搜索输入框，
+然后截图确认输入结果。结束后释放这个标签，保留页面。</code></pre>
+            <p>对应到工具，大致是这样一串显式步骤：</p>
+            <pre><code>1. browser_profiles                        取 connected 的 Firefox profile
+2. browser_tabs   discover (query: example) 得到 candidateId
+3. browser_tabs   attach (candidateId)      得到 tabId
+4. browser_snapshot (tabId)                 得到 snapshotId 与 ref
+5. browser_fill  (ref + snapshotId, 文本)   填写输入框
+6. browser_screenshot (tabId)               确认结果
+7. browser_tabs  release (tabId)            放手并保留页面</code></pre>
+            <div class="callout is-warn">
+              <p class="callout-title">这里的代码块只是步骤示例</p>
+              <p>
+                本页不代你执行，也不会显示伪造的执行结果；真实返回值以你的 Pi 会话为准。如果 ref 找不到或报
+                <code>stale-snapshot</code>，先重新 snapshot，不要重复动作。
+              </p>
+            </div>
+
+            <h3>基础能力与可选能力</h3>
+            <div class="table-scroll">
+              <table>
+                <caption>Firefox 后端下各类能力的使用条件</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">能力</th>
+                    <th scope="col">使用条件</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>标签管理、快照、点击、填写、截图、日志、网络</td>
+                    <td>只要普通扩展能力，不需要额外权限</td>
+                  </tr>
+                  <tr>
+                    <td>动态页面 JavaScript（<code>browser_evaluate</code>，以及 execute 中的 evaluate）</td>
+                    <td>
+                      Firefox 153+，并且你在扩展弹出页启用了页面 JavaScript（可选 <code>userScripts</code> 权限）
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>可选：页面 JavaScript</h3>
+            <ul>
+              <li>
+                启用方式：点扩展图标，点「启用页面 JavaScript」，然后在 Firefox 的正常权限请求里确认。
+                这是扩展自己的可选功能，不是开启远程调试。
+              </li>
+              <li>
+                未启用或 Firefox 版本过低时，evaluate 返回 <code>unsupported-capability</code>，
+                其它工具继续可用；权限变化后重新调用 <code>browser_profiles</code> 查看实际能力。
+              </li>
+              <li>
+                evaluate 运行在独立的用户脚本世界：可以读写 DOM，但页面自定义的全局变量和框架内部对象不一定可见；
+                代码必须显式 <code>return</code>，返回值需要是 JSON 可序列化内容。扩展不会用 MAIN world 注入或
+                放宽 CSP 来绕过这个边界。
+              </li>
+              <li>
+                输入的真实边界：DOM 合成的 <code>isTrusted=false</code>，依赖真实键盘/指针、系统选择器或浏览器
+                内置交互的页面可能拒绝动作；不要用伪造信任或扩大权限的方式掩盖失败。
+              </li>
+            </ul>
+          </section>
+
+          <section class="section" id="ending" aria-labelledby="ending-heading">
+            <h2 id="ending-heading">结束控制</h2>
+            <ul>
+              <li>
+                <strong>release</strong>：放手但保留页面。Pi 不再控制它，之后重连也不会把它拉回这个会话。
+              </li>
+              <li><strong>close</strong>：关闭标签，用它来真正结束一个不再需要的页面。</li>
+              <li>
+                <strong>解除整组控制</strong>：用对应工具关闭、释放标签，或直接停掉 Pi 会话。
+              </li>
+              <li>
+                扩展弹出页的「释放当前标签」按钮由你主动触发，用于释放当前窗口的活动标签；页面会保持打开。
+              </li>
+            </ul>
+            <p>
+              Pi 会话结束时，runtime 会释放该会话的 worker，但不会删除你建好的 group/tab，也不会停止共享的
+              runtime；release 之后重连不会重新接管旧标签。
+            </p>
+          </section>
+
+          <section class="section" id="troubleshooting" aria-labelledby="troubleshooting-heading">
+            <h2 id="troubleshooting-heading">排查</h2>
+            <p>从下往上分层检查，先确认最底层再做上层操作。</p>
+
+            <ol class="steps">
+              <li class="step">
+                <h3>runtime 层</h3>
+                <p>
+                  在 Pi 里运行 <code>/browser-status</code>，查看可达性、capabilities 和已连接的 profile。
+                  默认地址是 <code>127.0.0.1:19989</code>；如果你用了自定义 host/port，runtime 和扩展必须使用同一套配置
+                  （<code>PI_BROWSER_HOST</code> 只允许 loopback）。端口被其它进程占用时不会被顶替，
+                  需要你自己确认占用者，不要强行结束不认识的进程。
+                </p>
+              </li>
+              <li class="step">
+                <h3>profile 层</h3>
+                <p>
+                  在 <code>browser_profiles</code> 中，Firefox profile 必须是 <code>connected</code>。
+                  同时确认它的 capabilities 和 limitations 与你要做的事匹配；列表里没有 connected 的 profile 时，
+                  后面的 group/tab 操作都不会成功。
+                </p>
+              </li>
+              <li class="step">
+                <h3>扩展临时加载层</h3>
+                <p>
+                  Firefox 重启后临时扩展会失效，需要回到
+                  <code>about:debugging#/runtime/this-firefox</code> 重新加载
+                  <code>extension/dist-firefox/manifest.json</code>。工具栏图标状态和连接状态不是一回事，
+                  本页也不显示连接状态：请以 <code>/browser-status</code> 和 <code>browser_profiles</code>
+                  的实际返回为准。
+                </p>
+              </li>
+              <li class="step">
+                <h3>权限层</h3>
+                <p>
+                  evaluate 报 <code>unsupported-capability</code> 时，检查 Firefox 是否 153+，以及弹出页是否已启用
+                  页面 JavaScript。基础工具（标签、快照、点击、填写）不依赖这个权限。
+                </p>
+              </li>
+              <li class="step">
+                <h3>能力层：已知边界，不是故障</h3>
+                <p>下面这些是 Firefox 后端的既有边界，符合预期，不要当成 bug：</p>
+                <dl class="limits">
+                  <dt>受保护页面</dt>
+                  <dd>
+                    <code>about:</code>、扩展管理页、Firefox 禁止注入脚本的站点无法控制；网站权限和页面 CSP
+                    也可能影响具体内容。
+                  </dd>
+                  <dt>shadow DOM</dt>
+                  <dd>
+                    open shadow DOM 可以遍历，closed shadow DOM 不可读。跨 shadow 请写显式链式 locator，例如
+                    <code>page.locator('#host').locator('input')</code>；单条复合 CSS
+                    <code>#host input</code> 不会跨边界。
+                  </dd>
+                  <dt>输入事件</dt>
+                  <dd>
+                    通过 DOM API 完成，无法产生可信的原生输入：<code>isTrusted=false</code>，<code>hover</code>
+                    不会改变原生 <code>:hover</code>，浏览器快捷键和系统剪贴板快捷键会被明确拒绝。
+                  </dd>
+                  <dt>快照</dt>
+                  <dd>
+                    Firefox 用 DOM/ARIA 语义生成快照，与 Chrome 原生 AX 树不完全等价，隐藏节点和可访问名称
+                    可能存在差异。
+                  </dd>
+                  <dt>超时与取消</dt>
+                  <dd>
+                    动作不会被重放；已经开始的动作可能返回 <code>outcome: unknown</code>，此时先重新观察页面状态，
+                    再决定下一步。
+                  </dd>
+                  <dt>兼容范围</dt>
+                  <dd>
+                    0.0.138 的真实 Firefox 验收结果是 126 PASS / 0 FAIL / 2 SKIP，覆盖的是受控 fixture 矩阵，
+                    不代表对所有站点都兼容。
+                  </dd>
+                </dl>
+              </li>
+            </ol>
+          </section>
+        </main>
+      </div>
+
+      <footer class="page-footer">
+        <p>
+          本页资源全部随扩展离线打包（<code>firefox-tutorial.html</code>、<code>firefox-tutorial.css</code>、
+          <code>firefox-tutorial.js</code>），不请求外部脚本、字体或 CDN；复制按钮只使用浏览器本地剪贴板。
+        </p>
+        <p>
+          源码与发布：
+          <a href="https://github.com/tom-cat-mao/pi-browseruse-playwriter" target="_blank" rel="noopener noreferrer"
+            >tom-cat-mao/pi-browseruse-playwriter</a
+          >
+          （MIT 许可，基于 remorses/playwriter 的维护 fork）。
+        </p>
+      </footer>
+    </div>
+    <script src="firefox-tutorial.js"></script>
+  </body>
+</html>

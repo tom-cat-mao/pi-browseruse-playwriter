@@ -86,7 +86,6 @@ export default defineConfig({
       input: {
         background: resolve(__dirname, 'src/background.ts'),
         offscreen: resolve(__dirname, 'src/offscreen.html'),
-        welcome: resolve(__dirname, 'src/welcome.html'),
         tutorial: resolve(__dirname, 'src/tutorial.html'),
       },
       output: {

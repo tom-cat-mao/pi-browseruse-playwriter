@@ -26,6 +26,8 @@ export type BrowserJson =
   | BrowserJson[]
   | { [key: string]: BrowserJson }
 
+export type BrowserBackend = 'cdp' | 'webextension'
+
 export interface BrowserCapabilities {
   protocolVersion: typeof BROWSER_PROTOCOL_VERSION
   managedGroups: boolean
@@ -34,6 +36,13 @@ export interface BrowserCapabilities {
   isolatedExecution: boolean
   /** Optional so a profile served by an older extension keeps working. */
   existingTabControl?: boolean
+  backend?: BrowserBackend
+  inputMode?: 'native' | 'dom'
+  snapshotMode?: 'native-ax' | 'dom-aria'
+  executeMode?: 'playwright' | 'dom-compatible'
+  evaluateWorld?: 'page' | 'isolated'
+  limitations?: string[]
+  supportedOperations?: BrowserPageOperation['kind'][]
 }
 
 export interface BrowserProfile {
@@ -65,6 +74,7 @@ export interface BrowserGroup {
   browserEpoch: string
   revision: number
   chromeGroupId?: number
+  browserGroupId?: number
   windowId?: number
   origin?: BrowserTabOrigin
 }
@@ -79,7 +89,9 @@ export interface BrowserTab {
   state: BrowserResourceState
   browserEpoch: string
   revision: number
+  /** Legacy CDP identity. Firefox uses -1 and supplies browserTabId. */
   chromeTabId: number
+  browserTabId?: number
   targetId?: string
   cdpSessionId?: string
   origin?: BrowserTabOrigin
@@ -107,6 +119,8 @@ export interface BrowserTabCandidate {
    *  switches back to the terminal - never treated as "the one current tab"). */
   windowFocused: boolean
   chromeTabId: number
+  browserTabId?: number
+  backend?: BrowserBackend
   url: string
   title: string
   /** Already under this session's control; attach returns the existing tab. */
@@ -143,6 +157,31 @@ export function parseTabCandidateId(
   const chromeTabId = Number(parts[3])
   if (!Number.isInteger(chromeTabId) || chromeTabId < 0) return null
   return { profileId: parts[1], browserEpoch: parts[2], chromeTabId }
+}
+
+export function buildFirefoxTabCandidateId(options: {
+  profileId: string
+  browserEpoch: string
+  browserTabId: number
+}): string {
+  return `pfxdt:${options.profileId}:${options.browserEpoch}:${options.browserTabId}`
+}
+
+export function parseBrowserTabCandidateId(candidateId: string): {
+  profileId: string
+  browserEpoch: string
+  browserTabId: number
+  backend: BrowserBackend
+} | null {
+  const legacy = parseTabCandidateId(candidateId)
+  if (legacy) {
+    return { profileId: legacy.profileId, browserEpoch: legacy.browserEpoch, browserTabId: legacy.chromeTabId, backend: 'cdp' }
+  }
+  const parts = candidateId.split(':')
+  if (parts.length !== 4 || parts[0] !== 'pfxdt' || !parts[1] || !parts[2] || !/^(0|[1-9]\d*)$/.test(parts[3])) return null
+  const browserTabId = Number(parts[3])
+  if (!Number.isSafeInteger(browserTabId)) return null
+  return { profileId: parts[1], browserEpoch: parts[2], browserTabId, backend: 'webextension' }
 }
 
 export type BrowserOperation =
@@ -239,6 +278,8 @@ export type BrowserResponse =
     }
 
 export interface BrowserInventory {
+  backend?: BrowserBackend
+  capabilities?: BrowserCapabilities
   protocolVersion: typeof BROWSER_PROTOCOL_VERSION
   profileId: string
   browserEpoch: string
@@ -284,4 +325,69 @@ export interface ManagedExecutorPoolContract {
   releaseSession(options: { sessionId: string }): Promise<void>
   disconnectProfile(options: { profileId: string }): Promise<void>
   dispose(): Promise<void>
+}
+
+/** Serialized locator program; physical page ownership is carried by the envelope. */
+export interface BrowserDomLocator {
+  steps: BrowserDomLocatorStep[]
+  snapshotId?: string
+}
+
+export type BrowserDomLocatorStep =
+  | {
+      kind: 'selector'
+      engine: 'css' | 'role' | 'text' | 'label' | 'placeholder' | 'testId' | 'alt' | 'title'
+      value: string
+      name?: string
+      exact?: boolean
+      options?: {
+        checked?: boolean
+        disabled?: boolean
+        expanded?: boolean
+        selected?: boolean
+        pressed?: boolean
+        level?: number
+        includeHidden?: boolean
+      }
+    }
+  | { kind: 'nth'; index: number }
+  | { kind: 'filter'; hasText?: string; hasNotText?: string; has?: BrowserDomLocator; hasNot?: BrowserDomLocator }
+  | { kind: 'frame'; selector: string }
+
+export type BrowserDomLocatorAction =
+  | 'count' | 'click' | 'dblclick' | 'fill' | 'type' | 'press' | 'check' | 'uncheck' | 'setChecked'
+  | 'selectOption' | 'hover' | 'focus' | 'blur' | 'scrollIntoViewIfNeeded' | 'waitFor'
+  | 'textContent' | 'innerText' | 'innerHTML' | 'inputValue' | 'getAttribute'
+  | 'allTextContents' | 'allInnerTexts' | 'isVisible' | 'isHidden' | 'isEnabled' | 'isDisabled'
+  | 'isEditable' | 'isChecked' | 'boundingBox'
+
+export type BrowserDomCommand =
+  | { method: 'snapshot'; selector?: string; search?: string; full?: boolean; interactiveOnly?: boolean }
+  | { method: 'click'; selector: string; snapshotId?: string }
+  | { method: 'fill'; selector: string; value: string; snapshotId?: string }
+  | { method: 'evaluate'; code: string; locator?: BrowserDomLocator }
+  | { method: 'locator'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[]; expectedPoint?: { x: number; y: number }; preparationId?: string }
+  | { method: 'page'; action: 'title' | 'url' | 'content' | 'readyState' }
+  | { method: 'frame.resolve'; locator: BrowserDomLocator }
+  | { method: 'frame.check'; locator: BrowserDomLocator; point: { x: number; y: number } }
+  | { method: 'frame.actionPoint'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[] }
+  | { method: 'invalidate' | 'dispose' }
+  | { method: 'screenshot.prepare'; fullPage?: boolean; labels?: boolean }
+  | { method: 'screenshot.cleanup' }
+  | { method: 'logs'; limit?: number }
+  | { method: 'operation'; operation: Exclude<BrowserPageOperation, { kind: 'page.execute' }> }
+
+export interface BrowserDomRequest {
+  requestId: string
+  sessionId: string
+  tabId: string
+  browserEpoch: string
+  command: BrowserDomCommand
+  timeoutMs?: number
+}
+
+export interface BrowserExtensionDomRequest {
+  id: number
+  method: 'browserDomRequest'
+  params: BrowserDomRequest
 }

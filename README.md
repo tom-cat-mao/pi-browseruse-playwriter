@@ -1,12 +1,14 @@
 # Pi Browser Use
 
-Pi Browser Use lets a Pi agent work with your existing Chrome tabs, logins and
-extensions. A local runtime and this Chrome extension communicate over CDP;
-the browser stays on your machine.
+Pi Browser Use lets a Pi agent work with your existing browser tabs and logins.
+Chrome uses its debugger/CDP extension; Firefox uses an ordinary WebExtension
+with a DOM backend. Both connect to a local runtime, and the browser stays on
+your machine. Firefox does not require remote debugging or a special browser
+launch, but DOM input and execution have [platform differences](./docs/exec/firefox-extension-guide.md).
 
 This repository is a maintained fork of
 [remorses/playwriter](https://github.com/remorses/playwriter). It currently has
-no npm release and no Chrome Web Store listing.
+no npm release, Chrome Web Store listing, or signed Firefox/AMO release.
 
 ## Install the Chrome extension
 
@@ -30,6 +32,63 @@ The default development build has extension ID
 `eeklahpecooapnailfaebkjjembkjhhg` and connects to the local runtime on port
 `19989`.
 
+## Load the Firefox development extension
+
+The Firefox backend targets desktop Firefox 139+ and passed real-browser
+acceptance in 0.0.138 (126 PASS / 0 FAIL / 2 boundary SKIP; see the
+[Firefox guide](./docs/exec/firefox-extension-guide.md)). Other Firefox-derived
+browsers need their own compatibility check.
+There is no signed Firefox add-on yet; ordinary permanent installation requires
+Mozilla signing. The local unsigned ZIP/XPI is a development artifact.
+
+After the source setup below, build and package it with:
+
+```bash
+pnpm build:firefox
+pnpm package:firefox
+```
+
+Open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**,
+and select `extension/dist-firefox/manifest.json`. The temporary add-on is
+removed when Firefox restarts. The Pi package and local runtime must also be
+installed; they are shared with the Chrome backend.
+
+In Pi, use `browser_profiles` to select the connected Firefox profile, then
+`browser_tabs discover` and `browser_tabs attach` to adopt an already-open tab
+in place. Loading or attaching does not require refreshing the tab. Firefox
+reports its DOM input, DOM/ARIA snapshot, isolated evaluate, and supported
+execute capabilities in the profile result.
+Dynamic page JavaScript additionally requires Firefox 153+ and the optional
+permission enabled in the add-on popup; basic DOM tools work without it.
+
+See the [Firefox guide](./docs/exec/firefox-extension-guide.md) for supported
+operations, development settings, and limits imposed by ordinary extensions.
+
+## Open the built-in tutorials
+
+Both builds ship a local static getting-started page. They are ordinary bundled
+pages: no remote assets, no extra permissions, no relaxed CSP. A tutorial page
+never connects to the runtime, adopts a tab, opens a tab, or starts the runtime
+by itself — it only describes the source install, the paired runtime, and the
+normal `browser_profiles` → `browser_tabs discover`/`attach` →
+`browser_snapshot` → `browser_tabs release` flow. The old `npx playwriter`
+commands are not part of it.
+
+| Build | Page | Entry point |
+| --- | --- | --- |
+| Chrome | `src/tutorial.html` | Extension options (`options_ui`, opens in a tab): the extension's options in `chrome://extensions`, or the icon's context menu → Options |
+| Firefox 139+ | `firefox-tutorial.html` | Add-on options (`options_ui`, opens in a tab) in `about:addons`, or the Help link in the add-on popup |
+
+No new automatic opening was added: the entries above are the only new entry
+points. Chrome keeps its pre-existing development paths, which changed only in
+which page they show — the idle-icon click already opened `src/tutorial.html`,
+and the install-time open that used to show the removed `welcome.html` now calls
+the same helper. Packaged builds compile that install-time open out
+(`PLAYWRITER_OPEN_WELCOME_PAGE=0`), and Firefox never opens a page by itself.
+See the [browser tutorials record](./docs/exec/browser-tutorials.md) for the
+design and for the packaging checks that keep a tutorial page from being left
+out of a ZIP.
+
 ## Build from source
 
 Clone this repository, then use Node.js, Bun and pnpm `10.18.1`:
@@ -43,10 +102,13 @@ pnpm package:extension
 The last command packages the already-built fork extension into
 `dist-release/`, producing both the ZIP and its `.sha256` file. It only uses
 local bundled JavaScript and assets. The output directory is ignored by Git.
+The runtime build also bundles Firefox into `playwriter/dist/extension-firefox`;
+`pnpm package:firefox` creates its ZIP, explicitly unsigned XPI, and SHA256 files.
+Build and package commands do not install add-ons or open a browser.
 
 ## Install the Pi pieces
 
-The Pi package and the browser runtime are separate from the Chrome ZIP. The
+The Pi package and the browser runtime are separate from the browser ZIPs. A
 ZIP does not install either one automatically.
 
 Until npm distribution is available, run these from a source checkout after
@@ -68,6 +130,9 @@ stores its data under `~/.pi-browser-use`.
   The tag version must match `extension/manifest.json`.
 - Chrome Web Store: upload preparation only; no item has been submitted or
   published.
+- Firefox: ordinary add-on development build, no AMO signing or store
+  publication. The Gecko add-on ID is `pi-browser-use@tom-cat-mao.github.io`;
+  it is separate from the Chrome extension ID.
 - Store identity: the real Web Store item ID and public key must come from the
   developer dashboard before a store build is made. The fork development ID
   must not be presented as the store ID.

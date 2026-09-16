@@ -7,9 +7,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const playwriterDir = path.join(__dirname, '..')
 const repoRoot = path.join(playwriterDir, '..')
 const extensionDir = path.join(repoRoot, 'extension')
-const extensionOutDirName = 'dist-packaged'
-const extensionOutDir = path.join(extensionDir, extensionOutDirName)
-const bundledExtensionDir = path.join(playwriterDir, 'dist', 'extension')
+const bundleTargets = [
+  { script: 'build', output: 'dist-packaged', bundle: 'extension' },
+  { script: 'build:firefox', output: 'dist-firefox', bundle: 'extension-firefox' },
+]
 
 function runCommand({
   command,
@@ -46,20 +47,27 @@ function runCommand({
 async function main(): Promise<void> {
   const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
 
-  await runCommand({
-    command: pnpmCommand,
-    args: ['build'],
-    cwd: extensionDir,
-    env: {
-      ...process.env,
-      PLAYWRITER_EXTENSION_DIST: extensionOutDirName,
-      PLAYWRITER_OPEN_WELCOME_PAGE: '0',
-    },
-  })
+  for (const target of bundleTargets) {
+    if (process.argv.includes('--firefox') && target.bundle !== 'extension-firefox') {
+      continue
+    }
+    await runCommand({
+      command: pnpmCommand,
+      args: [target.script],
+      cwd: extensionDir,
+      env: {
+        ...process.env,
+        PLAYWRITER_EXTENSION_DIST: target.output,
+        PI_BROWSER_FIREFOX_DIST: target.output,
+        PLAYWRITER_OPEN_WELCOME_PAGE: '0',
+      },
+    })
 
-  fs.rmSync(bundledExtensionDir, { recursive: true, force: true })
-  fs.mkdirSync(path.dirname(bundledExtensionDir), { recursive: true })
-  fs.cpSync(extensionOutDir, bundledExtensionDir, { recursive: true })
+    const bundledExtensionDir = path.join(playwriterDir, 'dist', target.bundle)
+    fs.rmSync(bundledExtensionDir, { recursive: true, force: true })
+    fs.mkdirSync(path.dirname(bundledExtensionDir), { recursive: true })
+    fs.cpSync(path.join(extensionDir, target.output), bundledExtensionDir, { recursive: true })
+  }
 }
 
 main().catch((error) => {

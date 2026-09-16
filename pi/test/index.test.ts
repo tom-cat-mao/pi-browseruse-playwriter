@@ -242,6 +242,54 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     const post = server.requests.find((r) => r.url === "/browser/v1/request");
     expect(post?.body).toMatchObject({ requestId: "call-5", sessionId: "full-uuid-123" });
   });
+  it("puts Firefox backend capabilities and limitations in model-visible profile content", async () => {
+    const capabilities = {
+      ...validCapabilities,
+      existingTabControl: true,
+      backend: "webextension",
+      inputMode: "dom",
+      snapshotMode: "dom-aria",
+      executeMode: "dom-compatible",
+      evaluateWorld: "isolated",
+      supportedOperations: ["page.snapshot", "page.evaluate"],
+      limitations: ["DOM input cannot create trusted user events."],
+    };
+    runtimeHandler(() => {
+      return { profiles: [{ ...validProfile, browser: "firefox", capabilities }] };
+    });
+    const profiles = toolByName("browser_profiles");
+    const result = await profiles.execute("call-firefox-profile", {}, undefined, undefined, makeCtx());
+    const content = JSON.parse(textOf(result.content));
+    expect(content.profiles[0].capabilities).toEqual(capabilities);
+    expect(renderResultText(profiles, result, { expanded: false })).toContain("DOM input");
+  });
+  it("bounds long capability limitations while retaining backend modes and profile identity", async () => {
+    runtimeHandler(() => {
+      return {
+        profiles: [{
+          ...validProfile,
+          browser: "firefox",
+          capabilities: {
+            ...validCapabilities,
+            backend: "webextension",
+            inputMode: "dom",
+            limitations: Array.from({ length: 32 }, () => { return "限制".repeat(800); }),
+          },
+        }],
+      };
+    });
+    const profiles = toolByName("browser_profiles");
+    const result = await profiles.execute("call-firefox-bounded", {}, undefined, undefined, makeCtx());
+    const text = textOf(result.content);
+    const content = JSON.parse(text);
+    expect(content.profiles[0].profileId).toBe(validProfile.profileId);
+    expect(content.profiles[0].capabilities).toMatchObject({
+      backend: "webextension",
+      inputMode: "dom",
+      limitationsTruncated: true,
+    });
+    expect(Buffer.byteLength(text)).toBeLessThan(24_000);
+  });
 
   it("does not launch the runtime when the caller signal is already aborted", async () => {
     runtimeHandler(() => ({}));

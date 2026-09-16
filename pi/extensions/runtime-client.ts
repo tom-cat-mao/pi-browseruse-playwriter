@@ -27,6 +27,7 @@ import type {
   BrowserErrorCode,
   BrowserNetworkCaptureStatus,
   BrowserOperation,
+  BrowserPageOperation,
   BrowserProfile,
   BrowserRequest,
   BrowserResponse,
@@ -268,6 +269,44 @@ function validateCapabilities(value: unknown): BrowserCapabilities {
       "protocol",
       "runtime does not advertise the managed capabilities (managedGroups/explicitTabs/isolatedExecution)",
     );
+  }
+  if (cap.existingTabControl !== undefined && typeof cap.existingTabControl !== "boolean") {
+    throw new RuntimeRequestError("protocol", "capabilities existingTabControl is not a boolean");
+  }
+  const modes = {
+    backend: ["cdp", "webextension"],
+    inputMode: ["native", "dom"],
+    snapshotMode: ["native-ax", "dom-aria"],
+    executeMode: ["playwright", "dom-compatible"],
+    evaluateWorld: ["page", "isolated"],
+  } satisfies Partial<Record<keyof BrowserCapabilities, string[]>>;
+  for (const [key, allowed] of Object.entries(modes)) {
+    const mode = value[key];
+    if (mode !== undefined && (typeof mode !== "string" || !allowed.includes(mode))) {
+      throw new RuntimeRequestError("protocol", `capabilities ${key} is not a supported mode`);
+    }
+  }
+  if (
+    cap.limitations !== undefined &&
+    (!Array.isArray(cap.limitations) || cap.limitations.length > 32 ||
+      cap.limitations.some((item) => {
+        return typeof item !== "string" || item.length > 2_000;
+      }))
+  ) {
+    throw new RuntimeRequestError("protocol", "capabilities limitations must be a bounded array of strings");
+  }
+  const supportedOperations: readonly BrowserPageOperation["kind"][] = [
+    "page.navigate", "page.back", "page.snapshot", "page.click", "page.fill",
+    "page.evaluate", "page.screenshot", "page.network", "page.logs", "page.execute",
+  ];
+  if (
+    cap.supportedOperations !== undefined &&
+    (!Array.isArray(cap.supportedOperations) || cap.supportedOperations.length > supportedOperations.length ||
+      cap.supportedOperations.some((operation) => {
+        return !supportedOperations.includes(operation);
+      }))
+  ) {
+    throw new RuntimeRequestError("protocol", "capabilities supportedOperations contains an invalid page operation");
   }
   return value as unknown as BrowserCapabilities;
 }

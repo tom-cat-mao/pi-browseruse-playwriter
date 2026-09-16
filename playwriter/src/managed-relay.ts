@@ -17,20 +17,26 @@
  *   `{ id, method: 'browserRequest', params: BrowserRequest }` messages; the extension
  *   answers with the legacy `{ id, result: BrowserResponse }` envelope.
  * - profiles.list, session.release and request.cancel are handled by the relay.
- * - page.* runs in C's isolated executor pool (playwriter/src/managed-executor-pool.ts).
- *   Until that module exists the operation fails loudly with `unsupported-capability`;
- *   it never pretends to succeed.
+ * - Chrome page.* runs in the isolated CDP executor pool. Firefox structured
+ *   operations go to the owning WebExtension; execute uses an isolated worker
+ *   whose DOM requests are checked against its current tab and connection lease.
  *
  * Requests that were never sent can report outcome `not-started`; requests already sent
  * (to the extension or to a worker) must report `unknown` on abnormal termination and
  * must never be replayed automatically.
  */
 import { ManagedCancellation, ManagedExecutorPool } from './managed-executor-pool.js'
+import { FirefoxExecutorPool } from './firefox-executor-pool.js'
+import { parseBrowserDomRequest } from './browser-dom-validation.js'
+import fs from 'node:fs'
+import path from 'node:path'
 import { RuntimeNetworkCaptureStore } from './runtime-network-capture.js'
-import { parseTabCandidateId } from './browser-protocol.js'
+import { parseBrowserTabCandidateId } from './browser-protocol.js'
 import {
   BROWSER_PROTOCOL_VERSION,
   type BrowserCapabilities,
+  type BrowserBackend,
+  type BrowserDomRequest,
   type BrowserErrorCode,
   type BrowserGroup,
   type BrowserInventory,
@@ -123,6 +129,8 @@ export type ManagedProfileSnapshot = {
   stableKey: string
   browser: string
   label: string
+  backend?: BrowserBackend
+  capabilities?: BrowserCapabilities
   browserEpoch: string
   revision: number
   groups: Map<string, BrowserGroup>
@@ -191,6 +199,13 @@ export type ManagedRelayOptions = {
       request: BrowserRequest
       timeoutMs: number
     }) => Promise<unknown>
+    sendBrowserDomRequest?: (options: {
+      profileId: string
+      stableKey: string
+      connectionId: string
+      request: BrowserDomRequest
+      timeoutMs: number
+    }) => Promise<unknown>
     sendCdpCommand?: (options: {
       profileId: string
       stableKey: string
@@ -228,6 +243,7 @@ type PendingManagedRequest = {
   requestId: string
   profileId: string
   kind: BrowserOperation['kind']
+  tabId?: string
   controller: AbortController
   started: boolean
   cancelRequested: boolean
@@ -235,6 +251,7 @@ type PendingManagedRequest = {
   clientDisconnected: boolean
   timedOut: boolean
   detachClientSignal: (() => void) | null
+  domRequestIds: Set<string>
 }
 
 type ManagedClientEntry = {
@@ -857,6 +874,7 @@ function parseGroupValue(value: unknown, index: number): FieldResult<BrowserGrou
     'browserEpoch',
     'revision',
     'chromeGroupId',
+    'browserGroupId',
     'windowId',
     'origin',
   ])
@@ -896,6 +914,10 @@ function parseGroupValue(value: unknown, index: number): FieldResult<BrowserGrou
     return chromeGroupId
   }
   const windowId = readOptionalInteger(value, 'windowId', { min: 0, max: Number.MAX_SAFE_INTEGER })
+  const browserGroupId = readOptionalInteger(value, 'browserGroupId', { min: 0, max: Number.MAX_SAFE_INTEGER })
+  if (!browserGroupId.ok) {
+    return browserGroupId
+  }
   if (!windowId.ok) {
     return windowId
   }
@@ -910,13 +932,18 @@ function parseGroupValue(value: unknown, index: number): FieldResult<BrowserGrou
       browserEpoch: browserEpoch.value,
       revision: revision.value ?? 0,
       ...(chromeGroupId.value !== undefined ? { chromeGroupId: chromeGroupId.value } : {}),
+      ...(browserGroupId.value !== undefined ? { browserGroupId: browserGroupId.value } : {}),
       ...(windowId.value !== undefined ? { windowId: windowId.value } : {}),
       ...(readOrigin(value.origin) !== undefined ? { origin: readOrigin(value.origin) } : {}),
     },
   }
 }
 
-function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
+function parseTabValue({ value, index, backend = 'cdp' }: {
+  value: unknown
+  index: number
+  backend?: BrowserBackend
+}): FieldResult<BrowserTab> {
   if (!isRecord(value)) {
     return { ok: false, message: `tabs[${index}] must be an object` }
   }
@@ -931,6 +958,7 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
     'browserEpoch',
     'revision',
     'chromeTabId',
+    'browserTabId',
     'targetId',
     'cdpSessionId',
     'origin',
@@ -975,9 +1003,13 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
   if (!revision.ok) {
     return revision
   }
-  const chromeTabId = readOptionalInteger(value, 'chromeTabId', { min: 0, max: Number.MAX_SAFE_INTEGER })
+  const chromeTabId = readOptionalInteger(value, 'chromeTabId', { min: backend === 'webextension' ? -1 : 0, max: Number.MAX_SAFE_INTEGER })
   if (!chromeTabId.ok) {
     return chromeTabId
+  }
+  const browserTabId = readOptionalInteger(value, 'browserTabId', { min: 0, max: Number.MAX_SAFE_INTEGER })
+  if (!browserTabId.ok) {
+    return browserTabId
   }
   const targetId = readOptionalString(value, 'targetId', { maxLength: IDENTIFIER_MAX_LENGTH })
   if (!targetId.ok) {
@@ -1005,6 +1037,7 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
       browserEpoch: browserEpoch.value,
       revision: revision.value ?? 0,
       chromeTabId: chromeTabId.value ?? -1,
+      ...(browserTabId.value !== undefined ? { browserTabId: browserTabId.value } : {}),
       ...(targetId.value !== undefined ? { targetId: targetId.value } : {}),
       ...(cdpSessionId.value !== undefined ? { cdpSessionId: cdpSessionId.value } : {}),
       ...(origin !== undefined ? { origin } : {}),
@@ -1013,17 +1046,79 @@ function parseTabValue(value: unknown, index: number): FieldResult<BrowserTab> {
   }
 }
 
+function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabilities> {
+  if (!isRecord(value) || value.protocolVersion !== BROWSER_PROTOCOL_VERSION) {
+    return { ok: false, message: 'inventory capabilities must have the supported protocolVersion' }
+  }
+  const requiredFlags = ['managedGroups', 'persistentOwnership', 'explicitTabs', 'isolatedExecution']
+  const choices: Record<string, string[]> = {
+    backend: ['cdp', 'webextension'],
+    inputMode: ['native', 'dom'],
+    snapshotMode: ['native-ax', 'dom-aria'],
+    executeMode: ['playwright', 'dom-compatible'],
+    evaluateWorld: ['page', 'isolated'],
+  }
+  const allowed = new Set(['protocolVersion', ...requiredFlags, 'existingTabControl', ...Object.keys(choices), 'limitations', 'supportedOperations'])
+  const extra = assertNoExtraFields(value, allowed, 'BrowserCapabilities')
+  if (!extra.ok) {
+    return extra
+  }
+  for (const flag of requiredFlags) {
+    if (typeof value[flag] !== 'boolean') {
+      return { ok: false, message: `capabilities.${flag} must be boolean` }
+    }
+  }
+  if (value.existingTabControl !== undefined && typeof value.existingTabControl !== 'boolean') {
+    return { ok: false, message: 'capabilities.existingTabControl must be boolean' }
+  }
+  for (const [key, options] of Object.entries(choices)) {
+    const choice = value[key]
+    if (choice !== undefined && (typeof choice !== 'string' || !options.includes(choice))) {
+      return { ok: false, message: `capabilities.${key} is invalid` }
+    }
+  }
+  if (value.limitations !== undefined && (!Array.isArray(value.limitations) || value.limitations.length > 40 ||
+    value.limitations.some((limitation) => {
+      return typeof limitation !== 'string' || limitation.length > MESSAGE_MAX_LENGTH
+    }))) {
+    return { ok: false, message: 'capabilities.limitations must be a bounded string array' }
+  }
+  if (value.supportedOperations !== undefined && (!Array.isArray(value.supportedOperations) || value.supportedOperations.length > 20 ||
+    value.supportedOperations.some((operation) => {
+      return typeof operation !== 'string' || !operation.startsWith('page.') || !OPERATION_KINDS.has(operation as BrowserOperation['kind'])
+    }))) {
+    return { ok: false, message: 'capabilities.supportedOperations contains an invalid page operation' }
+  }
+  return { ok: true, value: value as unknown as BrowserCapabilities }
+}
+
 export function parseBrowserInventory(value: unknown): ParseResult<BrowserInventory> {
   if (!isRecord(value)) {
     return { ok: false, message: 'inventory must be a JSON object' }
   }
-  const allowed = new Set(['protocolVersion', 'profileId', 'browserEpoch', 'revision', 'groups', 'tabs'])
+  const allowed = new Set(['protocolVersion', 'profileId', 'browserEpoch', 'revision', 'groups', 'tabs', 'backend', 'capabilities'])
   const extra = assertNoExtraFields(value, allowed, 'BrowserInventory')
   if (!extra.ok) {
     return extra
   }
   if (value.protocolVersion !== BROWSER_PROTOCOL_VERSION) {
     return { ok: false, message: `unsupported protocolVersion ${String(value.protocolVersion)}` }
+  }
+  if (value.backend !== undefined && value.backend !== 'cdp' && value.backend !== 'webextension') {
+    return { ok: false, message: 'inventory.backend is invalid' }
+  }
+  const backend = value.backend ?? 'cdp'
+  const capabilities = value.capabilities === undefined ? undefined : parseInventoryCapabilities(value.capabilities)
+  if (capabilities && !capabilities.ok) {
+    return capabilities
+  }
+  if (capabilities?.value.backend !== undefined && capabilities.value.backend !== backend) {
+    return { ok: false, message: 'inventory capabilities backend does not match inventory.backend' }
+  }
+  if (backend === 'webextension' && (!capabilities?.value || capabilities.value.backend !== backend ||
+    capabilities.value.inputMode !== 'dom' || capabilities.value.snapshotMode !== 'dom-aria' ||
+    capabilities.value.executeMode !== 'dom-compatible' || capabilities.value.evaluateWorld !== 'isolated')) {
+    return { ok: false, message: 'Firefox inventory must advertise its actual DOM backend capabilities' }
   }
   const profileId = readString(value, 'profileId', { maxLength: IDENTIFIER_MAX_LENGTH })
   if (!profileId.ok) {
@@ -1053,7 +1148,7 @@ export function parseBrowserInventory(value: unknown): ParseResult<BrowserInvent
   }
   const tabs: BrowserTab[] = []
   for (const [index, tab] of value.tabs.entries()) {
-    const parsed = parseTabValue(tab, index)
+    const parsed = parseTabValue({ value: tab, index, backend })
     if (!parsed.ok) {
       return parsed
     }
@@ -1063,6 +1158,8 @@ export function parseBrowserInventory(value: unknown): ParseResult<BrowserInvent
     ok: true,
     value: {
       protocolVersion: BROWSER_PROTOCOL_VERSION,
+      ...(value.backend !== undefined ? { backend } : {}),
+      ...(capabilities?.value !== undefined ? { capabilities: capabilities.value } : {}),
       profileId: profileId.value,
       browserEpoch: browserEpoch.value,
       revision: revision.value ?? 0,
@@ -1217,6 +1314,7 @@ export function validateManagedInventoryConsistency({
     }
   }
   const tabIds = new Set<string>()
+  const physicalTabIds = new Set<number>()
   for (const tab of inventory.tabs) {
     if (tabIds.has(tab.tabId)) {
       return { ok: false, reason: `duplicate tabId ${tab.tabId}` }
@@ -1236,12 +1334,25 @@ export function validateManagedInventoryConsistency({
       if (tab.browserEpoch !== inventory.browserEpoch) {
         return { ok: false, reason: `ready tab ${tab.tabId} has a different browserEpoch` }
       }
-      if (!tab.cdpSessionId) {
-        return { ok: false, reason: `ready tab ${tab.tabId} is missing cdpSessionId` }
+      if (inventory.backend === 'webextension') {
+        if (!Number.isSafeInteger(tab.browserTabId) || tab.browserTabId === undefined || tab.browserTabId < 0) {
+          return { ok: false, reason: `ready Firefox tab ${tab.tabId} is missing browserTabId` }
+        }
+        if (physicalTabIds.has(tab.browserTabId)) {
+          return { ok: false, reason: `duplicate Firefox browserTabId ${tab.browserTabId}` }
+        }
+        physicalTabIds.add(tab.browserTabId)
+      } else {
+        if (!tab.cdpSessionId) {
+          return { ok: false, reason: `ready tab ${tab.tabId} is missing cdpSessionId` }
+        }
+        if (!(tab.chromeTabId >= 0)) {
+          return { ok: false, reason: `ready tab ${tab.tabId} is missing chromeTabId` }
+        }
       }
-      if (!(tab.chromeTabId >= 0)) {
-        return { ok: false, reason: `ready tab ${tab.tabId} is missing chromeTabId` }
-      }
+    }
+    if (inventory.backend === 'webextension' && (tab.chromeTabId !== -1 || tab.cdpSessionId !== undefined || tab.targetId !== undefined)) {
+      return { ok: false, reason: `Firefox tab ${tab.tabId} must not advertise a CDP identity` }
     }
   }
   return { ok: true }
@@ -1259,6 +1370,9 @@ export function applyBrowserInventory(
   const connectionSeq = state.connectionSeq.get(input.connectionId) ?? state.nextConnectionSeq + 1
   const existing = state.profiles.get(inventory.profileId)
   if (existing) {
+    if ((existing.backend ?? 'cdp') !== (inventory.backend ?? 'cdp')) {
+      return { state, result: { accepted: false, reason: 'profile backend cannot change across connections' } }
+    }
     if (connectionSeq < existing.connectionSeq) {
       return { state, result: { accepted: false, reason: 'stale-inventory from an older connection' } }
     }
@@ -1273,13 +1387,15 @@ export function applyBrowserInventory(
       return { state, result: { accepted: true, profile: existing, epochChanged: false } }
     }
   }
-  const browser = input.info.browser || existing?.browser || 'Chrome'
+  const browser = input.info.browser || existing?.browser || (inventory.backend === 'webextension' ? 'Firefox' : 'Chrome')
   const label = input.info.email || browser
   const snapshot: ManagedProfileSnapshot = {
     profileId: inventory.profileId,
     stableKey: input.info.stableKey || existing?.stableKey || `profile:${inventory.profileId}`,
     browser,
     label,
+    ...(inventory.backend !== undefined ? { backend: inventory.backend } : {}),
+    ...(inventory.capabilities !== undefined ? { capabilities: inventory.capabilities } : {}),
     browserEpoch: inventory.browserEpoch,
     revision: inventory.revision,
     groups: new Map(inventory.groups.map((group) => [group.groupId, group])),
@@ -1358,7 +1474,7 @@ export function listManagedProfiles(
         label: profile.label,
         connected: profile.connected,
         browserEpoch: profile.browserEpoch,
-        capabilities,
+        capabilities: profile.capabilities ? { ...profile.capabilities, isolatedExecution } : capabilities,
       }
     })
 }
@@ -1510,6 +1626,7 @@ export class ManagedRelay {
   private nextNetworkStartToken = 0
   private pool: ManagedExecutorPoolContract | null = null
   private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
+  private firefoxPool: FirefoxExecutorPool | null = null
   private disposed = false
 
   constructor(options: ManagedRelayOptions) {
@@ -1541,6 +1658,7 @@ export class ManagedRelay {
     info: ManagedInventoryInfo
     inventory: BrowserInventory
   }): ManagedInventoryResult {
+    const previous = this.state.profiles.get(inventory.profileId)
     const { state, result } = applyBrowserInventory(this.state, { connectionId, info, inventory })
     this.state = state
     if (!result.accepted) {
@@ -1555,6 +1673,21 @@ export class ManagedRelay {
         reason: 'browser epoch changed',
       })
       this.clearProfileScopes(result.profile.profileId)
+    }
+    if (result.profile.backend === 'webextension') {
+      if (previous && (previous.connectionId !== connectionId || result.epochChanged)) {
+        this.abortPendingForProfile(result.profile.profileId)
+        void this.firefoxPool?.disconnectProfile({ profileId: result.profile.profileId }).catch((error) => {
+          this.options.logger?.error('[managed-relay] Firefox epoch revocation failed:', error)
+        })
+      }
+      for (const pending of this.pending.values()) {
+        if (pending.profileId !== result.profile.profileId || !pending.tabId) continue
+        const tab = result.profile.tabs.get(pending.tabId)
+        if (!tab || tab.state !== 'ready' || tab.sessionId !== pending.sessionId) {
+          this.abortPending({ pending, reason: 'cancelled' })
+        }
+      }
     }
     this.networkCaptures.reconcileProfile({
       profileId: result.profile.profileId,
@@ -1575,6 +1708,9 @@ export class ManagedRelay {
       this.abortPendingForProfile(profile.profileId)
       this.networkCaptures.interruptProfile({ profileId: profile.profileId, reason: 'extension disconnected' })
       this.invalidateProfileExecutions({ profileId: profile.profileId, reason: 'extension disconnected' })
+      void this.firefoxPool?.disconnectProfile({ profileId: profile.profileId }).catch((error) => {
+        this.options.logger?.error('[managed-relay] Firefox disconnect failed:', error)
+      })
       this.clearProfileScopes(profile.profileId)
       void this.getExistingPool()
         .then(async (pool) => {
@@ -1630,7 +1766,7 @@ export class ManagedRelay {
       })
     }
     if (operation.kind === 'tabs.discover') {
-      return await this.discoverTabs({ request, operation })
+      return this.enforceResponseLimit(await this.discoverTabs({ request, operation }), request.requestId)
     }
     if (operation.kind === 'session.release') {
       return this.releaseSession({ requestId: request.requestId, sessionId: request.sessionId })
@@ -1727,7 +1863,7 @@ export class ManagedRelay {
         continue
       }
       const parsed = parseBrowserResponse(value)
-      if (!parsed.ok) {
+      if (!parsed.ok || parsed.value.requestId !== subRequest.requestId) {
         skipped.push(`${profile.profileId}: malformed response`)
         continue
       }
@@ -1736,12 +1872,19 @@ export class ManagedRelay {
         continue
       }
       const list = parsed.value.data.candidates
-      if (!Array.isArray(list)) {
+      if (!Array.isArray(list) || list.length > INVENTORY_ARRAY_MAX_LENGTH) {
         skipped.push(`${profile.profileId}: no candidate list`)
         continue
       }
       for (const candidate of list) {
         if (!isCandidateRecord(candidate)) continue
+        const identity = parseBrowserTabCandidateId(candidate.candidateId)
+        if (!identity || identity.backend !== (profile.backend ?? 'cdp') || identity.profileId !== profile.profileId ||
+          identity.browserEpoch !== profile.browserEpoch || candidate.profileId !== profile.profileId ||
+          candidate.browserEpoch !== profile.browserEpoch ||
+          (candidate.backend !== undefined && candidate.backend !== identity.backend) ||
+          (identity.backend === 'webextension' ? candidate.chromeTabId !== -1 || candidate.browserTabId !== identity.browserTabId :
+            candidate.chromeTabId !== identity.browserTabId)) continue
         candidates.push({ ...candidate, browser: profile.browser, profileLabel: profile.label })
       }
     }
@@ -1811,7 +1954,7 @@ export class ManagedRelay {
         case 'tabs.attach': {
           // The candidate pins profile + browserEpoch, so an old discovery can
           // never attach the wrong tab after a browser restart.
-          const parsed = parseTabCandidateId(operation.candidateId)
+          const parsed = parseBrowserTabCandidateId(operation.candidateId)
           if (!parsed) {
             return failureResponse(request.requestId, {
               code: 'invalid-request',
@@ -1826,11 +1969,16 @@ export class ManagedRelay {
           if (!routable.ok) {
             return routable.response
           }
+          if (parsed.backend !== (routable.profile.backend ?? 'cdp')) {
+            return failureResponse(request.requestId, {
+              code: 'invalid-request', message: 'candidate backend does not match this profile; discover again', outcome: 'not-started',
+            })
+          }
           if (routable.profile.browserEpoch !== parsed.browserEpoch) {
             return failureResponse(request.requestId, {
               code: 'stale-snapshot',
               message:
-                'this tab was discovered in an earlier browser run; discover it again before attaching (Chrome tab ids are not reused across runs)',
+                'this tab was discovered in an earlier browser run; discover it again before attaching (physical tab ids may be reused across runs)',
               outcome: 'not-started',
             })
           }
@@ -1912,6 +2060,9 @@ export class ManagedRelay {
       this.abortPending({ pending, reason: 'timeout' })
     }, timeoutMs)
     try {
+      if (pending.controller.signal.aborted) {
+        throw pending.controller.signal.reason
+      }
       const transportPromise = this.options.transport.sendBrowserRequest({
         profileId: profile.profileId,
         stableKey: profile.stableKey,
@@ -1989,6 +2140,18 @@ export class ManagedRelay {
       if (!tab || tab.sessionId !== request.sessionId) {
         return invalid('extension returned a tab that does not belong to this session')
       }
+      if (operation.kind === 'tabs.attach') {
+        const candidate = parseBrowserTabCandidateId(operation.candidateId)
+        if (candidate?.backend === 'webextension' && (tab.profileId !== candidate.profileId ||
+          tab.browserEpoch !== candidate.browserEpoch || tab.browserTabId !== candidate.browserTabId ||
+          tab.chromeTabId !== -1 || tab.cdpSessionId !== undefined || tab.targetId !== undefined)) {
+          return invalid('Firefox extension returned a tab that does not match the discovered identity')
+        }
+      }
+      if (operation.kind === 'tabs.activate' && this.state.profiles.get(tab.profileId)?.backend === 'webextension' &&
+        tab.tabId !== operation.tabId) {
+        return invalid('Firefox extension activated a different tab')
+      }
     }
     return { ok: true }
   }
@@ -2024,6 +2187,7 @@ export class ManagedRelay {
       requestId: request.requestId,
       profileId,
       kind: operation.kind,
+      tabId: operation.tabId,
       clientSignal,
     })
     const timer = setTimeout(() => {
@@ -2063,6 +2227,15 @@ export class ManagedRelay {
           })
           if (!authoritative.ok) {
             throw new ManagedTransportError(authoritative.failure)
+          }
+          if (freshProfile.profile.backend === 'webextension') {
+            return await this.executeFirefoxOperation({
+              request: { ...request, operation },
+              profile: freshProfile.profile,
+              tab: authoritative.tab,
+              pending,
+              deadlineAt,
+            })
           }
           // Capture the connection epoch only now, so a browserEpoch change while
           // the request was queued can never reuse a stale managed CDP connection.
@@ -2115,6 +2288,161 @@ export class ManagedRelay {
     }
   }
 
+  private async executeFirefoxOperation({ request, profile, tab, pending, deadlineAt }: {
+    request: BrowserRequest & { operation: BrowserPageOperation }
+    profile: ManagedProfileSnapshot
+    tab: BrowserTab
+    pending: PendingManagedRequest
+    deadlineAt: number
+  }): Promise<BrowserResponse> {
+    const { operation } = request
+    if (profile.capabilities?.supportedOperations && !profile.capabilities.supportedOperations.includes(operation.kind)) {
+      throw new ManagedTransportError({
+        code: 'unsupported-capability', message: `Firefox profile does not support ${operation.kind}`, outcome: 'not-started',
+      })
+    }
+    if (operation.kind === 'page.screenshot' && operation.path && !path.isAbsolute(operation.path)) {
+      throw new ManagedTransportError({
+        code: 'invalid-request', message: `Screenshot path must be absolute: ${operation.path}`, outcome: 'not-started',
+      })
+    }
+    this.assertFirefoxLease({ request, profile, tab, pending })
+    const timeoutMs = this.remainingTimeout({ deadlineAt, pending })
+    if (operation.kind !== 'page.execute') {
+      pending.started = true
+      const promise = this.options.transport.sendBrowserRequest({
+        profileId: profile.profileId,
+        stableKey: profile.stableKey,
+        request: { ...request, timeoutMs },
+        timeoutMs,
+      })
+      promise.catch(() => {})
+      const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
+      const response = this.parseFirefoxResponse({ value, requestId: request.requestId })
+      return this.saveFirefoxScreenshot({ response, operation })
+    }
+    if (!this.options.transport.sendBrowserDomRequest) {
+      throw new ManagedTransportError({
+        code: 'unsupported-capability', message: 'Firefox DOM transport is unavailable', outcome: 'not-started',
+      })
+    }
+    this.firefoxPool ??= new FirefoxExecutorPool()
+    pending.started = true
+    return await this.firefoxPool.execute({
+      request: { ...request, operation, timeoutMs },
+      tab,
+      connectionEpoch: profile.connectionId ?? '',
+      signal: pending.controller.signal,
+      sendDomRequest: async (value: BrowserDomRequest) => {
+        const domRequest = parseBrowserDomRequest(value)
+        if (!domRequest) {
+          throw new ManagedTransportError({
+            code: 'invalid-request', message: 'Firefox worker returned an invalid DOM command', outcome: 'not-started',
+          })
+        }
+        this.assertFirefoxLease({ request, profile, tab, pending })
+        if (domRequest.sessionId !== request.sessionId || domRequest.tabId !== tab.tabId || domRequest.browserEpoch !== tab.browserEpoch) {
+          throw new ManagedTransportError({
+            code: 'ownership-mismatch', message: 'Firefox worker DOM request escaped its assigned tab', outcome: 'not-started',
+          })
+        }
+        const nestedOperation = domRequest.command.method === 'operation' ? domRequest.command.operation : undefined
+        if (nestedOperation && nestedOperation.tabId !== tab.tabId) {
+          throw new ManagedTransportError({
+            code: 'ownership-mismatch', message: 'Firefox worker operation escaped its assigned tab', outcome: 'not-started',
+          })
+        }
+        if (nestedOperation?.kind === 'page.screenshot' && nestedOperation.path && !path.isAbsolute(nestedOperation.path)) {
+          throw new ManagedTransportError({
+            code: 'invalid-request', message: `Screenshot path must be absolute: ${nestedOperation.path}`, outcome: 'not-started',
+          })
+        }
+        const send = this.options.transport.sendBrowserDomRequest
+        if (!send || !profile.connectionId) {
+          throw new ManagedTransportError({
+            code: 'profile-disconnected', message: 'Firefox DOM transport disconnected', outcome: 'not-started',
+          })
+        }
+        const rpcTimeoutMs = Math.min(domRequest.timeoutMs ?? MANAGED_MAX_TIMEOUT_MS, this.remainingTimeout({ deadlineAt, pending }))
+        pending.domRequestIds.add(domRequest.requestId)
+        try {
+          const promise = send({
+            profileId: profile.profileId,
+            stableKey: profile.stableKey,
+            connectionId: profile.connectionId,
+            request: { ...domRequest, timeoutMs: rpcTimeoutMs },
+            timeoutMs: rpcTimeoutMs,
+          })
+          promise.catch(() => {})
+          const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
+          const response = this.parseFirefoxResponse({ value, requestId: domRequest.requestId })
+          return nestedOperation ? this.saveFirefoxScreenshot({ response, operation: nestedOperation }) : response
+        } finally {
+          pending.domRequestIds.delete(domRequest.requestId)
+        }
+      },
+    })
+  }
+
+  private assertFirefoxLease({ request, profile, tab, pending }: {
+    request: BrowserRequest
+    profile: ManagedProfileSnapshot
+    tab: BrowserTab
+    pending: PendingManagedRequest
+  }): void {
+    if (pending.controller.signal.aborted) {
+      throw pending.controller.signal.reason
+    }
+    const current = this.resolveTab({ requestId: request.requestId, sessionId: request.sessionId, tabId: tab.tabId })
+    if (!current.ok) {
+      throw new ManagedTransportError(failureFromErrorResponse(current.response))
+    }
+    if (!current.profile.connected || current.profile.connectionId !== profile.connectionId ||
+      current.profile.browserEpoch !== profile.browserEpoch || current.tab.browserEpoch !== tab.browserEpoch ||
+      current.tab.browserTabId !== tab.browserTabId || current.tab.state !== 'ready') {
+      throw new ManagedTransportError({
+        code: 'needs-rebind', message: 'Firefox tab ownership or connection changed during execution', outcome: 'not-started',
+      })
+    }
+  }
+
+  private parseFirefoxResponse({ value, requestId }: { value: unknown; requestId: string }): BrowserResponse {
+    const parsed = parseBrowserResponse(value)
+    if (!parsed.ok || parsed.value.requestId !== requestId) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'Firefox extension returned an invalid or mismatched response', outcome: 'unknown',
+      })
+    }
+    return this.enforceResponseLimit(parsed.value, requestId)
+  }
+
+  private saveFirefoxScreenshot({ response, operation }: { response: BrowserResponse; operation: BrowserPageOperation }): BrowserResponse {
+    if (!response.ok || operation.kind !== 'page.screenshot') {
+      return response
+    }
+    const images = response.data.images
+    if (!Array.isArray(images) || images.length !== 1) {
+      throw new ManagedTransportError({ code: 'internal-error', message: 'Firefox screenshot did not return one image', outcome: 'unknown' })
+    }
+    const screenshot = images[0]
+    if (screenshot?.mimeType !== 'image/png' || typeof screenshot.data !== 'string' || screenshot.data.length > MANAGED_RESPONSE_BODY_LIMIT_BYTES ||
+      screenshot.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(screenshot.data)) {
+      throw new ManagedTransportError({ code: 'internal-error', message: 'Firefox screenshot has invalid PNG data', outcome: 'unknown' })
+    }
+    const buffer = Buffer.from(screenshot.data, 'base64')
+    if (buffer.toString('base64') !== screenshot.data || !buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+      throw new ManagedTransportError({ code: 'internal-error', message: 'Firefox screenshot is not PNG', outcome: 'unknown' })
+    }
+    const artifacts: NonNullable<BrowserResultData['artifacts']> = []
+    if (operation.path) {
+      const outputPath = path.normalize(operation.path)
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+      fs.writeFileSync(outputPath, buffer)
+      artifacts.push({ path: outputPath, mimeType: 'image/png' })
+    }
+    return { ...response, data: { ...response.data, artifacts } }
+  }
+
   private async executeNetworkOperation({
     request,
     operation,
@@ -2128,6 +2456,10 @@ export class ManagedRelay {
     deadlineAt: number
     clientSignal?: AbortSignal
   }): Promise<BrowserResponse> {
+    const firefoxTab = this.resolveTab({ requestId: request.requestId, sessionId: request.sessionId, tabId: operation.tabId })
+    if (firefoxTab.ok && firefoxTab.profile.backend === 'webextension') {
+      return await this.executePageOperation({ request, operation, timeoutMs, deadlineAt, clientSignal })
+    }
     const tabResult = this.resolveTab({
       requestId: request.requestId,
       sessionId: request.sessionId,
@@ -2426,6 +2758,19 @@ export class ManagedRelay {
         },
       }
     }
+    if (profile.backend === 'webextension') {
+      const parsedTab = parseTabValue({ value: tab, index: 0, backend: 'webextension' })
+      const current = this.state.profiles.get(profile.profileId)
+      const cachedTab = current?.tabs.get(tab.tabId)
+      if (!parsedTab.ok || !Number.isSafeInteger(tab.browserTabId) || tab.browserTabId === undefined || tab.browserTabId < 0 ||
+        tab.chromeTabId !== -1 || tab.targetId !== undefined || tab.cdpSessionId !== undefined ||
+        tab.browserEpoch !== profile.browserEpoch || current?.connectionId !== profile.connectionId ||
+        current?.browserEpoch !== profile.browserEpoch || cachedTab?.browserTabId !== tab.browserTabId) {
+        return { ok: false, failure: {
+          code: 'needs-rebind', message: 'Firefox tab identity or connection changed before execution', outcome: 'not-started',
+        } }
+      }
+    }
     return { ok: true, tab }
   }
 
@@ -2503,6 +2848,25 @@ export class ManagedRelay {
       if (pool) {
         await pool.releaseSession({ sessionId })
       }
+      await this.firefoxPool?.releaseSession({ sessionId })
+      const notices = Array.from(this.state.profiles.values()).filter((profile) => {
+        return profile.connected && profile.backend === 'webextension' && Array.from(profile.tabs.values()).some((tab) => {
+          return tab.sessionId === sessionId
+        })
+      }).map(async (profile) => {
+        const subRequestId = `${requestId}#${profile.profileId}`
+        const value = await this.options.transport.sendBrowserRequest({
+          profileId: profile.profileId,
+          stableKey: profile.stableKey,
+          request: { requestId: subRequestId, sessionId, operation: { kind: 'session.release' } },
+          timeoutMs: MANAGED_DEFAULT_TIMEOUT_MS,
+        })
+        const response = this.parseFirefoxResponse({ value, requestId: subRequestId })
+        if (!response.ok) {
+          throw new ManagedTransportError(response.error)
+        }
+      })
+      await Promise.all(notices)
     } catch (error) {
       this.options.logger?.error('[managed-relay] releaseSession failed:', error)
       return failureResponse(requestId, {
@@ -2590,6 +2954,15 @@ export class ManagedRelay {
     pending: PendingManagedRequest
     reason: 'cancelled' | 'timeout' | 'client-disconnected' | 'session-released'
   }): void {
+    if (this.state.profiles.get(pending.profileId)?.backend === 'webextension') {
+      void this.firefoxPool?.cancel({ sessionId: pending.sessionId, requestId: pending.requestId, reason: poolCancelReason(reason) }).catch((error) => {
+        this.options.logger?.error('[managed-relay] Firefox cancel failed:', error)
+      })
+      for (const targetRequestId of [pending.requestId, ...pending.domRequestIds]) {
+        void this.notifyExtensionCancel({ sessionId: pending.sessionId, targetRequestId, profileId: pending.profileId, reason })
+      }
+      return
+    }
     if (isPageOperationKind(pending.kind)) {
       void this.cancelPoolRequest({
         sessionId: pending.sessionId,
@@ -2702,6 +3075,9 @@ export class ManagedRelay {
     const snapshot = this.state.profiles.get(profileId)
     if (!snapshot) {
       return { ok: false, code: 'profile-disconnected', reason: `unknown managed profile ${profileId}` }
+    }
+    if (snapshot.backend === 'webextension') {
+      return { ok: false, code: 'unsupported-capability', reason: 'Firefox WebExtension profiles do not expose CDP' }
     }
     if (request.stableKey && snapshot.stableKey !== request.stableKey) {
       return {
@@ -3082,6 +3458,9 @@ export class ManagedRelay {
     this.disposed = true
     this.networkCaptures.clear()
     this.pendingNetworkStarts.clear()
+    const firefoxPool = this.firefoxPool
+    this.firefoxPool = null
+    await firefoxPool?.dispose()
     for (const pending of this.pending.values()) {
       pending.controller.abort(new Error('relay shutting down'))
     }
@@ -3109,12 +3488,14 @@ export class ManagedRelay {
     requestId,
     profileId,
     kind,
+    tabId,
     clientSignal,
   }: {
     sessionId: string
     requestId: string
     profileId: string
     kind: BrowserOperation['kind']
+    tabId?: string
     clientSignal?: AbortSignal
   }): PendingManagedRequest {
     const pending: PendingManagedRequest = {
@@ -3122,6 +3503,7 @@ export class ManagedRelay {
       requestId,
       profileId,
       kind,
+      ...(tabId !== undefined ? { tabId } : {}),
       controller: new AbortController(),
       started: false,
       cancelRequested: false,
@@ -3129,6 +3511,7 @@ export class ManagedRelay {
       clientDisconnected: false,
       timedOut: false,
       detachClientSignal: null,
+      domRequestIds: new Set(),
     }
     if (clientSignal) {
       pending.detachClientSignal = this.attachClientSignal({ pending, signal: clientSignal })
@@ -3464,11 +3847,15 @@ function poolCancelReason(
 function isCandidateRecord(value: unknown): value is BrowserTabCandidate {
   if (!isRecord(value)) return false
   return (
-    typeof value.candidateId === 'string' &&
-    typeof value.profileId === 'string' &&
-    typeof value.browserEpoch === 'string' &&
-    typeof value.chromeTabId === 'number' &&
-    typeof value.windowId === 'number'
+    typeof value.candidateId === 'string' && value.candidateId.length <= IDENTIFIER_MAX_LENGTH &&
+    typeof value.profileId === 'string' && value.profileId.length <= IDENTIFIER_MAX_LENGTH &&
+    typeof value.browserEpoch === 'string' && value.browserEpoch.length <= IDENTIFIER_MAX_LENGTH &&
+    Number.isSafeInteger(value.chromeTabId) &&
+    Number.isSafeInteger(value.windowId) &&
+    typeof value.url === 'string' && value.url.length <= URL_MAX_LENGTH * 4 &&
+    typeof value.title === 'string' && value.title.length <= MESSAGE_MAX_LENGTH &&
+    typeof value.active === 'boolean' && typeof value.windowFocused === 'boolean' &&
+    typeof value.managed === 'boolean' && typeof value.ownedByThisSession === 'boolean' && typeof value.attachable === 'boolean'
   )
 }
 

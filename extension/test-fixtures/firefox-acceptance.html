@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Pi Browser Use — Firefox acceptance fixture</title>
+<style>
+  body { font: 16px system-ui; margin: 32px auto; max-width: 840px; padding: 0 24px; }
+  section { border: 1px solid #bbb; border-radius: 8px; padding: 20px; margin: 20px 0; }
+  label { display: block; margin: 12px 0; }
+  input, textarea, select, button { font: inherit; padding: 6px; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .covered { position: relative; display: inline-block; }
+  .cover { position: absolute; inset: 0; background: #ddd8; z-index: 2; }
+  #scroll-target { margin-top: 900px; }
+</style>
+<h1>Firefox ordinary-extension acceptance</h1>
+<p>Only fixture-owned data and tabs are used. Serve this file through an authorized local test fixture server.</p>
+<section>
+  <h2>Existing page state</h2>
+  <label>Existing note <input id="existing-note" value="Keep this text while attaching"></label>
+  <label>Controlled name <input id="controlled-name" data-testid="controlled-name" value="Alice"></label>
+  <label>Notes <textarea id="notes">Initial notes</textarea></label>
+  <label><input id="enabled-feature" type="checkbox"> Enable feature</label>
+  <label>Choice <select id="choice"><option value="alpha">Alpha</option><option value="beta">Beta</option></select></label>
+  <div role="textbox" aria-label="Rich text" contenteditable="true">Initial rich text</div>
+  <button id="submit">Save values</button>
+  <pre id="saved-values" aria-live="polite"></pre>
+</section>
+<section>
+  <h2>Strict selectors and state</h2>
+  <button aria-label="Duplicate">First duplicate</button>
+  <button aria-label="Duplicate">Second duplicate</button>
+  <button disabled>Disabled action</button>
+  <button hidden>Hidden action</button>
+  <div class="covered"><button>Covered action</button><div class="cover"></div></div>
+  <div id="replace-area"><button id="replaceable">Original element</button></div>
+  <button id="replace">Replace the original element</button>
+</section>
+<section>
+  <h2>Frames and shadow DOM</h2>
+  <iframe title="Local frame" srcdoc="<label>Frame name <input value='Inside frame'></label><button>Frame action</button>"></iframe>
+  <div id="shadow-host"></div>
+</section>
+<section>
+  <h2>Navigation, new tabs, network and logs</h2>
+  <a id="new-tab" target="_blank" href="?child=1">Open fixture child</a>
+  <a href="?history=next">Navigate within fixture</a>
+  <button id="network">Fetch fixture</button>
+  <button id="log">Emit page log</button>
+  <pre id="event-log" aria-label="Observed events"></pre>
+</section>
+<section id="scroll-target"><h2>Scroll marker</h2><p>Scroll here before attach; the viewport should stay here.</p></section>
+<script>
+  const eventLog = document.querySelector('#event-log');
+  const controlled = document.querySelector('#controlled-name');
+  const appendEvent = (message) => { eventLog.textContent += message + '\n'; };
+  const controlState = { name: controlled.value };
+  controlled.addEventListener('input', (event) => {
+    controlState.name = controlled.value;
+    appendEvent('input value=' + controlled.value + ' trusted=' + event.isTrusted);
+  });
+  controlled.addEventListener('change', (event) => { appendEvent('change trusted=' + event.isTrusted); });
+  document.querySelector('#submit').addEventListener('click', (event) => {
+    document.querySelector('#saved-values').textContent = JSON.stringify({
+      name: controlState.name,
+      note: document.querySelector('#existing-note').value,
+      notes: document.querySelector('#notes').value,
+      enabled: document.querySelector('#enabled-feature').checked,
+      choice: document.querySelector('#choice').value,
+      clickTrusted: event.isTrusted,
+    }, null, 2);
+  });
+  document.querySelector('#replace').addEventListener('click', () => {
+    const replacement = document.createElement('button');
+    replacement.id = 'replaceable';
+    replacement.textContent = 'Replacement element';
+    document.querySelector('#replace-area').replaceChildren(replacement);
+  });
+  document.querySelector('#shadow-host').attachShadow({ mode: 'open' }).innerHTML =
+    '<label>Shadow name <input value="Inside shadow"></label><button>Shadow action</button>';
+  document.querySelector('#network').addEventListener('click', async () => {
+    const response = await fetch('?capture=fixture');
+    appendEvent('network status=' + response.status + ' bytes=' + (await response.text()).length);
+  });
+  document.querySelector('#log').addEventListener('click', () => {
+    console.log('Pi Firefox fixture page log');
+    appendEvent('page console.log emitted');
+  });
+</script>
+</html>
