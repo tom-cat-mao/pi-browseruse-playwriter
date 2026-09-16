@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { PageExtractError, extractPageContent, EXTRACT_MAX_CHARS } from './page-extract.js'
+import { PageExtractError, extractPageContent, windowExtractedText, EXTRACT_MAX_CHARS } from './page-extract.js'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'test-fixtures')
 
@@ -14,6 +14,28 @@ const ARTICLE_URL = 'https://coastal.example/news/tidal-bores'
 const DOCS_URL = 'https://storage.example/docs/retention'
 const FORUM_URL = 'https://forum.example/t/build-times'
 const RELEASE_URL = 'https://runtime.example/releases/0.9'
+const MEDIAWIKI_URL = 'https://wiki.example/wiki/Tidal_bore'
+
+/**
+ * Parsoid output as MediaWiki serves it: each thumb is a `figure` whose `img`
+ * carries `resource` (an RDFa pointer at the file description page) next to a
+ * protocol-relative `src` and a density-descriptor `srcset`.
+ */
+const MEDIAWIKI_ARTICLE_HTML = [
+  '<!doctype html><html class="client-nojs" lang="en" dir="ltr">',
+  '<head><title>Tidal bore - Wikipedia</title></head><body>',
+  '<div id="mw-content-text"><div class="mw-content-ltr mw-parser-output" lang="en" dir="ltr">',
+  '<p>A <b>tidal bore</b> is a shallow-water wave that propagates up a river or narrow bay against the direction of the current. The bore forms where the incoming tide is funnelled into a narrowing channel and the tidal range is large relative to the depth of the estuary. Bores are documented in more than eighty estuaries worldwide, and the largest of them travel tens of kilometres inland before they dissipate.</p>',
+  '<figure typeof="mw:File/Thumb" class="mw-halign-right"><a href="/wiki/File:Tidal_bore_Qiantang.jpg" class="mw-file-description"><img resource="https://wiki.example/wiki/File:Tidal_bore_Qiantang.jpg" src="//upload.example/commons/thumb/8/8a/Tidal_bore_Qiantang.jpg/250px-Tidal_bore_Qiantang.jpg" decoding="async" width="250" height="167" class="mw-file-element" srcset="//upload.example/commons/thumb/8/8a/Tidal_bore_Qiantang.jpg/500px-Tidal_bore_Qiantang.jpg 2x" data-file-width="2000" data-file-height="1333" loading="lazy"></a><figcaption>The Qiantang River bore sweeping past the seawall at Hangzhou</figcaption></figure>',
+  '<p>The shape of a bore depends on the ratio of tidal amplitude to channel depth. When that ratio is small the wave steepens gradually and the front stays smooth; when it is large the front curls forward and the bore breaks, entraining air and suspending sediment from the bed. The transition between the two regimes can often be seen within a single tidal cycle as the flood tide gains strength.</p>',
+  '<p>Sediment transport in a bore is concentrated in the minutes around the passage of the front. Instruments anchored in the channel record a sharp spike in suspended-sediment concentration followed by a slower decay that lasts for the rest of the flood. The net effect over a spring-neap cycle is an upstream migration of sand that keeps many navigation channels shallow.</p>',
+  '<h2>Notable bores</h2>',
+  '<p>The Qiantang River bore in China is the largest in the world, with a front that can exceed nine metres during the autumn spring tides. The Severn bore in England and the Pororoca on the Amazon are also well documented. Smaller bores occur on the Petitcodiac in Canada and on several rivers draining into the Bay of Fundy.</p>',
+  '<figure typeof="mw:File/Thumb" class="mw-halign-left"><a href="/wiki/File:Severn_bore_surfer.jpg" class="mw-file-description"><img resource="https://wiki.example/wiki/File:Severn_bore_surfer.jpg" src="//upload.example/commons/thumb/1/1c/Severn_bore_surfer.jpg/220px-Severn_bore_surfer.jpg" decoding="async" width="220" height="147" class="mw-file-element" srcset="//upload.example/commons/thumb/1/1c/Severn_bore_surfer.jpg/440px-Severn_bore_surfer.jpg 2x" data-file-width="1600" data-file-height="1067" loading="lazy"></a><figcaption>A surfer riding the Severn bore near Newnham on Severn</figcaption></figure>',
+  '<p>Recreational surfing on bores has grown since the 1950s, and several rivers now publish tide tables aimed at surfers rather than navigators. The rides are short by ocean standards but the waves are unusually predictable, which makes them attractive for record attempts and for training.</p>',
+  '<p>Modelling a bore requires a depth-averaged solver that can represent a moving discontinuity in the free surface. Early one-dimensional models reproduced the timing of the front but not its height; modern two-dimensional models resolve the transverse structure of the wave and the secondary currents it drives along the banks. Field campaigns remain essential because the bed roughness of a muddy estuary is difficult to parameterise from first principles.</p>',
+  '</div></div></body></html>',
+].join('\n')
 
 describe('extractPageContent markdown extraction', () => {
   it('extracts a typical article without navigation or promo blocks', async () => {
@@ -97,6 +119,36 @@ describe('extractPageContent markdown extraction', () => {
 
     expect(result.text).toContain('(https://storage.example/docs/retention#migration)')
     expect(result.text).not.toContain('](/docs/retention#migration)')
+  })
+})
+
+describe('extractPageContent MediaWiki images', () => {
+  it('resolves figure images to the file bytes instead of the description page', async () => {
+    const result = await extractPageContent({
+      html: MEDIAWIKI_ARTICLE_HTML,
+      url: MEDIAWIKI_URL,
+      format: 'markdown',
+    })
+
+    expect(result.text).toContain(
+      '![](https://upload.example/commons/thumb/8/8a/Tidal_bore_Qiantang.jpg/250px-Tidal_bore_Qiantang.jpg)',
+    )
+    expect(result.text).toContain(
+      '![](https://upload.example/commons/thumb/1/1c/Severn_bore_surfer.jpg/220px-Severn_bore_surfer.jpg)',
+    )
+    expect(result.text).not.toMatch(/!\[[^\]]*\]\([^)]*\/File:/)
+    expect(result.text).toContain('## Notable bores')
+    expect(result.text).toMatchSnapshot()
+  })
+
+  it('keeps the resource attribute in the html format', async () => {
+    // Both backends serve `format: 'html'` straight from the serialized page,
+    // so the pipeline's Markdown normalization must not reach it.
+    const html = windowExtractedText({ text: MEDIAWIKI_ARTICLE_HTML })
+
+    expect(html.truncated).toBe(false)
+    expect(html.text).toContain('resource="https://wiki.example/wiki/File:Tidal_bore_Qiantang.jpg"')
+    expect(html.text).toBe(MEDIAWIKI_ARTICLE_HTML)
   })
 })
 
