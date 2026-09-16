@@ -155,8 +155,8 @@ images ∈ none | urls | save（缺省 none）。
   对应模式，没有广告即 unsupported-capability，且在任何页面流量之前拒绝。
 - artifact：字节只走浏览器→runtime→磁盘，模型拿描述符 {path,mimeType,bytes,label,
   sourceUrl}。save 的字节在 value.savedAssets 里到 relay，relay 写盘后把正文与
-  预览中这些图片的 URL 改成 artifact 路径（Chrome 含 src 与 srcset 选中的候选，
-  Firefox 重写抓取用的那个 URL），并在响应
+  预览中这些图片的 URL 改成 artifact 路径（两端一致：src 属性、
+  currentSrc 与全部 sourceUrls 别名），并在响应
   离开 runtime 前剥掉 savedAssets 与 artifactText。
 - 双端差异：Chrome 的 savedAssets 走 worker→relay 8 MiB 控制报文，单请求图片负载
   以 3 MiB 图字节（4 MiB base64）为界，超出按图失败；Firefox 的字节走扩展专属

@@ -1550,9 +1550,10 @@ export default function (pi: ExtensionAPI) {
       "it is not a structure operation: use browser_snapshot when you need to click/fill, browser_extract when you " +
       "need the content itself. Extraction is bounded and windowed: the result reports truncated/totalBytes, search " +
       "keeps only the lines matching a term (with surrounding context), and offset/limit page through the extracted " +
-      "lines. Passing an absolute path inside the runtime's artifacts directory makes the runtime write the full " +
-      "extraction there and return an artifact descriptor (path/mimeType/bytes) while the tool result keeps the " +
-      "bounded preview; a path outside that directory is refused. images controls the page's images: none (default) " +
+      "lines. Passing a path makes the runtime write the full extraction there and return an artifact descriptor " +
+      "(path/mimeType/bytes) while the tool result keeps the bounded preview. The path is confined to the runtime's " +
+      "artifacts directory: absolute paths inside it are used as-is, relative paths resolve inside it, anything " +
+      "escaping it is refused. images controls the page's images: none (default) " +
       "leaves them as remote URLs, urls returns a manifest (src/alt/naturalWidth/naturalHeight per image) without " +
       "downloading anything, and save downloads them through the runtime and rewrites markdown image URLs to the " +
       "local artifact paths. It needs a profile that advertises page.extract (see browser_profiles); a webextension " +
@@ -1589,7 +1590,7 @@ export default function (pi: ExtensionAPI) {
       path: Type.Optional(
         Type.String({
           description:
-            "Absolute path inside the runtime's artifacts directory: the runtime writes the full extraction there and returns an artifact",
+            "Path for the full extraction, confined to the runtime's artifacts directory (absolute, or relative to it): the runtime writes it there and returns an artifact",
         }),
       ),
     }),
