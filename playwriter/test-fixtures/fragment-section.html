@@ -1,0 +1,39 @@
+<section class="changelog" aria-labelledby="changelog-heading">
+  <p>
+    Release 0.9 changed how the runtime resolves a managed profile. The change is backwards compatible for
+    every caller that passes an explicit profile id, and it makes the previous implicit lookup unnecessary.
+  </p>
+  <p>
+    Profiles are now read once when the group is created and cached for the lifetime of the connection. A
+    profile that is closed while a group still references it no longer falls back to the default browser
+    profile; the affected request fails with <code>profile-disconnected</code> and the group keeps its
+    binding until the caller releases it. This is the behaviour operators asked for after the incident in
+    August, where a closed profile silently moved traffic to a signed-in browser.
+  </p>
+  <p>
+    The release also renames the diagnostic flag that used to be called <code>verboseRelay</code>. Logs now
+    carry the connection id on every line, which makes a single tab traceable across worker restarts. Old
+    flag names are still accepted and produce a deprecation line in the relay log.
+  </p>
+  <ul>
+    <li>Profiles are resolved once per group and never re-resolved implicitly.</li>
+    <li>Closed profiles fail the request instead of falling back to a default browser.</li>
+    <li>Every relay log line carries the connection id and the browser epoch.</li>
+    <li>The legacy diagnostic flag still works and prints one deprecation line.</li>
+  </ul>
+  <p>
+    Upgrade notes: callers that relied on the implicit lookup must pass a profile id when they create a
+    group. The runtime rejects a group without a profile with <code>invalid-request</code>, and the error
+    message names the argument that is missing.
+  </p>
+  <p>
+    Rollback is a single version pin. Groups created by 0.9 keep working after a rollback because the stored
+    binding is a plain profile id, but the cached lookups are rebuilt on the next connection, which takes one
+    extra round trip on the first request per tab.
+  </p>
+  <p>
+    Reporting: file a report from the runtime page if a group keeps failing after an upgrade. Include the
+    relay log excerpt around the failure and the value of the browser epoch, since both are needed to tell a
+    stale binding apart from a genuinely missing profile.
+  </p>
+</section>

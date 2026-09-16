@@ -1,0 +1,49 @@
+<div class="theme-doc-markdown markdown">
+  <div class="theme-doc-markdown__inner">
+    <h2>Retention window</h2>
+    <p>
+      Every object written to a locked bucket carries a retain-until timestamp. A retention window is the
+      interval between the write and that timestamp. While the window is open the object is protected: the
+      storage layer rejects every delete request, whether it comes from the API, the lifecycle engine or an
+      operator console, and it rejects overwrites of the same key.
+    </p>
+    <p>
+      The window is set when the object is written and can only be extended afterwards. Extending is
+      idempotent, so a retried request that already applied a longer window is accepted without changing the
+      stored timestamp. Shortening a window is not a supported operation; buckets that need a shorter policy
+      must copy the object to a bucket with a different policy instead.
+    </p>
+    <h3>Compliance mode</h3>
+    <p>
+      A compliance window cannot be lifted by any principal, including the account owner. The only way out is
+      for the window to elapse, which is why the tier is reserved for records a regulator asked you to keep.
+      The lifecycle engine skips objects under a compliance window and reports each skip in the bucket audit
+      log with the reason <code>retention-hold</code>.
+    </p>
+    <ul>
+      <li>Minimum lock is ninety days; shorter values are rejected with <code>InvalidRetentionPeriod</code>.</li>
+      <li>Maximum lock is ten years, matching the longest regulatory schedule in the reference table.</li>
+      <li>Objects larger than five tebibytes cannot enter the tier and stay under governance rules instead.</li>
+    </ul>
+    <h3>Early delete fees</h3>
+    <p>
+      Deleting a locked object before its window elapses is never allowed, but deleting it shortly after the
+      window elapses triggers a prorated storage fee. The fee covers the remainder of the billing term, which
+      is charged monthly: a window that ends six days into the month is billed for those six days only, and
+      the cost dashboard breaks the amount down per bucket.
+    </p>
+    <p>
+      Buckets that mix tiers report the fee per tier, so a bucket with governance and compliance objects shows
+      two lines. The migration notes describe how to move objects between tiers without restarting a window.
+    </p>
+    <p>
+      See the <a href="/docs/retention#migration">migration notes</a> before changing a bucket policy, and the
+      <a href="/docs/retention#audit">audit log reference</a> for the fields the storage layer records.
+    </p>
+    <p>
+      The retention window is the only lock that survives a bucket policy rewrite. Tags, ACLs and bucket
+      defaults are re-evaluated on the next request, so an operator who relies on a default to keep a record
+      must still set the window explicitly when the object is created.
+    </p>
+  </div>
+</div>
