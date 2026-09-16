@@ -11,7 +11,7 @@ import type {
   BrowserResponse,
 } from 'playwriter/browser-protocol'
 import fixture from '../test-fixtures/firefox-dom.html?raw'
-import { browserJson, createFirefoxDomDriver } from '../src/firefox-dom'
+import { browserJson, createFirefoxDomDriver, MAX_CONTENT_JSON_CHARS } from '../src/firefox-dom'
 import { firefoxScreenshotCleanupRequest } from '../src/firefox-resources'
 import type { FirefoxDomDriver } from '../src/firefox-dom'
 import {
@@ -423,6 +423,51 @@ describe('Firefox DOM snapshot lifetime and isolation', () => {
     }
   })
 
+  test('reads a serialized document past the generic value budget, whole or scoped', async () => {
+    // A real long-form page (an enwiki article, for example) serializes to more
+    // markup than any evaluated value is allowed to return.
+    const filler = 'x'.repeat(1_500_000)
+    const article = document.createElement('article')
+    article.id = 'long-article'
+    article.textContent = filler
+    document.body.append(article)
+
+    const whole = success(await driver.run(request({ method: 'page', action: 'content' })))
+    const serialized = String(whole.value)
+    expect(serialized.length).toBeGreaterThan(1_000_000)
+    expect(serialized).toContain(`<article id="long-article">${filler}</article>`)
+
+    const scoped = success(await driver.run(request({ method: 'page', action: 'content', selector: '#long-article' })))
+    expect(String(scoped.value)).toBe(article.outerHTML)
+  })
+
+  test('refuses a serialized document past the content budget and names the budget', async () => {
+    const article = document.createElement('article')
+    article.textContent = 'x'.repeat(MAX_CONTENT_JSON_CHARS)
+    document.body.append(article)
+    const response = await driver.run(request({ method: 'page', action: 'content' }))
+    expect(response).toMatchObject({ ok: false, error: { code: 'execution-failed', outcome: 'not-started' } })
+    if (!response.ok) expect(response.error.message).toContain('exceeds 6 MB')
+  })
+
+  test('keeps every other read on the 1 MB budget', async () => {
+    const filler = 'x'.repeat(1_000_001)
+    const article = document.createElement('article')
+    article.id = 'long-article'
+    article.textContent = filler
+    document.body.append(article)
+
+    const read = await driver.run(request({ method: 'locator', locator: locatorForSelector('#long-article'), action: 'innerHTML' }))
+    expect(read).toMatchObject({ ok: false, error: { code: 'execution-failed' } })
+    if (!read.ok) expect(read.error.message).toContain('exceeds 1 MB')
+
+    const evaluated = await driver.run(request({ method: 'evaluate', code: 'return 1' }), async () => {
+      return filler
+    })
+    expect(evaluated).toMatchObject({ ok: false, error: { code: 'execution-failed' } })
+    if (!evaluated.ok) expect(evaluated.error.message).toContain('exceeds 1 MB')
+  })
+
   test('cancellation wakes a pending locator wait before an action can start', async () => {
     const pendingRequest = request({
       method: 'locator',
@@ -775,6 +820,18 @@ describe('Firefox DOM JSON response serialization', () => {
     }).toThrow('finite number')
     expect(() => {
       browserJson('x'.repeat(1_000_001))
+    }).toThrow('exceeds 1 MB')
+  })
+
+  test('bounds the serialized document at the content budget and measures the JSON, quotes included', () => {
+    // A value two characters under the budget serializes to exactly the budget.
+    expect(browserJson('x'.repeat(MAX_CONTENT_JSON_CHARS - 2), MAX_CONTENT_JSON_CHARS)).toHaveLength(MAX_CONTENT_JSON_CHARS - 2)
+    expect(() => {
+      browserJson('x'.repeat(MAX_CONTENT_JSON_CHARS - 1), MAX_CONTENT_JSON_CHARS)
+    }).toThrow('exceeds 6 MB')
+    // The same document-wide value still exceeds the budget every other read keeps.
+    expect(() => {
+      browserJson('x'.repeat(MAX_CONTENT_JSON_CHARS - 1))
     }).toThrow('exceeds 1 MB')
   })
 })
