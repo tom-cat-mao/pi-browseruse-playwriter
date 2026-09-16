@@ -24,6 +24,15 @@
  *   pipeline reruns extraction with that scope when the automatic pass comes
  *   back suspiciously sparse. `includeReplies`, `removeLowScoring` and
  *   `removeContentPatterns` had no effect on this case.
+ * - A selector-scoped extraction arrives as one element's `outerHTML`, so the
+ *   input is a bare `<div>`/`<section>` rather than a document. Defuddle then
+ *   has no `<body>` to fall back on and scores the fragment by its own class
+ *   and id: a container whose name carries no article keyword scores as
+ *   boilerplate and the whole body is dropped while the result still looks
+ *   successful (`fragment-div.html`: 0 of 2370 visible characters, `ok` with
+ *   `truncated: false`). Inputs without an `<html>` or `<body>` tag are
+ *   therefore wrapped in a minimal document first, which also gives the
+ *   body-scoped retry something to scope to.
  *
  * This module only produces text in memory. Writing artifacts to disk is the
  * artifact store's job.
@@ -31,12 +40,18 @@
 
 import { parseHTML } from 'linkedom'
 import { Defuddle } from 'defuddle/node'
-import type { BrowserJson } from './browser-protocol.js'
+import type { BrowserErrorCode, BrowserJson } from './browser-protocol.js'
 
 export interface PageExtractInput {
   html: string
   /** Document URL, used for absolute link rewriting and metadata. */
   url?: string
+  /**
+   * Document title. An element-scoped input carries no `<head>`, so a caller
+   * that already knows the page title may pass it on; the fragment skeleton
+   * uses it, and an absent title stays empty.
+   */
+  title?: string
   format: 'markdown' | 'text'
   /** Keep matching lines with context (same windowing as page.snapshot). */
   search?: string
@@ -68,6 +83,22 @@ export interface PageExtractOutput {
 }
 
 /**
+ * Raised when the pipeline cannot deliver the content it was asked for. The
+ * extraction itself ran, so this is not a parsing error: the extractor dropped
+ * the body and reporting success would hand the caller an empty document that
+ * looks complete. The code is the protocol's generic execution failure, which
+ * both backends already map to a failed operation.
+ */
+export class PageExtractError extends Error {
+  readonly code: BrowserErrorCode = 'execution-failed'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'PageExtractError'
+  }
+}
+
+/**
  * Line caps mirror the page.snapshot renderer: `maxLines` bounds the window,
  * `maxChars` bounds the response and `marker` is appended whenever the caller
  * does not get every line.
@@ -94,6 +125,28 @@ const EXTRACT_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024
  */
 const SPARSE_CONTENT_RATIO = 0.4
 
+/**
+ * Guardrail against silent content loss. The extractor can drop the body and
+ * still report success — wave 2 acceptance lost a 7.9k character selector
+ * fragment down to 11 characters — which the caller cannot tell apart from a
+ * genuinely empty page.
+ *
+ * A result at or below this many characters carries no usable payload:
+ * defuddle's failure mode is all-or-nothing (0-11 characters kept in every
+ * observed case), while the smallest extraction any fixture in
+ * `test-fixtures/` produces is 806 characters.
+ */
+const NEAR_EMPTY_RESULT_MAX_CHARS = 200
+/**
+ * ... and only a document this large has enough visible text that some of it
+ * should have survived. The fixtures hold 1198-2074 visible characters and the
+ * acceptance fragment 7.9k, so the floor sits above every short page whose
+ * empty extraction is legitimate and well below a real article. Together the
+ * two bounds mean a failure is reported only when under 5% of a document's
+ * visible text came back.
+ */
+const NEAR_EMPTY_SOURCE_MIN_VISIBLE_CHARS = 4_000
+
 interface ExtractPassResult {
   /** Markdown produced by defuddle. */
   markdown: string
@@ -102,7 +155,7 @@ interface ExtractPassResult {
 }
 
 export async function extractPageContent(input: PageExtractInput): Promise<PageExtractOutput> {
-  const extracted = await extractFromHtml({ html: input.html, url: input.url })
+  const extracted = await extractFromHtml({ html: input.html, url: input.url, title: input.title })
   const body = input.format === 'text' ? stripMarkdownToText(extracted.markdown) : extracted.markdown
   const document = assembleDocument({
     title: extracted.title,
@@ -184,17 +237,68 @@ export function windowExtractedText({
   return { text: output, truncated }
 }
 
-async function extractFromHtml({ html, url }: { html: string; url?: string }): Promise<ExtractPassResult> {
+/**
+ * Leading whitespace and a doctype do not make an input a whole document: a
+ * selector-scoped extraction carries neither tag, and `<!doctype html>`
+ * contains `html>` without containing the `<html>` tag.
+ */
+const DOCUMENT_PREFIX_PATTERN = /^\s*(?:<!doctype\b[^>]*>\s*)?/i
+const DOCUMENT_TAG_PATTERN = /<(?:html|body)[\s/>]/i
+
+function looksLikeDocument(html: string): boolean {
+  return DOCUMENT_TAG_PATTERN.test(html.replace(DOCUMENT_PREFIX_PATTERN, ''))
+}
+
+/** Wrap a bare element fragment in the smallest document the pipeline needs. */
+function wrapFragmentInDocument({ html, title }: { html: string; title?: string }): string {
+  const fragment = html.replace(DOCUMENT_PREFIX_PATTERN, '')
+  return `<!doctype html><html><head><title>${escapeHtmlText(title ?? '')}</title></head><body>${fragment}</body></html>`
+}
+
+function escapeHtmlText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * Fail instead of reporting a near-empty extraction as a complete one. Both
+ * bounds have to hold, so an empty or short document keeps returning its empty
+ * text.
+ */
+function assertExtractionKeptContent({ markdown, visibleText }: { markdown: string; visibleText: number }): void {
+  const kept = markdown.trim().length
+  if (kept > NEAR_EMPTY_RESULT_MAX_CHARS || visibleText < NEAR_EMPTY_SOURCE_MIN_VISIBLE_CHARS) {
+    return
+  }
+  throw new PageExtractError(
+    `content extraction kept only ${kept} of ${visibleText} visible characters; the document body was likely dropped`,
+  )
+}
+
+async function extractFromHtml({
+  html,
+  url,
+  title,
+}: {
+  html: string
+  url?: string
+  title?: string
+}): Promise<ExtractPassResult> {
   if (!html.trim()) {
     return { markdown: '', title: '', metadata: {} }
   }
-  const [automatic, bodyScoped] = await Promise.all([runDefuddlePass({ html, url }), runDefuddlePass({ html, url, scopedToBody: true })])
-  const visibleText = estimateVisibleTextLength(html)
+  const documentHtml = looksLikeDocument(html) ? html : wrapFragmentInDocument({ html, title })
+  const [automatic, bodyScoped] = await Promise.all([
+    runDefuddlePass({ html: documentHtml, url }),
+    runDefuddlePass({ html: documentHtml, url, scopedToBody: true }),
+  ])
+  const visibleText = estimateVisibleTextLength(documentHtml)
   const automaticRatio = visibleText === 0 ? 1 : automatic.markdown.trim().length / visibleText
-  if (automaticRatio >= SPARSE_CONTENT_RATIO || bodyScoped.markdown.trim().length <= automatic.markdown.trim().length) {
-    return automatic
-  }
-  return bodyScoped
+  const chosen =
+    automaticRatio >= SPARSE_CONTENT_RATIO || bodyScoped.markdown.trim().length <= automatic.markdown.trim().length
+      ? automatic
+      : bodyScoped
+  assertExtractionKeptContent({ markdown: chosen.markdown, visibleText })
+  return chosen
 }
 
 async function runDefuddlePass({

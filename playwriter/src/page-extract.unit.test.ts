@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { extractPageContent, EXTRACT_MAX_CHARS } from './page-extract.js'
+import { PageExtractError, extractPageContent, EXTRACT_MAX_CHARS } from './page-extract.js'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'test-fixtures')
 
@@ -13,6 +13,7 @@ const readFixture = (name: string): string => {
 const ARTICLE_URL = 'https://coastal.example/news/tidal-bores'
 const DOCS_URL = 'https://storage.example/docs/retention'
 const FORUM_URL = 'https://forum.example/t/build-times'
+const RELEASE_URL = 'https://runtime.example/releases/0.9'
 
 describe('extractPageContent markdown extraction', () => {
   it('extracts a typical article without navigation or promo blocks', async () => {
@@ -96,6 +97,63 @@ describe('extractPageContent markdown extraction', () => {
 
     expect(result.text).toContain('(https://storage.example/docs/retention#migration)')
     expect(result.text).not.toContain('](/docs/retention#migration)')
+  })
+})
+
+describe('extractPageContent element fragments', () => {
+  it('extracts a bare div fragment instead of scoring its body as boilerplate', async () => {
+    const result = await extractPageContent({
+      html: readFixture('fragment-div.html'),
+      url: DOCS_URL,
+      format: 'markdown',
+    })
+
+    expect(result.title).toBeUndefined()
+    expect(result.truncated).toBe(false)
+    expect(result.text.startsWith('## Retention window')).toBe(true)
+    expect(result.text).toContain('Every object written to a locked bucket carries a retain-until timestamp.')
+    expect(result.text).toContain('- Objects larger than five tebibytes cannot enter the tier')
+    expect(result.text).toContain('(https://storage.example/docs/retention#migration)')
+    expect(result.text).toMatchSnapshot()
+  })
+
+  it('extracts a bare section fragment that carries no heading of its own', async () => {
+    const result = await extractPageContent({
+      html: readFixture('fragment-section.html'),
+      url: RELEASE_URL,
+      format: 'markdown',
+    })
+
+    expect(result.title).toBeUndefined()
+    expect(result.truncated).toBe(false)
+    expect(result.text.startsWith('Release 0.9 changed how the runtime resolves a managed profile.')).toBe(true)
+    expect(result.text).toContain('`profile-disconnected`')
+    expect(result.text).toContain('- Every relay log line carries the connection id and the browser epoch.')
+    expect(result.text).toContain('Rollback is a single version pin.')
+    expect(result.text).toMatchSnapshot()
+  })
+
+  it('still treats a doctype-only prefix as a fragment', async () => {
+    const result = await extractPageContent({
+      html: readFixture('fragment-div.html').replace(/^/, '  <!doctype html>\n\n'),
+      url: DOCS_URL,
+      format: 'markdown',
+    })
+
+    expect(result.text.startsWith('## Retention window')).toBe(true)
+    expect(result.text).toContain('The window is set when the object is written')
+  })
+
+  it('titles a fragment with the title the caller already knows', async () => {
+    const result = await extractPageContent({
+      html: readFixture('fragment-section.html'),
+      url: RELEASE_URL,
+      title: 'Runtime 0.9 release notes',
+      format: 'markdown',
+    })
+
+    expect(result.title).toBe('Runtime 0.9 release notes')
+    expect(result.text.startsWith('# Runtime 0.9 release notes\n\nRelease 0.9')).toBe(true)
   })
 })
 
@@ -376,5 +434,67 @@ describe('extractPageContent robustness', () => {
 
     expect(result.text).toContain('After upgrading to 0.9')
     expect(result.text).toContain('That was it. Confirmed: 13 minutes')
+  })
+})
+
+describe('extractPageContent silent content loss', () => {
+  const indexPage = ({ links }: { links: number }): string => {
+    const rows = Array.from({ length: links }, (_unused, index) => {
+      return `<a href="/docs/${index}">Guide ${index}: configuring the managed runtime for a shared team workspace</a>`
+    }).join('\n')
+    const head = '<!doctype html><html><head><title>Documentation index</title></head><body>'
+    return `${head}<nav>${rows}</nav></body></html>`
+  }
+
+  it('fails explicitly when a long page extracts to nothing', async () => {
+    const failure = await extractPageContent({
+      html: indexPage({ links: 80 }),
+      url: 'https://runtime.example/docs',
+      format: 'markdown',
+    }).catch((error: unknown) => {
+      return error
+    })
+
+    expect(failure).toBeInstanceOf(PageExtractError)
+    expect((failure as PageExtractError).code).toBe('execution-failed')
+    const message = (failure as Error).message
+    expect(message.endsWith('; the document body was likely dropped')).toBe(true)
+    const [, kept, visible] = /kept only (\d+) of (\d+) visible characters/.exec(message) ?? []
+    expect(Number(kept)).toBeLessThanOrEqual(200)
+    expect(Number(visible)).toBeGreaterThan(4_000)
+  })
+
+  it('keeps returning near-empty text when the page itself is short', async () => {
+    const result = await extractPageContent({
+      html: indexPage({ links: 3 }),
+      url: 'https://runtime.example/docs',
+      format: 'markdown',
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.text.length).toBeLessThan(200)
+  })
+
+  it('does not fail a long page whose body survives extraction', async () => {
+    const paragraphs = Array.from({ length: 30 }, (_unused, index) => {
+      return (
+        `<p>Paragraph ${index} explains how a group binds to one managed profile and why the runtime never ` +
+        `falls back to a default browser when that profile is closed mid-session.</p>`
+      )
+    }).join('\n')
+    const html = [
+      '<!doctype html><html><head><title>Managed profiles</title></head><body>',
+      '<article><h1>Managed profiles</h1>',
+      paragraphs,
+      '</article></body></html>',
+    ].join('\n')
+    const result = await extractPageContent({
+      html,
+      url: 'https://runtime.example/docs/profiles',
+      format: 'markdown',
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.text.length).toBeGreaterThan(4_000)
   })
 })

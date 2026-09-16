@@ -1,5 +1,50 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`extractPageContent element fragments > extracts a bare div fragment instead of scoring its body as boilerplate 1`] = `
+"## Retention window
+
+Every object written to a locked bucket carries a retain-until timestamp. A retention window is the interval between the write and that timestamp. While the window is open the object is protected: the storage layer rejects every delete request, whether it comes from the API, the lifecycle engine or an operator console, and it rejects overwrites of the same key.
+
+The window is set when the object is written and can only be extended afterwards. Extending is idempotent, so a retried request that already applied a longer window is accepted without changing the stored timestamp. Shortening a window is not a supported operation; buckets that need a shorter policy must copy the object to a bucket with a different policy instead.
+
+### Compliance mode
+
+A compliance window cannot be lifted by any principal, including the account owner. The only way out is for the window to elapse, which is why the tier is reserved for records a regulator asked you to keep. The lifecycle engine skips objects under a compliance window and reports each skip in the bucket audit log with the reason \`retention-hold\`.
+
+- Minimum lock is ninety days; shorter values are rejected with \`InvalidRetentionPeriod\`.
+- Maximum lock is ten years, matching the longest regulatory schedule in the reference table.
+- Objects larger than five tebibytes cannot enter the tier and stay under governance rules instead.
+
+### Early delete fees
+
+Deleting a locked object before its window elapses is never allowed, but deleting it shortly after the window elapses triggers a prorated storage fee. The fee covers the remainder of the billing term, which is charged monthly: a window that ends six days into the month is billed for those six days only, and the cost dashboard breaks the amount down per bucket.
+
+Buckets that mix tiers report the fee per tier, so a bucket with governance and compliance objects shows two lines. The migration notes describe how to move objects between tiers without restarting a window.
+
+See the [migration notes](https://storage.example/docs/retention#migration) before changing a bucket policy, and the [audit log reference](https://storage.example/docs/retention#audit) for the fields the storage layer records.
+
+The retention window is the only lock that survives a bucket policy rewrite. Tags, ACLs and bucket defaults are re-evaluated on the next request, so an operator who relies on a default to keep a record must still set the window explicitly when the object is created."
+`;
+
+exports[`extractPageContent element fragments > extracts a bare section fragment that carries no heading of its own 1`] = `
+"Release 0.9 changed how the runtime resolves a managed profile. The change is backwards compatible for every caller that passes an explicit profile id, and it makes the previous implicit lookup unnecessary.
+
+Profiles are now read once when the group is created and cached for the lifetime of the connection. A profile that is closed while a group still references it no longer falls back to the default browser profile; the affected request fails with \`profile-disconnected\` and the group keeps its binding until the caller releases it. This is the behaviour operators asked for after the incident in August, where a closed profile silently moved traffic to a signed-in browser.
+
+The release also renames the diagnostic flag that used to be called \`verboseRelay\`. Logs now carry the connection id on every line, which makes a single tab traceable across worker restarts. Old flag names are still accepted and produce a deprecation line in the relay log.
+
+- Profiles are resolved once per group and never re-resolved implicitly.
+- Closed profiles fail the request instead of falling back to a default browser.
+- Every relay log line carries the connection id and the browser epoch.
+- The legacy diagnostic flag still works and prints one deprecation line.
+
+Upgrade notes: callers that relied on the implicit lookup must pass a profile id when they create a group. The runtime rejects a group without a profile with \`invalid-request\`, and the error message names the argument that is missing.
+
+Rollback is a single version pin. Groups created by 0.9 keep working after a rollback because the stored binding is a plain profile id, but the cached lookups are rebuilt on the next connection, which takes one extra round trip on the first request per tab.
+
+Reporting: file a report from the runtime page if a group keeps failing after an upgrade. Include the relay log excerpt around the failure and the value of the browser epoch, since both are needed to tell a stale binding apart from a genuinely missing profile."
+`;
+
 exports[`extractPageContent markdown extraction > extracts a typical article without navigation or promo blocks 1`] = `
 "# How Tidal Bores Reshape Estuaries
 
