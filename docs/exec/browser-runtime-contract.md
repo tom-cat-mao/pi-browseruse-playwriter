@@ -137,10 +137,11 @@ images ∈ none | urls | save（缺省 none）。
 
 - format：markdown/text 由 runtime 侧共享管线从浏览器给的高保真 HTML 产出，
   一端实现；html 直接给序列化文档，同样受窗口预算；assets-manifest 只给页面
-  图片清单，不产正文。selector 存在时只序列化严格匹配的单个元素。
+  图片清单，不产正文（selector 只作用于正文格式，assets-manifest 忽略它）。selector
+  存在时只序列化严格匹配的单个元素。
 - 窗口与预算：search/offset/limit 只作用于模型可见窗口；带 path 时整篇经
   value.artifactText 交给 relay 落盘，模型仍只看窗口。清单最多 200 条，
-  清单 JSON 与预览共用 40,000 字节预算，被截断时 value.assetsTruncated=true。
+  清单 JSON 上限 40,000 字节（预览正文另按 40,000 字符计），被截断时 value.assetsTruncated=true。
 - images：'urls' 在任意 format 上附 value.assets（assetCount + 每条
   {src,currentSrc,srcset,alt,naturalWidth,naturalHeight}），零字节；'save' 先给同一
   清单，再抓最多 20 张的字节。逐图独立：抓不到、超限或类型不可命名的进
@@ -153,7 +154,8 @@ images ∈ none | urls | save（缺省 none）。
   对应模式，没有广告即 unsupported-capability，且在任何页面流量之前拒绝。
 - artifact：字节只走浏览器→runtime→磁盘，模型拿描述符 {path,mimeType,bytes,label,
   sourceUrl}。save 的字节在 value.savedAssets 里到 relay，relay 写盘后把正文与
-  预览中这些图片的 URL（含 src 与 srcset 选中的那个）改成 artifact 路径，并在响应
+  预览中这些图片的 URL 改成 artifact 路径（Chrome 含 src 与 srcset 选中的候选，
+  Firefox 重写抓取用的那个 URL），并在响应
   离开 runtime 前剥掉 savedAssets 与 artifactText。
 - 双端差异：Chrome 的 savedAssets 走 worker→relay 8 MiB 控制报文，单请求图片负载
   以 3 MiB 图字节（4 MiB base64）为界，超出按图失败；Firefox 的字节走扩展专属

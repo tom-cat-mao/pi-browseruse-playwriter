@@ -1930,8 +1930,8 @@ describe("tool execution shaping (real HTTP runtime)", () => {
   });
 
   it("reports how many images a save run left over the per-request limit when it returns no manifest", async () => {
-    // The Chrome save shape: the relay writes the bytes, drops savedAssets and
-    // hands the model the counters only — no `assets` array to read.
+    // The relay writes the bytes, strips `savedAssets`, and may hand the model
+    // the counters without an `assets` array to read.
     runtimeHandler(() => ({
       text: "# Example\n\n![Hero](/home/u/.pi-browser-use/artifacts/hero.png)",
       value: {
