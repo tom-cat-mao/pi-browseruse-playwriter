@@ -87,8 +87,34 @@ function textOf(content: ContentBlock[]): string {
     .join("\n");
 }
 
+/** A managed tab whose profile is the one the extract gate inspects. */
+const extractTab = {
+  tabId: "tab-1",
+  groupId: "grp-1",
+  sessionId: "s",
+  profileId: "profile-1",
+  url: "https://example.com/article",
+  title: "Example article",
+  state: "ready",
+  browserEpoch: "e",
+  revision: 1,
+  chromeTabId: 7,
+};
+
+/** A profile advertising exactly the given page operations (or none at all). */
+function profileWith(supportedOperations: string[] | undefined, browser = "chrome") {
+  return {
+    ...validProfile,
+    browser,
+    capabilities: {
+      ...validCapabilities,
+      ...(supportedOperations ? { supportedOperations } : {}),
+    },
+  };
+}
+
 describe("extension factory registration", () => {
-  it("registers the 12 managed tools and no browser_save_as_pdf", () => {
+  it("registers the 13 managed tools and no browser_save_as_pdf", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     expect(tools.map((t) => t.name).sort()).toEqual(
@@ -98,6 +124,7 @@ describe("extension factory registration", () => {
         "browser_tabs",
         "browser_navigate",
         "browser_snapshot",
+        "browser_extract",
         "browser_click",
         "browser_fill",
         "browser_evaluate",
@@ -136,6 +163,15 @@ describe("extension factory registration", () => {
     factory(pi as never);
     const click = tools.find((t) => t.name === "browser_click")!;
     expect(Object.keys(click.parameters.properties ?? {}).sort()).toEqual(["selector", "snapshotId", "tabId"].sort());
+  });
+
+  it("declares browser_extract with tabId plus the extraction window and export options", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const extract = tools.find((t) => t.name === "browser_extract")!;
+    expect(Object.keys(extract.parameters.properties ?? {}).sort()).toEqual(
+      ["format", "limit", "offset", "path", "search", "tabId"].sort(),
+    );
   });
 });
 
@@ -1331,6 +1367,245 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(folded).toContain("…illhh1cdkl18");
     const expanded = renderResultText(tabs, result, { expanded: true, args: { action: "create" } });
     expect(expanded).toContain("ptab-mtwn3svh-5illhh1cdkl18");
+  });
+
+  it("sends page.extract for the given tab and defaults the format to markdown", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.snapshot", "page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "# Example\n\nline two", value: { format: "markdown", truncated: false, totalBytes: 15 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute("call-extract", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    const operations = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: { kind: string } }).operation);
+    expect(operations.map((op) => op.kind)).toEqual(["tabs.list", "page.extract"]);
+    expect(operations[1]).toEqual({ kind: "page.extract", tabId: "tab-1", format: "markdown" });
+    expect(textOf(result.content)).toContain("line two");
+  });
+
+  it("refuses browser_extract up front when the tab's profile does not advertise page.extract", async () => {
+    const operations: string[] = [];
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) {
+        return { json: { profiles: [profileWith(["page.snapshot", "page.evaluate"], "firefox")] } };
+      }
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      operations.push(body.operation.kind);
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: { text: "reached the browser" } } };
+    });
+    const extract = toolByName("browser_extract");
+    await expect(
+      extract.execute("call-gate", { tabId: "tab-1" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/does not advertise page\.extract/);
+    // The gate is a read-only precheck: the extraction itself is never sent.
+    expect(operations).toEqual(["tabs.list"]);
+  });
+
+  it("does not block browser_extract when the profile advertises no operation list", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(undefined)] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "extracted anyway", value: { format: "markdown", truncated: false, totalBytes: 16 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute("call-no-list", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    expect(textOf(result.content)).toContain("extracted anyway");
+  });
+
+  it("leaves an unknown tabId to the runtime instead of the capability gate", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: false,
+          error: { code: "resource-not-found", message: "tab tab-1 not found", outcome: "not-started" },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    await expect(
+      extract.execute("call-missing-tab", { tabId: "tab-1" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/code=resource-not-found/);
+  });
+
+  it("reports the extract window, page metadata and the written artifact in model content", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            text: "# Example\n\nline two",
+            value: {
+              format: "markdown",
+              truncated: true,
+              totalBytes: 52_311,
+              title: "Example article",
+              metadata: { siteName: "example.com", author: "A. Writer" },
+            },
+            artifacts: [
+              {
+                path: "/tmp/ex-artifacts/example-article.md",
+                mimeType: "text/markdown",
+                bytes: 52_311,
+                label: "Example article",
+              },
+            ],
+          },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-extract-artifact",
+      {
+        tabId: "tab-1",
+        format: "markdown",
+        search: "line",
+        offset: 10,
+        limit: 20,
+        path: "/tmp/ex-artifacts/example-article.md",
+      },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const post = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: unknown }).operation)
+      .find((operation) => (operation as { kind: string }).kind === "page.extract");
+    expect(post).toEqual({
+      kind: "page.extract",
+      tabId: "tab-1",
+      format: "markdown",
+      search: "line",
+      offset: 10,
+      limit: 20,
+      path: "/tmp/ex-artifacts/example-article.md",
+    });
+
+    const text = textOf(result.content);
+    expect(text).toContain("# Example");
+    expect(text).toContain("format=markdown");
+    expect(text).toContain('title="Example article"');
+    expect(text).toContain("site=example.com");
+    expect(text).toContain("author=A. Writer");
+    expect(text).toContain("52311 bytes of extracted content");
+    expect(text).toContain('window search="line" offset=10 limit=20');
+    expect(text).toContain("truncated=true");
+    expect(text).toContain("a window of the extraction, not the whole document");
+    expect(text).toContain("artifacts: /tmp/ex-artifacts/example-article.md (text/markdown, 52311 bytes)");
+
+    const folded = renderResultText(extract, result, { expanded: false, args: { tabId: "tab-1" } });
+    expect(folded).toContain("markdown · 3 line(s)");
+    expect(folded).toContain("# Example");
+    expect(folded).toContain('"Example article"');
+    expect(folded).toContain("site=example.com");
+    expect(folded).toContain("truncated");
+    expect(folded).toContain("/tmp/ex-artifacts/example-article.md (52311 bytes)");
+    const expanded = renderResultText(extract, result, { expanded: true, args: { tabId: "tab-1" } });
+    expect(expanded).toContain("line two");
+  });
+
+  it("marks a complete extraction as not truncated", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "whole document", value: { format: "text", truncated: false, totalBytes: 14 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-complete",
+      { tabId: "tab-1", format: "text" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain("format=text");
+    expect(text).toContain("truncated=false");
+    expect(text).not.toContain("a window of the extraction");
+  });
+
+  it("projects the extract feature matrix into profile content and hides unrelated keys", async () => {
+    runtimeHandler(() => ({
+      profiles: [
+        {
+          ...validProfile,
+          browser: "firefox",
+          capabilities: {
+            ...validCapabilities,
+            supportedOperations: ["page.snapshot", "page.extract"],
+            features: { extract: ["markdown", "text"], assets: ["urls"], unknownFeature: ["v2"] },
+          },
+        },
+      ],
+    }));
+    const profiles = toolByName("browser_profiles");
+    const result = await profiles.execute("call-features", {}, undefined, undefined, makeCtx());
+    const content = JSON.parse(textOf(result.content)) as {
+      profiles: Array<{ capabilities: Record<string, unknown> }>;
+    };
+    expect(content.profiles[0].capabilities.features).toEqual({ extract: ["markdown", "text"] });
+    expect(content.profiles[0].capabilities.supportedOperations).toEqual(["page.snapshot", "page.extract"]);
+  });
+
+  it("keeps the compact profile shape when a peer advertises no features", async () => {
+    runtimeHandler(() => ({ profiles: [profileWith(["page.snapshot"])] }));
+    const profiles = toolByName("browser_profiles");
+    const result = await profiles.execute("call-no-features", {}, undefined, undefined, makeCtx());
+    const content = JSON.parse(textOf(result.content)) as {
+      profiles: Array<{ capabilities: Record<string, unknown> }>;
+    };
+    expect(content.profiles[0].capabilities).not.toHaveProperty("features");
   });
 });
 

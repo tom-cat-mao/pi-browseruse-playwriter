@@ -84,8 +84,9 @@ describe("getCapabilities", () => {
     await expect(dead.getCapabilities()).rejects.toMatchObject({ category: "runtime-unreachable" });
   });
   it("ignores unknown page operations but keeps the known ones and the feature matrix", async () => {
-    // A peer that ships after this client (page.extract-era extension) must not
-    // be able to fail the connection just by advertising what it can do.
+    // A peer that ships after this client (a future extension advertising an
+    // operation this build has no code for) must not be able to fail the
+    // connection just by advertising what it can do.
     const features = { extract: ["markdown", "text"], assets: ["urls", "save"], unknownFeature: ["v2"] };
     server.setHandler(() => ({
       json: {
@@ -95,7 +96,7 @@ describe("getCapabilities", () => {
       },
     }));
     const caps = await client().getCapabilities();
-    expect(caps.supportedOperations).toEqual(["page.click"]);
+    expect(caps.supportedOperations).toEqual(["page.click", "page.extract"]);
     expect(caps.features).toEqual(features);
   });
   it("keeps capability keys it does not know instead of rejecting the peer", async () => {
@@ -166,18 +167,19 @@ describe("listProfiles", () => {
       profileId: "profile-newer",
       capabilities: {
         ...validCapabilities,
-        supportedOperations: ["page.snapshot", "page.extract"],
+        supportedOperations: ["page.snapshot", "page.extract", "page.teleport"],
         features: { extract: ["markdown"], unknownFeature: ["v2"] },
       },
     };
     server.setHandler(() => ({ json: { profiles: [newerProfile] } }));
     const profiles = await client().listProfiles();
-    expect(profiles[0].capabilities.supportedOperations).toEqual(["page.snapshot"]);
+    expect(profiles[0].capabilities.supportedOperations).toEqual(["page.snapshot", "page.extract"]);
     expect(profiles[0].capabilities.features).toEqual({ extract: ["markdown"], unknownFeature: ["v2"] });
   });
   it("rejects invalid or unbounded optional backend capabilities", async () => {
-    // An unknown page operation (page.extract, a control op) is deliberately not
-    // in this list: it is ignored, not rejected — see the getCapabilities tests.
+    // Operations this client has no code for (a future page operation, a control
+    // operation) are deliberately not in this list: they are ignored, not
+    // rejected — see the getCapabilities tests.
     const invalidCapabilities = [
       { backend: "remote-agent" },
       { inputMode: true },

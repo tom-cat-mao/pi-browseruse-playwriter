@@ -131,6 +131,44 @@ screenshots are an optional extra for visual/spatial questions.
   images; pass `path` to save, `fullPage` for the whole page, `labels` to overlay
   interactive markers. (There is no PDF tool.)
 
+## Extracting content (browser_extract)
+
+`browser_extract` (`tabId`, optional `format`, `search`, `offset`, `limit`, `path`)
+returns a tab's **content** instead of its structure.
+
+- **extract vs snapshot.** `browser_snapshot` reads the accessibility tree and
+  gives you `aria-ref=eN` refs to act on. `browser_extract` reads the content
+  itself and returns no refs and no `snapshotId`; it cannot click or fill, and it
+  does not invalidate the latest snapshot. Use extract to read, quote or export;
+  use snapshot when you are about to act.
+- **Format.** `markdown` (default) is what you want for reading and quoting —
+  headings, lists, links and tables survive. `text` is the same extraction with
+  the Markdown syntax stripped. `html` returns the serialized markup, windowed to
+  the same budget, for when the HTML itself matters. `assets-manifest` is not
+  available yet.
+- **A window, not the whole document.** The result reports `truncated` and
+  `totalBytes`, and the `extract:` line states when the text is a window of the
+  document. `search` keeps only the lines matching a term (with surrounding
+  context), `offset` skips lines and `limit` caps how many come back: page
+  through with `offset += limit`, and never summarize a document from a window
+  you have not read to its end.
+- **Exporting to disk.** Pass an absolute `path` to keep the FULL extraction: the
+  runtime writes the file itself (Markdown and plain text as `.md`, `html` as
+  `.html`) and returns an artifact descriptor with `path`, `mimeType` and
+  `bytes`, while the tool result keeps only the bounded preview. The write is
+  confined to the runtime's artifacts directory (`~/.pi-browser-use/artifacts` by
+  default, or `$PI_BROWSER_DATA_DIR/artifacts`); a path outside it is refused.
+  Report the returned path to the user as the durable copy — you never write
+  files yourself.
+- **Capability differences.** Extraction is served by the target tab's browser
+  build, so it is advertised per profile: `browser_profiles` reports each
+  profile's `supportedOperations` and, when the peer has one, its `extract`
+  feature matrix. Chrome profiles serve `page.extract` today. On Firefox it
+  depends on the installed add-on version: a profile that does not advertise
+  `page.extract` makes `browser_extract` fail with a clear error instead of
+  returning an empty extraction — read those pages with `browser_snapshot` /
+  `browser_evaluate`, and do not try to work around it with broader permissions.
+
 ## Console logs and network
 
 - `browser_logs` (`tabId`, optional `limit`) returns buffered console output —
