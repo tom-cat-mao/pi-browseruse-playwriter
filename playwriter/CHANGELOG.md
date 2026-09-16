@@ -1,5 +1,271 @@
 # Changelog
 
+## 0.6.0
+
+### Minor Changes
+
+- 859910d: Add a managed browser protocol for Pi sessions with explicitly named groups, profile-bound resources, and tab-scoped operations. Separate persistent resource ownership from transient browser connections and execution sessions.
+- 61456ba: Continue in the tab the user is already looking at, and come back after reading a link.
+
+  **Discover and attach existing tabs in place.** `tabs.discover` lists the real tabs of every connected profile — profile, window, URL, title, whether it is the active tab of its window and whether that window has focus — and `tabs.attach` takes control of the chosen one where it is. Nothing is reloaded, moved, regrouped or reopened: scroll position, form state and the user's existing Chrome groups survive. Only the chosen tab is attached, never the rest of its Chrome group, and tabs another session controls are refused. Each attached tab gets a normal `tabId`, so every existing page tool works on it; no group has to be created first.
+
+  ```jsonc
+  // browser_tabs action:"discover" (optionally query / windowId / profileId)
+  { "candidateId": "pcdt:profile-1:epoch-a:7", "windowId": 3, "title": "Invoice draft", "active": true }
+  // browser_tabs action:"attach" with that candidateId -> { "tab": { "tabId": "ptab_…", "origin": "existing" } }
+  ```
+
+  **Follow an external link and come back.** A tab opened by `target=_blank` / `window.open` records the managed tab it came from, so `browser_tabs list` with `sourceTabId` finds the real new tab instead of guessing by URL or "the last tab". A tab attached in place keeps its child tabs where Chrome put them — same window, same groups, no popup relocation — while task groups keep their existing "popup joins the group" behaviour. `browser_tabs action:"activate"` brings the original tab back to the front, and `browser_navigate action:"back"` uses real browser history instead of re-navigating the old URL; when the browser reports no navigation response (same-document/SPA history entries) the result says so instead of claiming nothing happened.
+
+  All of this works with the text accessibility tree: reading, clicking, filling and going back need no screenshots.
+
+- 7d0f92b: Build the fork extension identity by default, in every mode.
+
+  `pnpm build` (extension and repo root) builds the fork dev extension: stable ID `eeklahpecooapnailfaebkjjembkjhhg` and managed runtime port `19989`. This also applies to packaged and `PRODUCTION=true` builds, so the bundled extension inside the runtime package always has its own identity and port. A real store listing would need a store key in `extension/vite.config.mts`; there is no store publish flow in this repo.
+  - Legacy and test flows are explicit opt-ins: `pnpm --filter mcp-extension build:legacy`, `reload:legacy`.
+  - The package installs only the `pi-browser-runtime` bin. The legacy CLI stays available as `pnpm cli:legacy` and is never installed as a `playwriter` bin, so it cannot shadow an upstream global install.
+  - `reload:fork` / `reload:legacy` only build and print the `chrome://extensions` URL; they no longer launch Chrome.
+  - Root `pnpm reload` and `pnpm release` refuse to run (the old flows restarted port `19988` and targeted the upstream store listing).
+  - The distribution smoke check now verifies the packaged extension carries the fork ID and port `19989`.
+
+- 20c5fb5: add managed browser ownership to the extension for Pi sessions
+
+  the extension now keeps an authoritative ownership registry in `chrome.storage.local` (with `chrome.storage.session` tracking the browser run epoch) and exposes a new managed control protocol over the existing websocket:
+  - `browserInventory` broadcasts after connect and on every ownership change, with logical group/tab ids kept separate from Chrome numeric ids
+  - `browserRequest` handles `groups.list/create/rename/close` and `tabs.list/create/close/release/resolve`
+  - `tabs.create` creates a blank tab in the group window, groups it immediately, persists the record, attaches the debugger, navigates, then verifies the Chrome group before returning `ready` with `targetId`/`cdpSessionId`
+  - popups and `target=_blank` tabs opened from a managed tab inherit its group; unrelated user popups are left untouched
+  - dragging a tab out of a managed group, the Chrome debugger infobar cancel, or an explicit release writes a release tombstone that reconnects never pull back
+  - relay reconnects and service-worker restarts restore verifiable bindings without replaying page actions; after a full Chrome restart (or lost `storage.session`) unverifiable resources become `needs-rebind` instead of being adopted by reused numeric Chrome ids
+  - persisted create dedup ledger: retrying the same sessionId + requestId + payload returns the original group/tab across reconnects and service-worker restarts, and reusing a requestId with a different payload is rejected
+  - creates write a preallocated logical id and a `pending` ledger entry before any Chrome side effect; an interrupted attempt is only resumed by re-attaching a verifiably owned tab (navigation is never replayed) and otherwise answers `outcome-unknown`
+  - per-group serialized mutations, so concurrent first tab creates cannot materialize two Chrome groups for one logical group
+  - `request.cancel` stops future steps of a same-session request (never queued behind group locks); a dropped websocket invalidates its generation, cancels its control requests and drops their responses instead of answering on a newer socket
+  - ownership is never touched through stale numeric ids: chrome-id lookups are pinned to the current browser epoch, failed creates only remove tabs that are still provably ours, and a browser-wide debugger cancel stops automation without dissolving logical groups
+  - storage failures surface as `internal-error` (no inventory advertised, records never overwritten, failed write queues recover with a fresh authoritative read); manual Chrome group renames/window moves are synced by Chrome group id, never by title
+  - debugger listeners stay registered for the worker lifetime so user actions (infobar cancel, tab moves) are recorded even while the relay is offline; reconnects reconcile with a revision fence so a snapshot taken while observing Chrome cannot release newer records
+
+- 7fb8eaa: Add the managed browser runtime API: `GET /browser/v1/capabilities`, `GET /browser/v1/profiles` and `POST /browser/v1/request`.
+
+  The relay now caches each extension profile's authoritative resource inventory (`browserInventory` websocket snapshots), enforces session ownership on every group/tab operation, dedupes resource requests by `requestId`, serializes page operations per profile and exposes session-scoped managed CDP connections on `/cdp` (`browserSessionId`/`browserEpoch` query) that only see their own tabs. `session.release` frees the isolated executor without deleting groups or tabs, and cancelled or timed-out actions report `outcome: unknown` instead of being replayed.
+
+  Legacy `/extension` and `/cdp` clients keep working with the existing message and connection formats.
+
+  Cancelling a request also notifies the extension for control commands that are already in flight (`request.cancel` with `sessionId` + `targetRequestId`), including timeouts and dropped HTTP clients; cancelled or timed-out work keeps its `unknown` outcome and is never replayed. Inventory snapshots that are internally inconsistent (duplicate ids, tabs pointing at missing or foreign groups, wrong profile/session owners, or `ready` resources without their Chrome/CDP identity) are rejected instead of cached. Managed CDP clients are limited to an explicit root-method allowlist scoped to their own session/target, with profile-wide and wrapper transports denied.
+
+- 1107228: Ship the relay under the `@tom-cat/pi-browser-runtime` name with a second executable, `pi-browser-runtime`, that runs the managed browser runtime on its own port and data directory.
+
+  ```bash
+  pi-browser-runtime
+  # listening on 127.0.0.1:19989, logs in ~/.pi-browser-use
+  ```
+
+  Configuration comes from the environment:
+  - `PI_BROWSER_HOST` (default `127.0.0.1`)
+  - `PI_BROWSER_PORT` (default `19989`)
+  - `PI_BROWSER_TOKEN` (optional, required for non-loopback binds)
+  - `PI_BROWSER_DATA_DIR` (default `~/.pi-browser-use`)
+
+  The package installs only the `pi-browser-runtime` executable; the legacy CLI is available as the explicit `pnpm cli:legacy` script so it cannot shadow an upstream `playwriter` global install.
+
+  Invalid values for `PI_BROWSER_PORT` (zero, negative, above 65535, or not an integer) now fail the start with a clear error instead of silently falling back to the default; an unset port still means `19989`. `SIGINT`/`SIGTERM` shutdown flushes both log files.
+
+  The runtime runs next to the legacy playwriter relay on `19988`: it has its own logs and never stops a process it does not own. The legacy `playwriter` executable, WebSocket protocol and extension imports stay unchanged, and the Pi package now depends on this runtime.
+
+- c80390f: Add a local Firefox WebExtension backend for existing tabs, with explicit resource ownership, DOM-based page tools, and an isolated JavaScript executor for common page and locator operations. Preserve the Chrome CDP backend and advertise Firefox input, snapshot, and script-permission differences per profile.
+- 2e0e8d4: Add a local, versioned Chrome extension ZIP and SHA256 package for Pi Browser
+  Use releases and manual installation instructions. Pushing an
+  `extension@<version>` tag automatically builds and publishes the ZIP and
+  checksum to GitHub Releases; manual workflow runs default to Draft releases.
+- f37b70b: Add an isolated managed executor pool for Pi browser sessions. Managed page
+  operations run in killable per-session/profile workers, use explicit CDP
+  target IDs, return structured snapshots/results/logs/artifacts/images, and
+  report cancelled or timed-out actions without replaying them.
+
+### Patch Changes
+
+- f963175: Fix the Firefox `browser_snapshot` and role-locator failure `'getComputedStyle' called on an object that does not implement interface Window`.
+
+  `ariaVisible` passed no computed-style implementation to `isInaccessible`, so dom-accessibility-api extracted `element.ownerDocument.defaultView.getComputedStyle` and called it as a bare function. Firefox's WebIDL method rejects an undefined `this`; JSDOM does not catch it because its `getComputedStyle` ignores `this`, and the Chrome backend does not use this DOM driver. The call now supplies a helper that reads the view from the element's own document and invokes `view.getComputedStyle(element)` as a method, so the subtree path uses the same implementation and each same-origin iframe document resolves its own view. `computeAccessibleName` keeps its existing bound call, hidden-node filtering is unchanged, and no permission, CSP, protocol, ownership or cancellation semantics change.
+
+- 300fc74: Stop the Firefox page console bridge from breaking pages that call `console.log`.
+
+  The bridge replaced the page console method with an exported wrapper that forwarded to the page function through `original.apply(pageView.console, args)`. `original.apply` is the page realm's `Function.prototype.apply`, so it read `.length` and the indices of `args`, a rest array created in the extension content-script realm; the page has no access to that sandbox object and threw `Permission denied to access property "length"`, which propagated back into the page's own `console.log` call (the recorder had already stored the line, so the log looked captured). Forwarding now uses the content-script realm's `Reflect.apply(original, pageView.console, args)`, which extracts the arguments in the realm that owns them and still calls the page function with the same `this`. The original console call is not wrapped in a catch, so its errors keep propagating and are not silently hidden, and no object is cloned into the page.
+
+- 102c4c9: Harden Firefox DOM identity generation by deriving ids from `crypto.getRandomValues` instead of the secure-context-gated `crypto.randomUUID`.
+
+  `createFirefoxDomDriver` created the document id, snapshot ids and prepared-action ids with `view.crypto.randomUUID()` read from the page window. `randomUUID()` is `[SecureContext]` (unlike `getRandomValues()`), and Gecko exposes `[SecureContext]` members only when the caller realm or the object's realm is a secure context (`dom/bindings/DOMJSClass.h`). Extension content scripts run in an expanded-principal sandbox that Gecko does not flag as a secure context, so on a plain `http:` page — a supported class, because `firefoxPageSupported` accepts `http:` — neither side is secure. An independent baseline confirmed the failure on a non-trustworthy origin: `http://localtest.me:<loopback fixture port>` reports `isSecureContext=false` and `crypto.randomUUID=undefined` in the page itself, and snapshot/locator fail to enter the driver there (`content script returned invalid result`), while the same fixture works on `127.0.0.1`. The exact content-script stack was not captured, so the link from the missing member to the driver failure is a high-confidence root cause rather than a stepped trace. Identities now come from `view.crypto.getRandomValues`, which is available in insecure contexts, and are still random v4 UUIDs with the same `firefox:<document>:<snapshot>` shape; the fix is pending real verification with the new build, and is harmless if the member turns out to be exposed. No permission, CSP, protocol, ownership or cancellation semantics change.
+
+- 534080b: Let a chained Firefox locator address an open shadow root attached to the locator root.
+
+  `allElements` and the CSS branch of `selectElements` only descended into the shadow roots of matched descendants, never the shadow root of the root being scoped. A locator such as `page.locator('#shadow-host').locator('input')` therefore matched nothing even though open shadow DOM worked through role/label locators and from a document-scoped locator. Both paths now also traverse the root element's own open shadow root. This fixes the explicit chained form only: a single compound cross-shadow CSS selector such as `#shadow-host input` still does not pierce a shadow boundary, because `querySelectorAll` does not cross it and no compound-selector rewriter was added. Use a chained locator or a role/label/text engine for content inside an open shadow root.
+
+- a6cc285: Fix a managed CDP visibility race where tabs attached before the authoritative inventory update were not announced to their owning client.
+- 25d7a33: sync discovered tab ordering and page metadata in the extension
+  - `tabs.discover` now lists the active tab of every window first, with the focused window only ordering ties. The bug report had the active page at the end of 145 candidates, beyond the model-visible budget; the stable window/index tie-break keeps the listing deterministic for pagination.
+  - `chrome.tabs.onUpdated` url/title updates are merged into the authoritative managed inventory and published as one coalesced `browserInventory` message per burst, so `tabs.list` stops returning stale url/title. The coalescing interval is fixed (later updates join it instead of moving the deadline), so continuous title changes cannot starve the publish, and no disk write is added per title change.
+  - coalesced publishes are fenced by the connection generation: a disconnect/reconnect drops the pending snapshot instead of racing the restore that publishes freshly observed Chrome state. Released tombstones and browser epochs are respected, and the refresh only touches display metadata - owner, group/session binding and debugger attachment stay unchanged.
+
+- ec3e1ca: Fix recorder writing the same click 3 times.
+
+  Each Playwright CDP client used to inject its own document click listener. Two sessions, or a leftover enable from a previous recording, turned one user click into two or three `action` events.
+
+  The injected recorder is now one instance per document. `enableRecorder()` also attaches its server listener once, even when called concurrently.
+
+  ```bash
+  playwriter recorder events -r 66 --type action | jq -r '[.id, .t, .code] | @tsv'
+  ```
+
+- fee60a9: Fix the in-page toolbar **Record Skill** button staying on Record after a click.
+
+  The click was starting a recording, but the button only flipped to **Stop recording** when the relay went from zero recordings to one. If another recording was already active, the button did not change, extra clicks started more recordings, and fetch errors were swallowed with no toast.
+
+  The button now shows **Starting…** while the recorder attaches, then **Stop recording**. A failed start shows an error toast and returns the button to Record. Extra clicks no longer start more recordings.
+
+- b53637a: Accept the fork extension identity (`eeklahpecooapnailfaebkjjembkjhhg`) in the relay CORS, `/cdp` and `/extension` origin allowlists, next to the legacy Chrome Web Store and dev extension ids from `ALLOWED_EXTENSION_IDS`.
+- 64214b3: Make an explicit Firefox network capture start replace the previous capture even when it is still active, matching the documented tool contract. Release the old capture's filters and recorded-body budget before creating the new capture; stopping alone still retains records.
+- 0e4867a: Fix managed executor request lifetimes and invalidation ordering. Timed-out or
+  cancelled actions now report unknown outcomes after their worker control
+  connection is stopped, raw execution timers and CDP listeners cannot outlive
+  their request lease, and replacement workers wait for the previous worker to
+  finish shutting down.
+- 2a43124: Build the legacy extension identity in the Chrome test harness.
+
+  `playwriter/src/test-utils.ts` now runs `pnpm build:legacy` in `extension/`
+  instead of the fork default `pnpm build`. The legacy browser regression suites
+  assert the upstream dev extension ID, so the harness keeps that identity while
+  `pnpm build` stays the fork build for users. The test port and dist env vars
+  are unchanged, and the new Chrome acceptance harness builds the fork extension
+  through its own `build:fork` path, so it is unaffected.
+
+- 84ab1aa: Add a local, offline Chinese getting-started page to both browser builds.
+
+  Chrome opens `src/tutorial.html` from `manifest.json` `options_ui` (extension
+  options, or the icon context menu); Firefox 139+ opens `firefox-tutorial.html`
+  from `manifest.firefox.json` `options_ui` (add-on options) plus a Help link in
+  the add-on popup. Both pages are bundled HTML/CSS/JS with no remote assets, no
+  new permission, and no CSP exception, and they never connect to the runtime,
+  adopt or open a tab, or start the runtime. Their content documents the current
+  Pi Browser Use flow (source install, paired managed runtime, `browser_profiles`
+  → `browser_tabs discover`/`attach` → `browser_snapshot` → `browser_tabs
+release`) instead of the old `npx playwriter` commands.
+
+  No new automatic opening path was added. Chrome keeps its pre-existing
+  development paths, which changed only in which page they show: the idle-icon
+  click already opened `src/tutorial.html`, and the install-time open now calls the
+  same helper because the obsolete `welcome.html` is removed. Packaged builds still
+  compile that install-time open out (`PLAYWRITER_OPEN_WELCOME_PAGE=0`).
+
+  Packaging also verifies every manifest-declared local entry point (`background`,
+  `default_popup`, `options_ui.page`, `options_page`, icons) and each page's local
+  `<script src>` / `<link href>` / `<img src>` / `<a href>` before writing a
+  ZIP/XPI, so a missing page or asset fails the build instead of shipping. A
+  manifest entry must be a non-empty local path that exists in the bundle: a
+  remote URL, an empty string, a path that escapes the package, or a non-string
+  value now fails the package instead of being skipped. Explicit external links in
+  pages (`https:`, `mailto:`, `#fragment`) stay allowed.
+
+  With `welcome.html` gone, Prism has no consumer left: its CDN download script,
+  the build step that ran it, and the Prism-only packaging assertion are removed,
+  so building the extension no longer depends on a network download. Extension
+  builds now clear their own output directory first, so a removed page or asset
+  cannot survive in a loadable build or in a release archive. The Chrome output
+  directory must be `dist` or `dist-<suffix>`: source directories, parent or
+  nested paths, and the Firefox output directory are rejected before anything is
+  deleted, and a symlinked output directory only loses the link, never the
+  directory it points at.
+
+- cffbeea: Report a managed executor deadline as `timeout`, not `cancelled`.
+  - The relay now aborts its pending controller with an internal typed cancellation reason and passes the same reason to `ManagedExecutorPool.cancel()`, so both the signal listener and an explicit cancel keep the first abort reason instead of always classifying the stop as a user cancel.
+  - A relay deadline that terminates an active worker returns `code=timeout` with `outcome=unknown`; an explicit user/client cancel stays `cancelled`, and a request stopped before dispatch stays `not-started`. Worker termination, capture retention and no-replay semantics are unchanged.
+
+- 33e6ab2: Include stable snapshot reference metadata in managed snapshot results so
+  callers can select an `aria-ref` using the returned short ref, role, and name
+  without inferring refs from rendered CSS locators.
+- b28788a: Make managed snapshots and page actions fail fast and report truthfully.
+  - **Bounded snapshot scope selectors.** A `locator` scope that matches no elements or more than one now returns a clear, short error before the AX scan. Scope marking uses the remaining request budget, missing markers fail instead of falling back to the whole page, and UUID-guarded cleanup is best-effort with a 100ms native timeout.
+  - **Refs match model-visible snapshot text.** Search context, offset/limit, line count, UTF-8 byte/character truncation, and structured-ref budgets are applied together. Only refs whose complete lines and metadata fit are returned, while no-match searches return no refs.
+  - **Native `<details>`/`<summary>` get a valid selector.** Chrome exposes these as the unsupported `disclosuretriangle` AX role. Normal document and open-shadow summaries use exact DOM ancestry and `:nth-of-type()` selectors that count hidden siblings; open shadow roots are linked to their host through CDP `shadowRoots` metadata so the selector is anchored at the document root. Summaries in documents that `page.locator` cannot safely address, under closed/user-agent shadow roots, or behind any ancestor chain that cannot be proven to the root are shown without an actionable ref instead of a partial selector that could misclick.
+  - **Clearer stale-ref explanations.** Snapshot-ref errors now say whether no snapshot is current (a prior navigate/click/fill/evaluate/execute invalidated it), the snapshot was replaced, or the ref was filtered out by the search/offset/limit window — and how to recover.
+  - **Click reports an observation, not a settled navigation.** The click result URL is the tab state observed immediately after the click, never a promise that a triggered navigation has finished; no sleeps or auto-goto.
+  - **`full` snapshot flag is coherent.** `full: true` forces the complete readable tree (labels, contexts, text) even when a caller would narrow to interactive-only, and stays subject to the same line/character caps and windowing.
+  - **Request-aware native timeouts.** Navigate, back, click, fill, and snapshot-scope resolution use the request budget remaining after page lookup, capped at 30s for navigation and 5s for selectors with response time reserved. Outer worker cancellation still terminates unresponsive CDP/evaluate work and actions are never replayed.
+  - **Observed page context on results.** Page operations attach a `pageInfo { tabId, url, title? }` from cached URL and titles actually computed by navigate/back. Arbitrary evaluate/execute objects with a `title` business field no longer fabricate a page title.
+
+- c37a0ba: Wait for an explicitly selected managed tab's Playwright page to finish attaching before starting a page operation.
+- f14680e: Require the configured relay token before accepting MCP logs or returning browser metadata such as profile details, tab titles, and tab URLs.
+- d83355b: Keep observing Firefox navigation completion candidates through redirects and load-time history changes, and verify repeated matching frame/tab facts within the original cancellation and timeout budget. Defer the exact WebNavigation abort signal until a replacement navigation is observed and verified; preserve API errors and do not replay actions.
+- 8ca3e54: Stop a Firefox `tabs.create` from failing without a `tabId` when its optional DOM preheat runs on a tab whose document is not injectable yet.
+
+  The native tab and its ownership were already committed before the preheat, so a preheat failure is now logged and the created tab is still returned. The preheat only runs for a `complete` tab whose URL is a supported HTTP(S) page, mirroring the existing `tabs.onUpdated` guard. `tabs.attach` keeps its injection capability probe, and later snapshot/click operations still surface real host-permission or injection errors. No permission, CSP, session, epoch, ledger, atomic-persistence or cancellation semantics change.
+
+- 1107228: Stop clients from killing a running relay based on a version string, and stop the runtime from treating a busy port as a successful start.
+
+  Ports are probed with explicit states instead of an optimistic "running" flag:
+  - `ready`: a valid `/version` payload and every required managed capability is `true`
+  - `incompatible`: the managed protocol answers but a required capability is `false` (reported with the missing names)
+  - `occupied`: HTTP answers but the payload is not a relay version (or is invalid JSON)
+  - `unauthorized`: HTTP 401/403 from a token-protected listener
+  - `unreachable`: nothing is listening
+
+  Reachable is not the same as usable: `managedGroups: false` or `persistentOwnership: false` no longer counts as an available runtime. `pi-browser-runtime` exits successfully on `EADDRINUSE` only when another instance is fully capable; anything else exits with an error and a reason. `ensureManagedRuntime` refuses to use or replace incompatible and unsupported listeners, probes the requested host, never auto-starts remote hosts, and deduplicates in-flight probes per host/port/token. Full URLs are used as-is for probes (no default port injected into https tunnels) and bare IPv6 hosts are bracketed.
+
+- 1107228: Keep the relay alive when logging fails, and never wipe a running relay's logs.
+
+  Both the relay log and the CDP JSONL log open in append mode instead of truncating on startup, so a second process racing for the same data dir cannot erase the running relay's history. Rotation counters start from the size and line count already on disk, so an existing large file still rotates at the configured budget. Buffers are bounded, files rotate by size or line budget, and filesystem errors are swallowed: a full or unwritable disk no longer rejects the write queue, stops the relay, or grows memory without bound. Serializing an entry that cannot be stringified (for example a payload containing BigInt) writes a `cdpLogSerializeError` marker instead of throwing. Dropped lines are recorded with an overflow marker so gaps in the logs are visible.
+
+- f6172f8: Retain bounded page network metadata in the long-lived runtime when an executor worker is cancelled, times out, or is replaced. Network list and stop now report whether a capture is active, stopped, interrupted, or was never started, while preserving their existing value shapes.
+
+  Failed replacement starts preserve the previous evidence, and stop fences out older queued or in-flight starts without waiting behind page operations.
+
+  Queue wait time now consumes the original browser request deadline, and executor workers receive only the remaining timeout budget.
+
+- 709b880: Report a bounded, non-sensitive reason in the Firefox `stale-snapshot` error.
+
+  A snapshot ref resolved with the wrong or missing `snapshotId` previously returned only
+  "missing or stale", so the Firefox acceptance run could not tell which internal lifetime ended
+  the snapshot. `resolveRef` now appends one fixed enum reason: `missing-snapshot-id`,
+  `snapshot-replaced`, `ref-not-in-snapshot`, `different-document`, `element-detached`,
+  `element-document-changed`, `invalidated:<dom-mutation|navigation|explicit-invalidate|action|evaluate|dispose>`,
+  or `unknown` when the driver cannot attribute it. `snapshot-replaced` is reported only when the requested
+  `snapshotId` is the exact most recent ended snapshot this driver recorded, which `takeSnapshot` records
+  when it overwrites an existing snapshot; any other unmatched id stays `unknown`. The driver keeps only
+  that single most recent ended `snapshotId` plus its enum reason and stores no MutationRecord, DOM node,
+  text, attribute value, or URL.
+
+  The `stale-snapshot` code, the `not-started`/`unknown` outcome, and every rejection condition are
+  unchanged; refs are still never refreshed, retried, or revived, and no snapshot lifetime,
+  ownership, permission, CSP, protocol, or timer behavior changes. This is diagnostics only: it does
+  not fix the still-unreproduced intermittent stale ref.
+
+- 288c2d0: Keep the Firefox MV3 background page alive while a local runtime stays connected.
+
+  Firefox suspends a non-persistent background page after 30s without activity it counts, and a bare WebSocket round-trip is not counted, so replying to a relay ping did not keep the page alive. Each ping now performs one read-only `getBrowserInfo` parent call, which is one of the activities Firefox counts. Failures are contained, only the live socket answers, and no timer, permission, preference or loopback handshake/Origin/Host/CSP change is introduced. When the runtime disconnects the pings stop, the background is free to suspend again, and the existing reconnect alarm still wakes it.
+
+- 2913c2f: Allow Firefox frame actions (`frameLocator` fill/click) on stock Firefox, where `Element.getBoxQuads` is not exposed.
+
+  Gecko gates `getBoxQuads` behind `nsINode::HasBoxQuadsSupport`, which is `isChrome(cx compartment) || StaticPrefs::layout_css_getBoxQuads_enabled()`, and `layout.css.getBoxQuads.enabled` defaults to false. A WebExtension content script is not chrome, so the member is missing and every frame action was refused with `unsupported-capability`. When `getBoxQuads` is present the previous content-quad validation is unchanged. When it is absent, the ancestor frame content box is now derived from the frame's real client rect plus its used border and padding, and only for a chain that is provably axis-aligned: `transform` must be `none` or an identity matrix, and `rotate`, `scale`, `translate`, `zoom`, `perspective` and `offset-path` must be neutral. Fragmented, degenerate, non-finite, or unreconcilable boxes (including fractional border/padding where the rounded client offset or client box cannot be proven exact) are refused instead of approximated. Ancestor `elementFromPoint` occlusion, viewport bounds, and prepared-action identity checks are unchanged.
+
+- afe3a5d: Set an explicit Firefox extension-page CSP that permits only packaged scripts and omits upgrade-insecure-requests, preserving the local relay's plain WebSocket connection. Validate the policy during Firefox builds and packaging.
+- b22a91f: Validate Firefox frame injection results before attaching tabs or executing page commands, and recheck cancellation after asynchronous resource and frame resolution. Track newly created tab identity while finishing group setup so user release stops further operations.
+
+  Enforce Firefox network capture body quotas across retained UTF-8 text and all concurrent response chunks. Release in-flight reservations on redirects, errors, eviction and capture shutdown without replaying operations or changing the response bytes delivered to the page.
+
+  Wait for Firefox main-frame navigation or same-document history/fragment events before reporting navigate/back completion. Reject unconfirmed or mismatched navigation facts instead of returning the previous page URL, with cancellation, timeout and listener cleanup preserved.
+
+  Continue observing Firefox main-frame navigation chains after a document commits, ignore superseded document abort/completion events, and track history/fragment URL changes during loading without reporting early completion. Converge the inner navigation wait on interruption.
+
+- 781ee0f: Match in-page toasts to the toolbar and put them where you look.
+
+  Copied-element and recording confirmations use the same dark surface as the toolbar. Pin toasts sit on the click X. The recording "prompt copied" toast sits just below the toolbar instead of covering it.
+
+- 3e638d1: Publish released managed resources in the extension inventory so `tabs.release` tombstones stay visible to the runtime.
+
+  After releasing a tab, `tabs.list` keeps returning it with `state: released` and page operations on it fail with `resource-released` instead of `resource-not-found`. Released groups are published together with their tabs so the inventory stays internally consistent (the runtime rejects tabs that reference unknown groups). Tombstones only record state and never re-authorize work: released records keep no `targetId`/`cdpSessionId` and stay hidden from the active session lookups.
+
+- Updated dependencies [ec3e1ca]
+  - @xmorse/playwright-core@1.59.12
+
 ## 0.5.0
 
 1. **Skill Recorder** — record a workflow once in your real Chrome and let an agent turn it into a reusable skill. Click **Record Skill** on the in-page toolbar, or run:
@@ -100,6 +366,7 @@ Thanks @Ylandolsi for #103 and @tylergibbs1 for #101.
 1. **Cloud browser sessions via Browser Use** — spin up stealth Chromium VMs in the cloud with `playwriter session new --browser cloud`. Cloud browsers support residential proxies (`--proxy us`, `--proxy de`), custom proxies (`--custom-proxy host:port`), and configurable timeouts (`--timeout 120`). Idle sessions auto-disconnect after 10 minutes.
 
    New CLI commands for cloud management:
+
    ```bash
    playwriter cloud login       # authenticate via device flow
    playwriter cloud status      # list active cloud VMs
@@ -110,6 +377,7 @@ Thanks @Ylandolsi for #103 and @tylergibbs1 for #101.
    Selecting a running cloud session (`cloud-1`, `cloud-2`) reattaches to the existing VM instead of creating a new one.
 
 2. **Headless browser mode** — run without the extension or a visible browser:
+
    ```bash
    playwriter browser install                    # download Chrome for Testing
    playwriter session new --browser headless      # launch headless Chrome
@@ -119,6 +387,7 @@ Thanks @Ylandolsi for #103 and @tylergibbs1 for #101.
    Multiple sessions share the same Chrome process. Each session gets its own isolated context. Recording is not available in headless mode.
 
 3. **API key authentication for cloud browsers** — skip the interactive device flow in CI and headless environments:
+
    ```bash
    export PLAYWRITER_API_KEY=pw_xxxxx
    playwriter session new --browser cloud
