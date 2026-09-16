@@ -16,7 +16,7 @@ import type {
   BrowserTabCandidate,
 } from 'playwriter/src/browser-protocol'
 import type { FirefoxAssetFetchRequest, FirefoxAssetFetchResponse } from 'playwriter/src/firefox-executor-protocol'
-import { MAX_FIREFOX_ASSET_REASON_LENGTH } from 'playwriter/src/firefox-executor-protocol'
+import { FIREFOX_ASSET_REQUEST_METHOD, MAX_FIREFOX_ASSET_REASON_LENGTH } from 'playwriter/src/firefox-executor-protocol'
 import { parseBrowserDomRequest } from 'playwriter/src/browser-dom-validation'
 import { getFirefoxApi } from './firefox-api'
 import type { FirefoxApi, FirefoxTab, FirefoxNavigationDetails } from './firefox-api'
@@ -476,7 +476,7 @@ class FirefoxBackground {
             requestId: this.rawRequestId(message.params),
             error: new FirefoxResourceError({ code: 'invalid-request', message: 'Malformed Firefox DOM request' }),
           })
-    } else if (message.method === 'browserAssetRequest') {
+    } else if (message.method === FIREFOX_ASSET_REQUEST_METHOD) {
       const request = parseFirefoxAssetRequest(message.params)
       response = request
         ? await this.assets(request)

@@ -582,7 +582,7 @@ describe('Firefox executor page.extract', () => {
       expect(response, JSON.stringify(response)).toMatchObject({ ok: true, data: {
         value: {
           format: 'assets-manifest',
-          count: 2,
+          assetCount: 2,
           truncated: false,
           assets: [
             { src: 'https://cdn.example.test/hero.png', currentSrc: 'https://cdn.example.test/hero.png', srcset: '', alt: 'Hero', naturalWidth: 1_200, naturalHeight: 630 },
@@ -595,7 +595,7 @@ describe('Firefox executor page.extract', () => {
         throw new Error('expected a successful image manifest')
       }
       expect(response.data.value).not.toHaveProperty('savedAssets')
-      expect(response.data.text).toBe('1. https://cdn.example.test/hero.png [1200x630] alt: Hero\n2. https://cdn.example.test/logo@2x.png [32x32]')
+      expect(response.data.text).toBe('2 images found\n- https://cdn.example.test/hero.png 1200x630 alt="Hero"\n- https://cdn.example.test/logo@2x.png 32x32')
       // The manifest is a read: one DOM evaluate, no document read and no byte fetch.
       expect(peer.requests.map((request) => { return request.command })).toEqual([{ method: 'evaluate', code: expect.any(String) }])
       expect(peer.requests[0].command.method === 'evaluate' ? peer.requests[0].command.code : '').toContain('document.images')
@@ -622,8 +622,8 @@ describe('Firefox executor page.extract', () => {
         throw new Error('expected a structured asset manifest')
       }
       expect(value.assets).toHaveLength(200)
-      expect(value.count).toBe(200)
-      expect(value.truncated).toBe(true)
+      expect(value.assetCount).toBe(200)
+      expect(value.assetsTruncated).toBe(true)
       expect(value.assets[199]).toMatchObject({ src: 'https://cdn.example.test/199.png' })
     } finally {
       await pool.dispose()
@@ -732,7 +732,7 @@ describe('Firefox executor page.extract', () => {
       expect(assetPeer.requests).toHaveLength(1)
       expect(assetPeer.requests[0].targets).toHaveLength(MAX_FIREFOX_ASSET_COUNT)
       expect(value.savedAssets).toHaveLength(MAX_FIREFOX_ASSET_COUNT)
-      expect(value.count).toBe(MAX_FIREFOX_ASSET_COUNT + 4)
+      expect(value.assetCount).toBe(MAX_FIREFOX_ASSET_COUNT + 4)
       expect(value.assetsNotFetched).toBe(4)
     } finally {
       await pool.dispose()

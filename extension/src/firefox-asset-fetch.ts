@@ -1,4 +1,5 @@
 import {
+  FIREFOX_ASSET_FETCH_TIMEOUT_MS,
   MAX_FIREFOX_ASSET_BYTES,
   MAX_FIREFOX_ASSET_REASON_LENGTH,
   MAX_FIREFOX_ASSET_TOTAL_BYTES,
@@ -16,13 +17,34 @@ import type {
  * host permissions, so an authenticated or third-party image loads exactly as
  * the page would load it.
  *
- * Byte bounds are the shared channel bounds from firefox-executor-protocol.ts;
- * a failed image is reported per image and never fails its siblings or the
- * extraction.
+ * Byte bounds and the batch deadline are the shared channel bounds from
+ * firefox-executor-protocol.ts; a failed image is reported per image and never
+ * fails its siblings or the extraction. The byte bound also keeps one answer
+ * inside the channel's 96 MiB frame budget — 64 MiB of image bytes is 85.4 MiB
+ * of base64 — which is itself inside the relay's 100 MiB websocket default, so
+ * a full batch is never cut. The same image types the artifact store can name
+ * are accepted, in the same order of preference the Chrome backend uses, so a
+ * saved image always has a file the store can write.
  */
-/** One deadline for the whole batch: a hanging image cannot hold the extraction open. */
-export const ASSET_FETCH_TIMEOUT_MS = 20_000
 const BASE64_CHUNK_BYTES = 0x8000
+/** Types the runtime's artifact store can name a file with. */
+const SAVED_ASSET_MIME_TYPES = new Set<string>([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif',
+  'image/svg+xml',
+])
+/** Fallback for responses that do not declare an image content type. */
+const ASSET_MIME_TYPE_EXTENSIONS: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  svg: 'image/svg+xml',
+}
 
 export async function fetchFirefoxAssets({ request, fetchImpl = fetch }: {
   request: FirefoxAssetFetchRequest
@@ -31,8 +53,8 @@ export async function fetchFirefoxAssets({ request, fetchImpl = fetch }: {
 }): Promise<FirefoxAssetFetchResponse> {
   const controller = new AbortController()
   const timer = setTimeout(() => {
-    controller.abort(new Error(`image fetch exceeded ${ASSET_FETCH_TIMEOUT_MS} ms`))
-  }, ASSET_FETCH_TIMEOUT_MS)
+    controller.abort(new Error(`image fetch exceeded ${FIREFOX_ASSET_FETCH_TIMEOUT_MS} ms`))
+  }, FIREFOX_ASSET_FETCH_TIMEOUT_MS)
   const assets: FirefoxAssetOutcome[] = []
   let usedBytes = 0
   try {
@@ -66,7 +88,10 @@ async function fetchAsset({ src, signal, byteLimit, fetchImpl }: {
   if (!response.ok) {
     throw new Error(`image request failed with HTTP ${response.status}`)
   }
-  const mimeType = imageMimeType({ header: response.headers.get('content-type') })
+  const mimeType = resolveAssetMimeType({ declared: response.headers.get('content-type'), url: src })
+  if (!SAVED_ASSET_MIME_TYPES.has(mimeType)) {
+    throw new Error(`unsupported image type ${mimeType}`)
+  }
   const bytes = await readBoundedBody({ response, byteLimit })
   return { base64: toBase64(bytes), mimeType, bytes: bytes.byteLength }
 }
@@ -119,19 +144,20 @@ async function readBoundedBody({ response, byteLimit }: { response: Response; by
 }
 
 /**
- * Only image payloads are worth saving; a server that answers an image URL with
- * HTML or JSON has not returned an image. `application/octet-stream` is kept
- * because it is what many image CDNs send.
+ * Prefer a type the store knows; otherwise fall back to the file name, because
+ * a CDN that serves `application/octet-stream` still names the image in its URL.
+ * Anything else is reported as an unsupported image type by the caller.
  */
-function imageMimeType({ header }: { header: string | null }): string {
-  const declared = (header ?? '').split(';')[0].trim().toLowerCase()
-  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(declared)) {
-    return 'application/octet-stream'
+function resolveAssetMimeType({ declared, url }: { declared: string | null; url: string }): string {
+  const normalized = (declared ?? '').split(';')[0].trim().toLowerCase()
+  if (SAVED_ASSET_MIME_TYPES.has(normalized)) {
+    return normalized
   }
-  if (declared.startsWith('image/') || declared === 'application/octet-stream') {
-    return declared
-  }
-  throw new Error(`the response is not an image (content-type ${declared})`)
+  const pathname = url.split(/[?#]/)[0]
+  const lastSegment = pathname.slice(pathname.lastIndexOf('/') + 1)
+  const dot = lastSegment.lastIndexOf('.')
+  const extension = dot === -1 ? '' : lastSegment.slice(dot + 1).toLowerCase()
+  return ASSET_MIME_TYPE_EXTENSIONS[extension] ?? normalized
 }
 
 function toBase64(bytes: Uint8Array): string {

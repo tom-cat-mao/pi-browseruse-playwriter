@@ -576,17 +576,19 @@ async function extractionData({ execution, send, assets }: {
   const notFetched = selected?.notFetched ?? 0
 
   if (format === 'assets-manifest') {
-    const listing = manifestListing({ assets: manifest?.assets ?? [] })
+    const listing = manifestListing({ assets: manifest?.assets ?? [], truncated: manifest?.truncated ?? false })
     const preview = windowExtractedText({ text: listing, offset, limit })
     return {
       text: preview.text,
       value: withExtractArtifactText({
         value: {
           format,
-          count: manifest?.assets.length ?? 0,
-          truncated: preview.truncated || (manifest?.truncated ?? false),
+          truncated: preview.truncated,
           totalBytes: Buffer.byteLength(listing, 'utf8'),
+          assetCount: manifest?.assets.length ?? 0,
           assets: manifest?.assets ?? [],
+          ...(manifest?.truncated ? { assetsTruncated: true } : {}),
+          ...(read?.pageInfo?.title ? { title: read.pageInfo.title } : {}),
           ...assetValue({ outcomes, notFetched }),
         },
         persisted: persist ? boundExtractArtifactText({ text: listing }) : undefined,
@@ -604,7 +606,15 @@ async function extractionData({ execution, send, assets }: {
   // The read reports the tab it came from; the Chrome worker attaches the same
   // envelope to every result, so a consumer sees one response shape per backend.
   const pageInfo = content.pageInfo
-  const manifestValue = { ...(manifest ? { assets: manifest.assets } : {}), ...(manifest?.truncated ? { assetsTruncated: true } : {}) }
+  // The image channel reports the same fields the Chrome backend reports, so a
+  // consumer sees one manifest shape per backend.
+  const manifestValue = manifest
+    ? {
+        assetCount: manifest.assets.length,
+        assets: manifest.assets,
+        ...(manifest.truncated ? { assetsTruncated: true } : {}),
+      }
+    : {}
 
   if (format === 'html') {
     const preview = windowExtractedText({ text: html, search, offset, limit })
@@ -705,13 +715,19 @@ function naturalDimension(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
 }
 
-/** One line per image, so the model can read the manifest without the structured value. */
-function manifestListing({ assets }: { assets: AssetManifestEntry[] }): string {
-  return assets.map((asset, index) => {
-    const size = asset.naturalWidth > 0 || asset.naturalHeight > 0 ? ` [${asset.naturalWidth}x${asset.naturalHeight}]` : ''
-    const alt = asset.alt ? ` alt: ${asset.alt}` : ''
-    return `${index + 1}. ${asset.src}${size}${alt}`
-  }).join('\n')
+/** One line per image, in the same listing the Chrome backend produces. */
+function manifestListing({ assets, truncated }: { assets: AssetManifestEntry[]; truncated: boolean }): string {
+  if (assets.length === 0) {
+    return 'No images found'
+  }
+  const header = `${assets.length} image${assets.length === 1 ? '' : 's'} found${truncated ? ' (listing the first ones)' : ''}`
+  const lines = assets.map((asset) => {
+    const url = asset.currentSrc || asset.src
+    const size = asset.naturalWidth > 0 && asset.naturalHeight > 0 ? ` ${asset.naturalWidth}x${asset.naturalHeight}` : ''
+    const alt = asset.alt ? ` alt="${asset.alt}"` : ''
+    return `- ${url}${size}${alt}`
+  })
+  return [header, ...lines].join('\n')
 }
 
 /**

@@ -22,9 +22,15 @@ beforeAll(async () => {
       response.end(Buffer.from(IMAGE_BYTES))
       return
     }
-    if (path === '/octet') {
+    if (path === '/octet.jpg') {
+      // A CDN that serves no useful image type still names the file in its URL.
       response.writeHead(200, { 'content-type': 'application/octet-stream' })
       response.end(Buffer.from('raw-image-bytes'))
+      return
+    }
+    if (path === '/modern.avif') {
+      response.writeHead(200, { 'content-type': 'image/avif' })
+      response.end(Buffer.from('avif-bytes'))
       return
     }
     if (path === '/page.html') {
@@ -82,7 +88,7 @@ describe('Firefox background asset fetch', () => {
       inits.push(init ?? {})
       return await fetch(input, init)
     }
-    const response = await fetchFirefoxAssets({ request: request({ paths: ['/image.png', '/octet'], alt: 'Hero' }), fetchImpl: recording })
+    const response = await fetchFirefoxAssets({ request: request({ paths: ['/image.png', '/octet.jpg'], alt: 'Hero' }), fetchImpl: recording })
     expect(response.requestId).toBe('request:assets')
     expect(response.error).toBeUndefined()
     expect(response.assets).toHaveLength(2)
@@ -92,8 +98,8 @@ describe('Firefox background asset fetch', () => {
     }
     expect(image).toMatchObject({ src: `${origin}/image.png`, mimeType: 'image/png' })
     expect(Buffer.from(image.base64, 'base64')).toEqual(Buffer.from(IMAGE_BYTES))
-    // A CDN that sends no useful image type still travels as opaque bytes.
-    expect(octet).toMatchObject({ src: `${origin}/octet`, mimeType: 'application/octet-stream' })
+    // The URL names the type the artifact store can write.
+    expect(octet).toMatchObject({ src: `${origin}/octet.jpg`, mimeType: 'image/jpeg' })
     expect(Buffer.from(octet.base64, 'base64').toString()).toBe('raw-image-bytes')
     // The page's own session is what makes authenticated images load.
     expect(inits).toHaveLength(2)
@@ -101,11 +107,13 @@ describe('Firefox background asset fetch', () => {
   })
 
   test('reports a failure per image without failing its siblings', async () => {
-    const response = await fetchFirefoxAssets({ request: request({ paths: ['/missing', '/page.html', '/image.png'] }) })
-    expect(response.assets.map((asset) => { return asset.ok })).toEqual([false, false, true])
+    const response = await fetchFirefoxAssets({ request: request({ paths: ['/missing', '/page.html', '/modern.avif', '/image.png'] }) })
+    expect(response.assets.map((asset) => { return asset.ok })).toEqual([false, false, false, true])
     expect(response.assets[0]).toMatchObject({ src: `${origin}/missing`, reason: 'image request failed with HTTP 404' })
-    expect(response.assets[1]).toMatchObject({ src: `${origin}/page.html`, reason: 'the response is not an image (content-type text/html)' })
-    const saved = response.assets[2]
+    expect(response.assets[1]).toMatchObject({ src: `${origin}/page.html`, reason: 'unsupported image type text/html' })
+    // The store can only name files it has a type for, so an unnamed type is refused here.
+    expect(response.assets[2]).toMatchObject({ src: `${origin}/modern.avif`, reason: 'unsupported image type image/avif' })
+    const saved = response.assets[3]
     if (!saved?.ok) {
       throw new Error('expected the third image to be saved')
     }

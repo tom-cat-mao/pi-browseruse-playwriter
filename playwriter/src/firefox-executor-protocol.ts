@@ -23,6 +23,10 @@ export const MAX_FIREFOX_ASSET_BYTES = 16 * 1024 * 1024
 export const MAX_FIREFOX_ASSET_TOTAL_BYTES = 64 * 1024 * 1024
 /** Frame budget for asset payloads: base64 is 4/3 of the bytes plus envelope slack. */
 export const MAX_FIREFOX_ASSET_FRAME_BYTES = 96 * 1024 * 1024
+/** One batch deadline inside the extension; a hanging image cannot hold the extraction open. */
+export const FIREFOX_ASSET_FETCH_TIMEOUT_MS = 20_000
+/** How long the runtime waits for one batch: longer than the extension's own deadline. */
+export const FIREFOX_ASSET_REQUEST_TIMEOUT_MS = 30_000
 
 export const MAX_FIREFOX_ASSET_BASE64_LENGTH = base64Length(MAX_FIREFOX_ASSET_BYTES)
 export const MAX_FIREFOX_ASSET_TOTAL_BASE64_LENGTH = base64Length(MAX_FIREFOX_ASSET_TOTAL_BYTES)
@@ -41,6 +45,9 @@ export interface FirefoxAssetTarget {
   src: string
   alt?: string
 }
+
+/** Websocket method the runtime uses to ask the extension for image bytes. */
+export const FIREFOX_ASSET_REQUEST_METHOD = 'browserAssetRequest'
 
 /** Per-image outcome: a failed image never fails its siblings. */
 export type FirefoxAssetOutcome =

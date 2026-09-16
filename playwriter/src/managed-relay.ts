@@ -31,6 +31,13 @@ import { parseBrowserDomRequest } from './browser-dom-validation.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import { ArtifactStore, ArtifactStoreError } from './artifact-store.js'
+import {
+  FIREFOX_ASSET_REQUEST_TIMEOUT_MS,
+  parseFirefoxAssetFetchRequest,
+  parseFirefoxAssetFetchResponse,
+  type FirefoxAssetFetchRequest,
+  type FirefoxAssetFetchResponse,
+} from './firefox-executor-protocol.js'
 import { RuntimeNetworkCaptureStore } from './runtime-network-capture.js'
 import { parseBrowserTabCandidateId } from './browser-protocol.js'
 import {
@@ -215,6 +222,23 @@ export type ManagedRelayOptions = {
       stableKey: string
       connectionId: string
       request: BrowserDomRequest
+      timeoutMs: number
+    }) => Promise<unknown>
+    /**
+     * Image bytes for a Firefox `page.extract` with images:'save'. Only the
+     * extension background can fetch a page image with the browser's cookies
+     * and without CORS, so the request travels on the same connection the DOM
+     * requests use. The answer is bounded by the asset channel's own frame
+     * budget rather than the response limit, because its bytes are written to
+     * the artifact store and never reach a client. Optional: a runtime without
+     * it reports every image as a failed image instead of dropping the
+     * extraction.
+     */
+    sendBrowserAssetRequest?: (options: {
+      profileId: string
+      stableKey: string
+      connectionId: string
+      request: FirefoxAssetFetchRequest
       timeoutMs: number
     }) => Promise<unknown>
     sendCdpCommand?: (options: {
@@ -2554,11 +2578,66 @@ export class ManagedRelay {
     }
     this.firefoxPool ??= new FirefoxExecutorPool()
     pending.started = true
+    const assetTransport = this.options.transport.sendBrowserAssetRequest
     return await this.firefoxPool.execute({
       request: { ...request, operation, timeoutMs },
       tab,
       connectionEpoch: profile.connectionId ?? '',
       signal: pending.controller.signal,
+      // Bytes are not a page read and never come back to this process: the
+      // extension fetches them, the worker summarizes them, and `savedAssets`
+      // is what the relay then writes. Without a transport for them the pool
+      // reports each image as a failed image, so the extraction still lands.
+      ...(assetTransport
+        ? {
+            sendAssetRequest: async (value: FirefoxAssetFetchRequest): Promise<FirefoxAssetFetchResponse> => {
+              const assetRequest = parseFirefoxAssetFetchRequest(value)
+              if (!assetRequest) {
+                throw new ManagedTransportError({
+                  code: 'invalid-request', message: 'Firefox worker returned an invalid asset request', outcome: 'not-started',
+                })
+              }
+              this.assertFirefoxLease({ request, profile, tab, pending })
+              if (assetRequest.sessionId !== request.sessionId || assetRequest.tabId !== tab.tabId ||
+                assetRequest.browserEpoch !== tab.browserEpoch) {
+                throw new ManagedTransportError({
+                  code: 'ownership-mismatch', message: 'Firefox worker asset request escaped its assigned tab', outcome: 'not-started',
+                })
+              }
+              if (!profile.connectionId) {
+                throw new ManagedTransportError({
+                  code: 'profile-disconnected', message: 'Firefox asset transport disconnected', outcome: 'not-started',
+                })
+              }
+              // Image bytes take longer than a DOM read, so the wait is the
+              // channel's own bound (still capped by the request deadline).
+              const assetTimeoutMs = Math.min(FIREFOX_ASSET_REQUEST_TIMEOUT_MS, this.remainingTimeout({ deadlineAt, pending }))
+              pending.domRequestIds.add(assetRequest.requestId)
+              try {
+                const promise = assetTransport({
+                  profileId: profile.profileId,
+                  stableKey: profile.stableKey,
+                  connectionId: profile.connectionId,
+                  request: assetRequest,
+                  timeoutMs: assetTimeoutMs,
+                })
+                promise.catch(() => {})
+                const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
+                const response = parseFirefoxAssetFetchResponse(value)
+                if (!response || response.requestId !== assetRequest.requestId) {
+                  // Never trust a mismatched or oversized answer: the bytes are
+                  // about to be written, so the worker is told instead.
+                  throw new ManagedTransportError({
+                    code: 'internal-error', message: 'Firefox extension returned a malformed or mismatched asset response', outcome: 'unknown',
+                  })
+                }
+                return response
+              } finally {
+                pending.domRequestIds.delete(assetRequest.requestId)
+              }
+            },
+          }
+        : {}),
       sendDomRequest: async (value: BrowserDomRequest) => {
         const domRequest = parseBrowserDomRequest(value)
         if (!domRequest) {

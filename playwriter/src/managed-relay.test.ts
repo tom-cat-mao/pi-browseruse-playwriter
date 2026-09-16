@@ -24,6 +24,8 @@ import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
 import { ArtifactStore } from './artifact-store.js'
 import { ManagedExecutorPool } from './managed-executor-pool.js'
 import { extractPageContent, windowExtractedText } from './page-extract.js'
+import { FIREFOX_ASSET_REQUEST_METHOD, MAX_FIREFOX_ASSET_BASE64_LENGTH } from './firefox-executor-protocol.js'
+import type { FirefoxAssetFetchRequest, FirefoxAssetFetchResponse } from './firefox-executor-protocol.js'
 import {
   RUNTIME_NETWORK_MAX_BYTES,
   RUNTIME_NETWORK_MAX_CAPTURES,
@@ -436,6 +438,9 @@ type FakeExtensionOptions = {
 class FakeExtension {
   readonly received: BrowserRequest[] = []
   readonly domRequests: BrowserDomRequest[] = []
+  /** Asset batches the runtime asked this connection for; only a peer that implements
+   * the channel method ever records one. */
+  readonly assetRequests: FirefoxAssetFetchRequest[] = []
   readonly forwardCommands: Array<{ method: string; params?: unknown; sessionId?: string }> = []
   readonly closed: Promise<{ code: number; reason: string }>
   readonly inventoryByGroup = new Map<string, BrowserGroup>()
@@ -444,6 +449,7 @@ class FakeExtension {
   holdForwardCommands = false
   onRequest?: (request: BrowserRequest) => BrowserResponse | Promise<BrowserResponse>
   onDomRequest?: (request: BrowserDomRequest) => BrowserResponse | Promise<BrowserResponse>
+  onAssetRequest?: (request: FirefoxAssetFetchRequest) => FirefoxAssetFetchResponse | Promise<FirefoxAssetFetchResponse>
   private readonly ws: WebSocket
   private readonly held: Array<() => void> = []
   private readonly heldForwardCommands: Array<() => void> = []
@@ -524,6 +530,20 @@ class FakeExtension {
         requestId: request.requestId,
         ok: true,
         data: { value: request.command.method === 'page' ? 'Firefox fixture' : null },
+      }
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ id: message.id, result }))
+      }
+      return
+    }
+    if (message.method === FIREFOX_ASSET_REQUEST_METHOD) {
+      const request = message.params as FirefoxAssetFetchRequest
+      this.assetRequests.push(request)
+      const result = this.onAssetRequest ? await this.onAssetRequest(request) : {
+        requestId: request.requestId,
+        assets: request.targets.map((target) => {
+          return { src: target.src, ok: true as const, base64: Buffer.from('image-bytes').toString('base64'), mimeType: 'image/png' }
+        }),
       }
       if (this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ id: message.id, result }))
@@ -4305,13 +4325,27 @@ function firefoxExtractDocument(): string {
  * The Firefox worker runs for real behind this relay; only the extension side of
  * the transport is a peer that records what would have reached the browser.
  */
-function startFirefoxExtractRelay({ artifactStore, documentHtml, inventory }: {
+function startFirefoxExtractRelay({ artifactStore, documentHtml, inventory, pageImages = [], assetAnswer, withoutAssetTransport = false }: {
   artifactStore: ArtifactStore
   documentHtml: string
   inventory: BrowserInventory
-}): { relay: ManagedRelay; domRequests: BrowserDomRequest[]; operations: string[] } {
+  /** Images the DOM evaluate read reports, which is how the manifest path is reached. */
+  pageImages?: Record<string, BrowserJson>[]
+  /** The extension side of the asset byte channel: what one batch is answered with. */
+  assetAnswer?: (request: FirefoxAssetFetchRequest) => FirefoxAssetFetchResponse | Promise<FirefoxAssetFetchResponse>
+  /** A runtime that cannot carry asset bytes at all. */
+  withoutAssetTransport?: boolean
+}): {
+  relay: ManagedRelay
+  domRequests: BrowserDomRequest[]
+  operations: string[]
+  assetRequests: FirefoxAssetFetchRequest[]
+  assetTimeouts: number[]
+} {
   const domRequests: BrowserDomRequest[] = []
   const operations: string[] = []
+  const assetRequests: FirefoxAssetFetchRequest[] = []
+  const assetTimeouts: number[] = []
   const relay = new ManagedRelay({
     host: '127.0.0.1',
     port: 1,
@@ -4328,8 +4362,26 @@ function startFirefoxExtractRelay({ artifactStore, documentHtml, inventory }: {
         }
         return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
       },
+      ...(withoutAssetTransport ? {} : {
+        sendBrowserAssetRequest: async ({ request, timeoutMs }) => {
+          assetRequests.push(request)
+          assetTimeouts.push(timeoutMs)
+          return await (assetAnswer?.(request) ?? {
+            requestId: request.requestId,
+            assets: request.targets.map((target) => {
+              return { src: target.src, ok: true as const, base64: Buffer.from('image-bytes').toString('base64'), mimeType: 'image/png' }
+            }),
+          })
+        },
+      }),
       sendBrowserDomRequest: async ({ request }) => {
         domRequests.push(request)
+        if (request.command.method === 'evaluate') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: { items: pageImages },
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
         if (request.command.method === 'page' && request.command.action === 'content') {
           return { requestId: request.requestId, ok: true, data: {
             value: documentHtml,
@@ -4347,7 +4399,7 @@ function startFirefoxExtractRelay({ artifactStore, documentHtml, inventory }: {
     inventory,
   })
   expect(accepted.accepted).toBe(true)
-  return { relay, domRequests, operations }
+  return { relay, domRequests, operations, assetRequests, assetTimeouts }
 }
 
 describe('managed Firefox page.extract', () => {
@@ -4423,6 +4475,370 @@ describe('managed Firefox page.extract', () => {
       expect(fs.readFileSync(outputPath, 'utf8')).toBe(full.text)
       expect(domRequests.map((request) => { return request.command })).toEqual([{ method: 'page', action: 'content' }])
       expect(operations).not.toContain('page.extract')
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Firefox page.extract images
+// ---------------------------------------------------------------------------
+
+const FIREFOX_IMAGE_URL = 'https://cdn.example.com/chart.png'
+
+function firefoxImageDocument(): string {
+  return `<!doctype html><html lang="en"><head><title>${FIREFOX_EXTRACT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1><p>Retention keeps every revision for thirty days before the purge.</p><img src="${FIREFOX_IMAGE_URL}" alt="Chart"><p>Exports run nightly.</p></article></main></body></html>`
+}
+
+function firefoxPageImage({ src = FIREFOX_IMAGE_URL, alt = 'Chart' }: { src?: string; alt?: string } = {}): Record<string, BrowserJson> {
+  return { src, currentSrc: src, srcset: '', alt, naturalWidth: 800, naturalHeight: 600 }
+}
+
+/**
+ * The whole chain over the real extension connection: relay server, extension
+ * websocket, isolated worker, artifact store and URL rewriting. Only the far end
+ * of the browser websocket is a peer.
+ */
+describe('managed Firefox image bytes over the extension connection', () => {
+  test('asks the extension for bytes by method name and stores what it answers', async () => {
+    const dataDir = createExecutorTestDirectory('firefox-images-data-')
+    const previousDataDir = process.env.PI_BROWSER_DATA_DIR
+    process.env.PI_BROWSER_DATA_DIR = dataDir
+    const relay = await startTrackedRelay()
+    try {
+      const extension = await connectTrackedExtension({
+        port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+      })
+      extension.sendInventory(firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }))
+      await waitForCondition(() => {
+        return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+      }, { message: 'Firefox inventory accepted' })
+
+      const html = firefoxImageDocument()
+      extension.onDomRequest = (request) => {
+        if (request.command.method === 'evaluate') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: { items: [firefoxPageImage()] },
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        if (request.command.method === 'page' && request.command.action === 'content') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: html,
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        return { requestId: request.requestId, ok: true, data: { value: null } }
+      }
+      const imageBytes = Buffer.from('relay-chart-bytes')
+      extension.onAssetRequest = (request) => {
+        return {
+          requestId: request.requestId,
+          assets: request.targets.map((target) => {
+            return { src: target.src, ok: true as const, base64: imageBytes.toString('base64'), mimeType: 'image/png' }
+          }),
+        }
+      }
+      const artifactsRoot = path.join(dataDir, 'artifacts')
+      const outputPath = path.join(artifactsRoot, 'firefox-storage.md')
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      expect(full.text).toContain(`(${FIREFOX_IMAGE_URL})`)
+
+      const response = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-images-live',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, images: 'save' },
+      } })
+
+      const result = response.body as BrowserResponse
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        throw new Error(`expected a successful Firefox page.extract with images, got ${JSON.stringify(result)}`)
+      }
+      // The extension only records a batch when the runtime used the channel method.
+      expect(extension.assetRequests).toHaveLength(1)
+      expect(extension.assetRequests[0]).toMatchObject({
+        sessionId: 'session-1', tabId: 'firefox-tab', browserEpoch: 'epoch-1',
+        targets: [{ src: FIREFOX_IMAGE_URL, alt: 'Chart' }],
+      })
+      const artifacts = result.data.artifacts ?? []
+      expect(artifacts).toHaveLength(2)
+      const stored = artifacts[0]
+      expect(stored).toMatchObject({ mimeType: 'image/png', bytes: imageBytes.length, label: 'Chart', sourceUrl: FIREFOX_IMAGE_URL })
+      expect(path.dirname(stored.path)).toBe(artifactsRoot)
+      expect(fs.readFileSync(stored.path)).toEqual(imageBytes)
+      const persistedBody = full.text.split(`](${FIREFOX_IMAGE_URL}`).join(`](${stored.path}`)
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(persistedBody)
+      expect(result.data.text).toBe(persistedBody)
+      // The bytes never travel on to the model over the HTTP surface either.
+      expect(JSON.stringify(result.data)).not.toContain('savedAssets')
+      expect(JSON.stringify(result.data)).not.toContain(imageBytes.toString('base64'))
+    } finally {
+      if (previousDataDir === undefined) {
+        delete process.env.PI_BROWSER_DATA_DIR
+      } else {
+        process.env.PI_BROWSER_DATA_DIR = previousDataDir
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * The Firefox image channel: the worker asks the extension background for bytes
+ * over the transport, and the relay writes what comes back. Only the extension
+ * side of the transport is a peer here.
+ */
+describe('managed Firefox page.extract images', () => {
+  test('persists the bytes the extension fetched and rewrites their URLs in the body and the preview', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'firefox-storage.md')
+    const html = firefoxImageDocument()
+    const imageBytes = Buffer.from('chart-bytes')
+    const { relay, domRequests, operations, assetRequests, assetTimeouts } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: html,
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      assetAnswer: (request) => {
+        return {
+          requestId: request.requestId,
+          assets: request.targets.map((target) => {
+            return { src: target.src, ok: true as const, base64: imageBytes.toString('base64'), mimeType: 'image/png' }
+          }),
+        }
+      },
+    })
+    try {
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      // The pipeline has to keep the image for the rewrite to be observable.
+      expect(full.text).toContain(`(${FIREFOX_IMAGE_URL})`)
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error(`expected a successful Firefox page.extract with images, got ${JSON.stringify(response)}`)
+      }
+      expect(assetRequests).toHaveLength(1)
+      // The channel carries the lease it belongs to, and only the page's own images.
+      expect(assetRequests[0]).toMatchObject({
+        sessionId: 'session-1', tabId: 'firefox-tab', browserEpoch: 'epoch-1',
+        targets: [{ src: FIREFOX_IMAGE_URL, alt: 'Chart' }],
+      })
+      expect(assetTimeouts[0]).toBeGreaterThan(0)
+      expect(assetTimeouts[0]).toBeLessThanOrEqual(30_000)
+      // The manifest is a DOM read, then the document read.
+      expect(domRequests.map((request) => { return request.command.method })).toEqual(['evaluate', 'page'])
+      const artifacts = response.data.artifacts ?? []
+      expect(artifacts).toHaveLength(2)
+      const stored = artifacts[0]
+      expect(stored).toMatchObject({ mimeType: 'image/png', bytes: imageBytes.length, label: 'Chart', sourceUrl: FIREFOX_IMAGE_URL })
+      expect(fs.readFileSync(stored.path)).toEqual(imageBytes)
+      // The persisted body points at the stored image, and so does the preview.
+      const persistedBody = full.text.split(`](${FIREFOX_IMAGE_URL}`).join(`](${stored.path}`)
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(persistedBody)
+      expect(response.data.text).toBe(persistedBody)
+      expect(artifacts[1]).toMatchObject({ path: outputPath, mimeType: 'text/markdown', label: FIREFOX_EXTRACT_TITLE })
+      // The bytes and the URL list never travel on to the model.
+      const modelPayload = JSON.stringify(response.data)
+      expect(modelPayload).not.toContain('savedAssets')
+      expect(modelPayload).not.toContain(imageBytes.toString('base64'))
+      expect(operations).not.toContain('page.extract')
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('lists the manifest the page reported when only the URLs are asked for', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-urls-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, domRequests, assetRequests } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxImageDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage(), firefoxPageImage({ src: 'data:image/png;base64,AAAA' })],
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images-urls',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'urls' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful Firefox page.extract with image URLs')
+      }
+      // Same manifest fields the Chrome backend reports, inline bytes skipped.
+      expect(response.data.value).toMatchObject({
+        assetCount: 1,
+        assets: [{ src: FIREFOX_IMAGE_URL, currentSrc: FIREFOX_IMAGE_URL, srcset: '', alt: 'Chart', naturalWidth: 800, naturalHeight: 600 }],
+      })
+      expect(JSON.stringify(response.data.value)).not.toContain('data:image/png')
+      expect(assetRequests).toHaveLength(0)
+      expect(domRequests.map((request) => { return request.command.method })).toEqual(['evaluate', 'page'])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('reports every image as failed when the runtime cannot carry asset bytes', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-missing-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'firefox-storage.md')
+    const html = firefoxImageDocument()
+    const { relay, assetRequests } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: html,
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      withoutAssetTransport: true,
+    })
+    try {
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images-missing',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      // The extraction still lands: a missing byte channel is a per-image failure.
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected the extraction to survive a missing asset channel')
+      }
+      expect(response.data.value).toMatchObject({
+        failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('cannot fetch image bytes') }],
+      })
+      expect(response.data.value).not.toHaveProperty('savedAssets')
+      expect(assetRequests).toHaveLength(0)
+      expect(response.data.artifacts).toEqual([{
+        path: outputPath,
+        mimeType: 'text/markdown',
+        bytes: Buffer.byteLength(full.text, 'utf8'),
+        label: FIREFOX_EXTRACT_TITLE,
+      }])
+      // Nothing was stored, so the document keeps the page's own URL.
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(full.text)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('degrades a failed asset fetch into per-image failures instead of failing the extraction', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-timeout-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, assetTimeouts } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxImageDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      assetAnswer: () => {
+        throw new Error('browserAssetRequest failed: Extension request timeout after 30000ms: browserAssetRequest')
+      },
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images-timeout',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected the extraction to survive a timed-out asset fetch')
+      }
+      expect(response.data.value).toMatchObject({
+        failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('browserAssetRequest failed') }],
+      })
+      expect(response.data.text).toContain('Storage documentation')
+      expect(assetTimeouts).toHaveLength(1)
+      expect(assetTimeouts[0]).toBeLessThanOrEqual(30_000)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('refuses an oversized or mismatched asset answer instead of writing it', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-refused-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const oversizedBase64 = 'A'.repeat(MAX_FIREFOX_ASSET_BASE64_LENGTH + 1)
+    const { relay } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxImageDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      assetAnswer: (request) => {
+        return {
+          requestId: 'a different request',
+          assets: [{ src: FIREFOX_IMAGE_URL, ok: true, base64: oversizedBase64, mimeType: 'image/png' }],
+        }
+      },
+    })
+    try {
+      const mismatched = await relay.handleRequest({
+        requestId: 'firefox-extract-images-mismatched',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+      })
+      expect(mismatched.ok).toBe(true)
+      if (!mismatched.ok) {
+        throw new Error('expected the extraction to survive a mismatched asset answer')
+      }
+      expect(mismatched.data.value).toMatchObject({
+        failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('malformed or mismatched asset response') }],
+      })
+      expect(fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []).toEqual([])
+
+      // The same answer with the right requestId is refused for its size: a
+      // channel payload the runtime cannot accept is never written either.
+      const oversizedRelay = startFirefoxExtractRelay({
+        artifactStore,
+        documentHtml: firefoxImageDocument(),
+        inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+        pageImages: [firefoxPageImage()],
+        assetAnswer: (request) => {
+          return {
+            requestId: request.requestId,
+            assets: [{ src: FIREFOX_IMAGE_URL, ok: true, base64: oversizedBase64, mimeType: 'image/png' }],
+          }
+        },
+      })
+      try {
+        const oversizedResponse = await oversizedRelay.relay.handleRequest({
+          requestId: 'firefox-extract-images-oversized',
+          sessionId: 'session-1',
+          timeoutMs: 30_000,
+          operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+        })
+        expect(oversizedResponse.ok).toBe(true)
+        if (!oversizedResponse.ok) {
+          throw new Error('expected the extraction to survive an oversized asset answer')
+        }
+        expect(oversizedResponse.data.value).toMatchObject({
+          failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('malformed or mismatched asset response') }],
+        })
+        expect(fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []).toEqual([])
+      } finally {
+        await oversizedRelay.relay.dispose()
+      }
     } finally {
       await relay.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
@@ -4630,7 +5046,12 @@ describe('managed page.extract images', () => {
           outcome: 'not-started',
         },
       })
-      expect(domRequests.map((request) => { return request.command })).toEqual([{ method: 'page', action: 'content' }])
+      // Only the advertised mode reached the browser: the URL listing is a
+      // manifest read plus the document read, and the refused save read nothing.
+      expect(domRequests.map((request) => { return request.command })).toEqual([
+        { method: 'evaluate', code: expect.any(String) },
+        { method: 'page', action: 'content' },
+      ])
     } finally {
       await relay.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
