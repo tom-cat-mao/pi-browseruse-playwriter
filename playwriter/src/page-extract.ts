@@ -41,6 +41,12 @@ export interface PageExtractInput {
   search?: string
   offset?: number
   limit?: number
+  /**
+   * Return the whole extraction instead of the bounded preview window. Only
+   * callers that persist the result (artifacts) use this: the model-facing
+   * preview always stays inside the character budget.
+   */
+  full?: boolean
 }
 
 export interface PageExtractMetadata {
@@ -61,10 +67,13 @@ export interface PageExtractOutput {
 }
 
 /**
- * Line caps mirror the page.snapshot renderer: `maxLines` bounds the window
- * and `marker` is appended whenever the caller does not get every line.
+ * Line caps mirror the page.snapshot renderer: `maxLines` bounds the window,
+ * `maxChars` bounds the response and `marker` is appended whenever the caller
+ * does not get every line.
  */
 const EXTRACT_MAX_LINES = 2_000
+/** Character budget for the returned preview, aligned with page.snapshot. */
+export const EXTRACT_MAX_CHARS = 40_000
 const TRUNCATION_MARKER = '[truncated; use search or offset/limit for the rest]'
 const SEARCH_MATCH_LIMIT = 10
 const SEARCH_CONTEXT_LINES = 5
@@ -85,28 +94,84 @@ interface ExtractPassResult {
 export async function extractPageContent(input: PageExtractInput): Promise<PageExtractOutput> {
   const extracted = await extractFromHtml({ html: input.html, url: input.url })
   const body = input.format === 'text' ? stripMarkdownToText(extracted.markdown) : extracted.markdown
-  const document = assembleDocument({ title: extracted.title, metadata: extracted.metadata, body })
+  const document = assembleDocument({
+    title: extracted.title,
+    metadata: extracted.metadata,
+    body,
+    plain: input.format === 'text',
+  })
   const fullText = document.toWellFormed()
   const totalBytes = Buffer.byteLength(fullText, 'utf8')
-  const fullLines = fullText.split('\n')
-  const selectedLines = input.search ? selectSearchLines({ lines: fullLines, search: input.search }) : fullLines
-  const start = Number.isInteger(input.offset) && (input.offset ?? 0) >= 0 ? (input.offset ?? 0) : 0
-  const maxLines = input.limit === undefined ? EXTRACT_MAX_LINES : Math.max(0, Math.floor(input.limit))
-  const window = selectedLines.slice(start, start + Math.min(maxLines, EXTRACT_MAX_LINES))
-  const truncated = selectedLines.length !== fullLines.length || start > 0 || window.length < selectedLines.length
-
-  let text = window.join('\n')
-  if (truncated) {
-    text = text ? `${text}\n${TRUNCATION_MARKER}` : TRUNCATION_MARKER
-  }
+  const result = input.full
+    ? { text: fullText, truncated: false }
+    : windowExtractedText({
+        text: fullText,
+        search: input.search,
+        offset: input.offset,
+        limit: input.limit,
+      })
 
   return {
-    text,
+    text: result.text,
     ...(extracted.title ? { title: extracted.title } : {}),
     ...(hasMetadata(extracted.metadata) ? { metadata: extracted.metadata } : {}),
-    truncated,
+    truncated: result.truncated,
     totalBytes,
   }
+}
+
+/**
+ * Apply search, pagination and the character budget to an assembled document.
+ * Exported because backends that already hold serialized text (the `html`
+ * extraction format) must go through the same budget as the Markdown pipeline.
+ * A single over-long line is cut at the budget instead of being dropped or
+ * returned whole.
+ */
+export function windowExtractedText({
+  text,
+  search,
+  offset,
+  limit,
+  maxChars = EXTRACT_MAX_CHARS,
+}: {
+  text: string
+  search?: string
+  offset?: number
+  limit?: number
+  maxChars?: number
+}): { text: string; truncated: boolean } {
+  const lines = text.split('\n')
+  const selectedLines = search ? selectSearchLines({ lines, search }) : lines
+  const start = Number.isInteger(offset) && (offset ?? 0) >= 0 ? (offset ?? 0) : 0
+  const maxLines = limit === undefined ? EXTRACT_MAX_LINES : Math.max(0, Math.floor(limit))
+  const window = selectedLines.slice(start, start + Math.min(maxLines, EXTRACT_MAX_LINES))
+  const windowed = selectedLines.length !== lines.length || start > 0 || window.length < selectedLines.length
+  const budgetChars = Math.max(0, maxChars - TRUNCATION_MARKER.length - 1)
+  const outputLines: string[] = []
+  let usedChars = 0
+  let budgetExceeded = false
+
+  for (const line of window) {
+    const separatorChars = outputLines.length === 0 ? 0 : 1
+    const remaining = budgetChars - usedChars - separatorChars
+    if (line.length > remaining) {
+      const prefix = remaining > 0 ? sliceUnicodeText({ value: line, maxChars: remaining }) : ''
+      if (prefix) {
+        outputLines.push(prefix)
+      }
+      budgetExceeded = true
+      break
+    }
+    outputLines.push(line)
+    usedChars += separatorChars + line.length
+  }
+
+  const truncated = windowed || budgetExceeded
+  let output = outputLines.join('\n')
+  if (truncated) {
+    output = output ? `${output}\n${TRUNCATION_MARKER}` : TRUNCATION_MARKER
+  }
+  return { text: output, truncated }
 }
 
 async function extractFromHtml({ html, url }: { html: string; url?: string }): Promise<ExtractPassResult> {
@@ -157,18 +222,24 @@ function hasMetadata({ author, siteName, publishedTime, excerpt }: PageExtractMe
   return Boolean(author ?? siteName ?? publishedTime ?? excerpt)
 }
 
+/**
+ * `plain` (the `text` format) must not leave any Markdown syntax behind, so
+ * every block assembled here — not just the body — is emitted as plain text.
+ */
 function assembleDocument({
   title,
   metadata,
   body,
+  plain,
 }: {
   title: string
   metadata: PageExtractMetadata
   body: string
+  plain: boolean
 }): string {
   const blocks: string[] = []
   if (title) {
-    blocks.push(`# ${title}`)
+    blocks.push(plain ? title : `# ${title}`)
   }
   const metadataLine = [
     metadata.author ? `Author: ${metadata.author}` : '',
@@ -176,15 +247,30 @@ function assembleDocument({
     metadata.publishedTime ? `Published: ${metadata.publishedTime}` : '',
   ].filter(Boolean)
   if (metadataLine.length > 0) {
-    blocks.push(`*${metadataLine.join(' | ')}*`)
+    const line = metadataLine.join(' | ')
+    blocks.push(plain ? line : `*${line}*`)
   }
   if (metadata.excerpt) {
-    blocks.push(`> ${metadata.excerpt}`)
+    blocks.push(plain ? metadata.excerpt : `> ${metadata.excerpt}`)
   }
   if (body) {
     blocks.push(body)
   }
   return blocks.join('\n\n').trim()
+}
+
+/** Cut a string at a character budget without splitting a surrogate pair. */
+function sliceUnicodeText({ value, maxChars }: { value: string; maxChars: number }): string {
+  let result = ''
+  let chars = 0
+  for (const character of value) {
+    if (chars + character.length > maxChars) {
+      break
+    }
+    result += character
+    chars += character.length
+  }
+  return result
 }
 
 /**

@@ -19,7 +19,7 @@ export const ARTIFACT_FILE_LIMIT_BYTES = 16 * 1024 * 1024
 /** Largest artifact total the store accepts per session before rejecting further writes. */
 export const ARTIFACT_SESSION_LIMIT_BYTES = 64 * 1024 * 1024
 /** Directory under the runtime data directory that owns every stored artifact. */
-export const ARTIFACTS_DIR_NAME = 'artifacts'
+const ARTIFACTS_DIR_NAME = 'artifacts'
 
 /** Session accounting is bounded so a long-lived runtime cannot grow it forever. */
 const MAX_TRACKED_SESSIONS = 1024
@@ -38,9 +38,11 @@ const MIME_TYPE_EXTENSIONS: Record<string, string> = {
   'image/webp': '.webp',
   'image/gif': '.gif',
   'image/svg+xml': '.svg',
+  'text/markdown': '.md',
+  'text/html': '.html',
 }
 
-export type ArtifactStoreErrorCode = 'invalid-request' | 'internal-error'
+export type ArtifactStoreErrorCode = 'invalid-request'
 
 export class ArtifactStoreError extends Error {
   readonly code: ArtifactStoreErrorCode
@@ -62,6 +64,12 @@ export type WriteArtifactOptions = {
   label?: string
   sourceUrl?: string
   sessionId?: string
+  /**
+   * Exact file for the artifact, when the caller asked for one. Still confined
+   * to the artifacts root: a caller-picked path is honored inside it and
+   * rejected outside it, exactly like a generated name.
+   */
+  targetPath?: string
 }
 
 function createEscapeError(candidatePath: string): ArtifactStoreError {
@@ -73,6 +81,13 @@ function createEscapeError(candidatePath: string): ArtifactStoreError {
 
 function createMalformedPayloadError(): ArtifactStoreError {
   return new ArtifactStoreError({ code: 'invalid-request', message: 'artifact base64 payload is malformed' })
+}
+
+function createFileTooLargeError(bytes: number): ArtifactStoreError {
+  return new ArtifactStoreError({
+    code: 'invalid-request',
+    message: `artifact of ${bytes} bytes exceeds the ${ARTIFACT_FILE_LIMIT_BYTES} byte per-file limit`,
+  })
 }
 
 function isWithinDirectory({ directory, candidate }: { directory: string; candidate: string }): boolean {
@@ -115,6 +130,20 @@ function normalizeMimeType(mimeType: string): string {
   return mimeType.split(';')[0].trim().toLowerCase()
 }
 
+/**
+ * Decoded size computed from the base64 length, so an oversized payload is
+ * rejected before decoding allocates a copy of it. Exactly the size for well
+ * formed base64; a length that is not a multiple of four is malformed and gets
+ * the upper-bound estimate, which is enough to reject it early too.
+ */
+function estimateDecodedBytes(base64: string): number {
+  if (base64.length % 4 !== 0) {
+    return Math.ceil(base64.length / 4) * 3
+  }
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0
+  return (base64.length / 4) * 3 - padding
+}
+
 function decodeArtifactBytes({ base64, buffer }: Pick<WriteArtifactOptions, 'base64' | 'buffer'>): Buffer {
   if (buffer !== undefined && base64 === undefined) {
     return buffer
@@ -124,6 +153,10 @@ function decodeArtifactBytes({ base64, buffer }: Pick<WriteArtifactOptions, 'bas
       code: 'invalid-request',
       message: 'artifact requires exactly one of a base64 or a Buffer payload',
     })
+  }
+  const estimatedBytes = estimateDecodedBytes(base64)
+  if (estimatedBytes > ARTIFACT_FILE_LIMIT_BYTES) {
+    throw createFileTooLargeError(estimatedBytes)
   }
   const decoded = Buffer.from(base64, 'base64')
   if (base64.length % 4 !== 0 || !BASE64_PATTERN.test(base64) || decoded.toString('base64') !== base64) {
@@ -172,10 +205,7 @@ export class ArtifactStore {
     }
     const buffer = decodeArtifactBytes(options)
     if (buffer.length > ARTIFACT_FILE_LIMIT_BYTES) {
-      throw new ArtifactStoreError({
-        code: 'invalid-request',
-        message: `artifact of ${buffer.length} bytes exceeds the ${ARTIFACT_FILE_LIMIT_BYTES} byte per-file limit`,
-      })
+      throw createFileTooLargeError(buffer.length)
     }
     const sessionId = options.sessionId ?? ''
     const sessionTotal = (this.sessionBytes.get(sessionId) ?? 0) + buffer.length
@@ -186,7 +216,10 @@ export class ArtifactStore {
       })
     }
     fs.mkdirSync(this.rootDir, { recursive: true, mode: 0o700 })
-    const outputPath = path.join(this.rootDir, createArtifactFileName({ label: options.label, extension }))
+    const outputPath = options.targetPath === undefined
+      ? path.join(this.rootDir, createArtifactFileName({ label: options.label, extension }))
+      : this.resolveTargetPath(options.targetPath)
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true, mode: 0o700 })
     assertArtifactPathWithinRoot({ rootDir: this.rootDir, candidatePath: outputPath })
     this.scopedFs.writeFileSync(outputPath, buffer, { mode: 0o600 })
     this.trackSessionBytes({ sessionId, total: sessionTotal })
@@ -197,6 +230,19 @@ export class ArtifactStore {
       ...(options.label ? { label: options.label } : {}),
       ...(options.sourceUrl ? { sourceUrl: options.sourceUrl } : {}),
     }
+  }
+
+  /**
+   * A caller-picked path is checked lexically before any directory is created,
+   * so a target outside the root can never make the store create directories
+   * outside it; the symlink-safe check runs again after the parent exists.
+   */
+  private resolveTargetPath(targetPath: string): string {
+    const resolved = path.resolve(targetPath)
+    if (!isWithinDirectory({ directory: this.rootDir, candidate: resolved })) {
+      throw createEscapeError(resolved)
+    }
+    return resolved
   }
 
   private trackSessionBytes({ sessionId, total }: { sessionId: string; total: number }): void {

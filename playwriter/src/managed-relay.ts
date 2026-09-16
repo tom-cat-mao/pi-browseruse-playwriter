@@ -41,8 +41,10 @@ import {
   type BrowserFeatureFlags,
   type BrowserDomRequest,
   type BrowserErrorCode,
+  type BrowserExtractFormat,
   type BrowserGroup,
   type BrowserInventory,
+  type BrowserJson,
   type BrowserOperation,
   type BrowserPageOperation,
   type BrowserProfile,
@@ -71,6 +73,8 @@ const CODE_MAX_LENGTH = 1_000_000
 const VALUE_MAX_LENGTH = 1_000_000
 const URL_MAX_LENGTH = 8_192
 const MESSAGE_MAX_LENGTH = 2_000
+/** Upper bound for page.extract offset/limit; line count is capped by the pipeline. */
+const EXTRACT_MAX_OFFSET = 1_000_000
 const INVENTORY_ARRAY_MAX_LENGTH = 10_000
 const FEATURE_FLAGS_MAX_ENTRIES = 64
 const FEATURE_NAME_MAX_LENGTH = 64
@@ -416,7 +420,10 @@ const OPERATION_KINDS = new Set<BrowserOperation['kind']>([
   'page.network',
   'page.logs',
   'page.execute',
+  'page.extract',
 ])
+
+const EXTRACT_FORMATS: BrowserExtractFormat[] = ['markdown', 'text', 'html', 'assets-manifest']
 
 const REQUEST_FIELDS = new Set(['requestId', 'sessionId', 'operation', 'cwd', 'timeoutMs'])
 
@@ -859,6 +866,53 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
         value: { kind: 'page.logs', tabId: tabId.value, ...(limit.value !== undefined ? { limit: limit.value } : {}) },
       }
     }
+    case 'page.extract': {
+      const fields = withFields(['tabId', 'format', 'selector', 'search', 'offset', 'limit', 'path'])
+      if (!fields.ok) {
+        return fields
+      }
+      const tabId = readString(value, 'tabId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      if (!tabId.ok) {
+        return tabId
+      }
+      const format = value.format
+      if (typeof format !== 'string' || !EXTRACT_FORMATS.includes(format as BrowserExtractFormat)) {
+        return { ok: false, message: `"format" must be one of ${EXTRACT_FORMATS.join(', ')}` }
+      }
+      const selector = readOptionalString(value, 'selector', { maxLength: SELECTOR_MAX_LENGTH, trim: false })
+      if (!selector.ok) {
+        return selector
+      }
+      const search = readOptionalString(value, 'search', { maxLength: MESSAGE_MAX_LENGTH, trim: false })
+      if (!search.ok) {
+        return search
+      }
+      const offset = readOptionalInteger(value, 'offset', { min: 0, max: EXTRACT_MAX_OFFSET })
+      if (!offset.ok) {
+        return offset
+      }
+      const limit = readOptionalInteger(value, 'limit', { min: 0, max: EXTRACT_MAX_OFFSET })
+      if (!limit.ok) {
+        return limit
+      }
+      const extractPath = readOptionalString(value, 'path', { maxLength: URL_MAX_LENGTH, trim: false })
+      if (!extractPath.ok) {
+        return extractPath
+      }
+      return {
+        ok: true,
+        value: {
+          kind: 'page.extract',
+          tabId: tabId.value,
+          format: format as BrowserExtractFormat,
+          ...(selector.value !== undefined ? { selector: selector.value } : {}),
+          ...(search.value !== undefined ? { search: search.value } : {}),
+          ...(offset.value !== undefined ? { offset: offset.value } : {}),
+          ...(limit.value !== undefined ? { limit: limit.value } : {}),
+          ...(extractPath.value !== undefined ? { path: extractPath.value } : {}),
+        },
+      }
+    }
     default: {
       return { ok: false, message: `unknown operation kind "${kind}"` }
     }
@@ -1269,6 +1323,26 @@ export function parseBrowserResponse(value: unknown): ParseResult<BrowserRespons
 // Capabilities
 // ---------------------------------------------------------------------------
 
+/**
+ * Page operations the runtime can route to a Chrome profile. The Chrome
+ * extension does not report `supportedOperations` — the relay owns the CDP
+ * executor that runs them — so these profiles get this list instead. A profile
+ * that advertises its own operations (Firefox does) keeps its own.
+ */
+const CHROME_SUPPORTED_PAGE_OPERATIONS: BrowserPageOperation['kind'][] = [
+  'page.navigate',
+  'page.back',
+  'page.snapshot',
+  'page.click',
+  'page.fill',
+  'page.evaluate',
+  'page.screenshot',
+  'page.network',
+  'page.logs',
+  'page.execute',
+  'page.extract',
+]
+
 export function buildBrowserCapabilities({ isolatedExecution }: { isolatedExecution: boolean }): BrowserCapabilities {
   return {
     protocolVersion: BROWSER_PROTOCOL_VERSION,
@@ -1496,6 +1570,10 @@ export function listManagedProfiles(
   { isolatedExecution }: { isolatedExecution: boolean },
 ): BrowserProfile[] {
   const capabilities = buildBrowserCapabilities({ isolatedExecution })
+  const defaultCapabilities: BrowserCapabilities = {
+    ...capabilities,
+    supportedOperations: [...CHROME_SUPPORTED_PAGE_OPERATIONS],
+  }
   return Array.from(state.profiles.values())
     .sort((a, b) => {
       return a.profileId.localeCompare(b.profileId)
@@ -1507,7 +1585,7 @@ export function listManagedProfiles(
         label: profile.label,
         connected: profile.connected,
         browserEpoch: profile.browserEpoch,
-        capabilities: profile.capabilities ? { ...profile.capabilities, isolatedExecution } : capabilities,
+        capabilities: profile.capabilities ? { ...profile.capabilities, isolatedExecution } : defaultCapabilities,
       }
     })
 }
@@ -1639,6 +1717,26 @@ class ManagedInputQueue {
     )
     return result
   }
+}
+
+/**
+ * Page title of an extraction payload, reported as the artifact label. A page
+ * title is untrusted input, so it is only ever a descriptor field.
+ */
+function readExtractTitle(value: Record<string, BrowserJson>): string {
+  const title = value.title
+  return typeof title === 'string' && title.trim() ? title.trim() : 'page extract'
+}
+
+/** Drop the persisted body so it never travels on to the model. */
+function omitExtractArtifactText(value: Record<string, BrowserJson>): Record<string, BrowserJson> {
+  const modelValue: Record<string, BrowserJson> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key !== 'artifactText') {
+      modelValue[key] = entry
+    }
+  }
+  return modelValue
 }
 
 // ---------------------------------------------------------------------------
@@ -2040,7 +2138,8 @@ export class ManagedRelay {
         case 'page.evaluate':
         case 'page.screenshot':
         case 'page.logs':
-        case 'page.execute': {
+        case 'page.execute':
+        case 'page.extract': {
           return await this.executePageOperation({ request, operation, timeoutMs, deadlineAt, clientSignal })
         }
         case 'page.network': {
@@ -2312,7 +2411,11 @@ export class ManagedRelay {
           outcome: 'unknown',
         })
       }
-      return parsed.value
+      return this.savePageExtractArtifact({
+        response: parsed.value,
+        operation,
+        sessionId: request.sessionId,
+      })
     } catch (error) {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
     } finally {
@@ -2483,7 +2586,57 @@ export class ManagedRelay {
     return { ...response, data: { ...response.data, artifacts } }
   }
 
-  private saveArtifact(options: { buffer: Buffer; mimeType: string; label: string; sessionId: string }): BrowserArtifact {
+  /**
+   * page.extract with `path`: the worker returns the whole extraction in
+   * `value.artifactText` so the relay — which owns the artifact store and the
+   * runtime data directory — writes the bytes and hands the model a descriptor.
+   * The full text is stripped from the response, so the model keeps only the
+   * bounded preview in `text`.
+   */
+  private savePageExtractArtifact({ response, operation, sessionId }: {
+    response: BrowserResponse
+    operation: BrowserPageOperation
+    sessionId: string
+  }): BrowserResponse {
+    if (!response.ok || operation.kind !== 'page.extract' || operation.path === undefined) {
+      return response
+    }
+    const value = response.data.value
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'page.extract returned no payload to persist', outcome: 'unknown',
+      })
+    }
+    const artifactText = value.artifactText
+    if (typeof artifactText !== 'string' || artifactText.length === 0) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'page.extract returned no extracted text to persist', outcome: 'unknown',
+      })
+    }
+    const artifact = this.saveArtifact({
+      buffer: Buffer.from(artifactText, 'utf8'),
+      mimeType: operation.format === 'html' ? 'text/html' : 'text/markdown',
+      label: readExtractTitle(value),
+      sessionId,
+      targetPath: operation.path,
+    })
+    return {
+      ...response,
+      data: {
+        ...response.data,
+        value: omitExtractArtifactText(value),
+        artifacts: [...(response.data.artifacts ?? []), artifact],
+      },
+    }
+  }
+
+  private saveArtifact(options: {
+    buffer: Buffer
+    mimeType: string
+    label: string
+    sessionId: string
+    targetPath?: string
+  }): BrowserArtifact {
     try {
       return this.artifactStore().write(options)
     } catch (error) {

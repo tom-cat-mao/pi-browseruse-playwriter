@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import type { Browser, BrowserContext, Page } from '@xmorse/playwright-core'
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import type { BrowserPageOperation, BrowserRequest, BrowserTab, ManagedExecution } from './browser-protocol.js'
+import type { BrowserPageOperation, BrowserRequest, BrowserResponse, BrowserTab, ManagedExecution } from './browser-protocol.js'
 
 const connectOverCDP = vi.hoisted(() => {
   return vi.fn()
@@ -23,8 +23,13 @@ import {
 } from './managed-executor-worker.js'
 
 class FakePage extends EventEmitter {
-  constructor(private readonly id: string) {
+  html = '<html><head><title>Example</title></head><body><article><p>Example body text.</p></article></body></html>'
+  selectedHtml = '<article><p>Selected body text.</p></article>'
+  private readonly pageTitle: string
+
+  constructor(private readonly id: string, title = 'Example') {
     super()
+    this.pageTitle = title
   }
 
   targetId(): string {
@@ -37,6 +42,22 @@ class FakePage extends EventEmitter {
 
   isClosed(): boolean {
     return false
+  }
+
+  async content(): Promise<string> {
+    return this.html
+  }
+
+  async title(): Promise<string> {
+    return this.pageTitle
+  }
+
+  locator(): { evaluate: <R>(pageFunction: (element: { outerHTML: string }) => R) => Promise<R> } {
+    return {
+      evaluate: async <R>(pageFunction: (element: { outerHTML: string }) => R): Promise<R> => {
+        return pageFunction({ outerHTML: this.selectedHtml })
+      },
+    }
   }
 }
 
@@ -77,11 +98,23 @@ async function waitForCondition({ predicate, message }: { predicate: () => boole
 }
 
 function createExecution({ timeoutMs }: { timeoutMs: number }): ManagedExecution {
+  return createOperationExecution({ timeoutMs, operation: { kind: 'page.logs', tabId: 'tab-1', limit: 1 } })
+}
+
+function createOperationExecution({
+  timeoutMs,
+  operation,
+  requestId = 'request-1',
+}: {
+  timeoutMs: number
+  operation: BrowserPageOperation
+  requestId?: string
+}): ManagedExecution {
   const request: BrowserRequest & { operation: BrowserPageOperation } = {
-    requestId: 'request-1',
+    requestId,
     sessionId: 'session-1',
     timeoutMs,
-    operation: { kind: 'page.logs', tabId: 'tab-1', limit: 1 },
+    operation,
   }
   const tab: BrowserTab = {
     tabId: 'tab-1',
@@ -102,6 +135,33 @@ function createExecution({ timeoutMs }: { timeoutMs: number }): ManagedExecution
     cdpUrl: 'ws://managed-profile',
     connectionEpoch: 'connection-1',
   }
+}
+
+/** Start a request and resolve the target page the way the worker expects. */
+async function executeWithPage({
+  operation,
+  page,
+  timeoutMs = 4_000,
+}: {
+  operation: BrowserPageOperation
+  page: FakePage
+  timeoutMs?: number
+}): Promise<BrowserResponse> {
+  const context = new FakeContext()
+  const browser = new FakeBrowser(context as unknown as BrowserContext)
+  connectOverCDP.mockResolvedValue(browser as unknown as Browser)
+  const runtime = new ManagedExecutorWorkerRuntime()
+  const pending = runtime.execute(createOperationExecution({ timeoutMs, operation }))
+  await waitForCondition({
+    predicate: () => {
+      return context.listenerCount('page') === 2
+    },
+    message: 'target page listener',
+  })
+  context.addPage(page as unknown as Page)
+  const response = await pending
+  await runtime.dispose()
+  return response
 }
 
 describe('managed executor target initialization', () => {
@@ -251,5 +311,117 @@ describe('managed executor pure result helpers', () => {
     expect(calculateNativeOperationTimeout({ deadline: 10_000, now: 1_000, maximumMs: 5_000 })).toBe(5_000)
     expect(calculateNativeOperationTimeout({ deadline: 2_000, now: 1_000, maximumMs: 5_000 })).toBe(750)
     expect(calculateNativeOperationTimeout({ deadline: 1_200, now: 1_000, maximumMs: 5_000 })).toBe(0)
+  })
+})
+
+describe('managed executor page.extract', () => {
+  test('runs the extraction pipeline over the page HTML', async () => {
+    const page = new FakePage('target-1')
+    page.html = `<html><head><title>Retention policy</title>
+      <meta name="author" content="Dana Whitfield">
+      <meta property="og:site_name" content="Storage Docs">
+      </head><body><nav>Getting started</nav><article><h1>Retention policy</h1>
+      <p>A retention policy prevents objects from being deleted for a fixed period.</p></article>
+      <footer>All rights reserved</footer></body></html>`
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown' },
+    })
+
+    expect(response).toMatchObject({
+      ok: true,
+      data: {
+        value: { format: 'markdown', truncated: false, title: 'Retention policy', metadata: { author: 'Dana Whitfield' } },
+        pageInfo: { tabId: 'tab-1', url: 'https://example.com/' },
+      },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+    expect(response.data.text).toContain('# Retention policy')
+    expect(response.data.text).toContain('prevents objects from being deleted')
+    expect(response.data.text).not.toContain('Getting started')
+    expect(response.data.text).not.toContain('All rights reserved')
+    expect(response.data.value).not.toHaveProperty('artifactText')
+  })
+
+  test('scopes extraction to the selector and to the requested window', async () => {
+    const page = new FakePage('target-1')
+    const filler = Array.from({ length: 20 }, (_unused, index) => {
+      return `<p>Filler paragraph ${index} carries no keyword.</p>`
+    }).join('')
+    page.selectedHtml = `<article><h1>Chosen</h1><p>alpha marker</p>${filler}<p>omega marker</p></article>`
+
+    const markdown = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', selector: 'article' },
+    })
+    expect(markdown).toMatchObject({ ok: true, data: { value: { format: 'markdown' } } })
+    if (!markdown.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+    expect(markdown.data.text).toContain('Chosen')
+    expect(markdown.data.text).toContain('omega marker')
+    expect(markdown.data.text).not.toContain('Example body text')
+
+    const text = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'text', selector: 'article', search: 'alpha marker' },
+    })
+    if (!text.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+    expect(text.data.text).toContain('alpha marker')
+    expect(text.data.text).not.toContain('omega marker')
+    expect(text.data.value).toMatchObject({ truncated: true })
+  })
+
+  test('bounds the html format with the same budget and hands the whole document to a persistence request', async () => {
+    const page = new FakePage('target-1', 'Serialized page')
+    page.html = `<html><body><article><p>${'x'.repeat(400_000)}</p></article></body></html>`
+
+    const preview = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'html' },
+    })
+    if (!preview.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+    const previewText = preview.data.text ?? ''
+    expect(previewText.length).toBeGreaterThan(39_000)
+    expect(previewText.length).toBeLessThanOrEqual(40_000)
+    expect(preview.data.value).toMatchObject({
+      format: 'html',
+      truncated: true,
+      totalBytes: Buffer.byteLength(page.html, 'utf8'),
+      title: 'Serialized page',
+    })
+    expect(preview.data.value).not.toHaveProperty('artifactText')
+
+    const persisted = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'html', path: '/tmp/page.html' },
+    })
+    if (!persisted.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+    // The preview stays the same whether or not the caller persists the file.
+    expect(persisted.data.text ?? '').toBe(previewText)
+    expect(persisted.data.value).toMatchObject({ truncated: true })
+    const value = persisted.data.value
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('expected a structured extract value')
+    }
+    expect(value.artifactText).toBe(page.html)
+  })
+
+  test('reports assets-manifest as unsupported instead of returning an empty extraction', async () => {
+    const response = await executeWithPage({
+      page: new FakePage('target-1'),
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'assets-manifest' },
+    })
+
+    expect(response).toMatchObject({ ok: false, error: { code: 'unsupported-capability' } })
   })
 })
