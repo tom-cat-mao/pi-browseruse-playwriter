@@ -83,6 +83,48 @@ describe("getCapabilities", () => {
     const dead = new BrowserRuntimeClient({ baseUrl: "http://127.0.0.1:1" });
     await expect(dead.getCapabilities()).rejects.toMatchObject({ category: "runtime-unreachable" });
   });
+  it("ignores unknown page operations but keeps the known ones and the feature matrix", async () => {
+    // A peer that ships after this client (page.extract-era extension) must not
+    // be able to fail the connection just by advertising what it can do.
+    const features = { extract: ["markdown", "text"], assets: ["urls", "save"], unknownFeature: ["v2"] };
+    server.setHandler(() => ({
+      json: {
+        ...validCapabilities,
+        supportedOperations: ["page.click", "page.extract", "tabs.create", "page.teleport"],
+        features,
+      },
+    }));
+    const caps = await client().getCapabilities();
+    expect(caps.supportedOperations).toEqual(["page.click"]);
+    expect(caps.features).toEqual(features);
+  });
+  it("keeps capability keys it does not know instead of rejecting the peer", async () => {
+    const futureCapabilities = { ...validCapabilities, negotiationVersion: 2, limits: { tabs: 8 } };
+    server.setHandler(() => ({ json: futureCapabilities }));
+    await expect(client().getCapabilities()).resolves.toEqual(futureCapabilities);
+  });
+  it("rejects malformed supportedOperations or features shapes as protocol errors", async () => {
+    const invalidCapabilities = [
+      { supportedOperations: "page.click" },
+      { supportedOperations: [123] },
+      { supportedOperations: ["x".repeat(101)] },
+      { supportedOperations: Array.from({ length: 33 }, () => { return "page.click"; }) },
+      { features: "extract" },
+      { features: ["extract"] },
+      { features: { extract: "markdown" } },
+      { features: { extract: [123] } },
+      { features: { extract: ["x".repeat(101)] } },
+      { features: { extract: Array.from({ length: 33 }, () => { return "markdown"; }) } },
+      { features: { ["x".repeat(101)]: ["markdown"] } },
+      { features: Object.fromEntries(Array.from({ length: 33 }, (_unused, i) => { return [`f${i}`, ["v"]]; })) },
+    ];
+    for (const invalid of invalidCapabilities) {
+      server.setHandler(() => {
+        return { json: { ...validCapabilities, ...invalid } };
+      });
+      await expect(client().getCapabilities()).rejects.toMatchObject({ category: "protocol" });
+    }
+  });
 });
 
 describe("listProfiles", () => {
@@ -118,7 +160,24 @@ describe("listProfiles", () => {
     });
     await expect(client().listProfiles()).resolves.toEqual([validProfile, firefoxProfile]);
   });
+  it("tolerates unknown page operations and keeps features on a newer profile", async () => {
+    const newerProfile = {
+      ...validProfile,
+      profileId: "profile-newer",
+      capabilities: {
+        ...validCapabilities,
+        supportedOperations: ["page.snapshot", "page.extract"],
+        features: { extract: ["markdown"], unknownFeature: ["v2"] },
+      },
+    };
+    server.setHandler(() => ({ json: { profiles: [newerProfile] } }));
+    const profiles = await client().listProfiles();
+    expect(profiles[0].capabilities.supportedOperations).toEqual(["page.snapshot"]);
+    expect(profiles[0].capabilities.features).toEqual({ extract: ["markdown"], unknownFeature: ["v2"] });
+  });
   it("rejects invalid or unbounded optional backend capabilities", async () => {
+    // An unknown page operation (page.extract, a control op) is deliberately not
+    // in this list: it is ignored, not rejected — see the getCapabilities tests.
     const invalidCapabilities = [
       { backend: "remote-agent" },
       { inputMode: true },
@@ -129,7 +188,6 @@ describe("listProfiles", () => {
       { limitations: "DOM input" },
       { limitations: ["x".repeat(2_001)] },
       { limitations: Array.from({ length: 33 }, () => { return "bounded"; }) },
-      { supportedOperations: ["tabs.create"] },
       { supportedOperations: "page.click" },
     ];
     for (const invalid of invalidCapabilities) {
@@ -173,6 +231,29 @@ describe("request", () => {
     await expect(
       client().request({ requestId: "c", sessionId: "s", operation: { kind: "page.click", tabId: "t", selector: "#x" } }),
     ).rejects.toMatchObject({ category: "operation", code: "stale-snapshot", outcome: "not-started" });
+  });
+
+  it("tolerates unknown result fields and the extended artifact shape", async () => {
+    const artifacts = [
+      {
+        path: "artifacts/example.md",
+        mimeType: "text/markdown",
+        bytes: 1_024,
+        label: "Example page",
+        sourceUrl: "https://example.com/",
+      },
+    ];
+    server.setHandler((req) => ({
+      json: {
+        requestId: (req.body as { requestId: string }).requestId,
+        ok: true,
+        data: { text: "hello", artifacts, futureField: { nested: [1, 2] } },
+      },
+    }));
+    const data = await client().request({ requestId: "c", sessionId: "s", operation: { kind: "profiles.list" } });
+    expect(Object.keys(data).sort()).toEqual(["artifacts", "futureField", "text"]);
+    expect(data.artifacts).toEqual(artifacts);
+    expect(data.text).toBe("hello");
   });
 
   it("rejects a response whose requestId does not echo the request", async () => {

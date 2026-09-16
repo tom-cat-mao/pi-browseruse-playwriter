@@ -30,12 +30,15 @@ import { FirefoxExecutorPool } from './firefox-executor-pool.js'
 import { parseBrowserDomRequest } from './browser-dom-validation.js'
 import fs from 'node:fs'
 import path from 'node:path'
+import { ArtifactStore, ArtifactStoreError } from './artifact-store.js'
 import { RuntimeNetworkCaptureStore } from './runtime-network-capture.js'
 import { parseBrowserTabCandidateId } from './browser-protocol.js'
 import {
   BROWSER_PROTOCOL_VERSION,
+  type BrowserArtifact,
   type BrowserCapabilities,
   type BrowserBackend,
+  type BrowserFeatureFlags,
   type BrowserDomRequest,
   type BrowserErrorCode,
   type BrowserGroup,
@@ -69,6 +72,9 @@ const VALUE_MAX_LENGTH = 1_000_000
 const URL_MAX_LENGTH = 8_192
 const MESSAGE_MAX_LENGTH = 2_000
 const INVENTORY_ARRAY_MAX_LENGTH = 10_000
+const FEATURE_FLAGS_MAX_ENTRIES = 64
+const FEATURE_NAME_MAX_LENGTH = 64
+const FEATURE_VALUE_MAX_LENGTH = 200
 
 /** Navigation targets accepted from Pi. Anything else (javascript:, data:, chrome://,
  *  chrome-extension:, devtools:, file:, blob:, view-source:) is rejected as malformed. */
@@ -222,6 +228,8 @@ export type ManagedRelayOptions = {
   closeManagedClient: (options: { clientId: string; code: number; reason: string }) => void
   /** Test seam / custom wiring for the isolated executor pool. */
   poolFactory?: () => Promise<ManagedExecutorPoolContract>
+  /** Test seam / custom wiring for the artifact store that owns local writes. */
+  artifactStore?: ArtifactStore
   now?: () => number
 }
 
@@ -1046,6 +1054,28 @@ function parseTabValue({ value, index, backend = 'cdp' }: {
   }
 }
 
+/**
+ * `capabilities.features` is a forward-compatible matrix: only its shape is
+ * checked, so a newer extension adding feature names keeps working, while a
+ * malformed payload is still rejected instead of being cached unvalidated.
+ */
+function isCapabilityFeatures(value: unknown): value is BrowserFeatureFlags {
+  if (!isRecord(value)) {
+    return false
+  }
+  const entries = Object.entries(value)
+  if (entries.length > FEATURE_FLAGS_MAX_ENTRIES) {
+    return false
+  }
+  return entries.every(([name, features]) => {
+    return name.length > 0 && name.length <= FEATURE_NAME_MAX_LENGTH && Array.isArray(features) &&
+      features.length <= FEATURE_FLAGS_MAX_ENTRIES &&
+      features.every((feature) => {
+        return typeof feature === 'string' && feature.length <= FEATURE_VALUE_MAX_LENGTH
+      })
+  })
+}
+
 function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabilities> {
   if (!isRecord(value) || value.protocolVersion !== BROWSER_PROTOCOL_VERSION) {
     return { ok: false, message: 'inventory capabilities must have the supported protocolVersion' }
@@ -1058,7 +1088,7 @@ function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabili
     executeMode: ['playwright', 'dom-compatible'],
     evaluateWorld: ['page', 'isolated'],
   }
-  const allowed = new Set(['protocolVersion', ...requiredFlags, 'existingTabControl', ...Object.keys(choices), 'limitations', 'supportedOperations'])
+  const allowed = new Set(['protocolVersion', ...requiredFlags, 'existingTabControl', ...Object.keys(choices), 'limitations', 'supportedOperations', 'features'])
   const extra = assertNoExtraFields(value, allowed, 'BrowserCapabilities')
   if (!extra.ok) {
     return extra
@@ -1088,6 +1118,9 @@ function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabili
       return typeof operation !== 'string' || !operation.startsWith('page.') || !OPERATION_KINDS.has(operation as BrowserOperation['kind'])
     }))) {
     return { ok: false, message: 'capabilities.supportedOperations contains an invalid page operation' }
+  }
+  if (value.features !== undefined && !isCapabilityFeatures(value.features)) {
+    return { ok: false, message: 'capabilities.features must map feature names to bounded string arrays' }
   }
   return { ok: true, value: value as unknown as BrowserCapabilities }
 }
@@ -1627,6 +1660,7 @@ export class ManagedRelay {
   private pool: ManagedExecutorPoolContract | null = null
   private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
   private firefoxPool: FirefoxExecutorPool | null = null
+  private artifactStoreInstance: ArtifactStore | null = null
   private disposed = false
 
   constructor(options: ManagedRelayOptions) {
@@ -2319,7 +2353,7 @@ export class ManagedRelay {
       promise.catch(() => {})
       const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
       const response = this.parseFirefoxResponse({ value, requestId: request.requestId })
-      return this.saveFirefoxScreenshot({ response, operation })
+      return this.saveFirefoxScreenshot({ response, operation, sessionId: request.sessionId })
     }
     if (!this.options.transport.sendBrowserDomRequest) {
       throw new ManagedTransportError({
@@ -2376,7 +2410,7 @@ export class ManagedRelay {
           promise.catch(() => {})
           const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
           const response = this.parseFirefoxResponse({ value, requestId: domRequest.requestId })
-          return nestedOperation ? this.saveFirefoxScreenshot({ response, operation: nestedOperation }) : response
+          return nestedOperation ? this.saveFirefoxScreenshot({ response, operation: nestedOperation, sessionId: request.sessionId }) : response
         } finally {
           pending.domRequestIds.delete(domRequest.requestId)
         }
@@ -2416,7 +2450,11 @@ export class ManagedRelay {
     return this.enforceResponseLimit(parsed.value, requestId)
   }
 
-  private saveFirefoxScreenshot({ response, operation }: { response: BrowserResponse; operation: BrowserPageOperation }): BrowserResponse {
+  private saveFirefoxScreenshot({ response, operation, sessionId }: {
+    response: BrowserResponse
+    operation: BrowserPageOperation
+    sessionId: string
+  }): BrowserResponse {
     if (!response.ok || operation.kind !== 'page.screenshot') {
       return response
     }
@@ -2438,9 +2476,31 @@ export class ManagedRelay {
       const outputPath = path.normalize(operation.path)
       fs.mkdirSync(path.dirname(outputPath), { recursive: true })
       fs.writeFileSync(outputPath, buffer)
-      artifacts.push({ path: outputPath, mimeType: 'image/png' })
+      artifacts.push({ path: outputPath, mimeType: 'image/png', bytes: buffer.length })
+    } else {
+      artifacts.push(this.saveArtifact({ buffer, mimeType: 'image/png', label: 'screenshot', sessionId }))
     }
     return { ...response, data: { ...response.data, artifacts } }
+  }
+
+  private saveArtifact(options: { buffer: Buffer; mimeType: string; label: string; sessionId: string }): BrowserArtifact {
+    try {
+      return this.artifactStore().write(options)
+    } catch (error) {
+      if (error instanceof ArtifactStoreError) {
+        throw new ManagedTransportError({ code: error.code, message: error.message, outcome: 'unknown' })
+      }
+      throw error
+    }
+  }
+
+  private artifactStore(): ArtifactStore {
+    const configured = this.options.artifactStore
+    if (configured) {
+      return configured
+    }
+    this.artifactStoreInstance ??= new ArtifactStore({})
+    return this.artifactStoreInstance
   }
 
   private async executeNetworkOperation({
