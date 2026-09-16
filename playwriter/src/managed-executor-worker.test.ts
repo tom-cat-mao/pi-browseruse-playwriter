@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events'
+import http from 'node:http'
+import net from 'node:net'
 import type { Browser, BrowserContext, Page } from '@xmorse/playwright-core'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import type { BrowserPageOperation, BrowserRequest, BrowserResponse, BrowserTab, ManagedExecution } from './browser-protocol.js'
@@ -22,9 +24,59 @@ import {
   ManagedExecutorWorkerRuntime,
 } from './managed-executor-worker.js'
 
+type FakePageImage = {
+  src: string
+  currentSrc?: string
+  srcset?: string
+  alt?: string
+  naturalWidth?: number
+  naturalHeight?: number
+}
+
+type FakePageGlyph = {
+  src: string
+  currentSrc: string
+  srcset: string
+  alt: string
+  naturalWidth: number
+  naturalHeight: number
+}
+
+/**
+ * A page-side image element: the fake exposes the same properties the worker's
+ * in-page enumeration reads, so the real page function runs against it.
+ */
+function createPageGlyph(image: FakePageImage): FakePageGlyph & { getAttribute: (name: string) => string | null } {
+  return {
+    src: image.src,
+    currentSrc: image.currentSrc ?? '',
+    srcset: image.srcset ?? '',
+    alt: image.alt ?? '',
+    naturalWidth: image.naturalWidth ?? 0,
+    naturalHeight: image.naturalHeight ?? 0,
+    getAttribute: (name: string): string | null => {
+      if (name === 'alt') {
+        return image.alt ?? null
+      }
+      if (name === 'srcset') {
+        return image.srcset ?? null
+      }
+      return null
+    },
+  }
+}
+
 class FakePage extends EventEmitter {
   html = '<html><head><title>Example</title></head><body><article><p>Example body text.</p></article></body></html>'
   selectedHtml = '<article><p>Selected body text.</p></article>'
+  /** Images the in-page enumeration sees. */
+  images: FakePageImage[] = []
+  /** Image bytes the page's own fetch can read, the way a CORS-enabled image would. */
+  pageFetchable = new Map<string, { body: Uint8Array; contentType: string; declaredBytes?: number }>()
+  /** URLs the page's own fetch refuses, the way a cross-origin image without CORS headers fails. */
+  pageFetchBlocked = new Set<string>()
+  pageFetchUrls: string[] = []
+  pageFetchCredentials: string[] = []
   private readonly pageTitle: string
 
   constructor(private readonly id: string, title = 'Example') {
@@ -52,6 +104,58 @@ class FakePage extends EventEmitter {
     return this.pageTitle
   }
 
+  /**
+   * Run a page function with the page-side globals it expects. The worker's
+   * functions are already written for a browser realm, so the fake only has to
+   * provide the DOM and fetch surface they read.
+   */
+  async evaluate<Arg, R>(pageFunction: (arg: Arg) => R | Promise<R>, arg: Arg): Promise<R> {
+    const globals = globalThis as unknown as Record<string, unknown>
+    const previous = {
+      document: globals.document,
+      fetch: globals.fetch,
+      btoa: globals.btoa,
+    }
+    globals.document = { images: this.images.map((image) => createPageGlyph(image)) }
+    globals.fetch = async (url: string, init: { credentials?: string }) => {
+      this.pageFetchUrls.push(url)
+      this.pageFetchCredentials.push(init?.credentials ?? '')
+      const served = this.pageFetchBlocked.has(url) ? undefined : this.pageFetchable.get(url)
+      if (!served) {
+        throw new TypeError('Failed to fetch')
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name: string) => {
+            const header = name.toLowerCase()
+            if (header === 'content-type') {
+              return served.contentType
+            }
+            if (header === 'content-length' && served.declaredBytes !== undefined) {
+              return String(served.declaredBytes)
+            }
+            return null
+          },
+        },
+        arrayBuffer: async () => {
+          return served.body.buffer.slice(served.body.byteOffset, served.body.byteOffset + served.body.byteLength)
+        },
+      }
+    }
+    globals.btoa = (value: string) => {
+      return Buffer.from(value, 'binary').toString('base64')
+    }
+    try {
+      return await pageFunction(arg)
+    } finally {
+      globals.document = previous.document
+      globals.fetch = previous.fetch
+      globals.btoa = previous.btoa
+    }
+  }
+
   locator(): { evaluate: <R>(pageFunction: (element: { outerHTML: string }) => R) => Promise<R> } {
     return {
       evaluate: async <R>(pageFunction: (element: { outerHTML: string }) => R): Promise<R> => {
@@ -59,6 +163,48 @@ class FakePage extends EventEmitter {
       },
     }
   }
+}
+
+/** Serve image bytes over real HTTP for the worker-side fetch fallback. */
+async function serveImage({ body, contentType }: { body: Uint8Array; contentType: string }): Promise<{
+  url: string
+  close: () => Promise<void>
+}> {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': contentType })
+    response.end(body)
+  })
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  const port = typeof address === 'object' && address ? address.port : 0
+  return {
+    url: `http://127.0.0.1:${port}/image.png`,
+    close: async () => {
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve()
+        })
+      })
+    },
+  }
+}
+
+/** A port nothing listens on, so a fetch to it fails the way an offline URL does. */
+async function reserveClosedPort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.on('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? address.port : 0
+      server.close(() => {
+        resolve(port)
+      })
+    })
+  })
 }
 
 class FakeContext extends EventEmitter {
@@ -415,13 +561,298 @@ describe('managed executor page.extract', () => {
     }
     expect(value.artifactText).toBe(page.html)
   })
+})
 
-  test('reports assets-manifest as unsupported instead of returning an empty extraction', async () => {
+describe('managed executor page.extract images', () => {
+  test('lists the page images as an assets manifest and skips sources that carry no bytes', async () => {
+    const page = new FakePage('target-1')
+    page.images = [
+      { src: 'https://cdn.example.com/chart.png', alt: 'Chart', naturalWidth: 640, naturalHeight: 480 },
+      {
+        src: 'https://cdn.example.com/photo.jpg',
+        currentSrc: 'https://cdn.example.com/photo-2x.jpg',
+        srcset: 'photo.jpg 1x, photo-2x.jpg 2x',
+      },
+      { src: 'data:image/png;base64,AAAA' },
+      { src: '' },
+    ]
+
     const response = await executeWithPage({
-      page: new FakePage('target-1'),
+      page,
       operation: { kind: 'page.extract', tabId: 'tab-1', format: 'assets-manifest' },
     })
+    if (!response.ok) {
+      throw new Error('expected a successful assets-manifest extraction')
+    }
 
-    expect(response).toMatchObject({ ok: false, error: { code: 'unsupported-capability' } })
+    expect(response.data.value).toMatchObject({
+      format: 'assets-manifest',
+      truncated: false,
+      assetCount: 2,
+      assets: [
+        {
+          src: 'https://cdn.example.com/chart.png',
+          currentSrc: '',
+          srcset: '',
+          alt: 'Chart',
+          naturalWidth: 640,
+          naturalHeight: 480,
+        },
+        {
+          src: 'https://cdn.example.com/photo.jpg',
+          currentSrc: 'https://cdn.example.com/photo-2x.jpg',
+          srcset: 'photo.jpg 1x, photo-2x.jpg 2x',
+          alt: '',
+          naturalWidth: 0,
+          naturalHeight: 0,
+        },
+      ],
+    })
+    expect(response.data.value).not.toHaveProperty('assetsTruncated')
+    expect(response.data.text).toContain('2 images found')
+    expect(response.data.text).toContain('- https://cdn.example.com/chart.png 640x480 alt="Chart"')
+    // The chosen srcset candidate is the URL an image fetch would have to use.
+    expect(response.data.text).toContain('- https://cdn.example.com/photo-2x.jpg')
+    expect(page.pageFetchUrls).toEqual([])
+  })
+
+  test("attaches the same manifest for images: 'urls' and fetches nothing", async () => {
+    const page = new FakePage('target-1')
+    page.images = [{ src: 'https://cdn.example.com/chart.png', alt: 'Chart' }]
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'urls' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    expect((response.data.value as Record<string, unknown>).assetCount).toBe(1)
+    expect((response.data.value as Record<string, unknown>).assets).toEqual([
+      {
+        src: 'https://cdn.example.com/chart.png',
+        currentSrc: '',
+        srcset: '',
+        alt: 'Chart',
+        naturalWidth: 0,
+        naturalHeight: 0,
+      },
+    ])
+    expect(response.data.value).not.toHaveProperty('savedAssets')
+    expect(response.data.text).toContain('Example body text')
+    expect(page.pageFetchUrls).toEqual([])
+  })
+
+  test("saves image bytes through the page fetch with the page's cookies", async () => {
+    const page = new FakePage('target-1')
+    page.images = [
+      { src: 'https://cdn.example.com/chart.png', alt: 'Chart' },
+      { src: 'https://cdn.example.com/logo.svg' },
+    ]
+    page.pageFetchable.set('https://cdn.example.com/chart.png', {
+      body: new Uint8Array(Buffer.from('chart-bytes')),
+      contentType: 'image/png; charset=binary',
+    })
+    page.pageFetchable.set('https://cdn.example.com/logo.svg', {
+      body: new Uint8Array(Buffer.from('<svg/>')),
+      contentType: 'image/svg+xml',
+    })
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    expect((response.data.value as Record<string, unknown>).savedAssets).toEqual([
+      {
+        base64: Buffer.from('chart-bytes').toString('base64'),
+        mimeType: 'image/png',
+        src: 'https://cdn.example.com/chart.png',
+        alt: 'Chart',
+      },
+      { base64: Buffer.from('<svg/>').toString('base64'), mimeType: 'image/svg+xml', src: 'https://cdn.example.com/logo.svg' },
+    ])
+    expect(response.data.value).not.toHaveProperty('failedAssets')
+    expect(response.data.value).not.toHaveProperty('assets')
+    expect(page.pageFetchCredentials).toEqual(['include', 'include'])
+    // Image bytes travel to the relay, never on the model-inline image channel.
+    expect(response.data.images).toBeUndefined()
+  })
+
+  test('falls back to a node fetch when the page refuses and never lets one image fail the request', async () => {
+    const served = await serveImage({ body: new Uint8Array(Buffer.from('remote-bytes')), contentType: 'image/webp' })
+    const closedPort = await reserveClosedPort()
+    try {
+      const page = new FakePage('target-1')
+      const unreachable = `http://127.0.0.1:${closedPort}/missing.png`
+      page.images = [{ src: served.url, alt: 'Servable' }, { src: unreachable }]
+      page.pageFetchBlocked.add(served.url)
+
+      const response = await executeWithPage({
+        page,
+        operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+      })
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+
+      const value = response.data.value as Record<string, unknown>
+      expect(value.savedAssets).toEqual([
+        {
+          base64: Buffer.from('remote-bytes').toString('base64'),
+          mimeType: 'image/webp',
+          src: served.url,
+          alt: 'Servable',
+        },
+      ])
+      const failed = value.failedAssets as Array<{ src: string; reason: string }>
+      expect(failed).toHaveLength(1)
+      expect(failed[0].src).toBe(unreachable)
+      expect(failed[0].reason).toContain('page fetch failed (Failed to fetch)')
+      expect(failed[0].reason).toContain('node fetch failed')
+      expect(page.pageFetchCredentials).toEqual(['include', 'include'])
+    } finally {
+      await served.close()
+    }
+  })
+
+  test('bounds the manifest to its entry cap and the saved set to its image cap', async () => {
+    const page = new FakePage('target-1')
+    page.images = Array.from({ length: 205 }, (_unused, index) => {
+      return { src: `https://cdn.example.com/image-${index}.png` }
+    })
+    for (const image of page.images) {
+      page.pageFetchable.set(image.src, { body: new Uint8Array([1, 2, 3]), contentType: 'image/png' })
+    }
+
+    const manifest = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'assets-manifest' },
+    })
+    if (!manifest.ok) {
+      throw new Error('expected a successful assets-manifest extraction')
+    }
+    const manifestValue = manifest.data.value as Record<string, unknown>
+    expect((manifestValue.assets as unknown[]).length).toBe(200)
+    expect(manifestValue.assetCount).toBe(200)
+    expect(manifestValue.assetsTruncated).toBe(true)
+    expect(manifest.data.text).toContain('200 images found (listing the first ones)')
+
+    const saved = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!saved.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+    expect((saved.data.value as Record<string, unknown>).savedAssets as unknown[]).toHaveLength(20)
+    expect(page.pageFetchUrls).toHaveLength(20)
+  })
+
+  test('reports every image it cannot persist instead of failing the whole extraction', async () => {
+    const page = new FakePage('target-1')
+    page.images = [
+      { src: 'https://cdn.example.com/vector.avif' },
+      { src: 'https://cdn.example.com/huge.png' },
+      { src: 'https://cdn.example.com/first.png' },
+      { src: 'https://cdn.example.com/second.png' },
+    ]
+    page.pageFetchable.set('https://cdn.example.com/vector.avif', {
+      body: new Uint8Array(Buffer.from('avif-bytes')),
+      contentType: 'image/avif',
+    })
+    page.pageFetchable.set('https://cdn.example.com/huge.png', {
+      body: new Uint8Array(16 * 1024 * 1024 + 1),
+      contentType: 'image/png',
+    })
+    page.pageFetchable.set('https://cdn.example.com/first.png', {
+      body: new Uint8Array(2 * 1024 * 1024),
+      contentType: 'image/png',
+    })
+    page.pageFetchable.set('https://cdn.example.com/second.png', {
+      body: new Uint8Array(2 * 1024 * 1024),
+      contentType: 'image/png',
+    })
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    const value = response.data.value as Record<string, unknown>
+    expect(value.savedAssets).toEqual([
+      {
+        base64: Buffer.alloc(2 * 1024 * 1024).toString('base64'),
+        mimeType: 'image/png',
+        src: 'https://cdn.example.com/first.png',
+      },
+    ])
+    const failed = value.failedAssets as Array<{ src: string; reason: string }>
+    expect(failed.map((entry) => entry.src)).toEqual([
+      'https://cdn.example.com/vector.avif',
+      'https://cdn.example.com/huge.png',
+      'https://cdn.example.com/second.png',
+    ])
+    expect(failed[0].reason).toBe('unsupported image type image/avif')
+    expect(failed[1].reason).toBe('image of 16777217 bytes exceeds the 16777216 byte per-image limit')
+    expect(failed[2].reason).toContain('would exceed the response payload budget')
+  })
+
+  test('refuses an image whose declared size is already over the limit without reading it', async () => {
+    const page = new FakePage('target-1')
+    page.images = [{ src: 'https://cdn.example.com/enormous.png' }]
+    // A three-byte body that claims to be 100 MiB: only a check on the declared
+    // size can report the declared number, so the reason proves the read was cut
+    // short before a huge image was decoded into a string and then base64.
+    page.pageFetchable.set('https://cdn.example.com/enormous.png', {
+      body: new Uint8Array([1, 2, 3]),
+      contentType: 'image/png',
+      declaredBytes: 100 * 1024 * 1024,
+    })
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    const value = response.data.value as Record<string, unknown>
+    expect(value.savedAssets).toEqual([])
+    const failed = value.failedAssets as Array<{ src: string; reason: string }>
+    expect(failed).toHaveLength(1)
+    expect(failed[0].src).toBe('https://cdn.example.com/enormous.png')
+    expect(failed[0].reason).toContain('image of 104857600 bytes exceeds the 16777216 byte per-image limit')
+  })
+
+  test("keeps the manifest when images: 'save' is asked for the manifest format", async () => {
+    const page = new FakePage('target-1')
+    page.images = [{ src: 'https://cdn.example.com/chart.png', alt: 'Chart' }]
+    page.pageFetchable.set('https://cdn.example.com/chart.png', {
+      body: new Uint8Array(Buffer.from('chart-bytes')),
+      contentType: 'image/png',
+    })
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'assets-manifest', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful assets-manifest extraction')
+    }
+
+    expect(response.data.value).toMatchObject({
+      assetCount: 1,
+      assets: [{ src: 'https://cdn.example.com/chart.png' }],
+      savedAssets: [{ mimeType: 'image/png', src: 'https://cdn.example.com/chart.png', alt: 'Chart' }],
+    })
   })
 })
