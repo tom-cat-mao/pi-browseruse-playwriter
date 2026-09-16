@@ -28,6 +28,13 @@ export type BrowserJson =
 
 export type BrowserBackend = 'cdp' | 'webextension'
 
+/**
+ * Optional feature matrix reported by newer peers, e.g. `{ extract: ['markdown'], assets: ['urls','save'] }`.
+ * Absent means the peer predates feature flags; gate on supportedOperations instead.
+ * Unknown features must be ignored, never rejected (forward-compatible parsing).
+ */
+export type BrowserFeatureFlags = Record<string, readonly string[]>
+
 export interface BrowserCapabilities {
   protocolVersion: typeof BROWSER_PROTOCOL_VERSION
   managedGroups: boolean
@@ -43,6 +50,7 @@ export interface BrowserCapabilities {
   evaluateWorld?: 'page' | 'isolated'
   limitations?: string[]
   supportedOperations?: BrowserPageOperation['kind'][]
+  features?: BrowserFeatureFlags
 }
 
 export interface BrowserProfile {
@@ -184,6 +192,13 @@ export function parseBrowserTabCandidateId(candidateId: string): {
   return { profileId: parts[1], browserEpoch: parts[2], browserTabId, backend: 'webextension' }
 }
 
+/**
+ * Content-extraction output shape for `page.extract`. Unlike page.snapshot
+ * (structure for acting on the page, with refs), extract produces content for
+ * consumption/archival and never carries refs or a snapshotId.
+ */
+export type BrowserExtractFormat = 'markdown' | 'text' | 'html' | 'assets-manifest'
+
 export type BrowserOperation =
   | { kind: 'profiles.list' }
   | { kind: 'groups.list'; profileId?: string }
@@ -210,6 +225,19 @@ export type BrowserOperation =
   | { kind: 'page.network'; tabId: string; action: 'start' | 'list' | 'stop'; filter?: string }
   | { kind: 'page.logs'; tabId: string; limit?: number }
   | { kind: 'page.execute'; tabId: string; code: string }
+  | {
+      kind: 'page.extract'
+      tabId: string
+      format: BrowserExtractFormat
+      /** Scope extraction to a single matching element (strict CSS). */
+      selector?: string
+      /** Keep matching lines with context (same windowing as page.snapshot). */
+      search?: string
+      offset?: number
+      limit?: number
+      /** Absolute path: write the full extraction to disk and return an artifact. */
+      path?: string
+    }
 
 export type BrowserPageOperation = Extract<BrowserOperation, { kind: `page.${string}` }>
 export type BrowserControlOperation = Exclude<BrowserOperation, BrowserPageOperation>
@@ -225,6 +253,12 @@ export interface BrowserRequest {
 export interface BrowserArtifact {
   path: string
   mimeType: string
+  /** Size of the written file in bytes, when known. */
+  bytes?: number
+  /** Human-readable label, e.g. the page title or image alt text. */
+  label?: string
+  /** Origin URL for fetched assets. */
+  sourceUrl?: string
 }
 
 export interface BrowserImage {

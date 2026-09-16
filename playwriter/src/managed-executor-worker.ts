@@ -632,6 +632,13 @@ export class ManagedExecutorWorkerRuntime {
         return this.logs({ state: this.requirePageState({ page }), limit: operation.limit })
       case 'page.execute':
         return await this.executeJavaScript({ page, code: operation.code, deadline, markSideEffectsStarted })
+      case 'page.extract':
+        // Foundation type only; end-to-end implementation lands with the
+        // content-extraction track (docs/exec/content-extract-redesign-plan.md).
+        throw new ManagedExecutorOperationError({
+          code: 'unsupported-capability',
+          message: 'page.extract is not implemented on this backend yet',
+        })
       default:
         return assertNever(operation)
     }
