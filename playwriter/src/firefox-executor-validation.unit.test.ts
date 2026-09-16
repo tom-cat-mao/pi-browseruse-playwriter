@@ -38,6 +38,14 @@ describe('Firefox DOM command boundary', () => {
     expect(parseBrowserDomCommand({ method: 'evaluate', code: 'return 1', world: 'MAIN' })).toBeNull()
   })
 
+  test('scopes a content read to one selector and no other page read', () => {
+    const scoped = { method: 'page', action: 'content', selector: '#settings' }
+    expect(parseBrowserDomCommand(scoped)).toEqual(scoped)
+    expect(parseBrowserDomCommand({ ...scoped, action: 'title' })).toBeNull()
+    expect(parseBrowserDomCommand({ ...scoped, selector: '' })).toBeNull()
+    expect(parseBrowserDomCommand({ ...scoped, selector: 'x'.repeat(20_001) })).toBeNull()
+  })
+
   test('validates prepared frame action points, tokens, and strict parent locator scope', () => {
     const locator = { steps: [{ kind: 'selector', engine: 'css', value: 'iframe.payment' }] }
     const point = { x: 24, y: 32 }

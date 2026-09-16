@@ -1,13 +1,31 @@
 import { describe, expect, test } from 'vitest'
-import type { BrowserDomRequest, BrowserResponse, BrowserTab, BrowserResultData } from './browser-protocol.js'
+import path from 'node:path'
+import type { BrowserDomRequest, BrowserExtractFormat, BrowserResponse, BrowserTab, BrowserResultData } from './browser-protocol.js'
 import { parseBrowserDomRequest } from './browser-dom-validation.js'
 import { FirefoxExecutorPool, type FirefoxExecution } from './firefox-executor-pool.js'
+import { extractPageContent, windowExtractedText } from './page-extract.js'
 import { ManagedCancellation } from './managed-executor-pool.js'
+
+const EXTRACT_DOCUMENT_URL = 'https://example.test/storage'
+const EXTRACT_DOCUMENT_TITLE = 'Storage documentation'
+const EXTRACT_DOCUMENT_HTML = `<!doctype html><html lang="en"><head><title>${EXTRACT_DOCUMENT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1><p>Retention keeps every revision for thirty days.</p></article></main></body></html>`
+
+/** Longer than the 40,000 character preview budget, so windowing is observable. */
+function longDocumentHtml(): string {
+  const paragraphs = Array.from({ length: 1_500 }, (_value, index) => {
+    return `<p>Retention detail ${index}: the export keeps every revision for thirty days before the purge.</p>`
+  }).join('')
+  return `<!doctype html><html lang="en"><head><title>${EXTRACT_DOCUMENT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
+}
 
 /** A real protocol peer that records wire commands without pretending to implement a browser DOM. */
 class CommandPeer {
   readonly requests: BrowserDomRequest[] = []
   readonly snapshotMessages: BrowserResultData[] = []
+  /** Serialized document a real extension returns for a whole-document `page.content` read. */
+  documentHtml?: string
+  /** Serialized element a real extension returns for a strictly matched `page.content` read. */
+  scopedHtml?: string
   beforeReply?: (request: BrowserDomRequest) => Promise<void | BrowserResponse>
 
   async receive(value: BrowserDomRequest): Promise<BrowserResponse> {
@@ -18,6 +36,16 @@ class CommandPeer {
     this.requests.push(request)
     const override = await this.beforeReply?.(request)
     if (override) return override
+    if (this.documentHtml !== undefined && request.command.method === 'page' && request.command.action === 'content') {
+      return {
+        requestId: request.requestId,
+        ok: true,
+        data: {
+          value: request.command.selector !== undefined ? this.scopedHtml ?? '' : this.documentHtml,
+          pageInfo: { tabId: request.tabId, url: EXTRACT_DOCUMENT_URL, title: EXTRACT_DOCUMENT_TITLE },
+        },
+      }
+    }
     return {
       requestId: request.requestId,
       ok: true,
@@ -26,6 +54,18 @@ class CommandPeer {
         pageInfo: { tabId: request.tabId, url: 'https://example.test/current', title: 'Command peer' },
       },
     }
+  }
+}
+
+function firefoxTab({ session = 'session-1', profile = 'profile-1', epoch = 'epoch-1' }: {
+  session?: string
+  profile?: string
+  epoch?: string
+} = {}): BrowserTab {
+  return {
+    tabId: `tab-${session}`, groupId: `group-${session}`, sessionId: session,
+    profileId: profile, url: 'https://example.test/original', title: '',
+    state: 'ready', browserEpoch: epoch, revision: 1, chromeTabId: -1, browserTabId: 10,
   }
 }
 
@@ -38,13 +78,43 @@ function execution({ id, code, peer, session = 'session-1', profile = 'profile-1
   epoch?: string
   timeoutMs?: number
 }): FirefoxExecution {
-  const tab: BrowserTab = {
-    tabId: `tab-${session}`, groupId: `group-${session}`, sessionId: session,
-    profileId: profile, url: 'https://example.test/original', title: '',
-    state: 'ready', browserEpoch: epoch, revision: 1, chromeTabId: -1, browserTabId: 10,
-  }
+  const tab = firefoxTab({ session, profile, epoch })
   return {
     request: { requestId: id, sessionId: session, cwd: process.cwd(), timeoutMs, operation: { kind: 'page.execute', tabId: tab.tabId, code } },
+    tab, connectionEpoch: `connection-${epoch}`,
+    sendDomRequest: async (request) => { return await peer.receive(request) },
+  }
+}
+
+function extractExecution({ id, peer, format, selector, search, offset, limit, persist = false, session = 'session-1', profile = 'profile-1', epoch = 'epoch-1', timeoutMs = 5_000 }: {
+  id: string
+  peer: CommandPeer
+  format: BrowserExtractFormat
+  selector?: string
+  search?: string
+  offset?: number
+  limit?: number
+  persist?: boolean
+  session?: string
+  profile?: string
+  epoch?: string
+  timeoutMs?: number
+}): FirefoxExecution {
+  const tab = firefoxTab({ session, profile, epoch })
+  return {
+    request: {
+      requestId: id, sessionId: session, cwd: process.cwd(), timeoutMs,
+      operation: {
+        kind: 'page.extract', tabId: tab.tabId, format,
+        ...(selector !== undefined ? { selector } : {}),
+        ...(search !== undefined ? { search } : {}),
+        ...(offset !== undefined ? { offset } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        // Only the presence of a path matters to the worker: it hands the whole
+        // extraction back for the relay to write, and never touches this file.
+        ...(persist ? { path: path.join(process.cwd(), 'tmp', `${id}.md`) } : {}),
+      },
+    },
     tab, connectionEpoch: `connection-${epoch}`,
     sendDomRequest: async (request) => { return await peer.receive(request) },
   }
@@ -333,4 +403,157 @@ describe('FirefoxExecutorPool real child process', () => {
     } finally { await pool.dispose() }
   })
 
+})
+
+describe('Firefox executor page.extract', () => {
+  test('runs the shared Node pipeline for markdown and text over one serialized document read', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    try {
+      const markdown = await pool.execute(extractExecution({ id: 'extract-markdown', peer, format: 'markdown' }))
+      const expectedMarkdown = await extractPageContent({ html: EXTRACT_DOCUMENT_HTML, url: EXTRACT_DOCUMENT_URL, format: 'markdown' })
+      expect(markdown, JSON.stringify(markdown)).toMatchObject({ ok: true, data: {
+        text: expectedMarkdown.text,
+        value: { format: 'markdown', truncated: false, totalBytes: expectedMarkdown.totalBytes, title: EXTRACT_DOCUMENT_TITLE },
+        pageInfo: { tabId: 'tab-session-1', url: EXTRACT_DOCUMENT_URL, title: EXTRACT_DOCUMENT_TITLE },
+      } })
+      if (!markdown.ok) {
+        throw new Error('expected a successful markdown extraction')
+      }
+      expect(markdown.data.value).not.toHaveProperty('artifactText')
+      const text = await pool.execute(extractExecution({ id: 'extract-text', peer, format: 'text' }))
+      const expectedText = await extractPageContent({ html: EXTRACT_DOCUMENT_HTML, url: EXTRACT_DOCUMENT_URL, format: 'text' })
+      expect(text).toMatchObject({ ok: true, data: { text: expectedText.text, value: { format: 'text' } } })
+      if (!text.ok) {
+        throw new Error('expected a successful text extraction')
+      }
+      expect(text.data.text).not.toContain('#')
+      // Extraction only reads the document: one content read per request, no snapshot and no ref invalidation.
+      expect(peer.requests.map((request) => { return request.command })).toEqual([
+        { method: 'page', action: 'content' },
+        { method: 'page', action: 'content' },
+      ])
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('scopes the extraction to the single element the extension serializes under the requested selector', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    // An element serialized on its own, exactly what the extension returns for a strict match.
+    const scopedHtml = `<article id="settings"><h1>Account settings</h1>${Array.from({ length: 8 }, (_value, index) => {
+      return `<p>Scoped setting ${index} controls export retention.</p>`
+    }).join('')}</article>`
+    peer.scopedHtml = scopedHtml
+    try {
+      const response = await pool.execute(extractExecution({ id: 'extract-scoped', peer, format: 'markdown', selector: '#settings' }))
+      expect(peer.requests.map((request) => { return request.command })).toEqual([
+        { method: 'page', action: 'content', selector: '#settings' },
+      ])
+      const expected = await extractPageContent({ html: scopedHtml, url: EXTRACT_DOCUMENT_URL, format: 'markdown' })
+      expect(response, JSON.stringify(response)).toMatchObject({ ok: true, data: { text: expected.text } })
+      if (!response.ok) {
+        throw new Error('expected a successful scoped extraction')
+      }
+      expect(response.data.text).toContain('Account settings')
+      expect(response.data.text).toContain('Scoped setting 7 controls export retention.')
+      expect(response.data.text).not.toContain('Retention keeps every revision')
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('keeps the model preview bounded and hands the whole document to the relay when a path is requested', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    const html = longDocumentHtml()
+    peer.documentHtml = html
+    try {
+      const full = await extractPageContent({ html, url: EXTRACT_DOCUMENT_URL, format: 'markdown', full: true })
+      expect(full.text.length).toBeGreaterThan(40_000)
+      const persisted = await pool.execute(extractExecution({
+        id: 'extract-persist-markdown', peer, format: 'markdown', persist: true, offset: 0, limit: 5,
+      }))
+      expect(persisted, JSON.stringify(persisted)).toMatchObject({ ok: true, data: {
+        text: windowExtractedText({ text: full.text, offset: 0, limit: 5 }).text,
+        value: {
+          format: 'markdown', truncated: true, totalBytes: Buffer.byteLength(full.text, 'utf8'),
+          artifactText: full.text,
+        },
+      } })
+      if (!persisted.ok) {
+        throw new Error('expected a successful persisted extraction')
+      }
+      const previewText = persisted.data.text ?? ''
+      expect(previewText.length).toBeLessThan(40_000)
+      // Without a path the full extraction never travels: only the bounded preview is returned.
+      const inline = await pool.execute(extractExecution({ id: 'extract-inline-markdown', peer, format: 'markdown', offset: 0, limit: 5 }))
+      if (!inline.ok) {
+        throw new Error('expected a successful inline extraction')
+      }
+      expect(inline.data.value).not.toHaveProperty('artifactText')
+      expect(inline.data.text).toBe(previewText)
+      const persistedHtml = await pool.execute(extractExecution({ id: 'extract-persist-html', peer, format: 'html', persist: true }))
+      if (!persistedHtml.ok) {
+        throw new Error('expected a successful persisted html extraction')
+      }
+      expect(persistedHtml.data.value).toMatchObject({ format: 'html', truncated: true })
+      expect((persistedHtml.data.text ?? '').length).toBeLessThan(html.length)
+      const value = persistedHtml.data.value
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('expected a structured extract value')
+      }
+      expect(value.artifactText).toBe(html)
+      expect(value.truncated).toBe(true)
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('reports assets-manifest as unsupported without reading the page', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    try {
+      const response = await pool.execute(extractExecution({ id: 'extract-assets', peer, format: 'assets-manifest' }))
+      expect(response).toMatchObject({ ok: false, error: { code: 'unsupported-capability', outcome: 'not-started' } })
+      expect(peer.requests).toHaveLength(0)
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('surfaces a strict multi-match as a read failure instead of extracting the first element', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    peer.scopedHtml = EXTRACT_DOCUMENT_HTML
+    peer.beforeReply = async (request) => {
+      if (request.command.method === 'page' && request.command.action === 'content' && request.command.selector === '.repeated') {
+        return {
+          requestId: request.requestId,
+          ok: false,
+          error: {
+            code: 'execution-failed',
+            message: 'Strict locator requires exactly one element; matched 2. Refine the selector or use an explicit nth().',
+            outcome: 'not-started',
+          },
+        }
+      }
+    }
+    try {
+      const failed = await pool.execute(extractExecution({ id: 'extract-strict', peer, format: 'markdown', selector: '.repeated' }))
+      expect(failed).toMatchObject({ ok: false, error: { code: 'execution-failed', outcome: 'not-started' } })
+      if (failed.ok) {
+        throw new Error('expected a failed scoped extraction')
+      }
+      expect(failed.error.message).toContain('Firefox page.extract')
+      expect(peer.requests).toHaveLength(1)
+    } finally {
+      await pool.dispose()
+    }
+  })
 })

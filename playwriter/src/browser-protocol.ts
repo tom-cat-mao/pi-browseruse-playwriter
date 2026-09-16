@@ -401,7 +401,13 @@ export type BrowserDomCommand =
   | { method: 'fill'; selector: string; value: string; snapshotId?: string }
   | { method: 'evaluate'; code: string; locator?: BrowserDomLocator }
   | { method: 'locator'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[]; expectedPoint?: { x: number; y: number }; preparationId?: string }
-  | { method: 'page'; action: 'title' | 'url' | 'content' | 'readyState' }
+  | { method: 'page'; action: 'title' | 'url' | 'readyState' }
+  /**
+   * Serialized document. `selector` is an append-only addition for content
+   * extraction: it is resolved DOM-side as a strict single match, so a scoped
+   * extraction cannot silently read the first of several matching elements.
+   */
+  | { method: 'page'; action: 'content'; selector?: string }
   | { method: 'frame.resolve'; locator: BrowserDomLocator }
   | { method: 'frame.check'; locator: BrowserDomLocator; point: { x: number; y: number } }
   | { method: 'frame.actionPoint'; locator: BrowserDomLocator; action: BrowserDomLocatorAction; args?: BrowserJson[] }

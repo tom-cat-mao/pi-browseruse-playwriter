@@ -2433,7 +2433,19 @@ export class ManagedRelay {
     deadlineAt: number
   }): Promise<BrowserResponse> {
     const { operation } = request
-    if (profile.capabilities?.supportedOperations && !profile.capabilities.supportedOperations.includes(operation.kind)) {
+    // A Firefox profile advertises the page operations its extension answers.
+    // `page.extract` additionally demands that advertisement: a profile without
+    // one predates the operation (and its serialized-document selector) and must
+    // be told `unsupported-capability` instead of ever receiving the request.
+    const advertised = profile.capabilities?.supportedOperations
+    if (operation.kind === 'page.extract' && !advertised?.includes('page.extract')) {
+      throw new ManagedTransportError({
+        code: 'unsupported-capability',
+        message: 'Firefox profile does not advertise page.extract; update the browser extension',
+        outcome: 'not-started',
+      })
+    }
+    if (advertised && !advertised.includes(operation.kind)) {
       throw new ManagedTransportError({
         code: 'unsupported-capability', message: `Firefox profile does not support ${operation.kind}`, outcome: 'not-started',
       })
@@ -2445,7 +2457,7 @@ export class ManagedRelay {
     }
     this.assertFirefoxLease({ request, profile, tab, pending })
     const timeoutMs = this.remainingTimeout({ deadlineAt, pending })
-    if (operation.kind !== 'page.execute') {
+    if (operation.kind !== 'page.execute' && operation.kind !== 'page.extract') {
       pending.started = true
       const promise = this.options.transport.sendBrowserRequest({
         profileId: profile.profileId,

@@ -31,6 +31,7 @@
 
 import { parseHTML } from 'linkedom'
 import { Defuddle } from 'defuddle/node'
+import type { BrowserJson } from './browser-protocol.js'
 
 export interface PageExtractInput {
   html: string
@@ -77,6 +78,15 @@ export const EXTRACT_MAX_CHARS = 40_000
 const TRUNCATION_MARKER = '[truncated; use search or offset/limit for the rest]'
 const SEARCH_MATCH_LIMIT = 10
 const SEARCH_CONTEXT_LINES = 5
+
+/**
+ * Largest extraction a backend may hand to the relay for persistence. Unlike
+ * the preview it is allowed to exceed the preview budget, but it must still fit
+ * the worker and relay envelopes, so an over-long document is cut and reported
+ * instead of failing the whole request.
+ */
+const EXTRACT_ARTIFACT_MAX_CHARS = 1_000_000
+const EXTRACT_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024
 
 /**
  * Below this share of the source document's visible text the automatic
@@ -259,18 +269,61 @@ function assembleDocument({
   return blocks.join('\n\n').trim()
 }
 
-/** Cut a string at a character budget without splitting a surrogate pair. */
-function sliceUnicodeText({ value, maxChars }: { value: string; maxChars: number }): string {
+/** Cut a string at a character and byte budget without splitting a surrogate pair. */
+function sliceUnicodeText({
+  value,
+  maxChars,
+  maxBytes = Number.POSITIVE_INFINITY,
+}: {
+  value: string
+  maxChars: number
+  maxBytes?: number
+}): string {
   let result = ''
   let chars = 0
+  let bytes = 0
   for (const character of value) {
-    if (chars + character.length > maxChars) {
+    const characterBytes = Buffer.byteLength(character, 'utf8')
+    if (chars + character.length > maxChars || bytes + characterBytes > maxBytes) {
       break
     }
     result += character
     chars += character.length
+    bytes += characterBytes
   }
   return result
+}
+
+/**
+ * Bound the text a backend hands to the relay for persistence. A cut payload is
+ * reported through the returned flag so the response can say so.
+ */
+export function boundExtractArtifactText({ text }: { text: string }): { text: string; truncated: boolean } {
+  if (text.length <= EXTRACT_ARTIFACT_MAX_CHARS && Buffer.byteLength(text, 'utf8') <= EXTRACT_ARTIFACT_MAX_BYTES) {
+    return { text, truncated: false }
+  }
+  return {
+    text: sliceUnicodeText({ value: text, maxChars: EXTRACT_ARTIFACT_MAX_CHARS, maxBytes: EXTRACT_ARTIFACT_MAX_BYTES }),
+    truncated: true,
+  }
+}
+
+/**
+ * `value.artifactText` is the full extraction the relay persists; it is only
+ * attached when the caller asked for a file and is removed again before the
+ * response reaches the model.
+ */
+export function withExtractArtifactText({
+  value,
+  persisted,
+}: {
+  value: Record<string, BrowserJson>
+  persisted?: { text: string; truncated: boolean }
+}): Record<string, BrowserJson> {
+  if (!persisted) {
+    return value
+  }
+  return { ...value, artifactText: persisted.text, ...(persisted.truncated ? { artifactTruncated: true } : {}) }
 }
 
 /**
