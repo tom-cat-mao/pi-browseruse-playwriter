@@ -50,6 +50,7 @@ import {
   type BrowserDomRequest,
   type BrowserGroup,
   type BrowserInventory,
+  type BrowserJson,
   type BrowserRequest,
   type BrowserResponse,
   type BrowserResultData,
@@ -271,7 +272,7 @@ type TestPool = ManagedExecutorPoolContract & {
   resolveAll: () => Promise<void>
 }
 
-function createTestPool(): TestPool {
+function createTestPool({ respond }: { respond?: (request: BrowserRequest) => BrowserResponse | undefined } = {}): TestPool {
   const executions: TestPool['executions'] = []
   const cancels: TestPool['cancels'] = []
   const releasedSessions: string[] = []
@@ -346,6 +347,10 @@ function createTestPool(): TestPool {
           }
           setTimeout(release, 20)
         })
+        const override = respond?.(request)
+        if (override) {
+          return override
+        }
         return { requestId: request.requestId, ok: true, data: { text: `executed ${request.operation.kind}` } }
       } finally {
         concurrent -= 1
@@ -1214,6 +1219,19 @@ describe('managed inventory registry', () => {
               "managedGroups": true,
               "persistentOwnership": true,
               "protocolVersion": 1,
+              "supportedOperations": [
+                "page.navigate",
+                "page.back",
+                "page.snapshot",
+                "page.click",
+                "page.fill",
+                "page.evaluate",
+                "page.screenshot",
+                "page.network",
+                "page.logs",
+                "page.execute",
+                "page.extract",
+              ],
             },
             "connected": true,
             "label": "a@b.c",
@@ -4015,6 +4033,236 @@ describe('managed Firefox screenshot artifacts', () => {
 })
 
 // ---------------------------------------------------------------------------
+// page.extract artifacts
+// ---------------------------------------------------------------------------
+
+function chromeInventory(): BrowserInventory {
+  return makeInventory({
+    groups: [makeGroup({ groupId: 'chrome-group', sessionId: 'session-1' })],
+    tabs: [makeTab({ tabId: 'chrome-tab', groupId: 'chrome-group', sessionId: 'session-1' })],
+  })
+}
+
+/** The Chrome worker is replaced by this seam; the relay itself runs for real. */
+function startExtractRelay({
+  artifactStore,
+  respond,
+}: {
+  artifactStore: ArtifactStore
+  respond: (request: BrowserRequest) => BrowserResponse | undefined
+}): ManagedRelay {
+  const pool = createTestPool({ respond })
+  return new ManagedRelay({
+    host: '127.0.0.1',
+    port: 1,
+    artifactStore,
+    poolFactory: async () => pool,
+    hasConnectedExtensions: () => {
+      return true
+    },
+    closeManagedClient: () => {},
+    transport: {
+      sendBrowserRequest: async ({ request }) => {
+        if (request.operation.kind === 'tab.resolve') {
+          return { requestId: request.requestId, ok: true, data: { tab: chromeInventory().tabs[0] } }
+        }
+        return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+      },
+    },
+  })
+}
+
+function connectChromeProfile(relay: ManagedRelay): void {
+  relay.noteConnectionOpened({ connectionId: 'chrome-connection' })
+  const accepted = relay.handleInventory({
+    connectionId: 'chrome-connection',
+    info: { browser: 'Chrome', installId: 'profile-1', stableKey: 'install:Chrome:profile-1' },
+    inventory: chromeInventory(),
+  })
+  expect(accepted.accepted).toBe(true)
+}
+
+describe('managed page.extract artifacts', () => {
+  test('persists the whole extraction at the requested path and keeps a bounded preview', async () => {
+    const directory = createExecutorTestDirectory('page-extract-artifacts-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'storage-docs.md')
+    const fullMarkdown = `# Storage Docs\n\n${'retention detail '.repeat(5_000)}`
+    const previewText = '# Storage Docs\n\nretention detail retention detail'
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: previewText,
+            value: {
+              format: request.operation.format,
+              truncated: true,
+              totalBytes: Buffer.byteLength(fullMarkdown, 'utf8'),
+              title: 'Storage Docs',
+              metadata: { siteName: 'Storage Docs' },
+              artifactText: fullMarkdown,
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-persist',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: outputPath },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      expect(response.data.text).toBe(previewText)
+      expect(response.data.artifacts).toEqual([
+        {
+          path: outputPath,
+          mimeType: 'text/markdown',
+          bytes: Buffer.byteLength(fullMarkdown, 'utf8'),
+          label: 'Storage Docs',
+        },
+      ])
+      expect(response.data.value).toEqual({
+        format: 'markdown',
+        truncated: true,
+        totalBytes: Buffer.byteLength(fullMarkdown, 'utf8'),
+        title: 'Storage Docs',
+        metadata: { siteName: 'Storage Docs' },
+      })
+      // The persisted body must not travel on to the model.
+      expect(JSON.stringify(response.data)).not.toContain('artifactText')
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(fullMarkdown)
+      expect(fs.readdirSync(artifactStore.getRootDir())).toEqual(['storage-docs.md'])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('writes html extractions as html and refuses a target outside the artifacts root', async () => {
+    const directory = createExecutorTestDirectory('page-extract-html-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const htmlPath = path.join(artifactStore.getRootDir(), 'nested', 'page.html')
+    const serializedHtml = '<html><body><p>Retention</p></body></html>'
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        const value: Record<string, BrowserJson> = {
+          format: request.operation.format,
+          truncated: false,
+          totalBytes: serializedHtml.length,
+        }
+        if (request.operation.path !== undefined) {
+          value.artifactText = serializedHtml
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: '<html><body><p>Retention</p></body></html>',
+            value,
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const html = await relay.handleRequest({
+        requestId: 'extract-html',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'html', path: htmlPath },
+      })
+      expect(html).toMatchObject({
+        ok: true,
+        data: { artifacts: [{ path: htmlPath, mimeType: 'text/html', bytes: serializedHtml.length }] },
+      })
+      expect(fs.readFileSync(htmlPath, 'utf8')).toBe(serializedHtml)
+
+      // Without a path the extraction stays in memory: no artifact, no write.
+      const inline = await relay.handleRequest({
+        requestId: 'extract-inline',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown' },
+      })
+      expect(inline).toMatchObject({ ok: true, data: { text: '<html><body><p>Retention</p></body></html>' } })
+      if (!inline.ok) {
+        throw new Error('expected a successful inline page.extract')
+      }
+      expect(inline.data.artifacts).toBeUndefined()
+      expect(fs.readdirSync(artifactStore.getRootDir())).toEqual(['nested'])
+
+      const outside = await relay.handleRequest({
+        requestId: 'extract-outside',
+        sessionId: 'session-1',
+        operation: {
+          kind: 'page.extract',
+          tabId: 'chrome-tab',
+          format: 'markdown',
+          path: path.join(directory, 'outside.md'),
+        },
+      })
+      expect(outside).toMatchObject({ ok: false, error: { code: 'invalid-request', outcome: 'unknown' } })
+      expect(fs.existsSync(path.join(directory, 'outside.md'))).toBe(false)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('fails instead of dropping a requested file when the backend returns no text to persist', async () => {
+    const directory = createExecutorTestDirectory('page-extract-missing-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: { text: 'preview', value: { format: request.operation.format, truncated: false, totalBytes: 7 } },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-missing-text',
+        sessionId: 'session-1',
+        operation: {
+          kind: 'page.extract',
+          tabId: 'chrome-tab',
+          format: 'markdown',
+          path: path.join(artifactStore.getRootDir(), 'missing.md'),
+        },
+      })
+
+      expect(response).toMatchObject({ ok: false, error: { code: 'internal-error', outcome: 'unknown' } })
+      const written = fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []
+      expect(written).toEqual([])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Managed CDP scoping
 // ---------------------------------------------------------------------------
 
@@ -4861,8 +5109,75 @@ describe('managed request parsing', () => {
     ).toMatchObject({ ok: false })
   })
 
-  test('inventory parsing keeps the in-place origin and the source tab of a popup', () => {
-    const parsed = parseBrowserInventory(
+  test('parses page.extract fields and rejects a format the protocol does not define', () => {
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: {
+          kind: 'page.extract',
+          tabId: 't',
+          format: 'markdown',
+          selector: 'main article',
+          search: 'retention',
+          offset: 0,
+          limit: 20,
+          path: '/tmp/anything-not-written-here.md',
+        },
+      }),
+    ).toMatchObject({
+      ok: true,
+      value: {
+        operation: {
+          kind: 'page.extract',
+          tabId: 't',
+          format: 'markdown',
+          selector: 'main article',
+          search: 'retention',
+          offset: 0,
+          limit: 20,
+          path: '/tmp/anything-not-written-here.md',
+        },
+      },
+    })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'text' },
+      }),
+    ).toMatchObject({ ok: true, value: { operation: { kind: 'page.extract', format: 'text' } } })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'pdf' },
+      }),
+    ).toMatchObject({ ok: false, message: expect.stringContaining('"format"') })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't' },
+      }),
+    ).toMatchObject({ ok: false })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', offset: -1 },
+      }),
+    ).toMatchObject({ ok: false })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', maxChars: 10 },
+      }),
+    ).toMatchObject({ ok: false })
+  })
+
+  test('inventory parsing keeps the in-place origin and the source tab of a popup', () => {    const parsed = parseBrowserInventory(
       makeInventory({
         groups: [makeGroup({ groupId: 'g1', sessionId: 's1', origin: 'existing' })],
         tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1', origin: 'existing', sourceTabId: 't0' })],

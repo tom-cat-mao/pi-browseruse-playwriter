@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { extractPageContent } from './page-extract.js'
+import { extractPageContent, EXTRACT_MAX_CHARS } from './page-extract.js'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'test-fixtures')
 
@@ -114,6 +114,82 @@ describe('extractPageContent text format', () => {
     expect(result.text).not.toContain('](/')
     expect(result.text).toContain('| Tier | Minimum lock | Maximum lock | Object size limit | Early delete fee |')
     expect(result.text).toMatchSnapshot()
+  })
+
+  it('emits title, metadata and excerpt as plain text', async () => {
+    const result = await extractPageContent({
+      html: readFixture('article-typical.html'),
+      url: ARTICLE_URL,
+      format: 'text',
+    })
+
+    const [headline] = result.text.split('\n')
+    expect(headline).toBe('How Tidal Bores Reshape Estuaries')
+    expect(result.text).toContain('Author: Dana Whitfield | Site: Coastal Review | Published: 2024-11-02T08:30:00Z')
+    expect(result.text).toContain('Tidal bores look like a single wave, but they carry sediment budgets')
+    expect(result.text).not.toMatch(/^#{1,6} /m)
+    expect(result.text).not.toMatch(/^> /m)
+    expect(result.text).not.toMatch(/^\*[^*]*\*$/m)
+    expect(result.text).not.toContain('**')
+    expect(result.text).toMatchSnapshot()
+  })
+})
+
+describe('extractPageContent character budget', () => {
+  it('cuts a single over-long line at the budget instead of returning it whole', async () => {
+    const paragraph = 'x'.repeat(400_000)
+    const result = await extractPageContent({
+      html: `<html><head><title>Long page</title></head><body><article><p>${paragraph}</p></article></body></html>`,
+      format: 'markdown',
+    })
+
+    expect(result.truncated).toBe(true)
+    expect(result.text.length).toBeLessThanOrEqual(EXTRACT_MAX_CHARS)
+    expect(result.text.startsWith('# Long page\n\nxxx')).toBe(true)
+    expect(result.text.endsWith('\n[truncated; use search or offset/limit for the rest]')).toBe(true)
+    expect(result.totalBytes).toBeGreaterThan(EXTRACT_MAX_CHARS)
+  })
+
+  it('cuts an over-long document between lines and reports the full size', async () => {
+    const paragraphs = Array.from({ length: 400 }, (_unused, index) => {
+      return `<p>Paragraph ${index} ${'y'.repeat(500)}</p>`
+    }).join('')
+    const result = await extractPageContent({
+      html: `<html><head><title>Many paragraphs</title></head><body><article>${paragraphs}</article></body></html>`,
+      format: 'markdown',
+    })
+
+    expect(result.truncated).toBe(true)
+    expect(result.text.length).toBeLessThanOrEqual(EXTRACT_MAX_CHARS)
+    expect(result.text).toContain('Paragraph 0')
+    expect(result.text).not.toContain('Paragraph 399')
+    expect(result.totalBytes).toBeGreaterThan(200_000)
+  })
+
+  it('leaves a document that fits the budget untouched', async () => {
+    const result = await extractPageContent({
+      html: readFixture('article-typical.html'),
+      url: ARTICLE_URL,
+      format: 'markdown',
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.text.length).toBeLessThan(EXTRACT_MAX_CHARS)
+    expect(result.text).not.toContain('[truncated')
+  })
+
+  it('returns the whole extraction when the caller persists it', async () => {
+    const paragraph = 'z'.repeat(60_000)
+    const result = await extractPageContent({
+      html: `<html><head><title>Persisted page</title></head><body><article><p>${paragraph}</p></article></body></html>`,
+      format: 'markdown',
+      full: true,
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.text.length).toBeGreaterThan(EXTRACT_MAX_CHARS)
+    expect(result.text).not.toContain('[truncated')
+    expect(result.text.trimEnd().endsWith('z')).toBe(true)
   })
 })
 

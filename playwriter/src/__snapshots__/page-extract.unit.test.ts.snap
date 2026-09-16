@@ -105,10 +105,37 @@ Field teams use pressure transducers and acoustic Doppler profilers to log the p
 [truncated; use search or offset/limit for the rest]"
 `;
 
-exports[`extractPageContent text format > strips markdown syntax and keeps table cells readable 1`] = `
-"# Retention policy reference | Storage Docs
+exports[`extractPageContent text format > emits title, metadata and excerpt as plain text 1`] = `
+"How Tidal Bores Reshape Estuaries
 
-> Bucket-level retention tiers, their minimum lock periods and per-object limits.
+Author: Dana Whitfield | Site: Coastal Review | Published: 2024-11-02T08:30:00Z
+
+Tidal bores look like a single wave, but they carry sediment budgets that reshape estuaries over decades.
+
+A tidal bore is the leading edge of an incoming tide travelling up a river against the current. It looks like a single breaking wave, sometimes only a few centimetres high, yet it moves more water than a small river carries in an hour.
+
+Researchers have tracked bores in the Severn, the Qiantang, and the Amazon for decades. The measurements agree on one point: the bore is not just a curiosity of fluid dynamics, it is a sediment pump.
+Why sediment matters
+
+Sediment carried by a bore settles in slack water behind the wave front. Over a season the deposits raise the bed of the channel, which in turn changes where the next bore breaks. The feedback loop is slow but persistent.
+Coarse sand settles first, within hundreds of metres of the front.
+Fine silt travels further and builds the fluid mud layer upstream.
+Organic matter binds the deposits once vegetation returns.
+Measuring the front
+
+Field teams use pressure transducers and acoustic Doppler profilers to log the passage of a bore. A typical deployment returns a velocity profile such as u(z) = u* / k * ln(z / z0), which is then fitted to a log law.
+"The bore does the work of a dredger, and it does it for free. The problem is that we never asked where it puts the material."
+What happens next
+
+Estuary managers now model bores explicitly rather than treating them as noise in the tidal signal. The third-generation bore model couples the wave front to bed roughness, and early results suggest the coupling halves the error in long-run deposition forecasts.
+
+The remaining question is biological. If the fluid mud layer thickens, does the benthic community recover between bore seasons, or does it need several quiet years?"
+`;
+
+exports[`extractPageContent text format > strips markdown syntax and keeps table cells readable 1`] = `
+"Retention policy reference | Storage Docs
+
+Bucket-level retention tiers, their minimum lock periods and per-object limits.
 
 Retention policy reference
 

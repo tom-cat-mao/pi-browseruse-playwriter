@@ -101,6 +101,29 @@ describe('ArtifactStore writes', () => {
     }
   })
 
+  test('names extracted document artifacts with their document extension', () => {
+    const directory = createTempDir('artifact-store-')
+    try {
+      const store = new ArtifactStore({ rootDir: directory })
+      const markdown = store.write({
+        buffer: Buffer.from('# Title\n\nBody\n', 'utf8'),
+        mimeType: 'text/markdown',
+        label: 'Storage Docs',
+        sourceUrl: 'https://storage.example/docs/retention',
+      })
+      const html = store.write({ buffer: Buffer.from('<p>Body</p>', 'utf8'), mimeType: 'text/html; charset=utf-8' })
+
+      expect(path.basename(markdown.path)).toMatch(/^storage-docs-[0-9a-z]+-[0-9a-f]{8}\.md$/)
+      expect(markdown.mimeType).toBe('text/markdown')
+      expect(fs.readFileSync(markdown.path, 'utf8')).toBe('# Title\n\nBody\n')
+      expect(path.basename(html.path)).toMatch(/^artifact-[0-9a-z]+-[0-9a-f]{8}\.html$/)
+      expect(html.mimeType).toBe('text/html')
+      expect(fs.readFileSync(html.path, 'utf8')).toBe('<p>Body</p>')
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test('rejects an unsupported mime type instead of guessing an extension', () => {
     const directory = createTempDir('artifact-store-')
     try {
@@ -193,6 +216,42 @@ describe('ArtifactStore limits', () => {
       expect(error.code).toBe('invalid-request')
       expect(error.message).toContain('per-file limit')
       expect(fs.readdirSync(directory)).toEqual([])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects an oversized base64 payload from its length, before decoding it', () => {
+    const directory = createTempDir('artifact-store-')
+    try {
+      const store = new ArtifactStore({ rootDir: directory })
+      const base64 = Buffer.alloc(ARTIFACT_FILE_LIMIT_BYTES + 1, 1).toString('base64')
+      const error = captureArtifactStoreError({
+        run: () => {
+          store.write({ base64, mimeType: 'text/markdown' })
+        },
+      })
+
+      expect(error.code).toBe('invalid-request')
+      expect(error.message).toContain('per-file limit')
+      expect(error.message).toContain(String(ARTIFACT_FILE_LIMIT_BYTES + 1))
+      expect(fs.readdirSync(directory)).toEqual([])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('accepts a base64 payload whose decoded size is exactly the per-file limit', () => {
+    const directory = createTempDir('artifact-store-')
+    try {
+      const store = new ArtifactStore({ rootDir: directory })
+      const artifact = store.write({
+        base64: Buffer.alloc(ARTIFACT_FILE_LIMIT_BYTES, 2).toString('base64'),
+        mimeType: 'image/png',
+      })
+
+      expect(artifact.bytes).toBe(ARTIFACT_FILE_LIMIT_BYTES)
+      expect(fs.statSync(artifact.path).size).toBe(ARTIFACT_FILE_LIMIT_BYTES)
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })
     }

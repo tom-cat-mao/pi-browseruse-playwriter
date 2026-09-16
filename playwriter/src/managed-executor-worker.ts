@@ -7,6 +7,7 @@ import url from 'node:url'
 import vm from 'node:vm'
 import type {
   BrowserErrorCode,
+  BrowserExtractFormat,
   BrowserJson,
   BrowserRequest,
   BrowserPageOperation,
@@ -22,6 +23,7 @@ import {
   type SnapshotOutputLine,
 } from './aria-snapshot.js'
 import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
+import { extractPageContent, windowExtractedText } from './page-extract.js'
 import { getChromium } from './playwright-import.js'
 import { waitForPageLoad } from './wait-for-page-load.js'
 import { ManagedPlaywrightFacade } from './managed-executor-facade.js'
@@ -53,6 +55,10 @@ const MAX_NETWORK_ENTRIES = 500
 // Keep image payloads below the newline protocol's 8 MiB envelope budget.
 const MAX_INLINE_IMAGE_BASE64 = 4 * 1024 * 1024
 const MAX_EXECUTE_CODE_LENGTH = 1_000_000
+// An extraction the relay persists is not a preview, so it may exceed the
+// preview budget — but it still has to fit the 8 MiB worker message envelope.
+const MAX_EXTRACT_ARTIFACT_CHARS = 1_000_000
+const MAX_EXTRACT_ARTIFACT_BYTES = 2 * 1024 * 1024
 
 const SAFE_NODE_GLOBALS = {
   AbortController,
@@ -633,11 +639,15 @@ export class ManagedExecutorWorkerRuntime {
       case 'page.execute':
         return await this.executeJavaScript({ page, code: operation.code, deadline, markSideEffectsStarted })
       case 'page.extract':
-        // Foundation type only; end-to-end implementation lands with the
-        // content-extraction track (docs/exec/content-extract-redesign-plan.md).
-        throw new ManagedExecutorOperationError({
-          code: 'unsupported-capability',
-          message: 'page.extract is not implemented on this backend yet',
+        return await this.extract({
+          page,
+          format: operation.format,
+          selector: operation.selector,
+          search: operation.search,
+          offset: operation.offset,
+          limit: operation.limit,
+          persist: operation.path !== undefined,
+          deadline,
         })
       default:
         return assertNever(operation)
@@ -899,6 +909,94 @@ export class ManagedExecutorWorkerRuntime {
       text,
       images,
       artifacts,
+    }
+  }
+
+  /**
+   * page.extract reads content, never page structure: the browser side only
+   * produces high-fidelity HTML and the Node-side pipeline turns it into
+   * Markdown or plain text, so both backends share one extraction.
+   *
+   * `format: 'html'` skips the pipeline but not the window budget — a raw
+   * document can be far larger than any model-facing payload. When the caller
+   * persists the result (`path`), the whole extraction travels in
+   * `value.artifactText` for the relay to write, and is stripped there before
+   * the response reaches the model.
+   */
+  private async extract({
+    page,
+    format,
+    selector,
+    search,
+    offset,
+    limit,
+    persist,
+    deadline,
+  }: {
+    page: Page
+    format: BrowserExtractFormat
+    selector?: string
+    search?: string
+    offset?: number
+    limit?: number
+    persist: boolean
+    deadline: number
+  }): Promise<BrowserResultData> {
+    if (format === 'assets-manifest') {
+      // Assets are a later wave (docs/exec/content-extract-redesign-plan.md W7).
+      throw new ManagedExecutorOperationError({
+        code: 'unsupported-capability',
+        message: 'page.extract format assets-manifest is not implemented on this backend yet',
+      })
+    }
+    const html = selector
+      ? await page.locator(selector).evaluate(
+          (element) => {
+            return element.outerHTML
+          },
+          { timeout: this.nativeOperationTimeout({ deadline, maximumMs: MAX_SELECTOR_TIMEOUT_MS }) },
+        )
+      : await page.content()
+    const totalBytes = Buffer.byteLength(html, 'utf8')
+
+    if (format === 'html') {
+      const preview = windowExtractedText({ text: html, search, offset, limit })
+      const pageTitle = await page.title()
+      return {
+        text: preview.text,
+        value: withArtifactText({
+          value: {
+            format,
+            truncated: preview.truncated,
+            totalBytes,
+            ...(pageTitle ? { title: pageTitle } : {}),
+          },
+          persisted: persist ? boundArtifactText({ text: html }) : undefined,
+        }),
+      }
+    }
+
+    const extracted = await extractPageContent({
+      html,
+      url: page.url(),
+      format,
+      ...(persist ? { full: true } : { search, offset, limit }),
+    })
+    // A persisted extraction is complete; the model still gets the window it
+    // asked for, and never the whole document inline.
+    const preview = persist ? windowExtractedText({ text: extracted.text, search, offset, limit }) : extracted
+    return {
+      text: preview.text,
+      value: withArtifactText({
+        value: {
+          format,
+          truncated: preview.truncated,
+          totalBytes: extracted.totalBytes,
+          ...(extracted.title ? { title: extracted.title } : {}),
+          ...(extracted.metadata ? { metadata: { ...extracted.metadata } } : {}),
+        },
+        persisted: persist ? boundArtifactText({ text: extracted.text }) : undefined,
+      }),
     }
   }
 
@@ -1462,6 +1560,44 @@ function sliceUnicodeText({
     bytes += characterBytes
   }
   return result
+}
+
+/**
+ * Bound the text that will be persisted by the relay. Unlike the preview it is
+ * allowed to exceed the preview budget, but it must still fit the worker
+ * message envelope, so an over-long extraction is cut and reported instead of
+ * failing the whole request.
+ */
+function boundArtifactText({ text }: { text: string }): { text: string; truncated: boolean } {
+  if (text.length <= MAX_EXTRACT_ARTIFACT_CHARS && Buffer.byteLength(text, 'utf8') <= MAX_EXTRACT_ARTIFACT_BYTES) {
+    return { text, truncated: false }
+  }
+  return {
+    text: sliceUnicodeText({
+      value: text,
+      maxChars: MAX_EXTRACT_ARTIFACT_CHARS,
+      maxBytes: MAX_EXTRACT_ARTIFACT_BYTES,
+    }),
+    truncated: true,
+  }
+}
+
+/**
+ * `value.artifactText` is the full extraction the relay persists; it is only
+ * added when the caller asked for a file and is removed again before the
+ * response reaches the model.
+ */
+function withArtifactText({
+  value,
+  persisted,
+}: {
+  value: Record<string, BrowserJson>
+  persisted?: { text: string; truncated: boolean }
+}): Record<string, BrowserJson> {
+  if (!persisted) {
+    return value
+  }
+  return { ...value, artifactText: persisted.text, ...(persisted.truncated ? { artifactTruncated: true } : {}) }
 }
 
 // A synthetic "No matches found" line carries no ref, so refs collapse to empty
