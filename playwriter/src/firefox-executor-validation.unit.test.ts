@@ -3,6 +3,7 @@ import { parseBrowserDomCommand, parseBrowserDomRequest } from './browser-dom-va
 import {
   MAX_FIREFOX_ASSET_BASE64_LENGTH,
   MAX_FIREFOX_ASSET_COUNT,
+  isFirefoxBrowserResponse,
   parseFirefoxAssetFetchRequest,
   parseFirefoxAssetFetchResponse,
   validateFirefoxMessageSize,
@@ -145,5 +146,27 @@ describe('Firefox asset channel boundary', () => {
     expect(() => { validateFirefoxMessageSize(extraction) }).not.toThrow()
     const withoutAssets = { type: 'response', id: 'id', response: { requestId: 'r', ok: true, data: { text: base64 } } }
     expect(() => { validateFirefoxMessageSize(withoutAssets) }).toThrow(/8 MiB/)
+  })
+})
+
+describe('Firefox content-read frame budget', () => {
+  test('carries the widest serialized document the extension allows inside the control frame', () => {
+    // The extension-side document budget (6,000,000 characters in firefox-dom.ts)
+    // is derived from this frame, so the widest read has to fit it.
+    const response = {
+      requestId: 'request:content',
+      ok: true,
+      data: {
+        value: 'x'.repeat(6_000_000),
+        pageInfo: { tabId: 'tab', url: 'https://en.wikipedia.test/wiki/Article', title: 'Article' },
+      },
+    }
+    const message = { type: 'dom-response', id: 'id', rpcId: '1', response }
+    expect(isFirefoxBrowserResponse(response)).toBe(true)
+    expect(() => { validateFirefoxMessageSize(message) }).not.toThrow()
+
+    // A document past the frame budget is still refused, with its own limit named.
+    const overBudget = { ...message, response: { ...response, data: { ...response.data, value: 'x'.repeat(8 * 1024 * 1024 + 1) } } }
+    expect(() => { validateFirefoxMessageSize(overBudget) }).toThrow(/8 MiB/)
   })
 })

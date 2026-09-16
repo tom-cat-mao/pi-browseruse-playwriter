@@ -25,6 +25,14 @@ function longDocumentHtml(): string {
   return `<!doctype html><html lang="en"><head><title>${EXTRACT_DOCUMENT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
 }
 
+/** Larger than the 1 MB an evaluated value may return: a real long-form article serializes this way. */
+function wideDocumentHtml(): string {
+  const paragraphs = Array.from({ length: 5_000 }, (_value, index) => {
+    return `<p>Section ${index} of the retention policy: the exporter keeps every revision of a stored document for thirty days, then purges the oldest revisions in the order they were written until the store is back under its configured quota.</p>`
+  }).join('')
+  return `<!doctype html><html lang="en"><head><title>${EXTRACT_DOCUMENT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
+}
+
 /** One page image as the DOM evaluate command reports it. */
 function pageImage({ src, alt = '', width = 800, height = 600, currentSrc, srcset = '' }: {
   src: string
@@ -515,6 +523,41 @@ describe('Firefox executor page.extract', () => {
       expect(response.data.text).toContain('Account settings')
       expect(response.data.text).toContain('Scoped setting 7 controls export retention.')
       expect(response.data.text).not.toContain('Retention keeps every revision')
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('extracts a serialized document larger than the generic evaluate budget', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    const html = wideDocumentHtml()
+    const totalBytes = Buffer.byteLength(html, 'utf8')
+    expect(totalBytes).toBeGreaterThan(1_000_000)
+    expect(totalBytes).toBeLessThan(6 * 1024 * 1024)
+    peer.documentHtml = html
+    try {
+      const markdown = await pool.execute(extractExecution({ id: 'extract-wide', peer, format: 'markdown', limit: 5 }))
+      if (!markdown.ok) {
+        throw new Error(`expected a successful extraction of a large document: ${JSON.stringify(markdown)}`)
+      }
+      // The pipeline saw the whole document: its own text is past the value budget too.
+      expect(markdown.data.value).toMatchObject({ format: 'markdown', truncated: true })
+      const value = markdown.data.value
+      if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.totalBytes !== 'number') {
+        throw new Error(`expected a structured extract value: ${JSON.stringify(markdown)}`)
+      }
+      expect(value.totalBytes).toBeGreaterThan(1_000_000)
+      expect(markdown.data.text).toContain('Section 0 of the retention policy')
+      expect((markdown.data.text ?? '').length).toBeLessThan(40_000)
+
+      // `html` reports the document's own byte count, so the read reached the worker whole.
+      const serialized = await pool.execute(extractExecution({ id: 'extract-wide-html', peer, format: 'html', limit: 5 }))
+      expect(serialized, JSON.stringify(serialized)).toMatchObject({ ok: true, data: { value: { format: 'html', totalBytes } } })
+      expect(peer.requests.map((request) => { return request.command })).toEqual([
+        { method: 'page', action: 'content' },
+        { method: 'page', action: 'content' },
+      ])
     } finally {
       await pool.dispose()
     }
