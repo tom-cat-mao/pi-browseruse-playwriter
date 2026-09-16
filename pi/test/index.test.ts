@@ -1803,7 +1803,7 @@ describe("tool execution shaping (real HTTP runtime)", () => {
                 format: "assets-manifest",
                 truncated: false,
                 totalBytes: 0,
-                assetCount: 2,
+                assetCount: 3,
                 // The manifest entries carry the intrinsic size under the wire
                 // names both workers emit (collectPageAssets in the Chrome
                 // worker, readAssetManifest in the Firefox worker).
@@ -1821,6 +1821,16 @@ describe("tool execution shaping (real HTTP runtime)", () => {
                     currentSrc: "",
                     srcset: "",
                     alt: "",
+                    naturalWidth: 0,
+                    naturalHeight: 0,
+                  },
+                  {
+                    // srcset-only image: no src attribute; the listing falls
+                    // back to the rendered candidate in currentSrc.
+                    src: "",
+                    currentSrc: "https://example.com/c-2x.png",
+                    srcset: "https://example.com/c.png 1x, https://example.com/c-2x.png 2x",
+                    alt: "Srcset only",
                     naturalWidth: 0,
                     naturalHeight: 0,
                   },
@@ -1861,7 +1871,7 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     const manifestText = textOf(manifest.content);
     expect(manifestText).toContain("format=assets-manifest");
     expect(manifestText).toContain(
-      'assets: 2 image(s) · https://example.com/a.png alt="Chart" 640x480 · https://example.com/b.png',
+      'assets: 3 image(s) · https://example.com/a.png alt="Chart" 640x480 · https://example.com/b.png · https://example.com/c-2x.png alt="Srcset only"',
     );
     // naturalWidth/naturalHeight are what the runtime sends: reading width/height
     // instead left every entry without a size. A zero pair means the image
@@ -1872,7 +1882,7 @@ describe("tool execution shaping (real HTTP runtime)", () => {
       args: { tabId: "tab-1", format: "assets-manifest" },
     });
     // The manifest IS the payload here, so the row carries the listing.
-    expect(manifestRow).toContain("assets-manifest · assets: 2 image(s) · https://example.com/a.png");
+    expect(manifestRow).toContain("assets-manifest · assets: 3 image(s) · https://example.com/a.png");
 
     const urls = await extract.execute(
       "call-urls",

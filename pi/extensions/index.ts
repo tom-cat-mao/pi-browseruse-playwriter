@@ -324,7 +324,9 @@ function readExtractAssets(value: unknown): ExtractAssets | undefined {
   const assets: ImageAsset[] = [];
   for (const entry of manifest ?? []) {
     if (!isRecord(entry)) continue;
-    const src = typeof entry.src === "string" ? entry.src.trim() : "";
+    // srcset-only images have no src attribute; the rendered candidate is in currentSrc.
+    const src = (typeof entry.src === "string" ? entry.src.trim() : "") ||
+      (typeof entry.currentSrc === "string" ? entry.currentSrc.trim() : "");
     if (!src) continue;
     const alt = typeof entry.alt === "string" ? entry.alt.trim() : "";
     // Intrinsic size; 0 means the image reported no loaded dimensions.
@@ -1562,7 +1564,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use browser_extract to read or export a page's content (article text, documentation, tables) as markdown (default), plain text, raw html, or an assets-manifest listing of the page's images. It is a content operation: no refs, no snapshotId, and it does not invalidate the latest snapshot. Use browser_snapshot when you need to act on the page instead.",
       "browser_extract output is bounded and windowed — read truncated/totalBytes in the result. Use search to keep only the lines matching a term (with surrounding context) and offset/limit to page through the extracted lines: a truncated result is a window of the document, never the whole extraction.",
-      "Pass an absolute path inside the runtime's artifacts directory to browser_extract to keep the full extraction: the runtime writes the file and the result reports the artifact's path, mimeType and size, while the model keeps only the bounded preview. A path outside that directory is refused, so never invent an export path outside it.",
+      "Pass a `path` to browser_extract to keep the full extraction: it is confined to the runtime's artifacts directory (absolute paths inside it are used as-is, relative paths resolve inside it, anything escaping is refused — never invent an export path outside it). The runtime writes the file and the result reports the artifact's path, mimeType and size, while the model keeps only the bounded preview.",
       "browser_extract images=\"urls\" (or format=\"assets-manifest\") adds the page's image manifest — src, alt, naturalWidth and naturalHeight per image — without downloading anything. Read the manifest first and decide per image whether the bytes are really needed; the manifest itself is a complete answer when the user only asks which images a page uses. The assets line states when the manifest is truncated (assetsTruncated/assetCount: the page has more images than the listing carries) and how many images were left over the per-request save limit (assetsNotFetched, save only) — never describe those as saved.",
       "browser_extract images=\"save\" really downloads the images: it costs time, bandwidth and disk, so use it only when the user wants the files. The runtime saves them inside its artifacts directory and reports each saved image as an artifact (path, mimeType, bytes, label=alt); markdown image URLs that were saved now point at those local paths, so never invent a local path or claim an image was saved without reading the artifact list.",
       "browser_extract reports images it could not fetch in failedAssets (src plus the reason). Those were NOT saved and keep their original remote URL in the text — say so instead of implying the whole page was archived.",
