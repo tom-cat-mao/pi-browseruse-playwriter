@@ -265,6 +265,7 @@ const KNOWN_PAGE_OPERATIONS = [
   "page.network",
   "page.logs",
   "page.execute",
+  "page.extract",
 ] as const satisfies readonly BrowserPageOperation["kind"][];
 
 function isKnownPageOperation(value: string): value is BrowserPageOperation["kind"] {

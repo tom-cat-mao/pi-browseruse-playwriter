@@ -39,6 +39,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
+  BrowserArtifact,
+  BrowserFeatureFlags,
   BrowserGroup,
   BrowserNetworkCaptureMetadata,
   BrowserOperation,
@@ -49,7 +51,7 @@ import type {
   BrowserTabCandidate,
 } from "@tom-cat/pi-browser-runtime/browser-protocol";
 import * as runtime from "./bootstrap.ts";
-import { RuntimeRequestError } from "./runtime-client.ts";
+import { RuntimeRequestError, type BrowserRuntimeClient } from "./runtime-client.ts";
 import {
   byteLen,
   clampBytes,
@@ -69,6 +71,7 @@ import {
 } from "./page-context.ts";
 
 type Json = Record<string, unknown>;
+type ExtractOperation = Extract<BrowserOperation, { kind: "page.extract" }>;
 type RenderCallParams = Parameters<NonNullable<Parameters<ExtensionAPI["registerTool"]>[0]["renderCall"]>>;
 type RenderResultParams = Parameters<NonNullable<Parameters<ExtensionAPI["registerTool"]>[0]["renderResult"]>>;
 type Theme = RenderCallParams[1];
@@ -216,6 +219,44 @@ function legacyNetworkCaptureLine(value: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * One-line extraction report for model-visible content: format, the page's own
+ * metadata, the window that was asked for, and whether the text is a window of
+ * the document. The exact figures also ride in the structured value block; this
+ * line states "this is a window, not the whole extraction" in words instead of
+ * leaving it to a JSON flag the model has to interpret.
+ */
+function extractSummaryLine({ data, operation }: { data: BrowserResultData; operation: ExtractOperation }): string {
+  const value = isRecord(data.value) ? data.value : undefined;
+  const metadata = value && isRecord(value.metadata) ? value.metadata : undefined;
+  const readString = (source: Record<string, unknown> | undefined, key: string): string =>
+    typeof source?.[key] === "string" ? source[key].trim() : "";
+  const parts: string[] = [`format=${readString(value, "format") || operation.format}`];
+  const title = readString(value, "title");
+  if (title) parts.push(`title="${preview(title, 120)}"`);
+  const site = readString(metadata, "siteName");
+  if (site) parts.push(`site=${preview(site, 80)}`);
+  const author = readString(metadata, "author");
+  if (author) parts.push(`author=${preview(author, 80)}`);
+  const published = readString(metadata, "publishedTime");
+  if (published) parts.push(`published=${preview(published, 64)}`);
+  const totalBytes = value?.totalBytes;
+  if (typeof totalBytes === "number" && Number.isFinite(totalBytes) && totalBytes >= 0) {
+    parts.push(`${Math.floor(totalBytes)} bytes of extracted content`);
+  }
+  const window: string[] = [];
+  if (operation.search) window.push(`search="${preview(operation.search, 60)}"`);
+  if (operation.offset !== undefined) window.push(`offset=${operation.offset}`);
+  if (operation.limit !== undefined) window.push(`limit=${operation.limit}`);
+  if (window.length > 0) parts.push(`window ${window.join(" ")}`);
+  const truncated = value?.truncated === true;
+  parts.push(`truncated=${truncated}`);
+  const hint = truncated
+    ? " — a window of the extraction, not the whole document (narrow with search, page with offset/limit)"
+    : "";
+  return `extract: ${parts.join(" · ")}${hint}`;
+}
+
 // --- rendering helpers -------------------------------------------------------
 
 const DISCOVER_DEFAULT_LIMIT = 20;
@@ -292,6 +333,18 @@ export default function (pi: ExtensionAPI) {
     operation: BrowserOperation;
     timeoutMs?: number;
     /**
+     * Optional pre-flight capability check, run before the operation is sent
+     * with the same session/request identity. It may only read (list this
+     * session's tabs, read profile capabilities) and throws to block an
+     * operation the target profile cannot serve, with a model-facing reason.
+     */
+    precheck?: (options: {
+      client: BrowserRuntimeClient;
+      sessionId: string;
+      requestId: string;
+      signal: AbortSignal | undefined;
+    }) => Promise<void>;
+    /**
      * Local post-processing of a successful response (e.g. Pi-only pagination
      * of a full discover list). Runs before shaping, so nextOffset/reporting
      * always describes exactly what the model receives.
@@ -315,6 +368,11 @@ export default function (pi: ExtensionAPI) {
 
     let data: BrowserResultData;
     try {
+      // Capability precheck first: it runs on the same session identity and can
+      // only read, so blocking here never leaves a page action half-started.
+      if (options.precheck) {
+        await options.precheck({ client, sessionId, requestId, signal: options.signal });
+      }
       data = await client.request({
         requestId,
         sessionId,
@@ -340,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 
     const pageResult = options.refine ? options.refine(data) : undefined;
     if (pageResult) data = pageResult.data;
-    return shapeResult(options.ctx, data, sessionId, pageResult?.extraDetails, options.operation.kind);
+    return shapeResult(options.ctx, data, sessionId, pageResult?.extraDetails, options.operation);
   }
 
   /**
@@ -357,7 +415,7 @@ export default function (pi: ExtensionAPI) {
     data: BrowserResultData,
     sessionId: string | undefined,
     extraDetails?: Json,
-    operationKind?: BrowserOperation["kind"],
+    operation?: BrowserOperation,
   ): { content: ContentBlock[]; details: Json } {
     const content: ContentBlock[] = [];
     // Optional runtime observations (frozen protocol fields) are copied with
@@ -405,6 +463,10 @@ export default function (pi: ExtensionAPI) {
     const structured = buildStructuredText({ data, networkCapture, pageInfo });
     if (structured) pushText(structured);
 
+    // 1b) Extraction report (page.extract): format, page metadata, requested
+    // window, and whether the text that follows is a window of the document.
+    if (operation?.kind === "page.extract") pushText(`\n${extractSummaryLine({ data, operation })}`);
+
     // 2) Primary text (snapshot/navigate/etc.), truncated to its own cap first.
     const textTruncated = data.text != null && byteLen(data.text) > MAX_TEXT_BYTES;
     if (data.text) pushText(textTruncated ? `${sliceToBytes(data.text, MAX_TEXT_BYTES)}\n…[truncated]` : data.text);
@@ -416,7 +478,7 @@ export default function (pi: ExtensionAPI) {
     // value can also be an array or object and is not a capture.
     const captureLine = networkCapture
       ? networkCaptureLine(networkCapture)
-      : operationKind === "page.network"
+      : operation?.kind === "page.network"
         ? legacyNetworkCaptureLine(data.value)
         : undefined;
     if (captureLine) pushText(`\n${captureLine}`);
@@ -434,9 +496,18 @@ export default function (pi: ExtensionAPI) {
       pushText(`\nPage logs:\n${joined}`);
     }
 
-    // 4) Artifact paths (small).
+    // 4) Artifact descriptors (small): the durable copy on disk, with its real
+    // written size when the runtime reported one. Paths come from the runtime,
+    // so they are sanitized and byte-clamped like every other display field.
     if (data.artifacts && data.artifacts.length > 0) {
-      pushText(`\nartifacts: ${data.artifacts.map((a) => `${a.path} (${a.mimeType})`).join(", ")}`);
+      const descriptors = data.artifacts.map((artifact) => {
+        const path = clampBytes(stripTerminalControls(artifact.path), MAX_FIELD_BYTES);
+        const bytes = artifact.bytes;
+        const size =
+          typeof bytes === "number" && Number.isFinite(bytes) ? `, ${Math.max(0, Math.floor(bytes))} bytes` : "";
+        return `${path} (${artifact.mimeType}${size})`;
+      });
+      pushText(`\nartifacts: ${descriptors.join(", ")}`);
     }
 
     const canSee = ctx.model?.input?.includes("image") ?? false;
@@ -618,8 +689,36 @@ export default function (pi: ExtensionAPI) {
     ...(c.tabId ? { tabId: c.tabId } : {}),
     ...(c.reason ? { reason: c.reason } : {}),
   });
+
+  /**
+   * Capability feature keys that change what the model can ask for. The feature
+   * matrix is an open namespace by contract, so the client keeps every key it
+   * receives (forward compatibility) — but only these are projected into
+   * model-visible content: dumping arbitrary peer data there is noise, and a
+   * key this build cannot act on is not something to plan around.
+   */
+  const MODEL_FEATURE_KEYS = ["extract"] as const;
+
+  /**
+   * Bounded projection of `capabilities.features` for model content. Returns
+   * undefined when the peer advertises none of the relevant features, so a
+   * plain Chrome profile keeps its compact shape and older profiles stay
+   * unchanged.
+   */
+  const compactFeatures = (features: BrowserFeatureFlags | undefined): Json | undefined => {
+    if (!features) return undefined;
+    const out: Json = {};
+    for (const key of MODEL_FEATURE_KEYS) {
+      const values = features[key];
+      if (!values || values.length === 0) continue;
+      out[key] = values.map((value) => clampField(value));
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  };
+
   const compactProfile = (p: BrowserProfile): Json => {
     const caps = p.capabilities;
+    const features = compactFeatures(caps.features);
     const limitations: string[] = [];
     let remainingBytes = 4_000;
     let limitationsTruncated = false;
@@ -652,6 +751,7 @@ export default function (pi: ExtensionAPI) {
         ...(caps.executeMode ? { executeMode: caps.executeMode } : {}),
         ...(caps.evaluateWorld ? { evaluateWorld: caps.evaluateWorld } : {}),
         ...(caps.supportedOperations ? { supportedOperations: caps.supportedOperations } : {}),
+        ...(features ? { features } : {}),
         ...(caps.limitations ? { limitations } : {}),
         ...(limitationsTruncated ? { limitationsTruncated: true } : {}),
       },
@@ -1190,6 +1290,144 @@ export default function (pi: ExtensionAPI) {
       const refs = isRecord(view.value) && Array.isArray(view.value.refs) ? view.value.refs.length : 0;
       const snapshot = view.details.snapshotId ? ` · ${shortId(view.details.snapshotId)}` : "";
       return `✓ snapshot ${lines} lines${refs ? ` · ${refs} refs` : ""}${snapshot}${pageSuffix(view)}`;
+    }),
+  });
+
+  // --- page: extract --------------------------------------------------------
+
+  /**
+   * Pre-flight capability gate for page.extract. The runtime reports which page
+   * operations each profile advertises; when the target tab's profile lists
+   * them and page.extract is missing, fail here with a model-facing reason
+   * instead of sending an operation that browser build cannot serve. A profile
+   * that advertises no list at all is NOT blocked — absence is not a claim of
+   * "unsupported", it only means the peer predates the list — and an unknown
+   * tabId is left to the extract request so the runtime reports the real
+   * resource error instead of this gate inventing one.
+   *
+   * Both probes are reads: tabs.list is answered from the runtime's own session
+   * inventory and profiles.list is connection metadata, so refusing here starts
+   * nothing and changes nothing.
+   */
+  async function assertExtractSupported({
+    client,
+    sessionId,
+    requestId,
+    signal,
+    tabId,
+  }: {
+    client: BrowserRuntimeClient;
+    sessionId: string;
+    requestId: string;
+    signal: AbortSignal | undefined;
+    tabId: string;
+  }): Promise<void> {
+    const listed = await client.request({
+      requestId: `${requestId}:extract-gate`,
+      sessionId,
+      operation: { kind: "tabs.list" },
+      ...(signal ? { signal } : {}),
+    });
+    const tab = listed.tabs?.find((entry) => entry.tabId === tabId);
+    if (!tab) return;
+    const profiles = await client.listProfiles(signal);
+    const profile = profiles.find((entry) => entry.profileId === tab.profileId);
+    const supported = profile?.capabilities.supportedOperations;
+    if (!supported || supported.includes("page.extract")) return;
+    const label = profile ? `${profile.label} (${profile.browser}, ${profile.profileId})` : tab.profileId;
+    throw new Error(
+      `browser_extract is not supported by this tab's browser profile: ${label} does not advertise page.extract. ` +
+        "Check browser_profiles for each connected profile's capabilities, or read the page with browser_snapshot/browser_evaluate.",
+    );
+  }
+
+  pi.registerTool({
+    name: "browser_extract",
+    label: "Browser Extract",
+    description:
+      "Extract a managed tab's content for reading or export — markdown (default), plain text, or the raw html. Unlike " +
+      "browser_snapshot it returns no element refs and no snapshotId, and it is not a structure operation: use " +
+      "browser_snapshot when you need to click/fill, browser_extract when you need the content itself. Extraction is " +
+      "bounded and windowed: the result reports truncated/totalBytes, search keeps only the lines matching a term (with " +
+      "surrounding context), and offset/limit page through the extracted lines. Passing an absolute path inside the " +
+      "runtime's artifacts directory makes the runtime write the full extraction there and return an artifact descriptor " +
+      "(path/mimeType/bytes) while the tool result keeps the bounded preview; a path outside that directory is refused. " +
+      "It needs a profile that advertises page.extract (see browser_profiles); assets-manifest is not available yet.",
+    promptSnippet: "Extract a managed tab's content as markdown/text/html",
+    promptGuidelines: [
+      "Use browser_extract to read or export a page's content (article text, documentation, tables) as markdown (default), plain text, or raw html. It is a content operation: no refs, no snapshotId, and it does not invalidate the latest snapshot. Use browser_snapshot when you need to act on the page instead.",
+      "browser_extract output is bounded and windowed — read truncated/totalBytes in the result. Use search to keep only the lines matching a term (with surrounding context) and offset/limit to page through the extracted lines: a truncated result is a window of the document, never the whole extraction.",
+      "Pass an absolute path inside the runtime's artifacts directory to browser_extract to keep the full extraction: the runtime writes the file and the result reports the artifact's path, mimeType and size, while the model keeps only the bounded preview. A path outside that directory is refused, so never invent an export path outside it.",
+      "browser_extract is served by the target tab's profile: if that profile does not advertise page.extract the call fails with a clear error — check browser_profiles and use browser_snapshot/browser_evaluate there instead. The available formats are markdown/text/html; assets-manifest is not available yet.",
+    ],
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Target managed tab" }),
+      format: Type.Optional(
+        StringEnum(["markdown", "text", "html"] as const, { description: "Extraction format (default: markdown)" }),
+      ),
+      search: Type.Optional(
+        Type.String({ description: "Keep only extracted lines matching this text, with surrounding context" }),
+      ),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "Skip this many extracted lines (paging)" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum extracted lines to return (paging)" })),
+      path: Type.Optional(
+        Type.String({
+          description:
+            "Absolute path inside the runtime's artifacts directory: the runtime writes the full extraction there and returns an artifact",
+        }),
+      ),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      return run({
+        ctx,
+        toolCallId,
+        signal,
+        operation: {
+          kind: "page.extract",
+          tabId: params.tabId,
+          format: params.format ?? "markdown",
+          ...(params.search ? { search: params.search } : {}),
+          ...(params.offset !== undefined ? { offset: params.offset } : {}),
+          ...(params.limit !== undefined ? { limit: params.limit } : {}),
+          ...(params.path ? { path: params.path } : {}),
+        },
+        precheck: ({ client, sessionId, requestId, signal: gateSignal }) =>
+          assertExtractSupported({ client, sessionId, requestId, signal: gateSignal, tabId: params.tabId }),
+      });
+    },
+    renderCall: makeRenderCall("browser extract", (a) =>
+      `[${shortId(a.tabId)}] ${str(a.format) || "markdown"}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.offset !== undefined ? ` offset=${a.offset}` : ""}${a.limit !== undefined ? ` limit=${a.limit}` : ""}${a.path ? ` → ${preview(a.path, 64)}` : ""}`,
+    ),
+    // The row reports what the model got: format and size, a first-line
+    // preview, the page's own metadata, whether it is a window, and the
+    // artifact the runtime wrote.
+    renderResult: makeRenderResult((view) => {
+      const value = isRecord(view.value) ? view.value : undefined;
+      const metadata = value && isRecord(value.metadata) ? value.metadata : undefined;
+      const format = (typeof value?.format === "string" && value.format) || str(view.args.format) || "markdown";
+      const lines = view.text ? view.text.split("\n").length : 0;
+      const firstLine = (view.text ?? "").split("\n").find((line) => line.trim());
+      const title = typeof value?.title === "string" && value.title ? `"${preview(value.title, 56)}"` : "";
+      const site = typeof metadata?.siteName === "string" && metadata.siteName
+        ? `site=${preview(metadata.siteName, 40)}`
+        : "";
+      const totalBytes = typeof value?.totalBytes === "number" ? `${value.totalBytes} bytes` : "";
+      const truncated = value?.truncated === true ? "truncated" : "";
+      const artifacts = (view.details.artifacts as BrowserArtifact[] | undefined) ?? [];
+      const saved = artifacts[0];
+      const artifactLine = saved
+        ? `${clampBytes(stripTerminalControls(saved.path), 96)}${typeof saved.bytes === "number" ? ` (${saved.bytes} bytes)` : ""}`
+        : "";
+      const head = [
+        `${format} · ${lines} line(s)`,
+        firstLine ? preview(firstLine, 80) : "",
+        title,
+        site,
+        totalBytes,
+        truncated,
+        artifactLine,
+      ];
+      return `✓ ${head.filter(Boolean).join(" · ")}${pageSuffix(view)}`;
     }),
   });
 
