@@ -40,6 +40,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   BrowserArtifact,
+  BrowserExtractImagesMode,
   BrowserFeatureFlags,
   BrowserGroup,
   BrowserNetworkCaptureMetadata,
@@ -232,6 +233,9 @@ function extractSummaryLine({ data, operation }: { data: BrowserResultData; oper
   const readString = (source: Record<string, unknown> | undefined, key: string): string =>
     typeof source?.[key] === "string" ? source[key].trim() : "";
   const parts: string[] = [`format=${readString(value, "format") || operation.format}`];
+  // The requested image mode explains what the text below contains: 'save'
+  // rewrites saved image URLs to local artifact paths, 'urls' adds a manifest.
+  if (operation.images && operation.images !== "none") parts.push(`images=${operation.images}`);
   const title = readString(value, "title");
   if (title) parts.push(`title="${preview(title, 120)}"`);
   const site = readString(metadata, "siteName");
@@ -255,6 +259,115 @@ function extractSummaryLine({ data, operation }: { data: BrowserResultData; oper
     ? " — a window of the extraction, not the whole document (narrow with search, page with offset/limit)"
     : "";
   return `extract: ${parts.join(" · ")}${hint}`;
+}
+
+// --- image assets (page.extract `images` / assets-manifest) ------------------
+// The runtime answers image requests in `value` (the open JSON channel of the
+// frozen protocol): `assets` is the manifest, `failedAssets` the images it
+// could not fetch and save. Both are read defensively — a peer that returns
+// neither keeps the plain extraction shape.
+
+const MAX_ASSET_ENTRIES_INLINE = 5; // manifest entries printed per line
+const MAX_ASSET_SRC_COLS = 96; // visible columns per src
+const MAX_ASSET_ALT_COLS = 64; // visible columns per alt text
+const MAX_ASSET_REASON_COLS = 80; // visible columns per failure reason
+const MAX_ARTIFACT_DESCRIPTORS = 10; // artifacts printed in model content
+
+/** One entry of the extract image manifest. */
+type ImageAsset = {
+  src: string;
+  alt?: string;
+  width?: number;
+  height?: number;
+};
+
+/** An image the runtime could not fetch/save, with the reason it reported. */
+type FailedAsset = {
+  src: string;
+  reason?: string;
+};
+
+/** A non-negative integral pixel value, or undefined for anything else. */
+function readPixel(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.floor(value);
+}
+
+/**
+ * Read the `value.assets` manifest. Returns undefined when the response carries
+ * no manifest at all (a plain extraction), and skips entries without a usable
+ * src instead of printing empty rows.
+ */
+function readImageAssets(value: unknown): ImageAsset[] | undefined {
+  if (!isRecord(value) || !Array.isArray(value.assets)) return undefined;
+  const assets: ImageAsset[] = [];
+  for (const entry of value.assets) {
+    if (!isRecord(entry)) continue;
+    const src = typeof entry.src === "string" ? entry.src.trim() : "";
+    if (!src) continue;
+    const alt = typeof entry.alt === "string" ? entry.alt.trim() : "";
+    const width = readPixel(entry.width);
+    const height = readPixel(entry.height);
+    assets.push({
+      src: preview(src, MAX_ASSET_SRC_COLS),
+      ...(alt ? { alt: preview(alt, MAX_ASSET_ALT_COLS) } : {}),
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+    });
+  }
+  return assets;
+}
+
+/**
+ * One-line manifest report: how many images the page has, then the first few
+ * with src/alt/pixel size, so the model can decide which images are worth
+ * fetching without a second extraction. An empty manifest is still reported —
+ * "0 image(s)" is a fact about the page, not a missing answer.
+ */
+function assetManifestLine({ assets, max }: { assets: ImageAsset[]; max: number }): string {
+  const shown = assets.slice(0, max).map((asset) => {
+    const parts = [asset.src];
+    if (asset.alt) parts.push(`alt="${asset.alt}"`);
+    if (asset.width !== undefined && asset.height !== undefined) parts.push(`${asset.width}x${asset.height}`);
+    return parts.join(" ");
+  });
+  const hidden = assets.length - shown.length;
+  const parts = [`${assets.length} image(s)`, ...shown];
+  if (hidden > 0) parts.push(`… ${hidden} more`);
+  return `assets: ${parts.join(" · ")}`;
+}
+
+/**
+ * Read `value.failedAssets`. Always returned as an array when the runtime
+ * reported the field, so "saved nothing" is distinguishable from "no report".
+ */
+function readFailedAssets(value: unknown): FailedAsset[] | undefined {
+  if (!isRecord(value) || !Array.isArray(value.failedAssets)) return undefined;
+  const failed: FailedAsset[] = [];
+  for (const entry of value.failedAssets) {
+    if (!isRecord(entry)) continue;
+    const src = typeof entry.src === "string" ? entry.src.trim() : "";
+    if (!src) continue;
+    const reason = typeof entry.reason === "string" ? entry.reason.trim() : "";
+    failed.push({
+      src: preview(src, MAX_ASSET_SRC_COLS),
+      ...(reason ? { reason: preview(reason, MAX_ASSET_REASON_COLS) } : {}),
+    });
+  }
+  return failed;
+}
+
+/**
+ * One-line warning for images the runtime did not save. The saved ones have
+ * their markdown URLs rewritten to local paths; these kept their remote URL,
+ * which is exactly what the model has to know before quoting the text.
+ */
+function failedAssetsLine({ failed, max }: { failed: FailedAsset[]; max: number }): string {
+  const shown = failed.slice(0, max).map((entry) => (entry.reason ? `${entry.src} (${entry.reason})` : entry.src));
+  const hidden = failed.length - shown.length;
+  const parts = [`${failed.length} image(s) not saved`, ...shown];
+  if (hidden > 0) parts.push(`… ${hidden} more`);
+  return `failed assets: ${parts.join(" · ")} — the text keeps their original remote URLs`;
 }
 
 // --- rendering helpers -------------------------------------------------------
@@ -467,6 +580,17 @@ export default function (pi: ExtensionAPI) {
     // window, and whether the text that follows is a window of the document.
     if (operation?.kind === "page.extract") pushText(`\n${extractSummaryLine({ data, operation })}`);
 
+    // 1c) Image manifest and failed saves (page.extract with `images`). The
+    // manifest is the zero-byte listing the model decides from, so it stays
+    // model-visible even when the extraction itself produced no text; a plain
+    // extraction (no `assets` in the response) prints neither line.
+    if (operation?.kind === "page.extract") {
+      const assets = readImageAssets(data.value);
+      if (assets) pushText(`\n${assetManifestLine({ assets, max: MAX_ASSET_ENTRIES_INLINE })}`);
+      const failed = readFailedAssets(data.value);
+      if (failed && failed.length > 0) pushText(`\n${failedAssetsLine({ failed, max: MAX_ASSET_ENTRIES_INLINE })}`);
+    }
+
     // 2) Primary text (snapshot/navigate/etc.), truncated to its own cap first.
     const textTruncated = data.text != null && byteLen(data.text) > MAX_TEXT_BYTES;
     if (data.text) pushText(textTruncated ? `${sliceToBytes(data.text, MAX_TEXT_BYTES)}\n…[truncated]` : data.text);
@@ -499,14 +623,19 @@ export default function (pi: ExtensionAPI) {
     // 4) Artifact descriptors (small): the durable copy on disk, with its real
     // written size when the runtime reported one. Paths come from the runtime,
     // so they are sanitized and byte-clamped like every other display field.
+    // A `label` (the image alt text for saved assets) is appended when present;
+    // the count is bounded, since saving images can produce many descriptors.
     if (data.artifacts && data.artifacts.length > 0) {
-      const descriptors = data.artifacts.map((artifact) => {
+      const descriptors = data.artifacts.slice(0, MAX_ARTIFACT_DESCRIPTORS).map((artifact) => {
         const path = clampBytes(stripTerminalControls(artifact.path), MAX_FIELD_BYTES);
         const bytes = artifact.bytes;
         const size =
           typeof bytes === "number" && Number.isFinite(bytes) ? `, ${Math.max(0, Math.floor(bytes))} bytes` : "";
-        return `${path} (${artifact.mimeType}${size})`;
+        const label = artifact.label ? ` "${preview(artifact.label, MAX_ASSET_ALT_COLS)}"` : "";
+        return `${path} (${artifact.mimeType}${size})${label}`;
       });
+      const hidden = data.artifacts.length - descriptors.length;
+      if (hidden > 0) descriptors.push(`… ${hidden} more`);
       pushText(`\nartifacts: ${descriptors.join(", ")}`);
     }
 
@@ -695,9 +824,10 @@ export default function (pi: ExtensionAPI) {
    * matrix is an open namespace by contract, so the client keeps every key it
    * receives (forward compatibility) — but only these are projected into
    * model-visible content: dumping arbitrary peer data there is noise, and a
-   * key this build cannot act on is not something to plan around.
+   * key this build cannot act on is not something to plan around. `assets` is
+   * here because browser_extract's `images` modes are gated on it per profile.
    */
-  const MODEL_FEATURE_KEYS = ["extract"] as const;
+  const MODEL_FEATURE_KEYS = ["extract", "assets"] as const;
 
   /**
    * Bounded projection of `capabilities.features` for model content. Returns
@@ -886,9 +1016,17 @@ export default function (pi: ExtensionAPI) {
     }
     if (Array.isArray(view.details.artifacts)) {
       for (const artifact of view.details.artifacts.slice(0, MAX_DETAIL_ITEMS)) {
-        if (isRecord(artifact) && typeof artifact.path === "string") {
-          lines.push(`artifact: ${clampBytes(stripTerminalControls(artifact.path), MAX_FIELD_BYTES)}`);
-        }
+        if (!isRecord(artifact) || typeof artifact.path !== "string") continue;
+        const path = clampBytes(stripTerminalControls(artifact.path), MAX_FIELD_BYTES);
+        const mime = typeof artifact.mimeType === "string" ? stripTerminalControls(artifact.mimeType) : "";
+        const bytes = typeof artifact.bytes === "number" && Number.isFinite(artifact.bytes)
+          ? Math.max(0, Math.floor(artifact.bytes))
+          : undefined;
+        const meta = [mime, bytes !== undefined ? `${bytes} bytes` : ""].filter(Boolean).join(", ");
+        const label = typeof artifact.label === "string" && artifact.label
+          ? ` "${preview(artifact.label, MAX_ASSET_ALT_COLS)}"`
+          : "";
+        lines.push(`artifact: ${path}${meta ? ` (${meta})` : ""}${label}`);
       }
     }
     const joined = lines.join("\n");
@@ -1305,6 +1443,14 @@ export default function (pi: ExtensionAPI) {
    * tabId is left to the extract request so the runtime reports the real
    * resource error instead of this gate inventing one.
    *
+   * `images` is gated one level deeper, on `capabilities.features.assets`: a
+   * webextension (Firefox) build downloads the bytes itself, so it must say
+   * which modes it can serve. A missing mode is refused here rather than
+   * surfacing as an unsupported-capability after a partial download. Chrome is
+   * served by the runtime, which synthesizes its feature set, and a profile
+   * with no capabilities at all predates this negotiation — both are left to
+   * the runtime, matching the layering used for supportedOperations.
+   *
    * Both probes are reads: tabs.list is answered from the runtime's own session
    * inventory and profiles.list is connection metadata, so refusing here starts
    * nothing and changes nothing.
@@ -1315,12 +1461,14 @@ export default function (pi: ExtensionAPI) {
     requestId,
     signal,
     tabId,
+    images,
   }: {
     client: BrowserRuntimeClient;
     sessionId: string;
     requestId: string;
     signal: AbortSignal | undefined;
     tabId: string;
+    images: BrowserExtractImagesMode | undefined;
   }): Promise<void> {
     const listed = await client.request({
       requestId: `${requestId}:extract-gate`,
@@ -1332,12 +1480,24 @@ export default function (pi: ExtensionAPI) {
     if (!tab) return;
     const profiles = await client.listProfiles(signal);
     const profile = profiles.find((entry) => entry.profileId === tab.profileId);
-    const supported = profile?.capabilities.supportedOperations;
-    if (!supported || supported.includes("page.extract")) return;
     const label = profile ? `${profile.label} (${profile.browser}, ${profile.profileId})` : tab.profileId;
+    const supported = profile?.capabilities.supportedOperations;
+    if (supported && !supported.includes("page.extract")) {
+      throw new Error(
+        `browser_extract is not supported by this tab's browser profile: ${label} does not advertise page.extract. ` +
+          "Check browser_profiles for each connected profile's capabilities, or read the page with browser_snapshot/browser_evaluate.",
+      );
+    }
+    if (!images || images === "none") return;
+    const capabilities = profile?.capabilities;
+    if (!capabilities) return;
+    if (capabilities.backend !== "webextension") return;
+    const modes = capabilities.features?.assets;
+    if (modes?.includes(images)) return;
+    const advertised = modes && modes.length > 0 ? modes.join(", ") : "none";
     throw new Error(
-      `browser_extract is not supported by this tab's browser profile: ${label} does not advertise page.extract. ` +
-        "Check browser_profiles for each connected profile's capabilities, or read the page with browser_snapshot/browser_evaluate.",
+      `browser_extract images="${images}" is unsupported by this tab's browser profile: ${label} does not advertise the asset mode "${images}" ` +
+        `(advertised asset modes: ${advertised}). Update that browser's extension, or extract with images="none"/"urls" on this profile.`,
     );
   }
 
@@ -1345,25 +1505,41 @@ export default function (pi: ExtensionAPI) {
     name: "browser_extract",
     label: "Browser Extract",
     description:
-      "Extract a managed tab's content for reading or export — markdown (default), plain text, or the raw html. Unlike " +
-      "browser_snapshot it returns no element refs and no snapshotId, and it is not a structure operation: use " +
-      "browser_snapshot when you need to click/fill, browser_extract when you need the content itself. Extraction is " +
-      "bounded and windowed: the result reports truncated/totalBytes, search keeps only the lines matching a term (with " +
-      "surrounding context), and offset/limit page through the extracted lines. Passing an absolute path inside the " +
-      "runtime's artifacts directory makes the runtime write the full extraction there and return an artifact descriptor " +
-      "(path/mimeType/bytes) while the tool result keeps the bounded preview; a path outside that directory is refused. " +
-      "It needs a profile that advertises page.extract (see browser_profiles); assets-manifest is not available yet.",
-    promptSnippet: "Extract a managed tab's content as markdown/text/html",
+      "Extract a managed tab's content for reading or export — markdown (default), plain text, the raw html, or an " +
+      "assets-manifest of the page's images. Unlike browser_snapshot it returns no element refs and no snapshotId, and " +
+      "it is not a structure operation: use browser_snapshot when you need to click/fill, browser_extract when you " +
+      "need the content itself. Extraction is bounded and windowed: the result reports truncated/totalBytes, search " +
+      "keeps only the lines matching a term (with surrounding context), and offset/limit page through the extracted " +
+      "lines. Passing an absolute path inside the runtime's artifacts directory makes the runtime write the full " +
+      "extraction there and return an artifact descriptor (path/mimeType/bytes) while the tool result keeps the " +
+      "bounded preview; a path outside that directory is refused. images controls the page's images: none (default) " +
+      "leaves them as remote URLs, urls returns a manifest (src/alt/width/height) without downloading anything, and " +
+      "save downloads them through the runtime and rewrites markdown image URLs to the local artifact paths. It needs " +
+      "a profile that advertises page.extract (see browser_profiles); a webextension profile must also advertise the " +
+      "asset mode it is asked for.",
+    promptSnippet: "Extract a managed tab's content as markdown/text/html or an image manifest",
     promptGuidelines: [
-      "Use browser_extract to read or export a page's content (article text, documentation, tables) as markdown (default), plain text, or raw html. It is a content operation: no refs, no snapshotId, and it does not invalidate the latest snapshot. Use browser_snapshot when you need to act on the page instead.",
+      "Use browser_extract to read or export a page's content (article text, documentation, tables) as markdown (default), plain text, raw html, or an assets-manifest listing of the page's images. It is a content operation: no refs, no snapshotId, and it does not invalidate the latest snapshot. Use browser_snapshot when you need to act on the page instead.",
       "browser_extract output is bounded and windowed — read truncated/totalBytes in the result. Use search to keep only the lines matching a term (with surrounding context) and offset/limit to page through the extracted lines: a truncated result is a window of the document, never the whole extraction.",
       "Pass an absolute path inside the runtime's artifacts directory to browser_extract to keep the full extraction: the runtime writes the file and the result reports the artifact's path, mimeType and size, while the model keeps only the bounded preview. A path outside that directory is refused, so never invent an export path outside it.",
-      "browser_extract is served by the target tab's profile: if that profile does not advertise page.extract the call fails with a clear error — check browser_profiles and use browser_snapshot/browser_evaluate there instead. The available formats are markdown/text/html; assets-manifest is not available yet.",
+      "browser_extract images=\"urls\" (or format=\"assets-manifest\") adds the page's image manifest — src, alt, width and height per image — without downloading anything. Read the manifest first and decide per image whether the bytes are really needed; the manifest itself is a complete answer when the user only asks which images a page uses.",
+      "browser_extract images=\"save\" really downloads the images: it costs time, bandwidth and disk, so use it only when the user wants the files. The runtime saves them inside its artifacts directory and reports each saved image as an artifact (path, mimeType, bytes, label=alt); markdown image URLs that were saved now point at those local paths, so never invent a local path or claim an image was saved without reading the artifact list.",
+      "browser_extract reports images it could not fetch in failedAssets (src plus the reason). Those were NOT saved and keep their original remote URL in the text — say so instead of implying the whole page was archived.",
+      "browser_extract is served by the target tab's profile: a profile that does not advertise page.extract makes the call fail with a clear error, and an images mode other than \"none\" additionally needs the profile's matching asset mode (urls or save) — a webextension (Firefox) profile without it is refused before anything is downloaded. Check browser_profiles for capabilities, update that browser's extension, or fall back to images=\"none\" and read there with browser_snapshot/browser_evaluate.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       format: Type.Optional(
-        StringEnum(["markdown", "text", "html"] as const, { description: "Extraction format (default: markdown)" }),
+        StringEnum(["markdown", "text", "html", "assets-manifest"] as const, {
+          description:
+            "Extraction format (default: markdown); assets-manifest returns the page's image listing instead of text",
+        }),
+      ),
+      images: Type.Optional(
+        StringEnum(["none", "urls", "save"] as const, {
+          description:
+            "Image handling (default: none). urls adds the image manifest without downloading; save downloads the images and rewrites markdown image URLs to the local artifact paths",
+        }),
       ),
       search: Type.Optional(
         Type.String({ description: "Keep only extracted lines matching this text, with surrounding context" }),
@@ -1386,27 +1562,43 @@ export default function (pi: ExtensionAPI) {
           kind: "page.extract",
           tabId: params.tabId,
           format: params.format ?? "markdown",
+          ...(params.images && params.images !== "none" ? { images: params.images } : {}),
           ...(params.search ? { search: params.search } : {}),
           ...(params.offset !== undefined ? { offset: params.offset } : {}),
           ...(params.limit !== undefined ? { limit: params.limit } : {}),
           ...(params.path ? { path: params.path } : {}),
         },
         precheck: ({ client, sessionId, requestId, signal: gateSignal }) =>
-          assertExtractSupported({ client, sessionId, requestId, signal: gateSignal, tabId: params.tabId }),
+          assertExtractSupported({
+            client,
+            sessionId,
+            requestId,
+            signal: gateSignal,
+            tabId: params.tabId,
+            images: params.images,
+          }),
       });
     },
     renderCall: makeRenderCall("browser extract", (a) =>
-      `[${shortId(a.tabId)}] ${str(a.format) || "markdown"}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.offset !== undefined ? ` offset=${a.offset}` : ""}${a.limit !== undefined ? ` limit=${a.limit}` : ""}${a.path ? ` → ${preview(a.path, 64)}` : ""}`,
+      `[${shortId(a.tabId)}] ${str(a.format) || "markdown"}${a.images && a.images !== "none" ? ` images=${a.images}` : ""}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.offset !== undefined ? ` offset=${a.offset}` : ""}${a.limit !== undefined ? ` limit=${a.limit}` : ""}${a.path ? ` → ${preview(a.path, 64)}` : ""}`,
     ),
     // The row reports what the model got: format and size, a first-line
-    // preview, the page's own metadata, whether it is a window, and the
-    // artifact the runtime wrote.
+    // preview, the page's own metadata, whether it is a window, the image
+    // manifest or the images that failed, and the artifact the runtime wrote.
     renderResult: makeRenderResult((view) => {
       const value = isRecord(view.value) ? view.value : undefined;
       const metadata = value && isRecord(value.metadata) ? value.metadata : undefined;
       const format = (typeof value?.format === "string" && value.format) || str(view.args.format) || "markdown";
+      const assets = readImageAssets(view.value);
+      const failed = readFailedAssets(view.value) ?? [];
       const lines = view.text ? view.text.split("\n").length : 0;
       const firstLine = (view.text ?? "").split("\n").find((line) => line.trim());
+      // The manifest IS the payload of `format: "assets-manifest"`, so the row
+      // shows the listing itself instead of an empty line count.
+      const manifestIsPayload = format === "assets-manifest" && assets !== undefined;
+      const body = manifestIsPayload
+        ? preview(assetManifestLine({ assets: assets ?? [], max: MAX_ASSET_ENTRIES_INLINE }), 120)
+        : `${lines} line(s)`;
       const title = typeof value?.title === "string" && value.title ? `"${preview(value.title, 56)}"` : "";
       const site = typeof metadata?.siteName === "string" && metadata.siteName
         ? `site=${preview(metadata.siteName, 40)}`
@@ -1419,12 +1611,15 @@ export default function (pi: ExtensionAPI) {
         ? `${clampBytes(stripTerminalControls(saved.path), 96)}${typeof saved.bytes === "number" ? ` (${saved.bytes} bytes)` : ""}`
         : "";
       const head = [
-        `${format} · ${lines} line(s)`,
+        `${format} · ${body}`,
         firstLine ? preview(firstLine, 80) : "",
         title,
         site,
         totalBytes,
         truncated,
+        !manifestIsPayload && assets ? `${assets.length} image(s)` : "",
+        artifacts.length > 1 ? `${artifacts.length} artifacts` : "",
+        failed.length > 0 ? `${failed.length} failed` : "",
         artifactLine,
       ];
       return `✓ ${head.filter(Boolean).join(" · ")}${pageSuffix(view)}`;
