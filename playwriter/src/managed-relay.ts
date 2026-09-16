@@ -42,6 +42,7 @@ import {
   type BrowserDomRequest,
   type BrowserErrorCode,
   type BrowserExtractFormat,
+  type BrowserExtractImagesMode,
   type BrowserGroup,
   type BrowserInventory,
   type BrowserJson,
@@ -424,6 +425,8 @@ const OPERATION_KINDS = new Set<BrowserOperation['kind']>([
 ])
 
 const EXTRACT_FORMATS: BrowserExtractFormat[] = ['markdown', 'text', 'html', 'assets-manifest']
+
+const EXTRACT_IMAGES_MODES: BrowserExtractImagesMode[] = ['none', 'urls', 'save']
 
 const REQUEST_FIELDS = new Set(['requestId', 'sessionId', 'operation', 'cwd', 'timeoutMs'])
 
@@ -867,7 +870,7 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
       }
     }
     case 'page.extract': {
-      const fields = withFields(['tabId', 'format', 'selector', 'search', 'offset', 'limit', 'path'])
+      const fields = withFields(['tabId', 'format', 'selector', 'search', 'offset', 'limit', 'path', 'images'])
       if (!fields.ok) {
         return fields
       }
@@ -878,6 +881,10 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
       const format = value.format
       if (typeof format !== 'string' || !EXTRACT_FORMATS.includes(format as BrowserExtractFormat)) {
         return { ok: false, message: `"format" must be one of ${EXTRACT_FORMATS.join(', ')}` }
+      }
+      const images = value.images
+      if (images !== undefined && (typeof images !== 'string' || !EXTRACT_IMAGES_MODES.includes(images as BrowserExtractImagesMode))) {
+        return { ok: false, message: `"images" must be one of ${EXTRACT_IMAGES_MODES.join(', ')}` }
       }
       const selector = readOptionalString(value, 'selector', { maxLength: SELECTOR_MAX_LENGTH, trim: false })
       if (!selector.ok) {
@@ -905,6 +912,7 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
           kind: 'page.extract',
           tabId: tabId.value,
           format: format as BrowserExtractFormat,
+          ...(images !== undefined ? { images: images as BrowserExtractImagesMode } : {}),
           ...(selector.value !== undefined ? { selector: selector.value } : {}),
           ...(search.value !== undefined ? { search: search.value } : {}),
           ...(offset.value !== undefined ? { offset: offset.value } : {}),
@@ -1343,6 +1351,14 @@ const CHROME_SUPPORTED_PAGE_OPERATIONS: BrowserPageOperation['kind'][] = [
   'page.extract',
 ]
 
+/**
+ * Image modes this runtime serves for a Chrome profile. The relay owns the CDP
+ * executor that enumerates images and fetches their bytes, so a Chrome profile
+ * reports them here instead of advertising them itself; a WebExtension profile
+ * has to advertise `features.assets` because its browser side does the work.
+ */
+const CHROME_ASSET_FEATURES: BrowserExtractImagesMode[] = ['urls', 'save']
+
 export function buildBrowserCapabilities({ isolatedExecution }: { isolatedExecution: boolean }): BrowserCapabilities {
   return {
     protocolVersion: BROWSER_PROTOCOL_VERSION,
@@ -1573,6 +1589,7 @@ export function listManagedProfiles(
   const defaultCapabilities: BrowserCapabilities = {
     ...capabilities,
     supportedOperations: [...CHROME_SUPPORTED_PAGE_OPERATIONS],
+    features: { assets: [...CHROME_ASSET_FEATURES] },
   }
   return Array.from(state.profiles.values())
     .sort((a, b) => {
@@ -1737,6 +1754,58 @@ function omitExtractArtifactText(value: Record<string, BrowserJson>): Record<str
     }
   }
   return modelValue
+}
+
+/** Drop the fetched image bytes so they never travel on to the model. */
+function omitSavedAssets(value: Record<string, BrowserJson>): Record<string, BrowserJson> {
+  const modelValue: Record<string, BrowserJson> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key !== 'savedAssets') {
+      modelValue[key] = entry
+    }
+  }
+  return modelValue
+}
+
+/**
+ * One image the browser side fetched, checked before it is trusted enough to
+ * reach the store. The URL is page-derived, so it is only ever a descriptor
+ * field and never a path.
+ */
+function readSavedAsset({ value, index }: { value: BrowserJson; index: number }): {
+  base64: string
+  mimeType: string
+  src: string
+  alt?: string
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ManagedTransportError({
+      code: 'internal-error', message: `page.extract savedAssets[${index}] is not an object`, outcome: 'unknown',
+    })
+  }
+  const { base64, mimeType, src, alt } = value
+  if (typeof base64 !== 'string' || typeof mimeType !== 'string' || typeof src !== 'string' ||
+    (alt !== undefined && typeof alt !== 'string')) {
+    throw new ManagedTransportError({
+      code: 'internal-error', message: `page.extract savedAssets[${index}] is missing its image payload`, outcome: 'unknown',
+    })
+  }
+  return { base64, mimeType, src, ...(typeof alt === 'string' && alt ? { alt } : {}) }
+}
+
+/**
+ * Point every stored image URL at the artifact it was written to. Matching on
+ * `](url` — the Markdown image destination — is an exact replacement of the URL
+ * the relay actually fetched, independent of whether the extraction pipeline
+ * normalized or escaped the alt text, and tolerant of a link title after the
+ * URL. URLs that never reached the store are left as they are.
+ */
+function rewriteStoredImageUrls({ text, replacements }: { text: string; replacements: Map<string, string> }): string {
+  let result = text
+  for (const [src, path] of replacements) {
+    result = result.split(`](${src}`).join(`](${path}`)
+  }
+  return result
 }
 
 // ---------------------------------------------------------------------------
@@ -2314,6 +2383,14 @@ export class ManagedRelay {
     if (!routable.ok) {
       return routable.response
     }
+    const images = this.requireExtractImages({
+      requestId: request.requestId,
+      operation,
+      profile: routable.profile,
+    })
+    if (!images.ok) {
+      return images.response
+    }
     const profileId = tabResult.profile.profileId
     const pending = this.createPending({
       sessionId: request.sessionId,
@@ -2412,7 +2489,7 @@ export class ManagedRelay {
         })
       }
       return this.savePageExtractArtifact({
-        response: parsed.value,
+        response: this.persistExtractImages({ response: parsed.value, operation, sessionId: request.sessionId }),
         operation,
         sessionId: request.sessionId,
       })
@@ -2638,6 +2715,86 @@ export class ManagedRelay {
         ...response.data,
         value: omitExtractArtifactText(value),
         artifacts: [...(response.data.artifacts ?? []), artifact],
+      },
+    }
+  }
+
+  /**
+   * `images: 'save'`: the browser side collects image bytes because only it can
+   * reach the page's cookies, and sends them in `value.savedAssets` because it
+   * has no store access. The relay writes each image into the artifact store,
+   * hands the model descriptors instead, rewrites the URLs of the stored images
+   * to their local artifact paths — in the body that is about to be persisted
+   * and in the preview text the model reads — and drops the byte payload before
+   * the response leaves the relay.
+   *
+   * One image that cannot be written (over a store limit once a session has
+   * filled up, or a type the store cannot name) is reported next to the
+   * browser-side failures instead of failing the request.
+   */
+  private persistExtractImages({ response, operation, sessionId }: {
+    response: BrowserResponse
+    operation: BrowserPageOperation
+    sessionId: string
+  }): BrowserResponse {
+    // Only a save request owns `savedAssets`: every other value on the wire is
+    // page-derived data (page.evaluate, page.execute) that must travel untouched.
+    if (!response.ok || operation.kind !== 'page.extract' || operation.images !== 'save') {
+      return response
+    }
+    const value = response.data.value
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return response
+    }
+    const savedAssets = value.savedAssets
+    if (savedAssets === undefined) {
+      return response
+    }
+    if (!Array.isArray(savedAssets)) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'page.extract returned a malformed saved asset list', outcome: 'unknown',
+      })
+    }
+
+    const artifacts: BrowserArtifact[] = []
+    const replacements = new Map<string, string>()
+    const storeFailures: BrowserJson[] = []
+    for (const [index, entry] of savedAssets.entries()) {
+      const asset = readSavedAsset({ value: entry, index })
+      try {
+        const artifact = this.artifactStore().write({
+          buffer: Buffer.from(asset.base64, 'base64'),
+          mimeType: asset.mimeType,
+          label: asset.alt ?? 'image',
+          sourceUrl: asset.src,
+          sessionId,
+        })
+        artifacts.push(artifact)
+        replacements.set(asset.src, artifact.path)
+      } catch (error) {
+        if (!(error instanceof ArtifactStoreError)) {
+          throw error
+        }
+        storeFailures.push({ src: asset.src, reason: error.message })
+      }
+    }
+
+    const modelValue = omitSavedAssets(value)
+    if (typeof modelValue.artifactText === 'string') {
+      modelValue.artifactText = rewriteStoredImageUrls({ text: modelValue.artifactText, replacements })
+    }
+    if (storeFailures.length > 0) {
+      const reported = Array.isArray(value.failedAssets) ? value.failedAssets : []
+      modelValue.failedAssets = [...reported, ...storeFailures]
+    }
+    const text = response.data.text
+    return {
+      ...response,
+      data: {
+        ...response.data,
+        ...(text !== undefined ? { text: rewriteStoredImageUrls({ text, replacements }) } : {}),
+        value: modelValue,
+        artifacts: [...(response.data.artifacts ?? []), ...artifacts],
       },
     }
   }
@@ -3877,6 +4034,39 @@ export class ManagedRelay {
         break
       }
       this.dedup.delete(oldest)
+    }
+  }
+
+  /**
+   * `page.extract` images are gated on the browser side that has to serve them.
+   * A Chrome profile is served by this runtime's own CDP executor, so the mode
+   * is always allowed; a WebExtension profile must advertise it in
+   * `capabilities.features.assets`, and a profile that does not is refused here
+   * — before any page traffic leaves the runtime — the way `page.extract`
+   * itself is refused for a profile that predates it.
+   */
+  private requireExtractImages({
+    requestId,
+    operation,
+    profile,
+  }: {
+    requestId: string
+    operation: BrowserPageOperation
+    profile: ManagedProfileSnapshot
+  }): { ok: true } | { ok: false; response: BrowserResponse } {
+    if (operation.kind !== 'page.extract' || operation.images === undefined || operation.images === 'none') {
+      return { ok: true }
+    }
+    if (profile.backend !== 'webextension' || (profile.capabilities?.features?.assets ?? []).includes(operation.images)) {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      response: failureResponse(requestId, {
+        code: 'unsupported-capability',
+        message: `profile ${profile.profileId} does not advertise page.extract images '${operation.images}'; update the browser extension`,
+        outcome: 'not-started',
+      }),
     }
   }
 
