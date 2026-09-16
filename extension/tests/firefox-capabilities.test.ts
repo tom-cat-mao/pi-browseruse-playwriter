@@ -17,4 +17,12 @@ describe('Firefox capability advertisement', () => {
     // Content extraction is the operation the runtime refuses without an advertisement.
     expect(accepted).toContain('page.extract')
   })
+
+  /**
+   * The runtime gates page.extract images modes on this advertisement, so an
+   * extension that predates the background byte channel must not claim them.
+   */
+  test('advertises both image modes the background byte channel serves', () => {
+    expect(FIREFOX_CAPABILITIES.features?.assets).toEqual(['urls', 'save'])
+  })
 })

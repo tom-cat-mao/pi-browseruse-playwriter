@@ -46,6 +46,15 @@ export const FIREFOX_CAPABILITIES: BrowserCapabilities = {
   executeMode: 'dom-compatible',
   evaluateWorld: 'isolated',
   supportedOperations: [...FIREFOX_SUPPORTED_PAGE_OPERATIONS],
+  /**
+   * Image bytes are fetched by this extension's background, so `page.extract`
+   * with images:'save' is advertised here: an extension that predates the
+   * channel advertises nothing and the runtime refuses the mode instead of
+   * sending a request it cannot answer.
+   */
+  features: {
+    assets: ['urls', 'save'],
+  },
   limitations: [
     'Firefox uses DOM interaction; input events are not browser-native trusted input.',
     'Snapshots use DOM/ARIA instead of the browser accessibility tree.',

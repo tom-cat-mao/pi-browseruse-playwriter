@@ -14,9 +14,12 @@ import type {
 import { ManagedCancellation } from './managed-executor-pool.js'
 import { errorMessage } from './managed-executor-protocol.js'
 import {
+  MAX_FIREFOX_ASSET_REASON_LENGTH,
   isFirefoxBrowserResponse,
   parseFirefoxWorkerMessage,
   validateFirefoxMessageSize,
+  type FirefoxAssetFetchRequest,
+  type FirefoxAssetFetchResponse,
   type FirefoxWorkerCommand,
   type FirefoxWorkerMessage,
 } from './firefox-executor-protocol.js'
@@ -27,6 +30,13 @@ export interface FirefoxExecution {
   connectionEpoch?: string
   signal?: AbortSignal
   sendDomRequest: (request: BrowserDomRequest) => Promise<BrowserResponse>
+  /**
+   * Asset bytes live in the extension, never in the page: the runtime forwards
+   * the worker's request over the extension connection. Optional so a runtime
+   * that cannot carry the channel reports every image as failed instead of
+   * dropping the extraction.
+   */
+  sendAssetRequest?: (request: FirefoxAssetFetchRequest) => Promise<FirefoxAssetFetchResponse>
 }
 
 interface FirefoxTask {
@@ -254,6 +264,44 @@ export class FirefoxExecutorPool {
     if (task.rpcIds.has(message.rpcId) || task.rpcIds.size >= 10_000) {
       throw new Error('Firefox executor sent duplicate or excessive DOM requests')
     }
+    if (message.type === 'asset-request') {
+      // Bytes are not a page read: the runtime asks the extension for them and
+      // hands the answer back on the same lease, so a failed image stays data.
+      const request = message.request
+      if (request.sessionId !== task.execution.request.sessionId || request.tabId !== task.execution.tab.tabId ||
+        request.browserEpoch !== task.execution.tab.browserEpoch) {
+        throw new Error('Firefox asset request escaped its assigned tab')
+      }
+      task.rpcIds.add(message.rpcId)
+      task.rpcQueue = task.rpcQueue.then(async () => {
+        if (!this.isLeaseActive({ worker, task })) {
+          return
+        }
+        const send = task.execution.sendAssetRequest
+        let response: FirefoxAssetFetchResponse
+        if (!send) {
+          response = {
+            requestId: request.requestId, assets: [],
+            error: 'This runtime cannot fetch image bytes from the Firefox extension; update the runtime and the extension',
+          }
+        } else {
+          try {
+            response = await send(request)
+          } catch (error) {
+            response = {
+              requestId: request.requestId, assets: [],
+              error: `Firefox asset request failed: ${errorMessage(error)}`.slice(0, MAX_FIREFOX_ASSET_REASON_LENGTH),
+            }
+          }
+        }
+        if (this.isLeaseActive({ worker, task })) {
+          this.send({ worker, command: { type: 'asset-response', id: task.id, rpcId: message.rpcId, response } })
+        }
+      }).catch((error) => {
+        void this.invalidate({ worker, code: 'outcome-unknown', message: errorMessage(error) })
+      })
+      return
+    }
     if (message.command.method === 'operation' && message.command.operation.tabId !== task.execution.tab.tabId) {
       throw new Error('Firefox executor DOM operation does not match the selected tab')
     }
@@ -322,12 +370,15 @@ export class FirefoxExecutorPool {
         type: 'extract', id: task.id,
         execution: {
           requestId: task.execution.request.requestId,
+          sessionId: task.execution.request.sessionId,
           tabId: task.execution.tab.tabId,
+          browserEpoch: task.execution.tab.browserEpoch,
           format: operation.format,
           ...(operation.selector !== undefined ? { selector: operation.selector } : {}),
           ...(operation.search !== undefined ? { search: operation.search } : {}),
           ...(operation.offset !== undefined ? { offset: operation.offset } : {}),
           ...(operation.limit !== undefined ? { limit: operation.limit } : {}),
+          ...(operation.images !== undefined ? { images: operation.images } : {}),
           persist: operation.path !== undefined,
         },
       } })
