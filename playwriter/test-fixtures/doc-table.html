@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Retention policy reference | Storage Docs</title>
+    <meta name="description" content="Bucket-level retention tiers, their minimum lock periods and per-object limits." />
+  </head>
+  <body>
+    <div class="docs-shell">
+      <nav class="docs-sidebar">
+        <ul>
+          <li><a href="/docs/getting-started">Getting started</a></li>
+          <li><a href="/docs/buckets">Buckets</a></li>
+          <li><a href="/docs/retention">Retention policy</a></li>
+          <li><a href="/docs/lifecycle">Lifecycle rules</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-content">
+        <h1>Retention policy reference</h1>
+        <p>
+          A retention policy prevents objects from being deleted or overwritten for a fixed period.
+          Policies are set per bucket and apply to every object written afterwards.
+        </p>
+
+        <h2>Retention tiers</h2>
+        <p>
+          The table below lists the supported tiers. The minimum lock period is enforced by the
+          service; shorter values are rejected with <code>400 InvalidRetentionPeriod</code>.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Minimum lock</th>
+              <th>Maximum lock</th>
+              <th>Object size limit</th>
+              <th>Early delete fee</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>standard</code></td>
+              <td>1 day</td>
+              <td>3 years</td>
+              <td>5 TiB</td>
+              <td>none</td>
+            </tr>
+            <tr>
+              <td><code>compliance</code></td>
+              <td>90 days</td>
+              <td>10 years</td>
+              <td>5 TiB</td>
+              <td>prorated storage</td>
+            </tr>
+            <tr>
+              <td><code>archive</code></td>
+              <td>180 days</td>
+              <td>7 years</td>
+              <td>500 GiB</td>
+              <td>retrieval cost</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h2>Enabling a policy</h2>
+        <p>Set the tier with the CLI and confirm the resulting lock period:</p>
+        <pre><code>storage bucket retention set --bucket media --tier compliance
+storage bucket retention describe --bucket media</code></pre>
+        <p>
+          Policies take effect for new writes only. Objects written before the change keep their
+          previous retention state until it expires, which is why the
+          <a href="/docs/retention#migration">migration notes</a> recommend a two-week window.
+        </p>
+
+        <h2>Limits</h2>
+        <ul>
+          <li>One policy per bucket; changing tiers does not shorten existing locks.</li>
+          <li>Up to 100 lifecycle rules per bucket, each referencing a retention tier.</li>
+          <li>Legal holds override retention and can only be released by an account owner.</li>
+        </ul>
+      </main>
+    </div>
+  </body>
+</html>
