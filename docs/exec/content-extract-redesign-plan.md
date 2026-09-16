@@ -27,27 +27,32 @@
 
 ## 波次与任务
 
-### Wave 1（并行，三 worktree）
+### Wave 1（已合并 dev：4394a83，验收 codebuddy-7 通过）
+
+W1 artifact store（34ea60a）、W2 MD 管线 defuddle+linkedom（bceec1b+f954b02）、W3 Pi 前向兼容（d225648）。
+
+### Wave 2（已合并 dev：ddfb529，验收 codebuddy-13 通过，无 blocker）
+
+W4 Chrome extract 端到端 + text 零 MD + 40K 预算（d0afdc0）、W6 Pi 工具 browser_extract（5867e5d）、W5 Firefox extract 端到端 + 强制能力门禁（2ecbf48）。
+
+验收遗留（→ Wave 3 / 发行前清单）：
+1. selector 传片段（裸 div/section）时 defuddle 判稀疏 → 静默丢正文（CONCERN；extractFromHtml 需做片段包骨架）；当前模型路径无 selector 参数，W7 修复
+2. 契约文档 docs/exec/browser-runtime-contract.md 未写 page.extract（W8）
+3. extension/manifest.json 0.0.139 未递增（发行前由扩展 owner 处理）
+4. 可选加固：text 持久化为 .md 的 mime 语义、Chrome FakePage selector 断言、artifactTruncated 摘要措辞、非 extract op 门禁钉子测试、cdp profile 广告合并
+
+### Wave 3（并行，四 worktree；协议 images 字段已冻结在基础提交）
 
 | 任务 | 分支/worktree | 文件所有权 | 内容 |
 |---|---|---|---|
-| W1 artifact store | feat/extract-artifacts → .worktrees/ex-artifacts | playwriter/src/artifact-store.ts（新）、scoped-fs.ts、managed-relay.ts（仅 saveFirefoxScreenshot 区域 ~2419-2444 与 parseInventoryCapabilities ~1061）、相关测试 | 建 artifact store（dataDir/artifacts/ 下落盘、mime→扩展名映射含 png/jpg/jpeg/webp/gif/svg、单文件与总量上限）；saveFirefoxScreenshot 迁移走 store；managed-relay 的 parseInventoryCapabilities 透传可选 features 字段 |
-| W2 MD 管线 | feat/extract-pipeline → .worktrees/ex-pipeline | playwriter/src/page-extract.ts（新）、test-fixtures、测试、playwriter/package.json + pnpm-lock.yaml | 纯 Node 模块：HTML→Markdown（defuddle 与 readability+turndown 实测对比后选一，记录理由）；输出 title/metadata/正文 MD；search 窗口化 + offset/limit 分页；不落盘（落盘由 W1 store 负责，接口预留）；fixture HTML 单测，不起浏览器 |
-| W3 Pi 前向兼容 | feat/pi-forward-compat → .worktrees/pi-compat | pi/extensions/runtime-client.ts、pi/test/* | validateCapabilities：supportedOperations 含未知 op 时忽略不抛 protocol；透传并保留 features；补测试 |
-
-### Wave 2（Wave 1 合并后）
-
-- W4 Chrome 端 page.extract 端到端：worker page.content()→管线→响应/artifact；relay 路由 + 能力门禁
-- W5 Firefox 端 page.extract 端到端：扩展产出 HTML 经通道到 runtime；能力上报
-- W6 Pi 工具 browser_extract 注册 + SKILL.md + 渲染
-
-### Wave 3
-
-- W7 assets-manifest + 图片拉取（双端）+ MD 图片 URL 重写
+| W7a Chrome 图片 | feat/assets-chrome → .worktrees/assets-chrome | managed-executor-worker.ts、managed-relay.ts 及测试 | assets-manifest 实现（in-page evaluate 枚举 img）；images:'urls' 返回 manifest；images:'save' Chrome 拉字节（in-page fetch 带 cookie/CORS → 兜底 worker fetch）→ artifact store → MD URL 重写；relay 层 images 门禁（features.assets 含 'save'/'urls'，Chrome 由 relay 合成） |
+| W7b Firefox 图片 | feat/assets-firefox → .worktrees/assets-firefox | firefox-executor-worker.ts、firefox-executor-protocol.ts（runtime 侧）、extension/src/*（background fetch 二进制通道、features 广告）、扩展测试 | assets-manifest（DOM evaluate 枚举）；images:'save' 走扩展后台 fetch（<all_urls>+cookie 无 CORS）base64 回传 → relay 落盘；features: {assets:['urls','save']} 广告；旧扩展无广告即门禁拒绝 |
+| W7c Pi 图片参数 | feat/assets-pi → .worktrees/assets-pi | pi/ 全部 | browser_extract 暴露 format 'assets-manifest' 与 images 参数；门禁到 features 级；renderResult 资产清单/落盘呈现；SKILL.md |
+| W7d 片段骨架修复 | feat/extract-fragment-fix → .worktrees/ex-fragment | page-extract.ts 及测试 | extractFromHtml 入口：输入无 <html/<body 视为片段→包最小文档骨架；近空结果且明显低于可见文本估算时显式失败；fixture 测试 |
 
 ### Wave 4
 
-- W8 能力协商数据化收尾 + 文档 + changesets 检查
+- W8 能力协商收尾 + 契约文档 + changesets 检查 + 发行前清单（manifest 版本）
 
 ## 纪律（所有任务必须遵守）
 

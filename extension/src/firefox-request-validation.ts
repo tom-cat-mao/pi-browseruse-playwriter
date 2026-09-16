@@ -28,7 +28,7 @@ export const FIELDS: Record<BrowserOperation['kind'], string[]> = {
   'page.screenshot': ['tabId', 'path', 'fullPage', 'labels'],
   'page.network': ['tabId', 'action', 'filter'],
   'page.logs': ['tabId', 'limit'],
-  'page.extract': ['tabId', 'format', 'selector', 'search', 'offset', 'limit', 'path'],
+  'page.extract': ['tabId', 'format', 'selector', 'search', 'offset', 'limit', 'path', 'images'],
 }
 
 export function parseFirefoxBrowserRequest(raw: unknown): BrowserRequest | null {

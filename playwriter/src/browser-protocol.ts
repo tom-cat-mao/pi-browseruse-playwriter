@@ -199,6 +199,16 @@ export function parseBrowserTabCandidateId(candidateId: string): {
  */
 export type BrowserExtractFormat = 'markdown' | 'text' | 'html' | 'assets-manifest'
 
+/**
+ * Image handling for `page.extract`. 'none' (default) leaves image URLs as-is;
+ * 'urls' additionally returns an assets manifest in the response value without
+ * fetching bytes; 'save' fetches image bytes browser-side, persists them as
+ * artifacts, and rewrites markdown image URLs to the local artifact paths.
+ * 'save' requires the backend to advertise the `assets` feature `save`
+ * (capabilities.features); peers that do not advertise it must not receive it.
+ */
+export type BrowserExtractImagesMode = 'none' | 'urls' | 'save'
+
 export type BrowserOperation =
   | { kind: 'profiles.list' }
   | { kind: 'groups.list'; profileId?: string }
@@ -237,6 +247,8 @@ export type BrowserOperation =
       limit?: number
       /** Absolute path: write the full extraction to disk and return an artifact. */
       path?: string
+      /** Image handling; default 'none'. Gated on capabilities.features.assets. */
+      images?: BrowserExtractImagesMode
     }
 
 export type BrowserPageOperation = Extract<BrowserOperation, { kind: `page.${string}` }>
