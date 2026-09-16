@@ -154,12 +154,13 @@ screenshots are an optional extra for visual/spatial questions.
   context), `offset` skips lines and `limit` caps how many come back: page
   through with `offset += limit`, and never summarize a document from a window
   you have not read to its end.
-- **Exporting to disk.** Pass an absolute `path` to keep the FULL extraction: the
-  runtime writes the file itself (Markdown and plain text as `.md`, `html` as
-  `.html`) and returns an artifact descriptor with `path`, `mimeType` and
-  `bytes`, while the tool result keeps only the bounded preview. The write is
-  confined to the runtime's artifacts directory (`~/.pi-browser-use/artifacts` by
-  default, or `$PI_BROWSER_DATA_DIR/artifacts`); a path outside it is refused.
+- **Exporting to disk.** Pass a `path` to keep the FULL extraction: the runtime
+  writes the file itself (Markdown and plain text as `.md`, `html` as `.html`)
+  and returns an artifact descriptor with `path`, `mimeType` and `bytes`, while
+  the tool result keeps only the bounded preview. The write is confined to the
+  runtime's artifacts directory (`~/.pi-browser-use/artifacts` by default, or
+  `$PI_BROWSER_DATA_DIR/artifacts`): a relative path resolves against that
+  directory, an absolute one is used as is, and a path outside it is refused.
   Report the returned path to the user as the durable copy — you never write
   files yourself.
 - **Images: `none` (default) / `urls` / `save`.** `none` leaves every image as a

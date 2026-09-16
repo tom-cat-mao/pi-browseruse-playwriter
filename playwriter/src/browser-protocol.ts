@@ -245,7 +245,7 @@ export type BrowserOperation =
       search?: string
       offset?: number
       limit?: number
-      /** Absolute path: write the full extraction to disk and return an artifact. */
+      /** Write the full extraction to disk and return an artifact; a relative path resolves against the artifacts root. */
       path?: string
       /** Image handling; default 'none'. Gated on capabilities.features.assets. */
       images?: BrowserExtractImagesMode

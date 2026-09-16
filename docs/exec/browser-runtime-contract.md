@@ -140,7 +140,8 @@ images ∈ none | urls | save（缺省 none）。
   图片清单，不产正文（selector 只作用于正文格式，assets-manifest 忽略它）。selector
   存在时只序列化严格匹配的单个元素。
 - 窗口与预算：search/offset/limit 只作用于模型可见窗口；带 path 时整篇经
-  value.artifactText 交给 relay 落盘，模型仍只看窗口。清单最多 200 条，
+  value.artifactText 交给 relay 落盘，模型仍只看窗口；path 的相对路径按 artifacts
+  根解析，绝对路径按原样使用但同样必须落在根内，越界一律拒绝。清单最多 200 条，
   清单 JSON 上限 40,000 字节（预览正文另按 40,000 字符计），被截断时 value.assetsTruncated=true。
 - images：'urls' 在任意 format 上附 value.assets（assetCount + 每条
   {src,currentSrc,srcset,alt,naturalWidth,naturalHeight}），零字节；'save' 先给同一
