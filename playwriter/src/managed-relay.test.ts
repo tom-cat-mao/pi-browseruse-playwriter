@@ -21,6 +21,7 @@ import path from 'node:path'
 import url from 'node:url'
 import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
+import { ArtifactStore } from './artifact-store.js'
 import { ManagedExecutorPool } from './managed-executor-pool.js'
 import {
   RUNTIME_NETWORK_MAX_BYTES,
@@ -1158,6 +1159,18 @@ describe('managed inventory registry', () => {
     expect(apply({ ...inventory, tabs: [{ ...inventory.tabs[0], cdpSessionId: 'pretend-cdp' }] }).accepted).toBe(false)
     expect(apply({ ...inventory, tabs: [...inventory.tabs, { ...inventory.tabs[0], tabId: 'duplicate-physical-id' }] }).accepted).toBe(false)
     expect(apply({ ...inventory, backend: undefined }).accepted).toBe(false)
+  })
+  test('passes the optional feature matrix through and ignores unknown feature names', () => {
+    const inventory = firefoxInventory()
+    const features = { extract: ['markdown', 'text'], 'future-thing': ['whatever'] }
+    const parsed = parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, features } })
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) {
+      throw new Error(parsed.message)
+    }
+    expect(parsed.value.capabilities?.features).toEqual(features)
+    expect(parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, features: { extract: 'markdown' } } }).ok).toBe(false)
+    expect(parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, features: [] } }).ok).toBe(false)
   })
   test('profiles, groups and tabs come from the extension inventory and are session filtered', async () => {
     const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
@@ -3921,6 +3934,83 @@ describe('managed queue re-validation', () => {
       }),
     ).toHaveLength(1)
     await relay.dispose()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Firefox screenshot artifacts
+// ---------------------------------------------------------------------------
+
+describe('managed Firefox screenshot artifacts', () => {
+  test('a screenshot without a path lands in the artifact store and keeps the PNG check', async () => {
+    const directory = createExecutorTestDirectory('firefox-screenshot-artifacts-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j7AoAAAAASUVORK5CYII='
+    let mimeType = 'image/png'
+    const relay = new ManagedRelay({
+      host: '127.0.0.1',
+      port: 1,
+      artifactStore,
+      hasConnectedExtensions: () => {
+        return true
+      },
+      closeManagedClient: () => {},
+      transport: {
+        sendBrowserRequest: async ({ request }) => {
+          if (request.operation.kind === 'tab.resolve') {
+            return { requestId: request.requestId, ok: true, data: { tab: firefoxInventory().tabs[0] } }
+          }
+          if (request.operation.kind === 'page.screenshot') {
+            return { requestId: request.requestId, ok: true, data: { images: [{ mimeType, data: png }] } }
+          }
+          return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+        },
+      },
+    })
+    try {
+      relay.noteConnectionOpened({ connectionId: 'firefox-connection' })
+      const inventory = { ...firefoxInventory(), revision: 2 }
+      expect(
+        relay.handleInventory({
+          connectionId: 'firefox-connection',
+          info: { browser: 'Firefox', installId: 'profile-1', stableKey: 'install:Firefox:profile-1' },
+          inventory,
+        }).accepted,
+      ).toBe(true)
+
+      const screenshot = await relay.handleRequest({
+        requestId: 'firefox-store-screenshot',
+        sessionId: 'session-1',
+        operation: { kind: 'page.screenshot', tabId: 'firefox-tab' },
+      })
+      expect(screenshot.ok).toBe(true)
+      if (!screenshot.ok) {
+        throw new Error('expected a successful Firefox screenshot')
+      }
+      const artifacts = screenshot.data.artifacts ?? []
+      expect(artifacts).toHaveLength(1)
+      expect(artifacts[0]).toMatchObject({
+        mimeType: 'image/png',
+        bytes: Buffer.from(png, 'base64').length,
+        label: 'screenshot',
+      })
+      expect(artifacts[0]?.path.startsWith(artifactStore.getRootDir() + path.sep)).toBe(true)
+      expect(fs.readFileSync(artifacts[0]?.path ?? '').toString('base64')).toBe(png)
+      expect(screenshot.data.images).toEqual([{ mimeType: 'image/png', data: png }])
+      expect(fs.readdirSync(directory)).toEqual(['artifacts'])
+
+      mimeType = 'image/jpeg'
+      const rejected = await relay.handleRequest({
+        requestId: 'firefox-store-screenshot-not-png',
+        sessionId: 'session-1',
+        operation: { kind: 'page.screenshot', tabId: 'firefox-tab' },
+      })
+      expect(rejected).toMatchObject({ ok: false, error: { code: 'internal-error', outcome: 'unknown' } })
+      expect(fs.readdirSync(artifactStore.getRootDir())).toHaveLength(1)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
   })
 })
 
