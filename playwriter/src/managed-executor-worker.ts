@@ -62,16 +62,22 @@ const MAX_EXTRACT_ASSET_ENTRIES = 200
 const MAX_EXTRACT_ASSETS_BYTES = 40_000
 /** Images one `images: 'save'` request fetches bytes for. */
 const MAX_SAVED_ASSETS = 20
-/** Per-image and per-request byte caps, aligned with the artifact store limits. */
+/** Per-image byte cap, aligned with the artifact store limits. */
 const MAX_SAVED_ASSET_BYTES = 16 * 1024 * 1024
-const MAX_SAVED_ASSET_TOTAL_BYTES = 64 * 1024 * 1024
 /**
- * Base64 budget for what one response may carry back. The worker->relay
- * envelope is 8 MiB, so fetched bytes have to stay well inside it: images that
- * no longer fit are reported as per-image failures instead of breaking the
- * whole response.
+ * Base64 budget for what one response may carry back, and the same budget in
+ * image bytes. The worker->relay envelope is 8 MiB and the same response also
+ * carries the persisted body (`value.artifactText`, up to 2 MiB), the preview
+ * text and the assets manifest, so the image payload has to stay inside what
+ * is left: 4 MiB of base64 (3 MiB of image bytes) plus a 2 MiB body plus the
+ * preview and listing stays under the envelope. This is the per-request image
+ * budget on this backend, and it is much smaller than the Firefox channel's
+ * 64 MiB, which has a frame budget of its own. Images that no longer fit are
+ * reported as per-image failures instead of breaking the whole response.
  */
 const MAX_SAVED_ASSET_BASE64_BYTES = 4 * 1024 * 1024
+/** The same budget in image bytes; base64 is 4/3 of the bytes it carries. */
+const MAX_SAVED_ASSET_REQUEST_BYTES = (MAX_SAVED_ASSET_BASE64_BYTES / 4) * 3
 const MAX_ASSET_FETCH_TIMEOUT_MS = 10_000
 const ASSET_URL_MAX_LENGTH = 2_048
 const ASSET_ALT_MAX_LENGTH = 512
@@ -188,6 +194,12 @@ type SavedAsset = {
   base64: string
   mimeType: string
   src: string
+  /**
+   * Every URL the page uses for this image — its `src` attribute and the
+   * srcset candidate the browser chose — so the relay can rewrite whichever
+   * one the extracted body kept.
+   */
+  sourceUrls?: string[]
   alt?: string
 }
 
@@ -1152,8 +1164,10 @@ export class ManagedExecutorWorkerRuntime {
 
   /**
    * Attach the image channel the caller asked for. `none` leaves the payload
-   * alone; `urls` adds the DOM manifest; `save` adds the fetched bytes, always
-   * in `value.savedAssets` so the relay — not the model — owns them.
+   * alone; `urls` adds the DOM manifest; `save` adds the same manifest plus the
+   * fetched bytes, always in `value.savedAssets` so the relay — not the model —
+   * owns them. Both image modes report the same inventory, so a caller can see
+   * what was there next to what was saved.
    */
   private async withExtractImages({
     page,
@@ -1174,13 +1188,14 @@ export class ManagedExecutorWorkerRuntime {
     }
     const collected = assets ?? (await this.collectExtractAssets({ page }))
     const manifest = boundAssetManifest({ assets: collected })
-    const counted: Record<string, BrowserJson> = { ...value, assetCount: manifest.assets.length }
+    const counted: Record<string, BrowserJson> = {
+      ...value,
+      assetCount: manifest.assets.length,
+      assets: manifest.assets,
+      ...(manifest.truncated ? { assetsTruncated: true } : {}),
+    }
     if (images === 'urls') {
-      return {
-        ...counted,
-        assets: manifest.assets,
-        ...(manifest.truncated ? { assetsTruncated: true } : {}),
-      }
+      return counted
     }
     return await this.withSavedAssets({ page, assets: manifest.assets, value: counted, deadline })
   }
@@ -1189,7 +1204,9 @@ export class ManagedExecutorWorkerRuntime {
    * Fetch bytes for the first images of the manifest. Every image is
    * independent: a refused, oversized or unsupported one lands in
    * `failedAssets` and never fails the request, and the bounded `savedAssets`
-   * payload keeps a single response inside the worker envelope.
+   * payload keeps a single response inside the worker envelope. Images the
+   * 20-image bound left untried are counted in `assetsNotFetched`, the way the
+   * Firefox backend reports them.
    */
   private async withSavedAssets({
     page,
@@ -1204,17 +1221,17 @@ export class ManagedExecutorWorkerRuntime {
   }): Promise<Record<string, BrowserJson>> {
     const savedAssets: SavedAsset[] = []
     const failedAssets: FailedAsset[] = []
+    const attempted = assets.slice(0, MAX_SAVED_ASSETS)
     let savedBytes = 0
-    let base64Bytes = 0
 
-    for (const asset of assets.slice(0, MAX_SAVED_ASSETS)) {
+    for (const asset of attempted) {
       const src = asset.currentSrc || asset.src
       const failure = (reason: string): void => {
         failedAssets.push({ src, reason })
       }
       try {
-        if (savedBytes >= MAX_SAVED_ASSET_TOTAL_BYTES) {
-          failure(`saving stopped: the ${MAX_SAVED_ASSET_TOTAL_BYTES} byte per-request image budget is used up`)
+        if (savedBytes >= MAX_SAVED_ASSET_REQUEST_BYTES) {
+          failure(`saving stopped: the ${MAX_SAVED_ASSET_REQUEST_BYTES} byte per-request saved-image budget is already used up`)
           continue
         }
         const fetched = await this.fetchAssetBytes({ page, url: src, deadline })
@@ -1227,31 +1244,29 @@ export class ManagedExecutorWorkerRuntime {
           failure(`unsupported image type ${fetched.mimeType}`)
           continue
         }
-        if (savedBytes + bytes > MAX_SAVED_ASSET_TOTAL_BYTES) {
-          failure(`image of ${bytes} bytes would exceed the ${MAX_SAVED_ASSET_TOTAL_BYTES} byte per-request image budget`)
-          continue
-        }
-        if (base64Bytes + fetched.base64.length > MAX_SAVED_ASSET_BASE64_BYTES) {
-          failure(`image of ${bytes} bytes would exceed the response payload budget; save fewer images per request`)
+        if (savedBytes + bytes > MAX_SAVED_ASSET_REQUEST_BYTES) {
+          failure(`image of ${bytes} bytes would exceed the ${MAX_SAVED_ASSET_REQUEST_BYTES} byte per-request saved-image budget`)
           continue
         }
         savedAssets.push({
           base64: fetched.base64,
           mimeType: fetched.mimeType,
           src,
+          ...sourceUrls({ asset }),
           ...(asset.alt ? { alt: asset.alt } : {}),
         })
         savedBytes += bytes
-        base64Bytes += fetched.base64.length
       } catch (error) {
         failure(errorMessage(error))
       }
     }
 
+    const notFetched = assets.length - attempted.length
     return {
       ...value,
       savedAssets,
       ...(failedAssets.length > 0 ? { failedAssets } : {}),
+      ...(notFetched > 0 ? { assetsNotFetched: notFetched } : {}),
     }
   }
 
@@ -1260,7 +1275,9 @@ export class ManagedExecutorWorkerRuntime {
    * cookies and origin, which is what same-origin and CORS-enabled images need;
    * a page-side refusal — cross-origin without CORS headers, or the page's own
    * CSP — falls back to a Node-side fetch, which sends no cookies but reaches
-   * public CDNs.
+   * public CDNs. The fallback never touches a loopback, private or link-local
+   * address: without that bound a page could name any URL in its markup and
+   * have the runtime probe the machine and its network for it.
    */
   private async fetchAssetBytes({
     page,
@@ -1281,6 +1298,11 @@ export class ManagedExecutorWorkerRuntime {
       return { base64: fetched.base64, mimeType: resolveAssetMimeType({ declared: fetched.mimeType, url }) }
     } catch (error) {
       pageFailure = errorMessage(error)
+    }
+    if (isPrivateAssetFetchHost({ url })) {
+      throw new Error(
+        `page fetch failed (${pageFailure}); the runtime will not fetch a loopback, private or link-local address on the page's behalf`,
+      )
     }
     try {
       const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) })
@@ -2041,6 +2063,150 @@ function resolveAssetMimeType({ declared, url }: { declared?: string | null; url
   const dot = lastSegment.lastIndexOf('.')
   const extension = dot === -1 ? '' : lastSegment.slice(dot + 1).toLowerCase()
   return ASSET_MIME_TYPE_EXTENSIONS[extension] ?? normalized
+}
+
+/**
+ * Every URL the page names this image by: the `src` attribute and the srcset
+ * candidate whose bytes were fetched. Only attached when they differ, because
+ * the fetch URL always travels as `src`.
+ */
+function sourceUrls({ asset }: { asset: ExtractedAsset }): { sourceUrls?: string[] } {
+  const urls = Array.from(new Set([asset.src, asset.currentSrc])).filter((url) => {
+    return url.length > 0
+  })
+  return urls.length > 1 ? { sourceUrls: urls } : {}
+}
+
+/** Address ranges the runtime-side fetch must not reach: "this host", private, loopback, link-local. */
+const BLOCKED_IPV4_RANGES: Array<{ address: number; prefixBits: number }> = [
+  { address: ipv4Address({ a: 0, b: 0, c: 0, d: 0 }), prefixBits: 8 },
+  { address: ipv4Address({ a: 10, b: 0, c: 0, d: 0 }), prefixBits: 8 },
+  { address: ipv4Address({ a: 127, b: 0, c: 0, d: 0 }), prefixBits: 8 },
+  { address: ipv4Address({ a: 169, b: 254, c: 0, d: 0 }), prefixBits: 16 },
+  { address: ipv4Address({ a: 172, b: 16, c: 0, d: 0 }), prefixBits: 12 },
+  { address: ipv4Address({ a: 192, b: 168, c: 0, d: 0 }), prefixBits: 16 },
+]
+
+function ipv4Address({ a, b, c, d }: { a: number; b: number; c: number; d: number }): number {
+  return a * 256 ** 3 + b * 256 ** 2 + c * 256 + d
+}
+
+function isBlockedIpv4Address(address: number): boolean {
+  return BLOCKED_IPV4_RANGES.some((range) => {
+    const block = 2 ** (32 - range.prefixBits)
+    return Math.floor(address / block) === Math.floor(range.address / block)
+  })
+}
+
+/**
+ * Whether the runtime-side fallback fetch would reach the machine itself or a
+ * private network. The URL is page-derived, so only what a page can name
+ * literally is checked: an IPv4 host, a bracketed IPv6 host with its loopback,
+ * unspecified, unique-local, link-local and IPv4-mapped forms, and `localhost`
+ * with its subdomains. Short, decimal, hexadecimal and octal IPv4 spellings
+ * (`127.1`, `2130706433`, `0x7f000001`) do not need their own checks: the URL
+ * parser normalizes every one of them to a dotted quad, which is what the
+ * range check below reads.
+ *
+ * Boundaries: a public host name that resolves to a private address is not
+ * caught here — that needs a resolution-time check with its own rebinding
+ * window, while the page-side fetch can reach such an origin with the page's
+ * own credentials anyway; the runtime only declines to do it on the page's
+ * behalf. A redirect from a public URL to a private one is followed for the
+ * same reason the fallback exists: refusing redirects would break the CDNs it
+ * is here for.
+ */
+function isPrivateAssetFetchHost({ url }: { url: string }): boolean {
+  let host: string
+  try {
+    host = new URL(url).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1)
+  }
+  if (host === 'localhost' || host.endsWith('.localhost')) {
+    return true
+  }
+  if (host.includes(':')) {
+    return isPrivateIpv6Host({ host })
+  }
+  const address = parseIpv4Literal({ host })
+  return address === null ? false : isBlockedIpv4Address(address)
+}
+
+function isPrivateIpv6Host({ host }: { host: string }): boolean {
+  const groups = parseIpv6Groups({ host })
+  if (!groups) {
+    return false
+  }
+  // fe80::/10 link-local and fc00::/7 unique-local by their leading bits.
+  const leading = groups[0]
+  if ((leading & 0xffc0) === 0xfe80 || (leading & 0xfe00) === 0xfc00) {
+    return true
+  }
+  // `::`, `::1` and the IPv4-mapped/compatible forms carry their host in the
+  // low 32 bits; `::` reads as 0.0.0.0 and `::1` lands inside 0.0.0.0/8.
+  const carriesIpv4 = groups[5] === 0 || groups[5] === 0xffff
+  if (!carriesIpv4 || !groups.slice(0, 5).every((group) => { return group === 0 })) {
+    return false
+  }
+  return isBlockedIpv4Address(groups[6] * 65536 + groups[7])
+}
+
+/** The eight 16-bit groups of an IPv6 literal, or null when the host is not one. */
+function parseIpv6Groups({ host }: { host: string }): number[] | null {
+  const halves = host.split('::')
+  if (halves.length > 2) {
+    return null
+  }
+  const head = parseIpv6GroupsPart({ part: halves[0] })
+  const tail = halves.length === 2 ? parseIpv6GroupsPart({ part: halves[1] }) : []
+  if (!head || !tail) {
+    return null
+  }
+  if (halves.length === 1) {
+    return head.length === 8 ? head : null
+  }
+  if (head.length + tail.length > 7) {
+    return null
+  }
+  return [...head, ...Array.from({ length: 8 - head.length - tail.length }, () => { return 0 }), ...tail]
+}
+
+function parseIpv6GroupsPart({ part }: { part: string }): number[] | null {
+  if (part.length === 0) {
+    return []
+  }
+  const groups: number[] = []
+  for (const group of part.split(':')) {
+    if (group.length === 0 || group.length > 4 || !/^[0-9a-f]+$/.test(group)) {
+      return null
+    }
+    groups.push(Number.parseInt(group, 16))
+  }
+  return groups
+}
+
+/** The dotted-quad value of an IPv4 host, or null when the host is not one. */
+function parseIpv4Literal({ host }: { host: string }): number | null {
+  const parts = host.split('.')
+  if (parts.length !== 4) {
+    return null
+  }
+  let address = 0
+  for (const part of parts) {
+    if (!/^[0-9]{1,3}$/.test(part)) {
+      return null
+    }
+    const value = Number.parseInt(part, 10)
+    if (value > 255) {
+      return null
+    }
+    address = address * 256 + value
+  }
+  return address
 }
 
 /**

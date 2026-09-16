@@ -4585,6 +4585,69 @@ describe('managed Firefox image bytes over the extension connection', () => {
       fs.rmSync(dataDir, { recursive: true, force: true })
     }
   })
+
+  test("asks the extension for nothing when the caller only wants image URLs", async () => {
+    const dataDir = createExecutorTestDirectory('firefox-images-urls-data-')
+    const previousDataDir = process.env.PI_BROWSER_DATA_DIR
+    process.env.PI_BROWSER_DATA_DIR = dataDir
+    const relay = await startTrackedRelay()
+    try {
+      const extension = await connectTrackedExtension({
+        port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+      })
+      extension.sendInventory(firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }))
+      await waitForCondition(() => {
+        return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+      }, { message: 'Firefox inventory accepted' })
+
+      const html = firefoxImageDocument()
+      extension.onDomRequest = (request) => {
+        if (request.command.method === 'evaluate') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: { items: [firefoxPageImage()] },
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        if (request.command.method === 'page' && request.command.action === 'content') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: html,
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        return { requestId: request.requestId, ok: true, data: { value: null } }
+      }
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+
+      const response = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-images-urls-live',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'urls' },
+      } })
+
+      const result = response.body as BrowserResponse
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        throw new Error(`expected a successful Firefox page.extract with image URLs, got ${JSON.stringify(result)}`)
+      }
+      expect(result.data.text).toBe(full.text)
+      expect(result.data.value).toMatchObject({
+        assetCount: 1,
+        assets: [{ src: FIREFOX_IMAGE_URL, alt: 'Chart' }],
+      })
+      // A listing moves no bytes: the extension never sees the channel method.
+      expect(extension.assetRequests).toEqual([])
+      expect(JSON.stringify(result.data)).not.toContain('savedAssets')
+      expect(fs.existsSync(path.join(dataDir, 'artifacts'))).toBe(false)
+    } finally {
+      if (previousDataDir === undefined) {
+        delete process.env.PI_BROWSER_DATA_DIR
+      } else {
+        process.env.PI_BROWSER_DATA_DIR = previousDataDir
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
 })
 
 /**
@@ -4918,6 +4981,117 @@ describe('managed page.extract images', () => {
       const modelPayload = JSON.stringify(response.data)
       expect(modelPayload).not.toContain('savedAssets')
       expect(modelPayload).not.toContain(imageBytes.toString('base64'))
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('rewrites the src attribute URL of an image whose bytes came from its srcset candidate', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-srcset-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'srcset-docs.md')
+    const attributeUrl = 'https://cdn.example.com/photo.jpg'
+    const candidateUrl = 'https://cdn.example.com/photo-2x.jpg'
+    const imageBytes = Buffer.from('photo-bytes')
+    // The body keeps the `src` attribute while the browser fetched the srcset
+    // candidate, which is the gap this covers.
+    const artifactText = `# Photos\n\n![Photo](${attributeUrl})\n\ncaption\n`
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: `# Photos\n\n![Photo](${attributeUrl})`,
+            value: {
+              format: request.operation.format,
+              truncated: false,
+              totalBytes: Buffer.byteLength(artifactText, 'utf8'),
+              assetCount: 1,
+              savedAssets: [{
+                base64: imageBytes.toString('base64'),
+                mimeType: 'image/png',
+                src: candidateUrl,
+                sourceUrls: [attributeUrl, candidateUrl],
+                alt: 'Photo',
+              }],
+              artifactText,
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-images-srcset',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      const [stored] = response.data.artifacts ?? []
+      // The descriptor names the URL the bytes came from, and both spellings of
+      // the image point at the file the bytes were written to.
+      expect(stored).toMatchObject({ mimeType: 'image/png', label: 'Photo', sourceUrl: candidateUrl })
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(`# Photos\n\n![Photo](${stored.path})\n\ncaption\n`)
+      expect(response.data.text).toBe(`# Photos\n\n![Photo](${stored.path})`)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('refuses a malformed URL list instead of trusting it', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-urls-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: 'body',
+            value: {
+              format: request.operation.format,
+              truncated: false,
+              totalBytes: 4,
+              savedAssets: [{
+                base64: Buffer.from('bytes').toString('base64'),
+                mimeType: 'image/png',
+                src: 'https://cdn.example.com/chart.png',
+                sourceUrls: ['https://cdn.example.com/chart.png', 7],
+              }],
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-images-bad-urls',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', images: 'save' },
+      })
+
+      expect(response).toMatchObject({
+        ok: false,
+        error: { code: 'internal-error', message: 'page.extract savedAssets[0] has a malformed URL list', outcome: 'unknown' },
+      })
+      expect(fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []).toEqual([])
     } finally {
       await relay.dispose()
       fs.rmSync(directory, { recursive: true, force: true })

@@ -531,11 +531,27 @@ function resolveWorkerPath(): string {
   return fs.existsSync(compiled) ? compiled : path.join(directory, 'firefox-executor-worker.ts')
 }
 
+/**
+ * Heap ceiling for one Firefox worker. A single asset batch arrives whole: the
+ * extension answers up to MAX_FIREFOX_ASSET_TOTAL_BYTES (64 MiB) of image
+ * bytes as base64, which is ~85 MiB of text per copy. The worker keeps that
+ * text alive at least twice at the peak — the parsed `asset-response` payload
+ * it answers from, plus the stringified copy its own frame-budget check builds
+ * and again for the outgoing response — so a full-budget batch needs roughly
+ * 170-260 MiB before the execution realm and the extraction pipeline are
+ * counted. The previous 128 MB ceiling killed the worker on exactly that
+ * batch, and an OOM loses the whole extraction as outcome-unknown instead of
+ * one image. Lowering the byte budget instead would not help: the batch still
+ * arrives in full, so the receive side has to fit either way.
+ */
+const FIREFOX_WORKER_MAX_OLD_SPACE_MB = 512
+
 function workerArguments(workerPath: string): string[] {
+  const limit = `--max-old-space-size=${FIREFOX_WORKER_MAX_OLD_SPACE_MB}`
   if (workerPath.endsWith('.js')) {
-    return ['--max-old-space-size=128']
+    return [limit]
   }
-  return ['--max-old-space-size=128', '--import', import.meta.resolve('tsx')]
+  return [limit, '--import', import.meta.resolve('tsx')]
 }
 
 async function terminateWorker(child: childProcess.ChildProcess): Promise<void> {

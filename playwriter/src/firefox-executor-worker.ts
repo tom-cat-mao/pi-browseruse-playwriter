@@ -68,23 +68,33 @@ interface AssetOutcomes {
 
 /** Cap on the manifest itself; only MAX_FIREFOX_ASSET_COUNT images may be fetched. */
 const MAX_MANIFEST_ASSETS = 200
+/** Model-facing budget for the serialized manifest, aligned with the Chrome backend and the extract preview. */
+const MAX_MANIFEST_BYTES = 40_000
+/** Field clamps, aligned with the Chrome backend's page-side image read. */
+const MAX_MANIFEST_URL_LENGTH = 2_048
+const MAX_MANIFEST_SRCSET_LENGTH = 2_048
+const MAX_MANIFEST_ALT_LENGTH = 512
 const ASSET_SCHEME_REASON = 'unsupported image URL scheme: only http(s) images can be saved'
 
 /**
  * Runs through the existing DOM `evaluate` command, the same page-side path
  * `page.evaluate` uses, so the manifest reports what the page actually shows
- * (currentSrc after srcset selection) rather than only markup.
+ * (currentSrc after srcset selection) rather than only markup. Fields are
+ * clamped in the page for the same reason the Chrome backend clamps them
+ * there: a page with a huge `srcset` on every image must not turn one DOM read
+ * into a message that exceeds the transport budget and fails the extraction.
  */
 const ENUMERATE_IMAGES_CODE = `
+  const clip = (value, max) => (value.length > max ? value.slice(0, max) : value);
   return {
     items: Array.from(document.images).map((image) => {
       const currentSrc = typeof image.currentSrc === 'string' ? image.currentSrc : '';
       const src = typeof image.src === 'string' ? image.src : '';
       return {
-        src: currentSrc || src,
-        currentSrc,
-        srcset: image.getAttribute('srcset') || '',
-        alt: image.getAttribute('alt') || '',
+        src: clip(currentSrc || src, ${MAX_MANIFEST_URL_LENGTH}),
+        currentSrc: clip(currentSrc, ${MAX_MANIFEST_URL_LENGTH}),
+        srcset: clip(image.getAttribute('srcset') || '', ${MAX_MANIFEST_SRCSET_LENGTH}),
+        alt: clip(image.getAttribute('alt') || '', ${MAX_MANIFEST_ALT_LENGTH}),
         naturalWidth: Number.isFinite(image.naturalWidth) ? image.naturalWidth : 0,
         naturalHeight: Number.isFinite(image.naturalHeight) ? image.naturalHeight : 0,
       };
@@ -679,12 +689,19 @@ function failedAssetJson(asset: FailedAsset): BrowserJson {
   return { src: asset.src, reason: asset.reason }
 }
 
+/**
+ * Read the page's image inventory into the model-facing manifest: clamped
+ * fields, the entry cap and the byte budget the Chrome backend applies too, so
+ * a gallery page cannot hand the model a payload larger than any other
+ * extraction. A manifest cut by either bound reports itself as truncated.
+ */
 function readAssetManifest({ value }: { value: unknown }): AssetManifest {
   const items = isRecord(value) && Array.isArray(value.items) ? value.items : undefined
   if (!items) {
     throw new Error('Firefox returned no image manifest for this page')
   }
   const entries: AssetManifestEntry[] = []
+  let bytes = 0
   let truncated = false
   for (const item of items) {
     if (!isRecord(item) || typeof item.src !== 'string' || typeof item.currentSrc !== 'string') {
@@ -699,16 +716,27 @@ function readAssetManifest({ value }: { value: unknown }): AssetManifest {
       truncated = true
       break
     }
-    entries.push({
-      src,
-      currentSrc: item.currentSrc.trim(),
-      srcset: typeof item.srcset === 'string' ? item.srcset.trim() : '',
-      alt: typeof item.alt === 'string' ? item.alt.trim() : '',
+    const entry: AssetManifestEntry = {
+      src: clampAssetField({ value: src, maximum: MAX_MANIFEST_URL_LENGTH }),
+      currentSrc: clampAssetField({ value: item.currentSrc.trim(), maximum: MAX_MANIFEST_URL_LENGTH }),
+      srcset: typeof item.srcset === 'string' ? clampAssetField({ value: item.srcset.trim(), maximum: MAX_MANIFEST_SRCSET_LENGTH }) : '',
+      alt: typeof item.alt === 'string' ? clampAssetField({ value: item.alt.trim(), maximum: MAX_MANIFEST_ALT_LENGTH }) : '',
       naturalWidth: naturalDimension(item.naturalWidth),
       naturalHeight: naturalDimension(item.naturalHeight),
-    })
+    }
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8') + 1
+    if (bytes + entryBytes > MAX_MANIFEST_BYTES) {
+      truncated = true
+      break
+    }
+    entries.push(entry)
+    bytes += entryBytes
   }
   return { assets: entries, truncated }
+}
+
+function clampAssetField({ value, maximum }: { value: string; maximum: number }): string {
+  return value.length > maximum ? value.slice(0, maximum) : value
 }
 
 function naturalDimension(value: unknown): number {

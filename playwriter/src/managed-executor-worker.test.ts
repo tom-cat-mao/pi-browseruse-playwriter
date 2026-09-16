@@ -1,6 +1,5 @@
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
-import net from 'node:net'
 import type { Browser, BrowserContext, Page } from '@xmorse/playwright-core'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import type { BrowserPageOperation, BrowserRequest, BrowserResponse, BrowserTab, ManagedExecution } from './browser-protocol.js'
@@ -168,9 +167,13 @@ class FakePage extends EventEmitter {
 /** Serve image bytes over real HTTP for the worker-side fetch fallback. */
 async function serveImage({ body, contentType }: { body: Uint8Array; contentType: string }): Promise<{
   url: string
+  /** Requests the server answered, so a test can prove a fetch never happened. */
+  hits: () => number
   close: () => Promise<void>
 }> {
+  let hits = 0
   const server = http.createServer((_request, response) => {
+    hits += 1
     response.writeHead(200, { 'content-type': contentType })
     response.end(body)
   })
@@ -181,6 +184,9 @@ async function serveImage({ body, contentType }: { body: Uint8Array; contentType
   const port = typeof address === 'object' && address ? address.port : 0
   return {
     url: `http://127.0.0.1:${port}/image.png`,
+    hits: () => {
+      return hits
+    },
     close: async () => {
       await new Promise<void>((resolve) => {
         server.close(() => {
@@ -189,22 +195,6 @@ async function serveImage({ body, contentType }: { body: Uint8Array; contentType
       })
     },
   }
-}
-
-/** A port nothing listens on, so a fetch to it fails the way an offline URL does. */
-async function reserveClosedPort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const server = net.createServer()
-    server.unref()
-    server.on('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      const port = typeof address === 'object' && address ? address.port : 0
-      server.close(() => {
-        resolve(port)
-      })
-    })
-  })
 }
 
 class FakeContext extends EventEmitter {
@@ -677,20 +667,80 @@ describe('managed executor page.extract images', () => {
       { base64: Buffer.from('<svg/>').toString('base64'), mimeType: 'image/svg+xml', src: 'https://cdn.example.com/logo.svg' },
     ])
     expect(response.data.value).not.toHaveProperty('failedAssets')
-    expect(response.data.value).not.toHaveProperty('assets')
+    // A save reports the same inventory a listing does, so the caller sees what
+    // was there next to what was saved.
+    expect(response.data.value).toMatchObject({
+      assetCount: 2,
+      assets: [
+        { src: 'https://cdn.example.com/chart.png', currentSrc: '', alt: 'Chart' },
+        { src: 'https://cdn.example.com/logo.svg', currentSrc: '', alt: '' },
+      ],
+    })
+    expect(response.data.value).not.toHaveProperty('assetsTruncated')
+    expect(response.data.value).not.toHaveProperty('assetsNotFetched')
     expect(page.pageFetchCredentials).toEqual(['include', 'include'])
     // Image bytes travel to the relay, never on the model-inline image channel.
     expect(response.data.images).toBeUndefined()
   })
 
-  test('falls back to a node fetch when the page refuses and never lets one image fail the request', async () => {
-    const served = await serveImage({ body: new Uint8Array(Buffer.from('remote-bytes')), contentType: 'image/webp' })
-    const closedPort = await reserveClosedPort()
+  test('names every URL of a saved image so the relay can rewrite the one the body kept', async () => {
+    const page = new FakePage('target-1')
+    page.images = [{
+      src: 'https://cdn.example.com/photo.jpg',
+      currentSrc: 'https://cdn.example.com/photo-2x.jpg',
+      srcset: 'photo.jpg 1x, photo-2x.jpg 2x',
+      alt: 'Photo',
+    }]
+    page.pageFetchable.set('https://cdn.example.com/photo-2x.jpg', {
+      body: new Uint8Array(Buffer.from('photo-bytes')),
+      contentType: 'image/png',
+    })
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    // The srcset candidate is what a fetch can use; the `src` attribute is what
+    // the extracted body usually keeps.
+    expect((response.data.value as Record<string, unknown>).savedAssets).toEqual([{
+      base64: Buffer.from('photo-bytes').toString('base64'),
+      mimeType: 'image/png',
+      src: 'https://cdn.example.com/photo-2x.jpg',
+      sourceUrls: ['https://cdn.example.com/photo.jpg', 'https://cdn.example.com/photo-2x.jpg'],
+      alt: 'Photo',
+    }])
+    expect(page.pageFetchUrls).toEqual(['https://cdn.example.com/photo-2x.jpg'])
+  })
+
+  test('refuses a private or loopback image in the node fallback instead of letting a page probe the network', async () => {
+    const served = await serveImage({ body: new Uint8Array(Buffer.from('intranet-bytes')), contentType: 'image/png' })
     try {
       const page = new FakePage('target-1')
-      const unreachable = `http://127.0.0.1:${closedPort}/missing.png`
-      page.images = [{ src: served.url, alt: 'Servable' }, { src: unreachable }]
-      page.pageFetchBlocked.add(served.url)
+      const blocked = [
+        // A reachable loopback server: only the guard keeps the fallback from hitting it.
+        served.url,
+        'http://10.1.2.3/internal.png',
+        'http://172.16.4.4/private.png',
+        'http://192.168.1.1/router.png',
+        'http://169.254.169.254/latest/meta-data.png',
+        'http://0.0.0.0/zero.png',
+        'http://[::1]/v6.png',
+        'http://[::ffff:127.0.0.1]/mapped.png',
+        'http://[fd00::1]/unique-local.png',
+        'http://2130706433/decimal.png',
+        'http://0x7f000001/hex.png',
+        'http://0177.0.0.1/octal.png',
+        'http://localhost/loc.png',
+        'http://metadata.localhost/loc.png',
+      ]
+      page.images = blocked.map((src) => { return { src } })
+      for (const src of blocked) {
+        page.pageFetchBlocked.add(src)
+      }
 
       const response = await executeWithPage({
         page,
@@ -701,23 +751,46 @@ describe('managed executor page.extract images', () => {
       }
 
       const value = response.data.value as Record<string, unknown>
-      expect(value.savedAssets).toEqual([
-        {
-          base64: Buffer.from('remote-bytes').toString('base64'),
-          mimeType: 'image/webp',
-          src: served.url,
-          alt: 'Servable',
-        },
-      ])
+      expect(value.savedAssets).toEqual([])
       const failed = value.failedAssets as Array<{ src: string; reason: string }>
-      expect(failed).toHaveLength(1)
-      expect(failed[0].src).toBe(unreachable)
-      expect(failed[0].reason).toContain('page fetch failed (Failed to fetch)')
-      expect(failed[0].reason).toContain('node fetch failed')
-      expect(page.pageFetchCredentials).toEqual(['include', 'include'])
+      expect(failed.map((entry) => { return entry.src })).toEqual(blocked)
+      for (const entry of failed) {
+        expect(entry.reason).toContain('page fetch failed (Failed to fetch)')
+        expect(entry.reason).toContain('will not fetch a loopback, private or link-local address')
+      }
+      // The guard runs before the request: the loopback server never saw one.
+      expect(served.hits()).toBe(0)
+      expect(page.pageFetchUrls).toEqual(blocked)
     } finally {
       await served.close()
     }
+  })
+
+  test('leaves a public image to the node fallback instead of refusing it as private', async () => {
+    const page = new FakePage('target-1')
+    // The reserved `.invalid` TLD never resolves, so the fallback fails fast
+    // and for a reason that proves the guard let the URL through: it is a
+    // fetch failure, not a refusal.
+    const publicUrl = 'http://cdn.example.invalid/image.png'
+    const unreachable = 'http://127.0.0.1:9/missing.png'
+    page.images = [{ src: publicUrl }, { src: unreachable }]
+    page.pageFetchBlocked.add(publicUrl)
+    page.pageFetchBlocked.add(unreachable)
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    const failed = (response.data.value as Record<string, unknown>).failedAssets as Array<{ src: string; reason: string }>
+    expect(failed.map((entry) => { return entry.src })).toEqual([publicUrl, unreachable])
+    expect(failed[0].reason).toContain('page fetch failed (Failed to fetch)')
+    expect(failed[0].reason).toContain('node fetch failed')
+    expect(failed[0].reason).not.toContain('will not fetch a loopback, private or link-local address')
+    expect(failed[1].reason).toContain('will not fetch a loopback, private or link-local address')
   })
 
   test('bounds the manifest to its entry cap and the saved set to its image cap', async () => {
@@ -750,7 +823,47 @@ describe('managed executor page.extract images', () => {
       throw new Error('expected a successful page.extract')
     }
     expect((saved.data.value as Record<string, unknown>).savedAssets as unknown[]).toHaveLength(20)
+    // The manifest holds 200 of the 205 images, and the save bound leaves the
+    // rest of them untried — counted, not silently dropped.
+    expect((saved.data.value as Record<string, unknown>).assetsNotFetched).toBe(180)
     expect(page.pageFetchUrls).toHaveLength(20)
+  })
+
+  test('bounds the manifest by its model-facing byte budget, not only by its entry cap', async () => {
+    const page = new FakePage('target-1')
+    /** Long URLs and long alt text, so the manifest is cut by bytes well before 200 entries. */
+    const longPath = 'deeply-nested-segment/'.repeat(8)
+    const longAlt = 'a caption that a page can make arbitrarily long '.repeat(4)
+    page.images = Array.from({ length: 200 }, (_unused, index) => {
+      return { src: `https://cdn.example.com/${index}/${longPath}image-${index}.png`, alt: longAlt }
+    })
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'assets-manifest' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful assets-manifest extraction')
+    }
+
+    const value = response.data.value as Record<string, unknown>
+    const assets = value.assets as Array<Record<string, unknown>>
+    const entryBytes = (asset: Record<string, unknown>): number => {
+      return Buffer.byteLength(JSON.stringify(asset), 'utf8') + 1
+    }
+    expect(assets.length).toBeGreaterThan(0)
+    expect(assets.length).toBeLessThan(200)
+    expect(assets.length).toBe(value.assetCount)
+    expect(value.assetsTruncated).toBe(true)
+    expect(assets.reduce((total, asset) => { return total + entryBytes(asset) }, 0)).toBeLessThanOrEqual(40_000)
+    // The entry the budget stopped at is the one that would have crossed it.
+    const omitted = page.images[assets.length]
+    const omittedBytes = entryBytes({
+      src: omitted.src, currentSrc: '', srcset: '', alt: omitted.alt, naturalWidth: 0, naturalHeight: 0,
+    })
+    const listedBytes = assets.reduce((total, asset) => { return total + entryBytes(asset) }, 0)
+    expect(listedBytes + omittedBytes).toBeGreaterThan(40_000)
+    expect(response.data.text).toContain('images found (listing the first ones)')
   })
 
   test('reports every image it cannot persist instead of failing the whole extraction', async () => {
@@ -802,7 +915,40 @@ describe('managed executor page.extract images', () => {
     ])
     expect(failed[0].reason).toBe('unsupported image type image/avif')
     expect(failed[1].reason).toBe('image of 16777217 bytes exceeds the 16777216 byte per-image limit')
-    expect(failed[2].reason).toContain('would exceed the response payload budget')
+    // The request budget is what stops the third image, and it says so: the
+    // image is not saved because the response cannot carry it, not because the
+    // caller asked for too many images.
+    expect(failed[2].reason).toBe('image of 2097152 bytes would exceed the 3145728 byte per-request saved-image budget')
+  })
+
+  test('reports a request that has used up its image budget without fetching more bytes', async () => {
+    const page = new FakePage('target-1')
+    page.images = [
+      { src: 'https://cdn.example.com/first.png' },
+      { src: 'https://cdn.example.com/second.png' },
+      { src: 'https://cdn.example.com/third.png' },
+    ]
+    // Two images of 1.5 MiB fill the 3 MiB request budget exactly.
+    for (const image of page.images) {
+      page.pageFetchable.set(image.src, { body: new Uint8Array(3 * 1024 * 1024 / 2), contentType: 'image/png' })
+    }
+
+    const response = await executeWithPage({
+      page,
+      operation: { kind: 'page.extract', tabId: 'tab-1', format: 'markdown', images: 'save' },
+    })
+    if (!response.ok) {
+      throw new Error('expected a successful page.extract')
+    }
+
+    const value = response.data.value as Record<string, unknown>
+    expect(value.savedAssets as unknown[]).toHaveLength(2)
+    expect(value.failedAssets).toEqual([{
+      src: 'https://cdn.example.com/third.png',
+      reason: 'saving stopped: the 3145728 byte per-request saved-image budget is already used up',
+    }])
+    // An image that cannot be carried is not fetched either.
+    expect(page.pageFetchUrls).toEqual(['https://cdn.example.com/first.png', 'https://cdn.example.com/second.png'])
   })
 
   test('refuses an image whose declared size is already over the limit without reading it', async () => {

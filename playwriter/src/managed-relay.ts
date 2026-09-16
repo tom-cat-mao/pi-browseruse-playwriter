@@ -1800,6 +1800,7 @@ function readSavedAsset({ value, index }: { value: BrowserJson; index: number })
   base64: string
   mimeType: string
   src: string
+  sourceUrls?: string[]
   alt?: string
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1807,22 +1808,38 @@ function readSavedAsset({ value, index }: { value: BrowserJson; index: number })
       code: 'internal-error', message: `page.extract savedAssets[${index}] is not an object`, outcome: 'unknown',
     })
   }
-  const { base64, mimeType, src, alt } = value
+  const { base64, mimeType, src, alt, sourceUrls } = value
   if (typeof base64 !== 'string' || typeof mimeType !== 'string' || typeof src !== 'string' ||
     (alt !== undefined && typeof alt !== 'string')) {
     throw new ManagedTransportError({
       code: 'internal-error', message: `page.extract savedAssets[${index}] is missing its image payload`, outcome: 'unknown',
     })
   }
-  return { base64, mimeType, src, ...(typeof alt === 'string' && alt ? { alt } : {}) }
+  if (sourceUrls !== undefined && (!Array.isArray(sourceUrls) || sourceUrls.length > MAX_SAVED_ASSET_URLS ||
+    !sourceUrls.every((url) => { return typeof url === 'string' && url.length > 0 && url.length <= MAX_SAVED_ASSET_URL_LENGTH }))) {
+    throw new ManagedTransportError({
+      code: 'internal-error', message: `page.extract savedAssets[${index}] has a malformed URL list`, outcome: 'unknown',
+    })
+  }
+  return {
+    base64, mimeType, src,
+    ...(sourceUrls !== undefined ? { sourceUrls: sourceUrls as string[] } : {}),
+    ...(typeof alt === 'string' && alt ? { alt } : {}),
+  }
 }
+
+/** Bounds on the URL list a saved image may carry, one entry per spelling the page uses. */
+const MAX_SAVED_ASSET_URLS = 8
+const MAX_SAVED_ASSET_URL_LENGTH = 8_192
 
 /**
  * Point every stored image URL at the artifact it was written to. Matching on
  * `](url` — the Markdown image destination — is an exact replacement of the URL
  * the relay actually fetched, independent of whether the extraction pipeline
  * normalized or escaped the alt text, and tolerant of a link title after the
- * URL. URLs that never reached the store are left as they are.
+ * URL. A page names one image by more than one URL (its `src` attribute and the
+ * srcset candidate the browser chose), so every spelling the browser reported
+ * is rewritten. URLs that never reached the store are left as they are.
  */
 function rewriteStoredImageUrls({ text, replacements }: { text: string; replacements: Map<string, string> }): string {
   let result = text
@@ -2849,7 +2866,11 @@ export class ManagedRelay {
           sessionId,
         })
         artifacts.push(artifact)
-        replacements.set(asset.src, artifact.path)
+        // The body may name this image by any of its URLs, so every one of
+        // them points at the artifact the bytes were written to.
+        for (const url of [asset.src, ...(asset.sourceUrls ?? [])]) {
+          replacements.set(url, artifact.path)
+        }
       } catch (error) {
         if (!(error instanceof ArtifactStoreError)) {
           throw error
