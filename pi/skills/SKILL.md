@@ -22,8 +22,9 @@ by URL or title. Everything is addressed by id:
   A `profileId` is required to create a group; a profile must be `connected`.
   Read its `capabilities`: a Firefox profile advertises `backend: webextension`,
   `inputMode: dom`, `snapshotMode: dom-aria`, `executeMode: dom-compatible`,
-  `evaluateWorld: isolated`, supported operations, and concrete limitations.
-  Older Chrome profiles may omit these optional fields.
+  `evaluateWorld: isolated`, supported operations, an optional `features` matrix
+  (such as which extraction formats and image modes it can serve), and concrete
+  limitations. Older Chrome profiles may omit these optional fields.
 - **Group** — a named tab group owned by *this* Pi session and bound to one fixed
   profile for its lifetime. Create with `browser_groups` (`action:"create"`,
   `name`, `profileId`). Same-name groups are allowed — each has its own `groupId`.
@@ -133,8 +134,8 @@ screenshots are an optional extra for visual/spatial questions.
 
 ## Extracting content (browser_extract)
 
-`browser_extract` (`tabId`, optional `format`, `search`, `offset`, `limit`, `path`)
-returns a tab's **content** instead of its structure.
+`browser_extract` (`tabId`, optional `format`, `images`, `search`, `offset`,
+`limit`, `path`) returns a tab's **content** instead of its structure.
 
 - **extract vs snapshot.** `browser_snapshot` reads the accessibility tree and
   gives you `aria-ref=eN` refs to act on. `browser_extract` reads the content
@@ -144,8 +145,9 @@ returns a tab's **content** instead of its structure.
 - **Format.** `markdown` (default) is what you want for reading and quoting —
   headings, lists, links and tables survive. `text` is the same extraction with
   the Markdown syntax stripped. `html` returns the serialized markup, windowed to
-  the same budget, for when the HTML itself matters. `assets-manifest` is not
-  available yet.
+  the same budget, for when the HTML itself matters. `assets-manifest` returns
+  the page's image listing instead of text — the same manifest `images:"urls"`
+  adds to a normal extraction, for when the question is which images a page has.
 - **A window, not the whole document.** The result reports `truncated` and
   `totalBytes`, and the `extract:` line states when the text is a window of the
   document. `search` keeps only the lines matching a term (with surrounding
@@ -160,14 +162,34 @@ returns a tab's **content** instead of its structure.
   default, or `$PI_BROWSER_DATA_DIR/artifacts`); a path outside it is refused.
   Report the returned path to the user as the durable copy — you never write
   files yourself.
+- **Images: `none` (default) / `urls` / `save`.** `none` leaves every image as a
+  remote URL in the text. `urls` adds the page's image manifest to the result —
+  one entry per image with `src`, `alt`, `width` and `height` — and downloads
+  nothing; the `assets:` line reports the count and the first few, with the rest
+  in the result's `value`. `save` really downloads the images: the runtime writes
+  them into its artifacts directory, rewrites the saved image URLs in the
+  Markdown to those local paths (so the extracted text no longer depends on the
+  site), and reports each file as an artifact with its path, `mimeType`, `bytes`
+  and the image's alt text as `label`. `save` costs time, bandwidth and disk and
+  the runtime caps how many images it keeps, so read the manifest first and only
+  pull bytes the user actually asked for.
+- **Images that could not be saved.** `images:"save"` reports them in
+  `failedAssets` (`src` plus the reason). Those were NOT saved and keep their
+  original remote URL in the text — never say an image was archived without
+  reading the artifact list, and never invent a local path.
 - **Capability differences.** Extraction is served by the target tab's browser
   build, so it is advertised per profile: `browser_profiles` reports each
-  profile's `supportedOperations` and, when the peer has one, its `extract`
-  feature matrix. Chrome profiles serve `page.extract` today. On Firefox it
-  depends on the installed add-on version: a profile that does not advertise
-  `page.extract` makes `browser_extract` fail with a clear error instead of
-  returning an empty extraction — read those pages with `browser_snapshot` /
-  `browser_evaluate`, and do not try to work around it with broader permissions.
+  profile's `supportedOperations` and, when the peer has one, its `extract` and
+  `assets` feature matrices. Chrome profiles serve `page.extract` today. On
+  Firefox it depends on the installed add-on version: a profile that does not
+  advertise `page.extract` makes `browser_extract` fail with a clear error
+  instead of returning an empty extraction — read those pages with
+  `browser_snapshot` / `browser_evaluate`, and do not try to work around it with
+  broader permissions. `images:"urls"`/`"save"` are gated the same way one level
+  deeper: a Firefox profile must advertise the matching mode in
+  `features.assets`, and an add-on that does not is refused before anything is
+  downloaded. Use `images:"none"` there, or ask the user to update that
+  browser's extension.
 
 ## Console logs and network
 
