@@ -215,3 +215,10 @@ disconnecting everything` also fails on clean HEAD (verified via worktree).
 slower than the 10s exec timeout. `relay-session.test.ts > list scripts with
 Debugger class` flakes intermittently (passes on retry).
 Neither is a regression signal for unrelated changes.
+
+## 已知未诊断：Zen Browser 上 tabs.attach 失败
+
+用户实际使用的是 Zen Browser（Firefox 内核），不是官方 Firefox。`tabs.attach` 在真实
+网站上报 `execution-failed / outcome unknown`（masked error），`tabs.create` + snapshot
+正常。用户怀疑与 Zen 的磁贴（Essentials/pinned 类）功能有关。2026-09 决定暂不诊断，
+先记录环境前提：复现时需在 Zen 而非 Firefox 上验证。
