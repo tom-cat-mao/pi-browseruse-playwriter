@@ -1,0 +1,137 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`extractPageContent markdown extraction > extracts a typical article without navigation or promo blocks 1`] = `
+"# How Tidal Bores Reshape Estuaries
+
+*Author: Dana Whitfield | Site: Coastal Review | Published: 2024-11-02T08:30:00Z*
+
+> Tidal bores look like a single wave, but they carry sediment budgets that reshape estuaries over decades.
+
+A tidal bore is the leading edge of an incoming tide travelling up a river against the current. It looks like a single breaking wave, sometimes only a few centimetres high, yet it moves more water than a small river carries in an hour.
+
+Researchers have tracked bores in the Severn, the Qiantang, and the Amazon for decades. The measurements agree on one point: the bore is not just a curiosity of fluid dynamics, it is a sediment pump.
+
+## Why sediment matters
+
+Sediment carried by a bore settles in slack water behind the wave front. Over a season the deposits raise the bed of the channel, which in turn changes where the next bore breaks. The feedback loop is slow but persistent.
+
+- Coarse sand settles first, within hundreds of metres of the front.
+- Fine silt travels further and builds the *fluid mud* layer upstream.
+- Organic matter binds the deposits once vegetation returns.
+
+### Measuring the front
+
+Field teams use pressure transducers and acoustic Doppler profilers to log the passage of a bore. A typical deployment returns a velocity profile such as \`u(z) = u* / k * ln(z / z0)\`, which is then fitted to a log law.
+
+> "The bore does the work of a dredger, and it does it for free. The problem is that we never asked where it puts the material."
+
+## What happens next
+
+Estuary managers now model bores explicitly rather than treating them as noise in the tidal signal. The [third-generation bore model](https://coastal.example/research/bore-model-v3) couples the wave front to bed roughness, and early results suggest the coupling halves the error in long-run deposition forecasts.
+
+The remaining question is biological. If the fluid mud layer thickens, does the benthic community recover between bore seasons, or does it need several quiet years?"
+`;
+
+exports[`extractPageContent markdown extraction > falls back to body scoped extraction when the automatic pass drops replies 1`] = `
+"# Build times doubled after 0.9 upgrade
+
+*Site: Forum*
+
+After upgrading to 0.9 our CI went from 6 minutes to 13 minutes per build. Same runner image, same lockfile except for the upgrade itself. Anyone else seeing this?
+
+I already tried \`--no-cache\` and a clean checkout. The slowdown survives both, which makes me think it is not the cache format change.
+
+We changed the default for \`parallelism\` from \`auto\` to \`2\` in 0.9 because the auto heuristic was oversubscribing small runners. On a 4-core box that halves the concurrency.
+
+Set it back explicitly if your runner is not memory constrained:
+
+\`\`\`
+[build]
+parallelism = "auto"
+\`\`\`
+
+That was it. Confirmed: 13 minutes with \`parallelism = 2\`, 6 minutes with \`auto\`. The release notes mention the change but not the effective difference on 4-core runners."
+`;
+
+exports[`extractPageContent markdown extraction > keeps data tables as markdown pipe tables 1`] = `
+"# Retention policy reference | Storage Docs
+
+> Bucket-level retention tiers, their minimum lock periods and per-object limits.
+
+## Retention policy reference
+
+A retention policy prevents objects from being deleted or overwritten for a fixed period. Policies are set per bucket and apply to every object written afterwards.
+
+## Retention tiers
+
+The table below lists the supported tiers. The minimum lock period is enforced by the service; shorter values are rejected with \`400 InvalidRetentionPeriod\`.
+
+| Tier | Minimum lock | Maximum lock | Object size limit | Early delete fee |
+| --- | --- | --- | --- | --- |
+| \`standard\` | 1 day | 3 years | 5 TiB | none |
+| \`compliance\` | 90 days | 10 years | 5 TiB | prorated storage |
+| \`archive\` | 180 days | 7 years | 500 GiB | retrieval cost |
+
+## Enabling a policy
+
+Set the tier with the CLI and confirm the resulting lock period:
+
+\`\`\`
+storage bucket retention set --bucket media --tier compliance
+storage bucket retention describe --bucket media
+\`\`\`
+
+Policies take effect for new writes only. Objects written before the change keep their previous retention state until it expires, which is why the [migration notes](https://storage.example/docs/retention#migration) recommend a two-week window.
+
+## Limits
+
+- One policy per bucket; changing tiers does not shorten existing locks.
+- Up to 100 lifecycle rules per bucket, each referencing a retention tier.
+- Legal holds override retention and can only be released by an account owner."
+`;
+
+exports[`extractPageContent search windowing > returns the matching line with five lines of context 1`] = `
+"- Fine silt travels further and builds the *fluid mud* layer upstream.
+- Organic matter binds the deposits once vegetation returns.
+
+### Measuring the front
+
+Field teams use pressure transducers and acoustic Doppler profilers to log the passage of a bore. A typical deployment returns a velocity profile such as \`u(z) = u* / k * ln(z / z0)\`, which is then fitted to a log law.
+
+> "The bore does the work of a dredger, and it does it for free. The problem is that we never asked where it puts the material."
+
+## What happens next
+
+[truncated; use search or offset/limit for the rest]"
+`;
+
+exports[`extractPageContent text format > strips markdown syntax and keeps table cells readable 1`] = `
+"# Retention policy reference | Storage Docs
+
+> Bucket-level retention tiers, their minimum lock periods and per-object limits.
+
+Retention policy reference
+
+A retention policy prevents objects from being deleted or overwritten for a fixed period. Policies are set per bucket and apply to every object written afterwards.
+Retention tiers
+
+The table below lists the supported tiers. The minimum lock period is enforced by the service; shorter values are rejected with 400 InvalidRetentionPeriod.
+
+| Tier | Minimum lock | Maximum lock | Object size limit | Early delete fee |
+| --- | --- | --- | --- | --- |
+| standard | 1 day | 3 years | 5 TiB | none |
+| compliance | 90 days | 10 years | 5 TiB | prorated storage |
+| archive | 180 days | 7 years | 500 GiB | retrieval cost |
+Enabling a policy
+
+Set the tier with the CLI and confirm the resulting lock period:
+
+storage bucket retention set --bucket media --tier compliance
+storage bucket retention describe --bucket media
+
+Policies take effect for new writes only. Objects written before the change keep their previous retention state until it expires, which is why the migration notes recommend a two-week window.
+Limits
+One policy per bucket; changing tiers does not shorten existing locks.
+Up to 100 lifecycle rules per bucket, each referencing a retention tier.
+Legal holds override retention and can only be released by an account owner."
+`;

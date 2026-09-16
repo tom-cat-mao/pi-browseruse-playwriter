@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Build times doubled after 0.9 upgrade - Forum</title>
+  </head>
+  <body>
+    <div class="topbar">
+      <a href="/">Forums</a>
+      <a href="/latest">Latest</a>
+      <a href="/top">Top</a>
+      <a href="/login">Log in</a>
+      <form class="search"><input name="q" placeholder="Search posts" /></form>
+    </div>
+
+    <div class="ad-slot ad-slot--leaderboard">
+      <span>Advertisement</span>
+      <a href="https://ads.example.com/click?slot=leaderboard">Build faster with AcmeCI</a>
+    </div>
+
+    <div class="thread">
+      <header class="thread-header">
+        <h1>Build times doubled after 0.9 upgrade</h1>
+        <p class="thread-meta">
+          Started by <a href="/u/quietloop">quietloop</a> on 2025-03-11 &middot;
+          <span class="views">18,402 views</span> &middot;
+          <span class="replies">27 replies</span>
+        </p>
+      </header>
+
+      <div class="post" id="post-1">
+        <div class="post-author">
+          <a href="/u/quietloop">quietloop</a>
+          <span class="badge">Regular</span>
+        </div>
+        <div class="post-body">
+          <p>
+            After upgrading to 0.9 our CI went from 6 minutes to 13 minutes per build. Same runner
+            image, same lockfile except for the upgrade itself. Anyone else seeing this?
+          </p>
+          <p>
+            I already tried <code>--no-cache</code> and a clean checkout. The slowdown survives both,
+            which makes me think it is not the cache format change.
+          </p>
+        </div>
+        <div class="post-footer">
+          <a href="/posts/1/reply">Reply</a>
+          <span class="reactions">12</span>
+        </div>
+      </div>
+
+      <div class="post" id="post-2">
+        <div class="post-author">
+          <a href="/u/marcel">marcel</a>
+          <span class="badge">Maintainer</span>
+        </div>
+        <div class="post-body">
+          <p>
+            We changed the default for <code>parallelism</code> from <code>auto</code> to
+            <code>2</code> in 0.9 because the auto heuristic was oversubscribing small runners.
+            On a 4-core box that halves the concurrency.
+          </p>
+          <p>Set it back explicitly if your runner is not memory constrained:</p>
+          <pre><code>[build]
+parallelism = "auto"</code></pre>
+        </div>
+        <div class="post-footer">
+          <a href="/posts/2/reply">Reply</a>
+          <span class="reactions">48</span>
+        </div>
+      </div>
+
+      <div class="ad-slot ad-slot--inline">
+        <a href="https://ads.example.com/click?slot=inline">Advertisement: Try AcmeCI free for 30 days</a>
+      </div>
+
+      <div class="post" id="post-3">
+        <div class="post-author">
+          <a href="/u/quietloop">quietloop</a>
+          <span class="badge">Regular</span>
+        </div>
+        <div class="post-body">
+          <p>
+            That was it. Confirmed: 13 minutes with <code>parallelism = 2</code>, 6 minutes with
+            <code>auto</code>. The release notes mention the change but not the effective
+            difference on 4-core runners.
+          </p>
+        </div>
+        <div class="post-footer">
+          <a href="/posts/3/reply">Reply</a>
+          <span class="reactions">7</span>
+        </div>
+      </div>
+
+      <div class="related-threads">
+        <h2>Related threads</h2>
+        <ul>
+          <li><a href="/t/1137">Memory limits in CI containers</a></li>
+          <li><a href="/t/1188">Cache keys changed in 0.9</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <h3>Top contributors</h3>
+      <ul>
+        <li><a href="/u/marcel">marcel</a></li>
+        <li><a href="/u/ada">ada</a></li>
+      </ul>
+      <div class="ad-slot ad-slot--sidebar">
+        <a href="https://ads.example.com/click?slot=sidebar">Sponsored: AcmeCI</a>
+      </div>
+    </div>
+
+    <footer>
+      <a href="/rules">Rules</a> <a href="/privacy">Privacy</a> <a href="/contact">Contact</a>
+    </footer>
+  </body>
+</html>
