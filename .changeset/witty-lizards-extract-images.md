@@ -6,9 +6,13 @@ Expose the image asset modes of `page.extract` in `browser_extract`.
 
 `browser_extract` now takes `images` (`none` — the default, `urls`, `save`) and
 the `assets-manifest` format. `urls` and `assets-manifest` return the page's
-image manifest (`src`, `alt`, `width`, `height`) without fetching any bytes: the
-model-visible result reports the count and the first few images and the full
-listing rides in the structured value. `save` downloads the images through the
+image manifest (`src`, `alt`, `naturalWidth`, `naturalHeight` — the intrinsic
+pixel size the runtime reports) without fetching any bytes: the model-visible
+result reports the count, the first few images with their pixel size, and the
+counters that qualify the listing — `assetsTruncated`/`assetCount` when the page
+has more images than the manifest carries, and `assetsNotFetched` when a `save`
+run left images over the per-request fetch limit — while the full listing rides
+in the structured value. `save` downloads the images through the
 runtime, where each saved file comes back as an artifact (`path`, `mimeType`,
 `bytes`, and `label` = the image's alt text), the Markdown image URLs that were
 saved are rewritten to those local paths, and images that could not be fetched

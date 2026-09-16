@@ -263,9 +263,11 @@ function extractSummaryLine({ data, operation }: { data: BrowserResultData; oper
 
 // --- image assets (page.extract `images` / assets-manifest) ------------------
 // The runtime answers image requests in `value` (the open JSON channel of the
-// frozen protocol): `assets` is the manifest, `failedAssets` the images it
-// could not fetch and save. Both are read defensively — a peer that returns
-// neither keeps the plain extraction shape.
+// frozen protocol): `assets` is the manifest, `assetCount` its entry count,
+// `assetsTruncated` the flag that the page has more images than the manifest
+// carries, `assetsNotFetched` the images left over the per-request save limit
+// and `failedAssets` the images it could not fetch and save. All of them are
+// read defensively — a peer that returns none keeps the plain extraction shape.
 
 const MAX_ASSET_ENTRIES_INLINE = 5; // manifest entries printed per line
 const MAX_ASSET_SRC_COLS = 96; // visible columns per src
@@ -273,12 +275,28 @@ const MAX_ASSET_ALT_COLS = 64; // visible columns per alt text
 const MAX_ASSET_REASON_COLS = 80; // visible columns per failure reason
 const MAX_ARTIFACT_DESCRIPTORS = 10; // artifacts printed in model content
 
-/** One entry of the extract image manifest. */
+/**
+ * One entry of the extract image manifest. The runtime reports the image's
+ * intrinsic pixel size as `naturalWidth`/`naturalHeight` on both backends;
+ * they are projected to `width`/`height` here because this type is the display
+ * projection, while the untouched wire fields stay in the result `value`.
+ */
 type ImageAsset = {
   src: string;
   alt?: string;
   width?: number;
   height?: number;
+};
+
+/** The asset channel of one extraction: manifest plus its counter fields. */
+type ExtractAssets = {
+  assets: ImageAsset[];
+  /** Manifest size the runtime reported (`assetCount`), else the entries read. */
+  count: number;
+  /** `assetsTruncated`: the page has more images than the manifest carries. */
+  truncated: boolean;
+  /** `assetsNotFetched`: images over the save limit that were never attempted. */
+  notFetched: number;
 };
 
 /** An image the runtime could not fetch/save, with the reason it reported. */
@@ -287,52 +305,73 @@ type FailedAsset = {
   reason?: string;
 };
 
-/** A non-negative integral pixel value, or undefined for anything else. */
-function readPixel(value: unknown): number | undefined {
+/** A non-negative integral quantity (a pixel size or an entry count), else undefined. */
+function readCount(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
   return Math.floor(value);
 }
 
 /**
- * Read the `value.assets` manifest. Returns undefined when the response carries
- * no manifest at all (a plain extraction), and skips entries without a usable
- * src instead of printing empty rows.
+ * Read the asset channel of an extraction. Returns undefined when the response
+ * carries none of it (a plain extraction), and skips manifest entries without a
+ * usable src instead of printing empty rows. The counters are reported even
+ * when the manifest itself is absent, which is the shape `images: "save"`
+ * returns on Chrome: the saved bytes and the counts, but no listing.
  */
-function readImageAssets(value: unknown): ImageAsset[] | undefined {
-  if (!isRecord(value) || !Array.isArray(value.assets)) return undefined;
+function readExtractAssets(value: unknown): ExtractAssets | undefined {
+  if (!isRecord(value)) return undefined;
+  const manifest = Array.isArray(value.assets) ? value.assets : undefined;
   const assets: ImageAsset[] = [];
-  for (const entry of value.assets) {
+  for (const entry of manifest ?? []) {
     if (!isRecord(entry)) continue;
     const src = typeof entry.src === "string" ? entry.src.trim() : "";
     if (!src) continue;
     const alt = typeof entry.alt === "string" ? entry.alt.trim() : "";
-    const width = readPixel(entry.width);
-    const height = readPixel(entry.height);
+    // Intrinsic size; 0 means the image reported no loaded dimensions.
+    const width = readCount(entry.naturalWidth);
+    const height = readCount(entry.naturalHeight);
+    const sized = width !== undefined && height !== undefined && width > 0 && height > 0;
     assets.push({
       src: preview(src, MAX_ASSET_SRC_COLS),
       ...(alt ? { alt: preview(alt, MAX_ASSET_ALT_COLS) } : {}),
-      ...(width !== undefined ? { width } : {}),
-      ...(height !== undefined ? { height } : {}),
+      ...(sized ? { width, height } : {}),
     });
   }
-  return assets;
+  const reported = readCount(value.assetCount);
+  const truncated = value.assetsTruncated === true;
+  const notFetched = readCount(value.assetsNotFetched) ?? 0;
+  if (!manifest && reported === undefined && !truncated && notFetched === 0) return undefined;
+  return { assets, count: reported ?? assets.length, truncated, notFetched };
 }
 
 /**
- * One-line manifest report: how many images the page has, then the first few
- * with src/alt/pixel size, so the model can decide which images are worth
- * fetching without a second extraction. An empty manifest is still reported —
- * "0 image(s)" is a fact about the page, not a missing answer.
+ * One-line manifest report: how many images the runtime's manifest carries,
+ * whether it had to cut the listing short, how many images were left over the
+ * save limit, then the first few entries with src/alt/pixel size, so the model
+ * can decide which images are worth fetching without a second extraction. An
+ * empty manifest is still reported — "0 image(s)" is a fact about the page, not
+ * a missing answer.
  */
-function assetManifestLine({ assets, max }: { assets: ImageAsset[]; max: number }): string {
+function assetManifestLine({
+  assets,
+  count,
+  truncated,
+  notFetched,
+  max,
+}: ExtractAssets & { max: number }): string {
+  // The truncation and limit notices qualify the count, so they stay attached
+  // to it instead of reading as another manifest entry.
+  let head = `${count} image(s)`;
+  if (truncated) head += ` (manifest truncated at ${count} — the page has more images than this listing)`;
+  if (notFetched > 0) head += ` (${notFetched} image(s) not attempted — over the per-request save limit)`;
   const shown = assets.slice(0, max).map((asset) => {
-    const parts = [asset.src];
-    if (asset.alt) parts.push(`alt="${asset.alt}"`);
-    if (asset.width !== undefined && asset.height !== undefined) parts.push(`${asset.width}x${asset.height}`);
-    return parts.join(" ");
+    const entry = [asset.src];
+    if (asset.alt) entry.push(`alt="${asset.alt}"`);
+    if (asset.width !== undefined && asset.height !== undefined) entry.push(`${asset.width}x${asset.height}`);
+    return entry.join(" ");
   });
   const hidden = assets.length - shown.length;
-  const parts = [`${assets.length} image(s)`, ...shown];
+  const parts = [head, ...shown];
   if (hidden > 0) parts.push(`… ${hidden} more`);
   return `assets: ${parts.join(" · ")}`;
 }
@@ -580,13 +619,14 @@ export default function (pi: ExtensionAPI) {
     // window, and whether the text that follows is a window of the document.
     if (operation?.kind === "page.extract") pushText(`\n${extractSummaryLine({ data, operation })}`);
 
-    // 1c) Image manifest and failed saves (page.extract with `images`). The
-    // manifest is the zero-byte listing the model decides from, so it stays
-    // model-visible even when the extraction itself produced no text; a plain
-    // extraction (no `assets` in the response) prints neither line.
+    // 1c) Image manifest, its truncation/limit counters, and failed saves
+    // (page.extract with `images`). The manifest is the zero-byte listing the
+    // model decides from, so it stays model-visible even when the extraction
+    // itself produced no text; a plain extraction (no asset channel in the
+    // response) prints neither line.
     if (operation?.kind === "page.extract") {
-      const assets = readImageAssets(data.value);
-      if (assets) pushText(`\n${assetManifestLine({ assets, max: MAX_ASSET_ENTRIES_INLINE })}`);
+      const assets = readExtractAssets(data.value);
+      if (assets) pushText(`\n${assetManifestLine({ ...assets, max: MAX_ASSET_ENTRIES_INLINE })}`);
       const failed = readFailedAssets(data.value);
       if (failed && failed.length > 0) pushText(`\n${failedAssetsLine({ failed, max: MAX_ASSET_ENTRIES_INLINE })}`);
     }
@@ -1513,16 +1553,16 @@ export default function (pi: ExtensionAPI) {
       "lines. Passing an absolute path inside the runtime's artifacts directory makes the runtime write the full " +
       "extraction there and return an artifact descriptor (path/mimeType/bytes) while the tool result keeps the " +
       "bounded preview; a path outside that directory is refused. images controls the page's images: none (default) " +
-      "leaves them as remote URLs, urls returns a manifest (src/alt/width/height) without downloading anything, and " +
-      "save downloads them through the runtime and rewrites markdown image URLs to the local artifact paths. It needs " +
-      "a profile that advertises page.extract (see browser_profiles); a webextension profile must also advertise the " +
-      "asset mode it is asked for.",
+      "leaves them as remote URLs, urls returns a manifest (src/alt/naturalWidth/naturalHeight per image) without " +
+      "downloading anything, and save downloads them through the runtime and rewrites markdown image URLs to the " +
+      "local artifact paths. It needs a profile that advertises page.extract (see browser_profiles); a webextension " +
+      "profile must also advertise the asset mode it is asked for.",
     promptSnippet: "Extract a managed tab's content as markdown/text/html or an image manifest",
     promptGuidelines: [
       "Use browser_extract to read or export a page's content (article text, documentation, tables) as markdown (default), plain text, raw html, or an assets-manifest listing of the page's images. It is a content operation: no refs, no snapshotId, and it does not invalidate the latest snapshot. Use browser_snapshot when you need to act on the page instead.",
       "browser_extract output is bounded and windowed — read truncated/totalBytes in the result. Use search to keep only the lines matching a term (with surrounding context) and offset/limit to page through the extracted lines: a truncated result is a window of the document, never the whole extraction.",
       "Pass an absolute path inside the runtime's artifacts directory to browser_extract to keep the full extraction: the runtime writes the file and the result reports the artifact's path, mimeType and size, while the model keeps only the bounded preview. A path outside that directory is refused, so never invent an export path outside it.",
-      "browser_extract images=\"urls\" (or format=\"assets-manifest\") adds the page's image manifest — src, alt, width and height per image — without downloading anything. Read the manifest first and decide per image whether the bytes are really needed; the manifest itself is a complete answer when the user only asks which images a page uses.",
+      "browser_extract images=\"urls\" (or format=\"assets-manifest\") adds the page's image manifest — src, alt, naturalWidth and naturalHeight per image — without downloading anything. Read the manifest first and decide per image whether the bytes are really needed; the manifest itself is a complete answer when the user only asks which images a page uses. The assets line states when the manifest is truncated (assetsTruncated/assetCount: the page has more images than the listing carries) and how many images were left over the per-request save limit (assetsNotFetched, save only) — never describe those as saved.",
       "browser_extract images=\"save\" really downloads the images: it costs time, bandwidth and disk, so use it only when the user wants the files. The runtime saves them inside its artifacts directory and reports each saved image as an artifact (path, mimeType, bytes, label=alt); markdown image URLs that were saved now point at those local paths, so never invent a local path or claim an image was saved without reading the artifact list.",
       "browser_extract reports images it could not fetch in failedAssets (src plus the reason). Those were NOT saved and keep their original remote URL in the text — say so instead of implying the whole page was archived.",
       "browser_extract is served by the target tab's profile: a profile that does not advertise page.extract makes the call fail with a clear error, and an images mode other than \"none\" additionally needs the profile's matching asset mode (urls or save) — a webextension (Firefox) profile without it is refused before anything is downloaded. Check browser_profiles for capabilities, update that browser's extension, or fall back to images=\"none\" and read there with browser_snapshot/browser_evaluate.",
@@ -1589,16 +1629,17 @@ export default function (pi: ExtensionAPI) {
       const value = isRecord(view.value) ? view.value : undefined;
       const metadata = value && isRecord(value.metadata) ? value.metadata : undefined;
       const format = (typeof value?.format === "string" && value.format) || str(view.args.format) || "markdown";
-      const assets = readImageAssets(view.value);
+      const assets = readExtractAssets(view.value);
       const failed = readFailedAssets(view.value) ?? [];
       const lines = view.text ? view.text.split("\n").length : 0;
       const firstLine = (view.text ?? "").split("\n").find((line) => line.trim());
       // The manifest IS the payload of `format: "assets-manifest"`, so the row
       // shows the listing itself instead of an empty line count.
       const manifestIsPayload = format === "assets-manifest" && assets !== undefined;
-      const body = manifestIsPayload
-        ? preview(assetManifestLine({ assets: assets ?? [], max: MAX_ASSET_ENTRIES_INLINE }), 120)
-        : `${lines} line(s)`;
+      const body =
+        manifestIsPayload && assets
+          ? preview(assetManifestLine({ ...assets, max: MAX_ASSET_ENTRIES_INLINE }), 120)
+          : `${lines} line(s)`;
       const title = typeof value?.title === "string" && value.title ? `"${preview(value.title, 56)}"` : "";
       const site = typeof metadata?.siteName === "string" && metadata.siteName
         ? `site=${preview(metadata.siteName, 40)}`
@@ -1617,7 +1658,7 @@ export default function (pi: ExtensionAPI) {
         site,
         totalBytes,
         truncated,
-        !manifestIsPayload && assets ? `${assets.length} image(s)` : "",
+        !manifestIsPayload && assets ? `${assets.count} image(s)` : "",
         artifacts.length > 1 ? `${artifacts.length} artifacts` : "",
         failed.length > 0 ? `${failed.length} failed` : "",
         artifactLine,

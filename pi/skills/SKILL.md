@@ -164,15 +164,21 @@ screenshots are an optional extra for visual/spatial questions.
   files yourself.
 - **Images: `none` (default) / `urls` / `save`.** `none` leaves every image as a
   remote URL in the text. `urls` adds the page's image manifest to the result —
-  one entry per image with `src`, `alt`, `width` and `height` — and downloads
-  nothing; the `assets:` line reports the count and the first few, with the rest
-  in the result's `value`. `save` really downloads the images: the runtime writes
-  them into its artifacts directory, rewrites the saved image URLs in the
-  Markdown to those local paths (so the extracted text no longer depends on the
-  site), and reports each file as an artifact with its path, `mimeType`, `bytes`
-  and the image's alt text as `label`. `save` costs time, bandwidth and disk and
-  the runtime caps how many images it keeps, so read the manifest first and only
-  pull bytes the user actually asked for.
+  one entry per image with `src`, `alt`, `naturalWidth` and `naturalHeight` (the
+  intrinsic pixel size, as the runtime reports it) — and downloads nothing; the
+  `assets:` line reports the count and the first few entries, with the rest in
+  the result's `value`. When the runtime had to cut the listing short it says so
+  in that line (`manifest truncated at N`, from `assetsTruncated`/`assetCount`),
+  so a manifest is never the whole page: say the listing is partial instead of
+  concluding the page has no other images. `save` really downloads the images:
+  the runtime writes them into its artifacts directory, rewrites the saved image
+  URLs in the Markdown to those local paths (so the extracted text no longer
+  depends on the site), and reports each file as an artifact with its path,
+  `mimeType`, `bytes` and the image's alt text as `label`. `save` costs time,
+  bandwidth and disk and the runtime caps how many images it keeps per request —
+  the `assets:` line reports the images over that cap as `N image(s) not
+  attempted` (`assetsNotFetched`), which are neither saved nor failed — so read
+  the manifest first and only pull bytes the user actually asked for.
 - **Images that could not be saved.** `images:"save"` reports them in
   `failedAssets` (`src` plus the reason). Those were NOT saved and keep their
   original remote URL in the text — never say an image was archived without
