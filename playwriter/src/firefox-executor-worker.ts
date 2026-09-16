@@ -33,7 +33,11 @@ interface PendingAssetFetch {
   reject: (error: Error) => void
 }
 
-/** One image as the page reports it; `src` is already the URL a fetch would use. */
+/**
+ * One image as the page reports it: the URL its `src` attribute resolves to and
+ * the URL the browser actually chose (a srcset candidate), the same two fields
+ * the Chrome backend reads.
+ */
 type AssetManifestEntry = {
   src: string
   currentSrc: string
@@ -52,8 +56,14 @@ interface AssetManifest {
 type SavedAsset = {
   base64: string
   mimeType: string
-  alt?: string
   src: string
+  /**
+   * Every URL the page uses for this image — its `src` attribute and the srcset
+   * candidate the bytes were fetched from — so the relay can rewrite whichever
+   * one the extracted body kept.
+   */
+  sourceUrls?: string[]
+  alt?: string
 }
 
 type FailedAsset = {
@@ -64,6 +74,12 @@ type FailedAsset = {
 interface AssetOutcomes {
   saved: SavedAsset[]
   failed: FailedAsset[]
+}
+
+/** One image to fetch: the URL the channel fetches, plus every URL the page names it by. */
+type AssetFetchTarget = FirefoxAssetTarget & {
+  /** Carried to the saved asset so the relay can rewrite the body's URL for this image. */
+  sourceUrls?: string[]
 }
 
 /** Cap on the manifest itself; only MAX_FIREFOX_ASSET_COUNT images may be fetched. */
@@ -79,8 +95,9 @@ const ASSET_SCHEME_REASON = 'unsupported image URL scheme: only http(s) images c
 /**
  * Runs through the existing DOM `evaluate` command, the same page-side path
  * `page.evaluate` uses, so the manifest reports what the page actually shows
- * (currentSrc after srcset selection) rather than only markup. Fields are
- * clamped in the page for the same reason the Chrome backend clamps them
+ * (`currentSrc` after srcset selection) next to the `src` attribute the
+ * extracted body keeps, the same two URLs the Chrome backend reports. Fields
+ * are clamped in the page for the same reason the Chrome backend clamps them
  * there: a page with a huge `srcset` on every image must not turn one DOM read
  * into a message that exceeds the transport budget and fails the extraction.
  */
@@ -91,7 +108,7 @@ const ENUMERATE_IMAGES_CODE = `
       const currentSrc = typeof image.currentSrc === 'string' ? image.currentSrc : '';
       const src = typeof image.src === 'string' ? image.src : '';
       return {
-        src: clip(currentSrc || src, ${MAX_MANIFEST_URL_LENGTH}),
+        src: clip(src, ${MAX_MANIFEST_URL_LENGTH}),
         currentSrc: clip(currentSrc, ${MAX_MANIFEST_URL_LENGTH}),
         srcset: clip(image.getAttribute('srcset') || '', ${MAX_MANIFEST_SRCSET_LENGTH}),
         alt: clip(image.getAttribute('alt') || '', ${MAX_MANIFEST_ALT_LENGTH}),
@@ -559,7 +576,7 @@ function extractFailure({ execution, error }: { execution: FirefoxWorkerExtract;
 /** How extraction reaches page images: a DOM manifest read and, for 'save', extension-fetched bytes. */
 interface AssetReader {
   enumerate(): Promise<AssetManifestRead>
-  save(input: { targets: FirefoxAssetTarget[]; failed: FailedAsset[] }): Promise<AssetOutcomes>
+  save(input: { targets: AssetFetchTarget[]; failed: FailedAsset[] }): Promise<AssetOutcomes>
 }
 
 interface AssetManifestRead {
@@ -682,11 +699,34 @@ function assetValue({ outcomes, notFetched }: { outcomes?: AssetOutcomes; notFet
 }
 
 function savedAssetJson(asset: SavedAsset): BrowserJson {
-  return { base64: asset.base64, mimeType: asset.mimeType, src: asset.src, ...(asset.alt ? { alt: asset.alt } : {}) }
+  return {
+    base64: asset.base64,
+    mimeType: asset.mimeType,
+    src: asset.src,
+    ...(asset.sourceUrls ? { sourceUrls: asset.sourceUrls } : {}),
+    ...(asset.alt ? { alt: asset.alt } : {}),
+  }
 }
 
 function failedAssetJson(asset: FailedAsset): BrowserJson {
   return { src: asset.src, reason: asset.reason }
+}
+
+/** The URL whose bytes a fetch would get: the srcset candidate the browser chose, else the `src` attribute. */
+function assetFetchUrl(asset: AssetManifestEntry): string {
+  return asset.currentSrc || asset.src
+}
+
+/**
+ * Every URL the page names this image by: the `src` attribute and the srcset
+ * candidate whose bytes were fetched. Only attached when they differ, because
+ * the fetch URL always travels as `src`.
+ */
+function sourceUrls({ asset }: { asset: AssetManifestEntry }): { sourceUrls?: string[] } {
+  const urls = Array.from(new Set([asset.src, asset.currentSrc])).filter((url) => {
+    return url.length > 0
+  })
+  return urls.length > 1 ? { sourceUrls: urls } : {}
 }
 
 /**
@@ -707,22 +747,22 @@ function readAssetManifest({ value }: { value: unknown }): AssetManifest {
     if (!isRecord(item) || typeof item.src !== 'string' || typeof item.currentSrc !== 'string') {
       continue
     }
-    const src = item.src.trim()
-    // Inline bytes are page-local, not something the extension can fetch.
-    if (!src || src.startsWith('data:')) {
-      continue
-    }
-    if (entries.length === MAX_MANIFEST_ASSETS) {
-      truncated = true
-      break
-    }
     const entry: AssetManifestEntry = {
-      src: clampAssetField({ value: src, maximum: MAX_MANIFEST_URL_LENGTH }),
+      src: clampAssetField({ value: item.src.trim(), maximum: MAX_MANIFEST_URL_LENGTH }),
       currentSrc: clampAssetField({ value: item.currentSrc.trim(), maximum: MAX_MANIFEST_URL_LENGTH }),
       srcset: typeof item.srcset === 'string' ? clampAssetField({ value: item.srcset.trim(), maximum: MAX_MANIFEST_SRCSET_LENGTH }) : '',
       alt: typeof item.alt === 'string' ? clampAssetField({ value: item.alt.trim(), maximum: MAX_MANIFEST_ALT_LENGTH }) : '',
       naturalWidth: naturalDimension(item.naturalWidth),
       naturalHeight: naturalDimension(item.naturalHeight),
+    }
+    // Inline bytes are page-local, not something the extension can fetch.
+    const fetchUrl = assetFetchUrl(entry)
+    if (!fetchUrl || fetchUrl.startsWith('data:')) {
+      continue
+    }
+    if (entries.length === MAX_MANIFEST_ASSETS) {
+      truncated = true
+      break
     }
     const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8') + 1
     if (bytes + entryBytes > MAX_MANIFEST_BYTES) {
@@ -750,7 +790,7 @@ function manifestListing({ assets, truncated }: { assets: AssetManifestEntry[]; 
   }
   const header = `${assets.length} image${assets.length === 1 ? '' : 's'} found${truncated ? ' (listing the first ones)' : ''}`
   const lines = assets.map((asset) => {
-    const url = asset.currentSrc || asset.src
+    const url = assetFetchUrl(asset)
     const size = asset.naturalWidth > 0 && asset.naturalHeight > 0 ? ` ${asset.naturalWidth}x${asset.naturalHeight}` : ''
     const alt = asset.alt ? ` alt="${asset.alt}"` : ''
     return `- ${url}${size}${alt}`
@@ -763,20 +803,21 @@ function manifestListing({ assets, truncated }: { assets: AssetManifestEntry[]; 
  * channel's target bound is attempted; an image that is never attempted is
  * reported rather than silently dropped.
  */
-function selectAssetTargets({ manifest }: { manifest: AssetManifest }): { targets: FirefoxAssetTarget[]; failed: FailedAsset[]; notFetched: number } {
-  const targets: FirefoxAssetTarget[] = []
+function selectAssetTargets({ manifest }: { manifest: AssetManifest }): { targets: AssetFetchTarget[]; failed: FailedAsset[]; notFetched: number } {
+  const targets: AssetFetchTarget[] = []
   const failed: FailedAsset[] = []
   let notFetched = 0
   for (const asset of manifest.assets) {
-    if (!isFetchableAssetUrl(asset.src)) {
-      failed.push({ src: asset.src, reason: ASSET_SCHEME_REASON })
+    const src = assetFetchUrl(asset)
+    if (!isFetchableAssetUrl(src)) {
+      failed.push({ src, reason: ASSET_SCHEME_REASON })
       continue
     }
     if (targets.length === MAX_FIREFOX_ASSET_COUNT) {
       notFetched += 1
       continue
     }
-    targets.push({ src: asset.src, ...(asset.alt ? { alt: asset.alt } : {}) })
+    targets.push({ src, ...(asset.alt ? { alt: asset.alt } : {}), ...sourceUrls({ asset }) })
   }
   return { targets, failed, notFetched }
 }
@@ -794,7 +835,7 @@ function isFetchableAssetUrl(value: string): boolean {
  * it never fails the extraction or its sibling images.
  */
 async function saveAssets({ targets, plannedFailed, execution, fetchOnce }: {
-  targets: FirefoxAssetTarget[]
+  targets: AssetFetchTarget[]
   /** Images the DOM manifest listed but the channel can never fetch. */
   plannedFailed: FailedAsset[]
   execution: FirefoxWorkerExtract
@@ -803,7 +844,6 @@ async function saveAssets({ targets, plannedFailed, execution, fetchOnce }: {
   if (targets.length === 0) {
     return { saved: [], failed: [...plannedFailed] }
   }
-  const alts = new Map(targets.map((target) => { return [target.src, target.alt] }))
   const failure = (reason: string): AssetOutcomes => {
     return {
       saved: [],
@@ -817,7 +857,9 @@ async function saveAssets({ targets, plannedFailed, execution, fetchOnce }: {
       sessionId: execution.sessionId,
       tabId: execution.tabId,
       browserEpoch: execution.browserEpoch,
-      targets,
+      // The channel only reads the URL to fetch and the alt text; the other URL
+      // spellings stay on this side for the relay's rewrite.
+      targets: targets.map((target) => { return { src: target.src, ...(target.alt ? { alt: target.alt } : {}) } }),
     })
   } catch (error) {
     return failure(messageOf(error))
@@ -838,8 +880,13 @@ async function saveAssets({ targets, plannedFailed, execution, fetchOnce }: {
       failed.push({ src: asset.src, reason: asset.reason })
       continue
     }
-    const alt = alts.get(asset.src)
-    saved.push({ base64: asset.base64, mimeType: asset.mimeType, src: asset.src, ...(alt ? { alt } : {}) })
+    saved.push({
+      base64: asset.base64,
+      mimeType: asset.mimeType,
+      src: asset.src,
+      ...(target.sourceUrls ? { sourceUrls: target.sourceUrls } : {}),
+      ...(target.alt ? { alt: target.alt } : {}),
+    })
   }
   return { saved, failed }
 }

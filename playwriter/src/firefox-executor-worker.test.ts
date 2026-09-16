@@ -34,9 +34,9 @@ function pageImage({ src, alt = '', width = 800, height = 600, currentSrc, srcse
   currentSrc?: string
   srcset?: string
 }): Record<string, unknown> {
-  // The page-side enumeration reports both fields the way the DOM driver sees them.
-  const chosen = currentSrc ?? src
-  return { src: chosen || src, currentSrc: currentSrc ?? src, srcset, alt, naturalWidth: width, naturalHeight: height }
+  // The page-side enumeration reports the `src` attribute and the URL the
+  // browser chose as separate fields, the way the Chrome backend's page read does.
+  return { src, currentSrc: currentSrc ?? src, srcset, alt, naturalWidth: width, naturalHeight: height }
 }
 
 /** A real protocol peer that records wire commands without pretending to implement a browser DOM. */
@@ -573,7 +573,11 @@ describe('Firefox executor page.extract', () => {
     peer.documentHtml = EXTRACT_DOCUMENT_HTML
     peer.pageImages = [
       pageImage({ src: 'https://cdn.example.test/hero.png', alt: 'Hero', width: 1_200, height: 630 }),
+      // An image whose bytes come from a srcset candidate reports both URLs: the
+      // `src` attribute the body keeps and the candidate the browser chose.
       pageImage({ src: 'https://cdn.example.test/logo.png', width: 32, height: 32, currentSrc: 'https://cdn.example.test/logo@2x.png' }),
+      // A srcset-only image has no `src` attribute but still has bytes to fetch.
+      pageImage({ src: '', currentSrc: 'https://cdn.example.test/srcset-only.png' }),
       // Inline bytes and empty sources are page-local, so the manifest skips them.
       pageImage({ src: 'data:image/png;base64,AAAA' }),
       pageImage({ src: '' }),
@@ -584,11 +588,12 @@ describe('Firefox executor page.extract', () => {
       expect(response, JSON.stringify(response)).toMatchObject({ ok: true, data: {
         value: {
           format: 'assets-manifest',
-          assetCount: 2,
+          assetCount: 3,
           truncated: false,
           assets: [
             { src: 'https://cdn.example.test/hero.png', currentSrc: 'https://cdn.example.test/hero.png', srcset: '', alt: 'Hero', naturalWidth: 1_200, naturalHeight: 630 },
-            { src: 'https://cdn.example.test/logo@2x.png', currentSrc: 'https://cdn.example.test/logo@2x.png', alt: '', naturalWidth: 32, naturalHeight: 32 },
+            { src: 'https://cdn.example.test/logo.png', currentSrc: 'https://cdn.example.test/logo@2x.png', alt: '', naturalWidth: 32, naturalHeight: 32 },
+            { src: '', currentSrc: 'https://cdn.example.test/srcset-only.png', alt: '', naturalWidth: 800, naturalHeight: 600 },
           ],
         },
         pageInfo: { tabId: 'tab-session-1', url: 'https://example.test/current' },
@@ -597,7 +602,7 @@ describe('Firefox executor page.extract', () => {
         throw new Error('expected a successful image manifest')
       }
       expect(response.data.value).not.toHaveProperty('savedAssets')
-      expect(response.data.text).toBe('2 images found\n- https://cdn.example.test/hero.png 1200x630 alt="Hero"\n- https://cdn.example.test/logo@2x.png 32x32')
+      expect(response.data.text).toBe('3 images found\n- https://cdn.example.test/hero.png 1200x630 alt="Hero"\n- https://cdn.example.test/logo@2x.png 32x32\n- https://cdn.example.test/srcset-only.png 800x600')
       // The manifest is a read: one DOM evaluate, no document read and no byte fetch.
       expect(peer.requests.map((request) => { return request.command })).toEqual([{ method: 'evaluate', code: expect.any(String) }])
       expect(peer.requests[0].command.method === 'evaluate' ? peer.requests[0].command.code : '').toContain('document.images')
@@ -709,6 +714,63 @@ describe('Firefox executor page.extract', () => {
         throw new Error('expected a structured extract value')
       }
       expect(value.assetsNotFetched).toBeUndefined()
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('reports every URL the page used for an image whose bytes came from a srcset candidate', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    peer.pageImages = [
+      pageImage({ src: 'https://cdn.example.test/photo.png', alt: 'Photo', currentSrc: 'https://cdn.example.test/photo-2x.png' }),
+    ]
+    const assetPeer = new AssetPeer()
+    try {
+      const response = await pool.execute(extractExecution({ id: 'markdown-save-aliases', peer, assetPeer, format: 'markdown', images: 'save' }))
+      expect(response, JSON.stringify(response)).toMatchObject({ ok: true, data: { value: {
+        savedAssets: [{
+          base64: Buffer.from('bytes:https://cdn.example.test/photo-2x.png').toString('base64'),
+          mimeType: 'image/png',
+          // The bytes come from the candidate, so that is the saved URL; the
+          // `src` attribute the extracted body keeps travels as an alias, and
+          // the relay rewrites every one of them.
+          src: 'https://cdn.example.test/photo-2x.png',
+          sourceUrls: ['https://cdn.example.test/photo.png', 'https://cdn.example.test/photo-2x.png'],
+          alt: 'Photo',
+        }],
+      } } })
+      // The extension channel is only asked for the URL it should fetch.
+      expect(assetPeer.requests[0].targets).toEqual([{ src: 'https://cdn.example.test/photo-2x.png', alt: 'Photo' }])
+    } finally {
+      await pool.dispose()
+    }
+  })
+
+  test('keeps the saved asset minimal when the page names an image by one URL', async () => {
+    const pool = new FirefoxExecutorPool()
+    const peer = new CommandPeer()
+    peer.documentHtml = EXTRACT_DOCUMENT_HTML
+    peer.pageImages = [pageImage({ src: 'https://cdn.example.test/hero.png', alt: 'Hero' })]
+    const assetPeer = new AssetPeer()
+    try {
+      const response = await pool.execute(extractExecution({ id: 'markdown-save-one-url', peer, assetPeer, format: 'markdown', images: 'save' }))
+      if (!response.ok) {
+        throw new Error(`expected a successful save extraction, got ${JSON.stringify(response)}`)
+      }
+      const value = response.data.value
+      if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.savedAssets)) {
+        throw new Error('expected a structured extract value')
+      }
+      const saved = value.savedAssets[0] as Record<string, unknown>
+      expect(saved).not.toHaveProperty('sourceUrls')
+      expect(saved).toEqual({
+        base64: Buffer.from('bytes:https://cdn.example.test/hero.png').toString('base64'),
+        mimeType: 'image/png',
+        src: 'https://cdn.example.test/hero.png',
+        alt: 'Hero',
+      })
     } finally {
       await pool.dispose()
     }
