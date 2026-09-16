@@ -1,5 +1,33 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`extractPageContent MediaWiki images > resolves figure images to the file bytes instead of the description page 1`] = `
+"# Tidal bore
+
+*Site: Wikipedia*
+
+A **tidal bore** is a shallow-water wave that propagates up a river or narrow bay against the direction of the current. The bore forms where the incoming tide is funnelled into a narrowing channel and the tidal range is large relative to the depth of the estuary. Bores are documented in more than eighty estuaries worldwide, and the largest of them travel tens of kilometres inland before they dissipate.
+
+![](https://upload.example/commons/thumb/8/8a/Tidal_bore_Qiantang.jpg/250px-Tidal_bore_Qiantang.jpg)
+
+The Qiantang River bore sweeping past the seawall at Hangzhou
+
+The shape of a bore depends on the ratio of tidal amplitude to channel depth. When that ratio is small the wave steepens gradually and the front stays smooth; when it is large the front curls forward and the bore breaks, entraining air and suspending sediment from the bed. The transition between the two regimes can often be seen within a single tidal cycle as the flood tide gains strength.
+
+Sediment transport in a bore is concentrated in the minutes around the passage of the front. Instruments anchored in the channel record a sharp spike in suspended-sediment concentration followed by a slower decay that lasts for the rest of the flood. The net effect over a spring-neap cycle is an upstream migration of sand that keeps many navigation channels shallow.
+
+## Notable bores
+
+The Qiantang River bore in China is the largest in the world, with a front that can exceed nine metres during the autumn spring tides. The Severn bore in England and the Pororoca on the Amazon are also well documented. Smaller bores occur on the Petitcodiac in Canada and on several rivers draining into the Bay of Fundy.
+
+![](https://upload.example/commons/thumb/1/1c/Severn_bore_surfer.jpg/220px-Severn_bore_surfer.jpg)
+
+A surfer riding the Severn bore near Newnham on Severn
+
+Recreational surfing on bores has grown since the 1950s, and several rivers now publish tide tables aimed at surfers rather than navigators. The rides are short by ocean standards but the waves are unusually predictable, which makes them attractive for record attempts and for training.
+
+Modelling a bore requires a depth-averaged solver that can represent a moving discontinuity in the free surface. Early one-dimensional models reproduced the timing of the front but not its height; modern two-dimensional models resolve the transverse structure of the wave and the secondary currents it drives along the banks. Field campaigns remain essential because the bed roughness of a muddy estuary is difficult to parameterise from first principles."
+`;
+
 exports[`extractPageContent element fragments > extracts a bare div fragment instead of scoring its body as boilerplate 1`] = `
 "## Retention window
 

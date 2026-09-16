@@ -313,6 +313,18 @@ async function runDefuddlePass({
   const pageUrl = url ?? 'about:blank'
   // `parseHTML` hands back the same Document shape defuddle's node entry takes.
   const { document } = parseHTML(html)
+  // MediaWiki/Parsoid images carry `resource="…/wiki/File:X.jpg"`: an RDFa
+  // pointer at the file description page, not at the image bytes. Defuddle's
+  // generic lazy-load transform scans every image attribute for a value that
+  // looks more like the real image URL and prefers an absolute one, so it
+  // rewrites `src` to that page link. The real URL only survives in `srcset`,
+  // whose `2x` density descriptors the same transform's image selection skips,
+  // so the page link is what reaches the Markdown. The attribute is Parsoid
+  // metadata, so it is dropped from the defuddle input only: the `html` format
+  // serializes the document untouched.
+  for (const image of document.querySelectorAll('img[resource]')) {
+    image.removeAttribute('resource')
+  }
   // `content` carries Markdown once `markdown: true` is set. `contentMarkdown`
   // only exists when browser globals are present, so it is not used here.
   const result = await Defuddle(document as unknown as Document, pageUrl, {
