@@ -1,147 +1,90 @@
 # Pi Browser Use
 
-Pi Browser Use lets a Pi agent work with your existing browser tabs and logins.
-Chrome uses its debugger/CDP extension; Firefox uses an ordinary WebExtension
-with a DOM backend. Both connect to a local runtime, and the browser stays on
-your machine. Firefox does not require remote debugging or a special browser
-launch, but DOM input and execution have [platform differences](./docs/exec/firefox-extension-guide.md).
+English | [简体中文](./README.zh-CN.md)
 
-This repository is a maintained fork of
-[remorses/playwriter](https://github.com/remorses/playwriter). It currently has
-no npm release, Chrome Web Store listing, or signed Firefox/AMO release.
+Pi Browser Use lets a Pi agent work with your real browser — the tabs, cookies
+and logins you already have — through the `browser_*` tools. Chrome is driven by
+a `chrome.debugger` extension; Firefox 139+ and Zen use an ordinary WebExtension
+with a DOM backend, with no remote debugging or special launch. Both talk to a
+managed runtime on `127.0.0.1:19989` (data in `~/.pi-browser-use`), and the
+browser never leaves your machine — there is no cloud browser.
+
+Downloads are the versioned artifacts on
+[GitHub Releases](https://github.com/tom-cat-mao/pi-browseruse-playwriter/releases);
+a release is published automatically when an `extension@<version>` tag is
+pushed. Use those artifacts, not GitHub's auto-generated source archive.
 
 ## Install the Chrome extension
 
-The main download is the versioned ZIP on
-[GitHub Releases](https://github.com/tom-cat-mao/pi-browseruse-playwriter/releases).
-Use the versioned extension ZIP, not GitHub's automatically generated source archive.
+Chrome is not on the Web Store yet (listing planned), so this is a one-time
+manual load:
 
 1. Download `pi-browser-use-extension-<version>.zip` from a Release.
-2. Unzip it into a fixed directory that you will keep, such as
-   `~/Applications/pi-browser-use-extension`.
-3. Open `chrome://extensions`, enable **Developer mode**, choose **Load
-   unpacked**, and select the unzipped directory containing `manifest.json`.
+2. Unzip it into a permanent directory you will keep, for example
+   `~/Applications/pi-browser-use-extension`. Do not move or delete it while the
+   extension is installed.
+3. Open `chrome://extensions`, enable **Developer mode**, click **Load
+   unpacked** and select the folder containing `manifest.json`.
 
-The ZIP is not a universal one-click Chrome installer: on desktop Chrome,
-GitHub manual installation still requires selecting the unpacked directory.
-Do not delete or move that directory while the extension is installed. The
-Chrome Web Store will provide one-click installation and automatic updates
-only after this project passes review; the store listing is **待上架**.
+The development build has extension ID `eeklahpecooapnailfaebkjjembkjhhg`, and
+its options page ships a local getting-started guide.
 
-The default development build has extension ID
-`eeklahpecooapnailfaebkjjembkjhhg` and connects to the local runtime on port
-`19989`.
+## Install the Firefox / Zen add-on
 
-## Load the Firefox development extension
+Firefox 139+ and Zen install the Mozilla-signed
+`pi-browser-use-firefox-extension-<version>.xpi`, which comes from the AMO
+unlisted (self-distributed) channel and installs permanently:
 
-The Firefox backend targets desktop Firefox 139+ and passed real-browser
-acceptance in 0.0.138 (126 PASS / 0 FAIL / 2 boundary SKIP; see the
-[Firefox guide](./docs/exec/firefox-extension-guide.md)). Other Firefox-derived
-browsers need their own compatibility check.
-There is no signed Firefox add-on yet; ordinary permanent installation requires
-Mozilla signing. The local unsigned ZIP/XPI is a development artifact.
+1. Download `pi-browser-use-firefox-extension-<version>.xpi` from a Release.
+2. Open `about:addons`, click the gear icon, choose **Install Add-on From
+   File…** and select the XPI.
 
-After the source setup below, build and package it with:
+The `-unsigned.xpi` and the Firefox ZIP are development artifacts: load them
+temporarily through `about:debugging#/runtime/this-firefox` → **Load Temporary
+Add-on**; they disappear when Firefox restarts. Dynamic page JavaScript needs
+Firefox 153+ and the optional permission in the add-on popup — the DOM tools
+work without it. See the [Firefox guide](./docs/exec/firefox-extension-guide.md).
 
-```bash
-pnpm build:firefox
-pnpm package:firefox
-```
+## Install the Pi side
 
-Open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**,
-and select `extension/dist-firefox/manifest.json`. The temporary add-on is
-removed when Firefox restarts. The Pi package and local runtime must also be
-installed; they are shared with the Chrome backend.
-
-In Pi, use `browser_profiles` to select the connected Firefox profile, then
-`browser_tabs discover` and `browser_tabs attach` to adopt an already-open tab
-in place. Loading or attaching does not require refreshing the tab. Firefox
-reports its DOM input, DOM/ARIA snapshot, isolated evaluate, and supported
-execute capabilities in the profile result.
-Dynamic page JavaScript additionally requires Firefox 153+ and the optional
-permission enabled in the add-on popup; basic DOM tools work without it.
-
-See the [Firefox guide](./docs/exec/firefox-extension-guide.md) for supported
-operations, development settings, and limits imposed by ordinary extensions.
-
-## Open the built-in tutorials
-
-Both builds ship a local static getting-started page. They are ordinary bundled
-pages: no remote assets, no extra permissions, no relaxed CSP. A tutorial page
-never connects to the runtime, adopts a tab, opens a tab, or starts the runtime
-by itself — it only describes the source install, the paired runtime, and the
-normal `browser_profiles` → `browser_tabs discover`/`attach` →
-`browser_snapshot` → `browser_tabs release` flow. The old `npx playwriter`
-commands are not part of it.
-
-| Build | Page | Entry point |
-| --- | --- | --- |
-| Chrome | `src/tutorial.html` | Extension options (`options_ui`, opens in a tab): the extension's options in `chrome://extensions`, or the icon's context menu → Options |
-| Firefox 139+ | `firefox-tutorial.html` | Add-on options (`options_ui`, opens in a tab) in `about:addons`, or the Help link in the add-on popup |
-
-No new automatic opening was added: the entries above are the only new entry
-points. Chrome keeps its pre-existing development paths, which changed only in
-which page they show — the idle-icon click already opened `src/tutorial.html`,
-and the install-time open that used to show the removed `welcome.html` now calls
-the same helper. Packaged builds compile that install-time open out
-(`PLAYWRITER_OPEN_WELCOME_PAGE=0`), and Firefox never opens a page by itself.
-See the [browser tutorials record](./docs/exec/browser-tutorials.md) for the
-design and for the packaging checks that keep a tutorial page from being left
-out of a ZIP.
-
-## Build from source
-
-Clone this repository, then use Node.js, Bun and pnpm `10.18.1`:
+The browser download does not install the Pi package or the runtime. From a
+source checkout (Node >= 20, pnpm `10.18.1`, Bun):
 
 ```bash
 pnpm bootstrap
 pnpm --filter @tom-cat/pi-browser-runtime build
-pnpm package:extension
-```
-
-The last command packages the already-built fork extension into
-`dist-release/`, producing both the ZIP and its `.sha256` file. It only uses
-local bundled JavaScript and assets. The output directory is ignored by Git.
-The runtime build also bundles Firefox into `playwriter/dist/extension-firefox`;
-`pnpm package:firefox` creates its ZIP, explicitly unsigned XPI, and SHA256 files.
-Build and package commands do not install add-ons or open a browser.
-
-## Install the Pi pieces
-
-The Pi package and the browser runtime are separate from the browser ZIPs. A
-ZIP does not install either one automatically.
-
-Until npm distribution is available, run these from a source checkout after
-completing the build steps above:
-
-```bash
 pi install ./pi
-node playwriter/bin-runtime.js
 ```
 
-The Pi package starts its companion runtime when used through Pi; the second
-command is the manual runtime path. The runtime uses `19989` by default and
-stores its data under `~/.pi-browser-use`.
+There is no npm release yet, so the Pi package is installed from this checkout.
+The runtime is not a service you manage: Pi starts it on first tool use, and
+`/browser-status` reports reachability, capabilities and connected profiles.
 
-## Project status
+## What it can do
 
-- GitHub Releases: pushing an `extension@<version>` tag automatically builds
-  and publishes the extension ZIP and SHA256 file. Manual runs create a Draft.
-  The tag version must match `extension/manifest.json`.
-- Chrome Web Store: upload preparation only; no item has been submitted or
-  published.
-- Firefox: ordinary add-on development build, no AMO signing or store
-  publication. The Gecko add-on ID is `pi-browser-use@tom-cat-mao.github.io`;
-  it is separate from the Chrome extension ID.
-- Store identity: the real Web Store item ID and public key must come from the
-  developer dashboard before a store build is made. The fork development ID
-  must not be presented as the store ID.
+- Drive a real tab by explicit `tabId`: accessibility snapshot, click, fill,
+  evaluate, screenshot, console logs, network capture.
+- Adopt a tab the user already has open with `browser_tabs discover` + `attach`,
+  in place: no reload, no window move, scroll and form state preserved;
+  `release` hands it back when you are done.
+- `browser_extract` exports a page as Markdown, text or HTML, saves the full
+  extraction into the runtime's artifacts directory, and can download the page's
+  images there too.
+- Isolate parallel work across several browser profiles and named groups per
+  session; each group is bound to one profile.
 
-See the [extension distribution checklist](./docs/exec/extension-distribution-plan.md)
-for the short maintainer path.
+## Documentation
+
+| Document                                                                       | Contents                                                |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------- |
+| [Firefox guide](./docs/exec/firefox-extension-guide.md)                        | DOM backend capabilities, limits and Chrome differences |
+| [Extension distribution checklist](./docs/exec/extension-distribution-plan.md) | Release assets, AMO signing and Web Store preparation   |
+| [Model-side usage](./pi/skills/SKILL.md)                                       | How the agent is expected to drive the tools            |
+| [AGENTS.md](./AGENTS.md)                                                       | Repository layout, commands and contribution rules      |
+| [README.zh-CN.md](./README.zh-CN.md)                                           | Simplified Chinese mirror of this page                  |
 
 ## License and upstream
 
-This fork keeps the upstream [MIT license](./LICENSE) and credits
-[remorses/playwriter](https://github.com/remorses/playwriter). The original
-README is preserved in Git history.
+Pi Browser Use is a maintained fork of
+[remorses/playwriter](https://github.com/remorses/playwriter), keeping the
+upstream [MIT license](./LICENSE) and attribution.
