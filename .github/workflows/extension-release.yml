@@ -73,8 +73,11 @@ jobs:
       - name: Build runtime assets
         run: pnpm --filter @tom-cat/pi-browser-runtime build
 
-      - name: Create extension ZIP and checksum
+      - name: Create Chrome extension ZIP and checksum
         run: pnpm package:extension
+
+      - name: Create Firefox extension ZIP, checksum and unsigned XPI
+        run: pnpm package:firefox
 
       - name: Upload extension release
         env:
@@ -83,9 +86,16 @@ jobs:
           RELEASE_EVENT: ${{ github.event_name }}
         run: |
           REPO="tom-cat-mao/pi-browseruse-playwriter"
-          ZIP="dist-release/pi-browser-use-extension-$EXTENSION_VERSION.zip"
+          CHROME_ZIP="dist-release/pi-browser-use-extension-$EXTENSION_VERSION.zip"
+          FIREFOX_ZIP="dist-release/pi-browser-use-firefox-extension-$EXTENSION_VERSION.zip"
+          FIREFOX_XPI="dist-release/pi-browser-use-firefox-extension-$EXTENSION_VERSION-unsigned.xpi"
+          ASSETS=(
+            "$CHROME_ZIP" "$CHROME_ZIP.sha256"
+            "$FIREFOX_ZIP" "$FIREFOX_ZIP.sha256"
+            "$FIREFOX_XPI" "$FIREFOX_XPI.sha256"
+          )
           if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" --repo "$REPO" --clobber
+            gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --repo "$REPO" --clobber
             if [ "$RELEASE_EVENT" = "push" ]; then
               gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false --latest=false
             fi
@@ -94,11 +104,11 @@ jobs:
             if [ "$RELEASE_EVENT" = "push" ]; then
               OPTIONS=(--verify-tag)
             fi
-            gh release create "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" \
+            gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
               --repo "$REPO" \
               --target "$BUILD_SHA" \
               --title "Extension $EXTENSION_VERSION" \
               "${OPTIONS[@]}" \
               --latest=false \
-              --notes "Prebuilt Pi Browser Use extension. Download the versioned ZIP, extract it to a permanent directory, then use Developer mode > Load unpacked at chrome://extensions. SHA256 checksum included. Pi and the companion runtime are installed separately."
+              --notes "Prebuilt Pi Browser Use extension. Download the versioned ZIP, extract it to a permanent directory, then use Developer mode > Load unpacked at chrome://extensions. The Firefox ZIP is the same extension built for Firefox 139+: it is unsigned, so load it as a temporary add-on at about:debugging or sign it yourself; permanent installation requires AMO signing. SHA256 checksums included. Pi and the companion runtime are installed separately."
           fi

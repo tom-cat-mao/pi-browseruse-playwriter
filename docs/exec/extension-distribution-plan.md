@@ -15,8 +15,9 @@ prompt: |
 
 # Extension distribution plan
 
-当前状态：推送 extension@<version> tag 自动构建并发布 GitHub Release；
-手动触发仍默认创建 Draft。Chrome Web Store 仍是“上传准备包”，尚未提交或上架。
+当前状态：推送 extension@<version> tag 自动构建并发布 GitHub Release，附件含
+Chrome 与 Firefox 两套产物；手动触发仍默认创建 Draft。Chrome Web Store 仍是
+“上传准备包”，尚未提交或上架。
 
 ## GitHub Releases
 
@@ -28,24 +29,25 @@ prompt: |
    git push origin extension@0.0.131
    ```
 
-3. `.github/workflows/extension-release.yml` 自动检出该 tag、构建并校验 ZIP，
-   发布同名 Release，附版本 ZIP 与 `.sha256`。不触发 Chrome 商店或 npm 发布。
-   该 workflow 只跑 `pnpm package:extension`，**自动上传的只有 Chrome ZIP**；
-   它不含 `pnpm package:firefox`，因此 Firefox ZIP 与未签名 XPI 不会随 tag 自动
-   产出。需要 Firefox 归档时，在同一 tag 上手动 `pnpm package:firefox`，再把
-   `dist-release/pi-browser-use-firefox-extension-<版本>.zip`、`-unsigned.xpi`
-   及各自的 `.sha256` 补传到同一个 Release。
-4. 现有 Release 就体现了这一分工：`extension@0.0.138` 上既有自动上传的 Chrome
-   `pi-browser-use-extension-0.0.138.zip(.sha256)`，也有手动补传的 Firefox
-   `pi-browser-use-firefox-extension-0.0.138.zip(.sha256)` 与
-   `pi-browser-use-firefox-extension-0.0.138-unsigned.xpi(.sha256)`。
+3. `.github/workflows/extension-release.yml` 自动检出该 tag、构建并校验产物，
+   发布同名 Release，附 Chrome ZIP、Firefox ZIP、未签名 XPI 及各自 `.sha256`：
+   `pi-browser-use-extension-<版本>.zip`（Chrome）、
+   `pi-browser-use-firefox-extension-<版本>.zip` 与同名前缀的 `-unsigned.xpi`
+   （Firefox 139+，未签名，只能 `about:debugging` 临时加载或自行签名，永久安装需要
+   AMO 签名）。不触发 Chrome 商店或 npm 发布。该 workflow 依次跑
+   `pnpm package:extension`（Chrome）与 `pnpm package:firefox`（Firefox）；两者都
+   只打包 runtime 构建产出的 bundle，缺失时打包直接报错，不静默跳过。
+4. `extension@0.0.138` 与 `extension@0.0.140` 上 Firefox ZIP 与未签名 XPI 是自动
+   发布后手工补传的，附件名与内容同 workflow 现在产出的完全一致；本改动之后无需
+   再手工补传。已发布的 tag 不会补跑。
 5. 本地仅创建 tag 不触发；其他前缀的 tag 不触发；现有 tag 不会因 workflow
    合并而补跑。版本或 tag 所指提交不匹配时停止，避免打包错版本。
-6. Actions 重跑会更新该 Release 的同名附件，不重复创建 Release；同 tag
-   串行执行。手工 dispatch 填写 ref/tag 时仍默认 Draft，便于提前检查。
+6. Actions 重跑会更新该 Release 的同名附件（Chrome 与 Firefox 产物都覆盖），
+   不重复创建 Release；同 tag 串行执行。手工 dispatch 填写 ref/tag 时仍默认
+   Draft，便于提前检查。
 
-本地验证命令仍为 `pnpm --filter @tom-cat/pi-browser-runtime build` 后
-`pnpm package:extension`，产物位于 `dist-release/`。
+本地验证命令为 `pnpm --filter @tom-cat/pi-browser-runtime build` 后
+`pnpm package:extension` 与 `pnpm package:firefox`，产物位于 `dist-release/`。
 
 ZIP 必须把 `manifest.json` 放在根目录；扩展运行时 JavaScript、页面、样式与图标
 全部随 ZIP 提供，不依赖远程脚本或 CDN。
