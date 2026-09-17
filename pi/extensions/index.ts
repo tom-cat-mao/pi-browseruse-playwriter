@@ -1177,8 +1177,7 @@ export default function (pi: ExtensionAPI) {
       "and actual backend capabilities. A profileId is required to create a group. This is connection metadata, not filtered by session.",
     promptSnippet: "List available browser profiles",
     promptGuidelines: [
-      "Use browser_profiles to discover a profileId before browser_groups create. A profile must be connected to open groups/tabs in it.",
-      "Use browser_profiles capabilities to choose the execution approach: Firefox webextension uses DOM input and DOM/ARIA snapshots, isolated-world evaluate, and a documented Playwright-compatible subset. Read its limitations before relying on native input, page globals, or CDP.",
+      "browser_profiles is the capability gate for the session: only a connected profileId can own a group, and that profile's capabilities decide what the browser can serve (native input vs DOM input, isolated-world evaluate, supportedOperations, features, limitations) — re-read browser_profiles instead of assuming a backend supports something.",
     ],
     parameters: Type.Object({}),
     async execute(toolCallId, _params, signal, _onUpdate, ctx) {
@@ -1208,7 +1207,7 @@ export default function (pi: ExtensionAPI) {
       "Same-name groups are allowed — each has its own groupId; there is no merging by title.",
     promptSnippet: "List/create/rename/close this session's tab groups",
     promptGuidelines: [
-      "Use browser_groups create with an explicit name and a profileId from browser_profiles before opening tabs; a group is bound to one profile for its lifetime. Use its groupId with browser_tabs create.",
+      "The resource chain is explicit: browser_groups create (name + profileId from browser_profiles) → browser_tabs create (that groupId + url) → every page tool takes the returned tabId. There is no implicit current tab and no matching by URL or title.",
     ],
     parameters: Type.Object({
       action: StringEnum(["list", "create", "rename", "close"] as const),
@@ -1269,10 +1268,10 @@ export default function (pi: ExtensionAPI) {
       "current tab.",
     promptSnippet: "List/create/attach/activate/close/release tabs, or discover the tabs already open",
     promptGuidelines: [
-      "When the user says they are looking at a page and want you to continue there, call browser_tabs with action:\"discover\", pick the matching entry by title/URL/window, then action:\"attach\" with its candidateId — you get a normal tabId and keep working in that same tab (nothing is reloaded or moved).",
-      "browser_tabs discover returns one page at a time (default 20, ordered active-first). Read the total/returned/nextOffset/truncated line: when truncated=true, call discover again with offset=nextOffset to see the rest — never assume the page contains every open tab.",
-      "Use browser_tabs create with a groupId (from browser_groups) and a url to open a managed tab; use the returned tabId for all page tools. Use release to give up control of a tab when you are done with it so a later reconnect won't pull it back into this session.",
-      "After a link opens in a new tab, use browser_tabs list with sourceTabId set to the tab you clicked in to find the real new tab, or browser_tabs activate to go back to the original tab. Never guess by URL or by 'the last tab'.",
+      "When the user says they are looking at a page, run browser_tabs discover, pick the entry by title/URL/window, then attach that candidateId — the tab is taken over in place, with no reload, no move, and scroll/form state kept.",
+      "browser_tabs discover returns one page at a time (default 20, active-first): when the result says truncated=true, call discover again with offset=nextOffset — one page is never every open tab.",
+      "After a link opens a new tab, find it with browser_tabs list sourceTabId=<the tab you clicked in> (never by URL or by 'the last tab'), and use browser_tabs activate to return to the original tab.",
+      "Finish with browser_tabs release to give up this session's control of a tab (a later reconnect won't pull it back) or close for tabs you no longer need — tabs are never closed via browser.close()/context.close() in browser_execute.",
     ],
     parameters: Type.Object({
       action: StringEnum(["list", "discover", "attach", "activate", "create", "close", "release"] as const),
@@ -1386,8 +1385,7 @@ export default function (pi: ExtensionAPI) {
       "you were on and you want the previous page back (it does not reopen or re-navigate the old URL).",
     promptSnippet: "Navigate a managed tab, or go back in its history",
     promptGuidelines: [
-      "Use browser_navigate with a tabId from browser_tabs to load a URL, then browser_snapshot to read the page — pages redirect, so always re-check.",
-      "Use browser_navigate with action:\"back\" (no url) when a link navigated the tab you were working in; the browser restores the previous history entry (scroll/form state depends on the site — re-snapshot to check). To return to an original tab after reading a link that opened a NEW tab, use browser_tabs action:\"activate\" instead.",
+      "Same tab vs new tab: browser_navigate action:\"back\" follows the tab's real browser history (re-snapshot when a site has not restored its own scroll/form state); when the link opened a NEW tab, return with browser_tabs activate instead.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
@@ -1438,9 +1436,8 @@ export default function (pi: ExtensionAPI) {
       "scope element. Output stays bounded; full requests the complete tree within the same output caps.",
     promptSnippet: "Read a managed tab as an accessibility tree",
     promptGuidelines: [
-      "Use browser_snapshot to read a tab's content and obtain aria-ref=eN refs; pass those refs (with the returned snapshotId) to browser_click/browser_fill. Refs are only valid against the snapshot that produced them.",
-      "browser_snapshot selector must match exactly one element: zero or multiple matches is an error (there is no implicit .first()) — narrow the selector or use search instead. The default result is the readable tree, not only interactive nodes; use search to keep large pages compact (all snapshot output is bounded).",
-      "Any browser_evaluate or browser_execute call conservatively invalidates the latest snapshot, even a read-only one: take a fresh browser_snapshot before using refs again, or the action throws stale-snapshot.",
+      "browser_snapshot owns the refs: browser_click/browser_fill need an aria-ref=eN from the latest snapshot together with its snapshotId, and any browser_evaluate or browser_execute invalidates that snapshot conservatively — even a read-only one — so re-snapshot before the next ref-based action.",
+      "Work observe → act → observe: browser_navigate or browser_snapshot to load and read, one acting tool, then a fresh snapshot (or evaluate) to verify — pages redirect and change, so never chain actions blindly or re-click something that did not react.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
@@ -1550,26 +1547,27 @@ export default function (pi: ExtensionAPI) {
       "Extract a managed tab's content for reading or export — markdown (default), plain text, the raw html, or an " +
       "assets-manifest of the page's images. Unlike browser_snapshot it returns no element refs and no snapshotId, and " +
       "it is not a structure operation: use browser_snapshot when you need to click/fill, browser_extract when you " +
-      "need the content itself. Extraction is bounded and windowed: the result reports truncated/totalBytes, search " +
-      "keeps only the lines matching a term (with surrounding context), and offset/limit page through the extracted " +
-      "lines. Passing a path makes the runtime write the full extraction there and return an artifact descriptor " +
-      "(path/mimeType/bytes) while the tool result keeps the bounded preview. The path is confined to the runtime's " +
-      "artifacts directory: absolute paths inside it are used as-is, relative paths resolve inside it, anything " +
-      "escaping it is refused. images controls the page's images: none (default) " +
+      "need the content itself. It reads without touching the page, so it does not invalidate the latest snapshot. " +
+      "Extraction is bounded and windowed: the result reports truncated/totalBytes, search keeps only the lines " +
+      "matching a term (with surrounding context), and offset/limit page through the extracted lines — a truncated " +
+      "result is a window of the document, never the whole extraction. Passing a path makes the runtime write the " +
+      "full extraction there and return an artifact descriptor (path/mimeType/bytes) while the tool result keeps the " +
+      "bounded preview. The path is confined to the runtime's artifacts directory: absolute paths inside it are used " +
+      "as-is, relative paths resolve inside it, anything escaping it is refused — never invent an export path outside " +
+      "it. images controls the page's images: none (default) " +
       "leaves them as remote URLs, urls returns a manifest (src/alt/naturalWidth/naturalHeight per image) without " +
-      "downloading anything, and save downloads them through the runtime and rewrites markdown image URLs to the " +
-      "local artifact paths. It needs a profile that advertises page.extract (see browser_profiles); a webextension " +
-      "profile must also advertise the asset mode it is asked for.",
+      "downloading anything — the manifest answers \"which images does this page use\" on its own, and when the " +
+      "runtime had to cut it short it reports assetsTruncated/assetCount, so never present a partial listing as the " +
+      "complete one. save downloads them through the runtime, reports each saved image as an artifact " +
+      "(path/mimeType/bytes/label=alt) and rewrites markdown image URLs to those local artifact paths: read the " +
+      "artifact list before claiming an image was saved and never invent a local path. Images over the per-request " +
+      "save limit are reported as assetsNotFetched (neither saved nor failed), and any image the runtime could not " +
+      "fetch is reported in failedAssets with its src and reason — those were NOT saved and keep their original " +
+      "remote URL in the text. It needs a profile that advertises page.extract (see browser_profiles); a webextension " +
+      "profile must also advertise the asset mode it is asked for, and is refused before anything is downloaded — " +
+      "update that browser's extension, or fall back to images=\"none\" and read there with " +
+      "browser_snapshot/browser_evaluate.",
     promptSnippet: "Extract a managed tab's content as markdown/text/html or an image manifest",
-    promptGuidelines: [
-      "Use browser_extract to read or export a page's content (article text, documentation, tables) as markdown (default), plain text, raw html, or an assets-manifest listing of the page's images. It is a content operation: no refs, no snapshotId, and it does not invalidate the latest snapshot. Use browser_snapshot when you need to act on the page instead.",
-      "browser_extract output is bounded and windowed — read truncated/totalBytes in the result. Use search to keep only the lines matching a term (with surrounding context) and offset/limit to page through the extracted lines: a truncated result is a window of the document, never the whole extraction.",
-      "Pass a `path` to browser_extract to keep the full extraction: it is confined to the runtime's artifacts directory (absolute paths inside it are used as-is, relative paths resolve inside it, anything escaping is refused — never invent an export path outside it). The runtime writes the file and the result reports the artifact's path, mimeType and size, while the model keeps only the bounded preview.",
-      "browser_extract images=\"urls\" (or format=\"assets-manifest\") adds the page's image manifest — src, alt, naturalWidth and naturalHeight per image — without downloading anything. Read the manifest first and decide per image whether the bytes are really needed; the manifest itself is a complete answer when the user only asks which images a page uses. The assets line states when the manifest is truncated (assetsTruncated/assetCount: the page has more images than the listing carries) and how many images were left over the per-request save limit (assetsNotFetched, save only) — never describe those as saved.",
-      "browser_extract images=\"save\" really downloads the images: it costs time, bandwidth and disk, so use it only when the user wants the files. The runtime saves them inside its artifacts directory and reports each saved image as an artifact (path, mimeType, bytes, label=alt); markdown image URLs that were saved now point at those local paths, so never invent a local path or claim an image was saved without reading the artifact list.",
-      "browser_extract reports images it could not fetch in failedAssets (src plus the reason). Those were NOT saved and keep their original remote URL in the text — say so instead of implying the whole page was archived.",
-      "browser_extract is served by the target tab's profile: a profile that does not advertise page.extract makes the call fail with a clear error, and an images mode other than \"none\" additionally needs the profile's matching asset mode (urls or save) — a webextension (Firefox) profile without it is refused before anything is downloaded. Check browser_profiles for capabilities, update that browser's extension, or fall back to images=\"none\" and read there with browser_snapshot/browser_evaluate.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       format: Type.Optional(
@@ -1680,9 +1678,6 @@ export default function (pi: ExtensionAPI) {
       "came from, or a plain CSS/role selector. Selectors are matched strictly — zero or multiple matches is an error, " +
       "never a guess.",
     promptSnippet: "Click an element by ref or CSS selector",
-    promptGuidelines: [
-      "Use browser_click with an aria-ref=eN from the latest browser_snapshot plus its snapshotId; if the page changed or you ran browser_evaluate/browser_execute since the snapshot, re-snapshot first (refs are invalidated conservatively). A plain CSS/role selector must match exactly one element: zero or multiple matches is an error.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       selector: Type.String({ description: "aria-ref=eN, @eN, or a strict CSS/role selector" }),
@@ -1712,11 +1707,9 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Fill",
     description:
       "Set text into an input/textarea/contenteditable in a managed tab (clear-and-insert: existing content is replaced). " +
-      "Target by snapshot ref (aria-ref=eN / @eN with its snapshotId) or a strict CSS selector that matches exactly one element.",
+      "Target by snapshot ref (aria-ref=eN / @eN with its snapshotId) or a strict CSS selector that matches exactly one element. " +
+      "To append instead of replacing, read the current value with browser_evaluate, concatenate and fill that.",
     promptSnippet: "Fill inputs and rich-text editors",
-    promptGuidelines: [
-      "Use browser_fill to replace an input's value; to append, read the current value with browser_evaluate, concatenate, then fill. Use an aria ref + snapshotId, or a strict CSS/role selector (zero or multiple matches is an error). Re-snapshot after browser_evaluate/browser_execute before reusing refs.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       selector: Type.String({ description: "aria-ref=eN, @eN, or a strict CSS selector" }),
@@ -1749,14 +1742,12 @@ export default function (pi: ExtensionAPI) {
     name: "browser_evaluate",
     label: "Browser Evaluate",
     description:
-      "Run JavaScript inside a managed tab's page (document/window available, async/await supported). Returns the " +
-      "JSON-serializable result value. Firefox uses an isolated world (requires Firefox 153+ and the add-on's optional " +
-      "page-JavaScript permission): DOM is available, page-script globals may not be. Use browser_execute for the Node/Playwright sandbox instead.",
+      "Run JavaScript inside a managed tab's page (document/window available, async/await supported) for reads a " +
+      "snapshot cannot express (attributes, scrolling, custom checks). End the code with `return <value>` — a bare " +
+      "expression returns undefined. Returns the JSON-serializable result value. Firefox uses an isolated world " +
+      "(requires Firefox 153+ and the add-on's optional page-JavaScript permission): DOM is available, page-script " +
+      "globals may not be. Use browser_execute for the Node/Playwright sandbox instead.",
     promptSnippet: "Run JavaScript in a managed tab's page",
-    promptGuidelines: [
-      "Use browser_evaluate for attributes/scrolling/complex reads a snapshot can't give; it runs in the page (document/window). End with `return <value>` — a bare expression returns undefined. Use browser_execute for Playwright-level control.",
-      "browser_evaluate conservatively invalidates the latest browser_snapshot even when it only read data: take a fresh snapshot before the next browser_click/browser_fill that uses a ref.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       code: Type.String({ description: "JS code, async/await supported" }),
@@ -1778,11 +1769,9 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Screenshot",
     description:
       "Screenshot a managed tab. Returns the image inline (when the model can see images) and, if a path is given, saves it. " +
-      "Optionally capture the full scrollable page or overlay interactive-element labels.",
+      "Optionally capture the full scrollable page or overlay interactive-element labels. Use it for visual/spatial " +
+      "questions only — browser_snapshot is cheaper when text is enough.",
     promptSnippet: "Screenshot a managed tab",
-    promptGuidelines: [
-      "Use browser_screenshot when you need visual/spatial state; browser_snapshot is cheaper for text. Pass a path to save the file, fullPage for the whole page, or labels to overlay element markers.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       path: Type.Optional(Type.String({ description: "Absolute output path" })),
@@ -1823,15 +1812,13 @@ export default function (pi: ExtensionAPI) {
     name: "browser_network",
     label: "Browser Network",
     description:
-      "Capture network responses of a managed tab: start capture, list requests (optional url substring filter), or stop. " +
+      "Capture network responses of a managed tab: start capture before the action that triggers the requests, list " +
+      "requests (optional url substring filter), or stop. " +
       "Stopping does not erase the evidence: the retained entries stay queryable and the capture state (active/stopped/" +
-      "interrupted/not-started) is reported, including after a worker interruption. A later explicit start replaces the " +
-      "previous capture. Capture is bound to the tab.",
+      "interrupted/not-started) is reported, including after a worker interruption — an interrupted or not-started " +
+      "capture is never a silent empty list, so list again before reading anything into it, and only start a new " +
+      "capture when you mean to replace the previous one. Capture is bound to the tab.",
     promptSnippet: "Capture and inspect a tab's network requests",
-    promptGuidelines: [
-      "Use browser_network start before the action that triggers requests, then list with a url filter to inspect API calls of that tab.",
-      "browser_network stop keeps the retained entries and reports the capture state and counts; if a request timed out or the worker was interrupted, the capture is marked interrupted (or not-started) instead of a silent empty list — list again to read what was retained, and only start a new capture when you mean to replace it.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       action: StringEnum(["start", "list", "stop"] as const),
@@ -1883,9 +1870,6 @@ export default function (pi: ExtensionAPI) {
       "Return buffered console/log output for a managed tab (most recent first-capped). Use it after an action to surface " +
       "hydration errors, failed requests, and runtime exceptions without attaching listeners.",
     promptSnippet: "Read a managed tab's buffered console logs",
-    promptGuidelines: [
-      "Use browser_logs after a navigate/click/submit to check for page errors; pass limit to bound how many lines you get back.",
-    ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: "Max log lines to return" })),
@@ -1908,7 +1892,8 @@ export default function (pi: ExtensionAPI) {
     name: "browser_execute",
     label: "Browser Execute",
     description:
-      "Escape hatch: run a Playwright snippet against a managed tab in the runtime's Node sandbox. Scope is fixed to the " +
+      "Escape hatch: run a Playwright snippet against a managed tab in the runtime's Node sandbox — use it when the " +
+      "typed tools are insufficient (custom waits, iframes, multi-step flows). Scope is fixed to the " +
       "requested tab (its `page`); there is no newPage/close/context escape. Each call is independent: you may keep plain " +
       "data or ids in variables you return, but page/locator/CDP handles cannot be reused across calls — re-acquire them " +
       "each time. Await every action to completion and leave no background timers running. Chrome does not expose raw " +
@@ -1917,8 +1902,7 @@ export default function (pi: ExtensionAPI) {
       "Errors and output are returned verbatim. Optional timeout in ms (runtime caps it at 120s).",
     promptSnippet: "Run a Playwright snippet against a managed tab (escape hatch)",
     promptGuidelines: [
-      "Use browser_execute when the typed tools are insufficient (custom waits, iframes, multi-step flows); `page` is bound to the given tabId. Do not rely on page/locator/CDP objects surviving between calls (re-acquire them); await all actions and leave no background timers; Chrome does not expose keyboard/mouse/touchscreen objects; Firefox page.keyboard.press/type dispatch DOM input to :focus, while native input and other raw keyboard methods remain unsupported. Never call browser.close()/context.close(); close tabs via browser_tabs.",
-      "browser_execute conservatively invalidates the latest browser_snapshot (it may have changed the page): take a fresh snapshot before the next ref-based browser_click/browser_fill. Its returned value and the page logs it produced are reported in the tool result.",
+      "A call that is cancelled or times out reports outcome=not-started or outcome=unknown; outcome=unknown means it may have partially happened — re-observe with browser_snapshot before assuming anything, and never replay the action.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
