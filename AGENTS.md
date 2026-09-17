@@ -186,14 +186,16 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
 ## 延伸阅读
 
 - 文档同步：`README.md`（英文 canonical，安装与发行现状）与 `README.zh-CN.md`（中文镜像）
-  必须同步更新，改一边必须改另一边；`pi/README.md` 只做概述、不得复制工具细节，模型侧
-  用法以 `pi/skills/SKILL.md`（source of truth）为准。
+  必须同步更新，改一边必须改另一边；`pi/README.md` 只做概述、不得复制工具细节。模型侧文本分层：
+  操作纪律的 source of truth 是 `pi/extensions/index.ts` 里各工具的 description（单工具语义）与
+  promptGuidelines（跨工具编排，只放这里），两处不重复；`pi/skills/SKILL.md` 是按需加载的后端差异
+  参考（必须保持有效 frontmatter：name + description，缺失即不会被 pi 注册）。
 - `docs/exec/browser-runtime-contract.md`：HTTP/WS 契约（目标态，当前实现以代码为准）；
   `docs/exec/` 下的计划与验收文档只描述具体任务（含被取代方案），不是长期指令；
   `docs/exec/extension-distribution-plan.md` 是可复用的发行清单。
 - `playwriter/src/browser-protocol.ts`：类型与操作定义的唯一来源；`playwriter/src/resource.md`：
   Playwright 通用知识。
 - `MEMORY.md` 是历史踩坑记录，可参考但先对照当前代码。`playwriter/src/skill.md` 仍是
-  上游 legacy MCP/CLI 文档的源文件与资源生成器输入：改 legacy CLI/MCP 时要同步改它，
-  模型侧现行用法以 `pi/skills/SKILL.md` 为准；`website/`、`db/`、`slop/` 及 `docs/` 下
+  上游 legacy MCP/CLI 文档的源文件与资源生成器输入：改 legacy CLI/MCP 时要同步改它；
+  `website/`、`db/`、`slop/` 及 `docs/` 下
   的非 exec 文档属于历史/上游资料。
