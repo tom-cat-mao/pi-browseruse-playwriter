@@ -1,5 +1,67 @@
 # @tom-cat/pi-browser-use-extension
 
+## 0.3.0
+
+### Minor Changes
+
+- 5867e5d: Add the `browser_extract` tool for reading and exporting page content.
+
+  `browser_extract` reads a managed tab's content instead of its structure: `markdown` (the default), plain `text`, or the raw `html`. It returns no element refs and no `snapshotId` and performs no page action, so a snapshot taken before it stays valid — use `browser_snapshot` when you need to act on the page. Output is bounded and windowed: the result reports `truncated`/`totalBytes`, states in words when the text is a window of the document, keeps only the lines matching a `search` term (with surrounding context), and pages through the extraction with `offset`/`limit`. Passing an absolute path inside the runtime's artifacts directory saves the full extraction through the runtime and returns an artifact descriptor (`path`/`mimeType`/`bytes`) while the model keeps only the bounded preview.
+
+  The tool is gated on the target tab's profile before anything is sent: a profile that advertises its page operations without `page.extract` is refused with a model-facing reason instead of an empty extraction, while a peer that advertises no operation list at all is not blocked. `page.extract` is now a known operation for capability gating, and `browser_profiles` projects the relevant `capabilities.features` keys (currently `extract`) into model content so the model can see which extraction formats a profile supports; unrelated or unknown feature keys stay out of the model's context.
+
+- 3f0f27d: Expose the image asset modes of `page.extract` in `browser_extract`.
+
+  `browser_extract` now takes `images` (`none` — the default, `urls`, `save`) and
+  the `assets-manifest` format. `urls` and `assets-manifest` return the page's
+  image manifest (`src`, `alt`, `naturalWidth`, `naturalHeight` — the intrinsic
+  pixel size the runtime reports) without fetching any bytes: the model-visible
+  result reports the count, the first few images with their pixel size, and the
+  counters that qualify the listing — `assetsTruncated`/`assetCount` when the page
+  has more images than the manifest carries, and `assetsNotFetched` when a `save`
+  run left images over the per-request fetch limit — while the full listing rides
+  in the structured value. `save` downloads the images through the
+  runtime, where each saved file comes back as an artifact (`path`, `mimeType`,
+  `bytes`, and `label` = the image's alt text), the Markdown image URLs that were
+  saved are rewritten to those local paths, and images that could not be fetched
+  are reported in `failedAssets` (`src` plus the reason) with a warning that those
+  keep their remote URLs. Artifact descriptors in model content are now bounded and
+  carry the label, so a save run with many images cannot flood the context.
+
+  The pre-flight gate now checks one level deeper than `page.extract`: an `images`
+  mode other than `none` is refused with a model-facing reason — naming the profile
+  and the asset modes it does advertise — when the target webextension profile does
+  not advertise that mode in `features.assets`, so nothing is downloaded for a mode
+  that browser build cannot serve. Chrome profiles, served by the runtime, and a
+  peer that advertises no capabilities at all are left to the runtime's own
+  `unsupported-capability` answer, matching the existing layering for
+  `supportedOperations`. `browser_profiles` now projects the `assets` feature key
+  alongside `extract` into model content.
+
+### Patch Changes
+
+- d225648: Parse browser capabilities forward-compatibly so a peer that ships later than this client can no longer break the connection.
+
+  `capabilities.supportedOperations` is still shape-checked (a bounded array of bounded strings) and the page operations this client knows are kept for gating, but an operation it does not know yet — the upcoming `page.extract`, a control operation, or anything a future extension advertises — is ignored instead of failing the whole exchange with a protocol error. The new optional `capabilities.features` matrix is shape-checked (an object of bounded string arrays) and preserved verbatim, including feature names this client does not understand. Unknown keys in capabilities and in result payloads were already tolerated and stay tolerated.
+
+- 3926340: The `page.extract` tool description now documents that `path` may also be relative to the runtime's artifacts directory, matching the runtime's behavior.
+
+  The image manifest listing now falls back to an image's `currentSrc` when it has no `src` attribute (srcset-only images), so those images appear in the listing instead of being silently dropped.
+
+- Updated dependencies [206cde8]
+- Updated dependencies [bceec1b]
+- Updated dependencies [6756639]
+- Updated dependencies [abe8c57]
+- Updated dependencies [2d05228]
+- Updated dependencies [2ecbf48]
+- Updated dependencies [7d0ec5e]
+- Updated dependencies [d0afdc0]
+- Updated dependencies [5f01cfd]
+- Updated dependencies [be305ed]
+- Updated dependencies [3dea107]
+- Updated dependencies [34ea60a]
+  - @tom-cat/pi-browser-runtime@0.7.0
+
 ## 0.2.0
 
 ### Minor Changes

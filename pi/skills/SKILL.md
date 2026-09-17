@@ -22,8 +22,9 @@ by URL or title. Everything is addressed by id:
   A `profileId` is required to create a group; a profile must be `connected`.
   Read its `capabilities`: a Firefox profile advertises `backend: webextension`,
   `inputMode: dom`, `snapshotMode: dom-aria`, `executeMode: dom-compatible`,
-  `evaluateWorld: isolated`, supported operations, and concrete limitations.
-  Older Chrome profiles may omit these optional fields.
+  `evaluateWorld: isolated`, supported operations, an optional `features` matrix
+  (such as which extraction formats and image modes it can serve), and concrete
+  limitations. Older Chrome profiles may omit these optional fields.
 - **Group** — a named tab group owned by *this* Pi session and bound to one fixed
   profile for its lifetime. Create with `browser_groups` (`action:"create"`,
   `name`, `profileId`). Same-name groups are allowed — each has its own `groupId`.
@@ -130,6 +131,72 @@ screenshots are an optional extra for visual/spatial questions.
 - `browser_screenshot` (`tabId`) returns an inline image when your model can see
   images; pass `path` to save, `fullPage` for the whole page, `labels` to overlay
   interactive markers. (There is no PDF tool.)
+
+## Extracting content (browser_extract)
+
+`browser_extract` (`tabId`, optional `format`, `images`, `search`, `offset`,
+`limit`, `path`) returns a tab's **content** instead of its structure.
+
+- **extract vs snapshot.** `browser_snapshot` reads the accessibility tree and
+  gives you `aria-ref=eN` refs to act on. `browser_extract` reads the content
+  itself and returns no refs and no `snapshotId`; it cannot click or fill, and it
+  does not invalidate the latest snapshot. Use extract to read, quote or export;
+  use snapshot when you are about to act.
+- **Format.** `markdown` (default) is what you want for reading and quoting —
+  headings, lists, links and tables survive. `text` is the same extraction with
+  the Markdown syntax stripped. `html` returns the serialized markup, windowed to
+  the same budget, for when the HTML itself matters. `assets-manifest` returns
+  the page's image listing instead of text — the same manifest `images:"urls"`
+  adds to a normal extraction, for when the question is which images a page has.
+- **A window, not the whole document.** The result reports `truncated` and
+  `totalBytes`, and the `extract:` line states when the text is a window of the
+  document. `search` keeps only the lines matching a term (with surrounding
+  context), `offset` skips lines and `limit` caps how many come back: page
+  through with `offset += limit`, and never summarize a document from a window
+  you have not read to its end.
+- **Exporting to disk.** Pass a `path` to keep the FULL extraction: the runtime
+  writes the file itself (Markdown and plain text as `.md`, `html` as `.html`)
+  and returns an artifact descriptor with `path`, `mimeType` and `bytes`, while
+  the tool result keeps only the bounded preview. The write is confined to the
+  runtime's artifacts directory (`~/.pi-browser-use/artifacts` by default, or
+  `$PI_BROWSER_DATA_DIR/artifacts`): a relative path resolves against that
+  directory, an absolute one is used as is, and a path outside it is refused.
+  Report the returned path to the user as the durable copy — you never write
+  files yourself.
+- **Images: `none` (default) / `urls` / `save`.** `none` leaves every image as a
+  remote URL in the text. `urls` adds the page's image manifest to the result —
+  one entry per image with `src`, `alt`, `naturalWidth` and `naturalHeight` (the
+  intrinsic pixel size, as the runtime reports it) — and downloads nothing; the
+  `assets:` line reports the count and the first few entries, with the rest in
+  the result's `value`. When the runtime had to cut the listing short it says so
+  in that line (`manifest truncated at N`, from `assetsTruncated`/`assetCount`),
+  so a manifest is never the whole page: say the listing is partial instead of
+  concluding the page has no other images. `save` really downloads the images:
+  the runtime writes them into its artifacts directory, rewrites the saved image
+  URLs in the Markdown to those local paths (so the extracted text no longer
+  depends on the site), and reports each file as an artifact with its path,
+  `mimeType`, `bytes` and the image's alt text as `label`. `save` costs time,
+  bandwidth and disk and the runtime caps how many images it keeps per request —
+  the `assets:` line reports the images over that cap as `N image(s) not
+  attempted` (`assetsNotFetched`), which are neither saved nor failed — so read
+  the manifest first and only pull bytes the user actually asked for.
+- **Images that could not be saved.** `images:"save"` reports them in
+  `failedAssets` (`src` plus the reason). Those were NOT saved and keep their
+  original remote URL in the text — never say an image was archived without
+  reading the artifact list, and never invent a local path.
+- **Capability differences.** Extraction is served by the target tab's browser
+  build, so it is advertised per profile: `browser_profiles` reports each
+  profile's `supportedOperations` and, when the peer has one, its `extract` and
+  `assets` feature matrices. Chrome profiles serve `page.extract` today. On
+  Firefox it depends on the installed add-on version: a profile that does not
+  advertise `page.extract` makes `browser_extract` fail with a clear error
+  instead of returning an empty extraction — read those pages with
+  `browser_snapshot` / `browser_evaluate`, and do not try to work around it with
+  broader permissions. `images:"urls"`/`"save"` are gated the same way one level
+  deeper: a Firefox profile must advertise the matching mode in
+  `features.assets`, and an add-on that does not is refused before anything is
+  downloaded. Use `images:"none"` there, or ask the user to update that
+  browser's extension.
 
 ## Console logs and network
 

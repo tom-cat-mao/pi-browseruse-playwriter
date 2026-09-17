@@ -25,6 +25,7 @@
 import type {
   BrowserCapabilities,
   BrowserErrorCode,
+  BrowserFeatureFlags,
   BrowserNetworkCaptureStatus,
   BrowserOperation,
   BrowserPageOperation,
@@ -50,6 +51,14 @@ export const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 // Per-image base64 ceiling enforced during validation so one giant image does
 // not slip past MAX_RESPONSE_BYTES undetected.
 const MAX_IMAGE_BASE64_BYTES = 24 * 1024 * 1024;
+// Bounds on peer-reported capability data. Unrecognized entries are ignored
+// (forward compatibility), but the containers must stay bounded so a
+// misbehaving peer cannot push unbounded data into gating decisions or into
+// model-facing content.
+const MAX_SUPPORTED_OPERATIONS = 32;
+const MAX_FEATURE_KEYS = 32;
+const MAX_FEATURE_VALUES = 32;
+const MAX_CAPABILITY_TOKEN_LENGTH = 100;
 
 // The protocol version this client speaks. Hardcoded (not imported as a runtime
 // value) so this module never loads runtime JS; kept in lockstep with the frozen
@@ -241,6 +250,84 @@ function toTransportError(
 
 // --- runtime response validation --------------------------------------------
 
+// Page operations this client can reason about and gate on. Deliberately a
+// local literal (never imported as a runtime value) that may lag the wire
+// protocol: a peer advertising an operation we do not know yet is ignored,
+// never a protocol failure.
+const KNOWN_PAGE_OPERATIONS = [
+  "page.navigate",
+  "page.back",
+  "page.snapshot",
+  "page.click",
+  "page.fill",
+  "page.evaluate",
+  "page.screenshot",
+  "page.network",
+  "page.logs",
+  "page.execute",
+  "page.extract",
+] as const satisfies readonly BrowserPageOperation["kind"][];
+
+function isKnownPageOperation(value: string): value is BrowserPageOperation["kind"] {
+  return (KNOWN_PAGE_OPERATIONS as readonly string[]).includes(value);
+}
+
+/**
+ * Parse the optional `supportedOperations`. Only the shape is enforced (a
+ * bounded array of bounded strings); an operation this client does not know —
+ * the extension always ships later than this client — is dropped rather than
+ * rejected, so a newer peer degrades to "not advertised here" instead of
+ * killing the whole connection.
+ */
+function parseSupportedOperations(value: unknown): BrowserPageOperation["kind"][] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > MAX_SUPPORTED_OPERATIONS) {
+    throw new RuntimeRequestError("protocol", "capabilities supportedOperations must be a bounded array");
+  }
+  const known: BrowserPageOperation["kind"][] = [];
+  for (const operation of value) {
+    if (typeof operation !== "string" || operation.length > MAX_CAPABILITY_TOKEN_LENGTH) {
+      throw new RuntimeRequestError("protocol", "capabilities supportedOperations must contain bounded strings");
+    }
+    if (isKnownPageOperation(operation)) known.push(operation);
+  }
+  return known;
+}
+
+/**
+ * Parse the optional `features` matrix. Feature names and their values are an
+ * open namespace by contract, so only the shape is enforced (bounded string
+ * arrays); unknown features are kept verbatim for callers that understand them.
+ */
+function parseFeatureFlags(value: unknown): BrowserFeatureFlags | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new RuntimeRequestError("protocol", "capabilities features must be an object");
+  }
+  const entries = Object.entries(value);
+  if (entries.length > MAX_FEATURE_KEYS) {
+    throw new RuntimeRequestError("protocol", "capabilities features has too many entries");
+  }
+  const features: Record<string, readonly string[]> = {};
+  for (const [name, tokens] of entries) {
+    if (name.length > MAX_CAPABILITY_TOKEN_LENGTH) {
+      throw new RuntimeRequestError("protocol", "capabilities features has an over-long feature name");
+    }
+    if (!Array.isArray(tokens) || tokens.length > MAX_FEATURE_VALUES) {
+      throw new RuntimeRequestError("protocol", `capabilities features.${name} must be a bounded array`);
+    }
+    const values: string[] = [];
+    for (const token of tokens) {
+      if (typeof token !== "string" || token.length > MAX_CAPABILITY_TOKEN_LENGTH) {
+        throw new RuntimeRequestError("protocol", `capabilities features.${name} must contain bounded strings`);
+      }
+      values.push(token);
+    }
+    features[name] = values;
+  }
+  return features;
+}
+
 function validateCapabilities(value: unknown): BrowserCapabilities {
   if (!isRecord(value)) {
     throw new RuntimeRequestError("protocol", "capabilities response is not an object");
@@ -295,20 +382,15 @@ function validateCapabilities(value: unknown): BrowserCapabilities {
   ) {
     throw new RuntimeRequestError("protocol", "capabilities limitations must be a bounded array of strings");
   }
-  const supportedOperations: readonly BrowserPageOperation["kind"][] = [
-    "page.navigate", "page.back", "page.snapshot", "page.click", "page.fill",
-    "page.evaluate", "page.screenshot", "page.network", "page.logs", "page.execute",
-  ];
-  if (
-    cap.supportedOperations !== undefined &&
-    (!Array.isArray(cap.supportedOperations) || cap.supportedOperations.length > supportedOperations.length ||
-      cap.supportedOperations.some((operation) => {
-        return !supportedOperations.includes(operation);
-      }))
-  ) {
-    throw new RuntimeRequestError("protocol", "capabilities supportedOperations contains an invalid page operation");
-  }
-  return value as unknown as BrowserCapabilities;
+  const supportedOperations = parseSupportedOperations(cap.supportedOperations);
+  const features = parseFeatureFlags(cap.features);
+  // Shallow copy so callers see exactly the supportedOperations/features we
+  // validated; unknown top-level keys are left untouched (forward compatibility).
+  return {
+    ...value,
+    ...(supportedOperations !== undefined ? { supportedOperations } : {}),
+    ...(features !== undefined ? { features } : {}),
+  } as unknown as BrowserCapabilities;
 }
 
 function validateProfile(value: unknown): BrowserProfile {
@@ -327,8 +409,10 @@ function validateProfile(value: unknown): BrowserProfile {
   }
   // capabilities is a required nested object on the contract; validate it too so
   // a truncated profile is caught here rather than surfacing as undefined later.
-  validateCapabilities(p.capabilities);
-  return value as unknown as BrowserProfile;
+  // The normalized copy is kept (see validateCapabilities) so gating code reads
+  // the same supportedOperations/features whichever endpoint reported them.
+  const capabilities = validateCapabilities(p.capabilities);
+  return { ...value, capabilities } as unknown as BrowserProfile;
 }
 
 // Capture lifecycle values as frozen in the protocol type.

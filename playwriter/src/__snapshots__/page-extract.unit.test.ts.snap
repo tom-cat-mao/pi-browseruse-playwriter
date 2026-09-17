@@ -1,0 +1,237 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`extractPageContent MediaWiki images > resolves figure images to the file bytes instead of the description page 1`] = `
+"# Tidal bore
+
+*Site: Wikipedia*
+
+A **tidal bore** is a shallow-water wave that propagates up a river or narrow bay against the direction of the current. The bore forms where the incoming tide is funnelled into a narrowing channel and the tidal range is large relative to the depth of the estuary. Bores are documented in more than eighty estuaries worldwide, and the largest of them travel tens of kilometres inland before they dissipate.
+
+![](https://upload.example/commons/thumb/8/8a/Tidal_bore_Qiantang.jpg/250px-Tidal_bore_Qiantang.jpg)
+
+The Qiantang River bore sweeping past the seawall at Hangzhou
+
+The shape of a bore depends on the ratio of tidal amplitude to channel depth. When that ratio is small the wave steepens gradually and the front stays smooth; when it is large the front curls forward and the bore breaks, entraining air and suspending sediment from the bed. The transition between the two regimes can often be seen within a single tidal cycle as the flood tide gains strength.
+
+Sediment transport in a bore is concentrated in the minutes around the passage of the front. Instruments anchored in the channel record a sharp spike in suspended-sediment concentration followed by a slower decay that lasts for the rest of the flood. The net effect over a spring-neap cycle is an upstream migration of sand that keeps many navigation channels shallow.
+
+## Notable bores
+
+The Qiantang River bore in China is the largest in the world, with a front that can exceed nine metres during the autumn spring tides. The Severn bore in England and the Pororoca on the Amazon are also well documented. Smaller bores occur on the Petitcodiac in Canada and on several rivers draining into the Bay of Fundy.
+
+![](https://upload.example/commons/thumb/1/1c/Severn_bore_surfer.jpg/220px-Severn_bore_surfer.jpg)
+
+A surfer riding the Severn bore near Newnham on Severn
+
+Recreational surfing on bores has grown since the 1950s, and several rivers now publish tide tables aimed at surfers rather than navigators. The rides are short by ocean standards but the waves are unusually predictable, which makes them attractive for record attempts and for training.
+
+Modelling a bore requires a depth-averaged solver that can represent a moving discontinuity in the free surface. Early one-dimensional models reproduced the timing of the front but not its height; modern two-dimensional models resolve the transverse structure of the wave and the secondary currents it drives along the banks. Field campaigns remain essential because the bed roughness of a muddy estuary is difficult to parameterise from first principles."
+`;
+
+exports[`extractPageContent element fragments > extracts a bare div fragment instead of scoring its body as boilerplate 1`] = `
+"## Retention window
+
+Every object written to a locked bucket carries a retain-until timestamp. A retention window is the interval between the write and that timestamp. While the window is open the object is protected: the storage layer rejects every delete request, whether it comes from the API, the lifecycle engine or an operator console, and it rejects overwrites of the same key.
+
+The window is set when the object is written and can only be extended afterwards. Extending is idempotent, so a retried request that already applied a longer window is accepted without changing the stored timestamp. Shortening a window is not a supported operation; buckets that need a shorter policy must copy the object to a bucket with a different policy instead.
+
+### Compliance mode
+
+A compliance window cannot be lifted by any principal, including the account owner. The only way out is for the window to elapse, which is why the tier is reserved for records a regulator asked you to keep. The lifecycle engine skips objects under a compliance window and reports each skip in the bucket audit log with the reason \`retention-hold\`.
+
+- Minimum lock is ninety days; shorter values are rejected with \`InvalidRetentionPeriod\`.
+- Maximum lock is ten years, matching the longest regulatory schedule in the reference table.
+- Objects larger than five tebibytes cannot enter the tier and stay under governance rules instead.
+
+### Early delete fees
+
+Deleting a locked object before its window elapses is never allowed, but deleting it shortly after the window elapses triggers a prorated storage fee. The fee covers the remainder of the billing term, which is charged monthly: a window that ends six days into the month is billed for those six days only, and the cost dashboard breaks the amount down per bucket.
+
+Buckets that mix tiers report the fee per tier, so a bucket with governance and compliance objects shows two lines. The migration notes describe how to move objects between tiers without restarting a window.
+
+See the [migration notes](https://storage.example/docs/retention#migration) before changing a bucket policy, and the [audit log reference](https://storage.example/docs/retention#audit) for the fields the storage layer records.
+
+The retention window is the only lock that survives a bucket policy rewrite. Tags, ACLs and bucket defaults are re-evaluated on the next request, so an operator who relies on a default to keep a record must still set the window explicitly when the object is created."
+`;
+
+exports[`extractPageContent element fragments > extracts a bare section fragment that carries no heading of its own 1`] = `
+"Release 0.9 changed how the runtime resolves a managed profile. The change is backwards compatible for every caller that passes an explicit profile id, and it makes the previous implicit lookup unnecessary.
+
+Profiles are now read once when the group is created and cached for the lifetime of the connection. A profile that is closed while a group still references it no longer falls back to the default browser profile; the affected request fails with \`profile-disconnected\` and the group keeps its binding until the caller releases it. This is the behaviour operators asked for after the incident in August, where a closed profile silently moved traffic to a signed-in browser.
+
+The release also renames the diagnostic flag that used to be called \`verboseRelay\`. Logs now carry the connection id on every line, which makes a single tab traceable across worker restarts. Old flag names are still accepted and produce a deprecation line in the relay log.
+
+- Profiles are resolved once per group and never re-resolved implicitly.
+- Closed profiles fail the request instead of falling back to a default browser.
+- Every relay log line carries the connection id and the browser epoch.
+- The legacy diagnostic flag still works and prints one deprecation line.
+
+Upgrade notes: callers that relied on the implicit lookup must pass a profile id when they create a group. The runtime rejects a group without a profile with \`invalid-request\`, and the error message names the argument that is missing.
+
+Rollback is a single version pin. Groups created by 0.9 keep working after a rollback because the stored binding is a plain profile id, but the cached lookups are rebuilt on the next connection, which takes one extra round trip on the first request per tab.
+
+Reporting: file a report from the runtime page if a group keeps failing after an upgrade. Include the relay log excerpt around the failure and the value of the browser epoch, since both are needed to tell a stale binding apart from a genuinely missing profile."
+`;
+
+exports[`extractPageContent markdown extraction > extracts a typical article without navigation or promo blocks 1`] = `
+"# How Tidal Bores Reshape Estuaries
+
+*Author: Dana Whitfield | Site: Coastal Review | Published: 2024-11-02T08:30:00Z*
+
+> Tidal bores look like a single wave, but they carry sediment budgets that reshape estuaries over decades.
+
+A tidal bore is the leading edge of an incoming tide travelling up a river against the current. It looks like a single breaking wave, sometimes only a few centimetres high, yet it moves more water than a small river carries in an hour.
+
+Researchers have tracked bores in the Severn, the Qiantang, and the Amazon for decades. The measurements agree on one point: the bore is not just a curiosity of fluid dynamics, it is a sediment pump.
+
+## Why sediment matters
+
+Sediment carried by a bore settles in slack water behind the wave front. Over a season the deposits raise the bed of the channel, which in turn changes where the next bore breaks. The feedback loop is slow but persistent.
+
+- Coarse sand settles first, within hundreds of metres of the front.
+- Fine silt travels further and builds the *fluid mud* layer upstream.
+- Organic matter binds the deposits once vegetation returns.
+
+### Measuring the front
+
+Field teams use pressure transducers and acoustic Doppler profilers to log the passage of a bore. A typical deployment returns a velocity profile such as \`u(z) = u* / k * ln(z / z0)\`, which is then fitted to a log law.
+
+> "The bore does the work of a dredger, and it does it for free. The problem is that we never asked where it puts the material."
+
+## What happens next
+
+Estuary managers now model bores explicitly rather than treating them as noise in the tidal signal. The [third-generation bore model](https://coastal.example/research/bore-model-v3) couples the wave front to bed roughness, and early results suggest the coupling halves the error in long-run deposition forecasts.
+
+The remaining question is biological. If the fluid mud layer thickens, does the benthic community recover between bore seasons, or does it need several quiet years?"
+`;
+
+exports[`extractPageContent markdown extraction > falls back to body scoped extraction when the automatic pass drops replies 1`] = `
+"# Build times doubled after 0.9 upgrade
+
+*Site: Forum*
+
+After upgrading to 0.9 our CI went from 6 minutes to 13 minutes per build. Same runner image, same lockfile except for the upgrade itself. Anyone else seeing this?
+
+I already tried \`--no-cache\` and a clean checkout. The slowdown survives both, which makes me think it is not the cache format change.
+
+We changed the default for \`parallelism\` from \`auto\` to \`2\` in 0.9 because the auto heuristic was oversubscribing small runners. On a 4-core box that halves the concurrency.
+
+Set it back explicitly if your runner is not memory constrained:
+
+\`\`\`
+[build]
+parallelism = "auto"
+\`\`\`
+
+That was it. Confirmed: 13 minutes with \`parallelism = 2\`, 6 minutes with \`auto\`. The release notes mention the change but not the effective difference on 4-core runners."
+`;
+
+exports[`extractPageContent markdown extraction > keeps data tables as markdown pipe tables 1`] = `
+"# Retention policy reference | Storage Docs
+
+> Bucket-level retention tiers, their minimum lock periods and per-object limits.
+
+## Retention policy reference
+
+A retention policy prevents objects from being deleted or overwritten for a fixed period. Policies are set per bucket and apply to every object written afterwards.
+
+## Retention tiers
+
+The table below lists the supported tiers. The minimum lock period is enforced by the service; shorter values are rejected with \`400 InvalidRetentionPeriod\`.
+
+| Tier | Minimum lock | Maximum lock | Object size limit | Early delete fee |
+| --- | --- | --- | --- | --- |
+| \`standard\` | 1 day | 3 years | 5 TiB | none |
+| \`compliance\` | 90 days | 10 years | 5 TiB | prorated storage |
+| \`archive\` | 180 days | 7 years | 500 GiB | retrieval cost |
+
+## Enabling a policy
+
+Set the tier with the CLI and confirm the resulting lock period:
+
+\`\`\`
+storage bucket retention set --bucket media --tier compliance
+storage bucket retention describe --bucket media
+\`\`\`
+
+Policies take effect for new writes only. Objects written before the change keep their previous retention state until it expires, which is why the [migration notes](https://storage.example/docs/retention#migration) recommend a two-week window.
+
+## Limits
+
+- One policy per bucket; changing tiers does not shorten existing locks.
+- Up to 100 lifecycle rules per bucket, each referencing a retention tier.
+- Legal holds override retention and can only be released by an account owner."
+`;
+
+exports[`extractPageContent search windowing > returns the matching line with five lines of context 1`] = `
+"- Fine silt travels further and builds the *fluid mud* layer upstream.
+- Organic matter binds the deposits once vegetation returns.
+
+### Measuring the front
+
+Field teams use pressure transducers and acoustic Doppler profilers to log the passage of a bore. A typical deployment returns a velocity profile such as \`u(z) = u* / k * ln(z / z0)\`, which is then fitted to a log law.
+
+> "The bore does the work of a dredger, and it does it for free. The problem is that we never asked where it puts the material."
+
+## What happens next
+
+[truncated; use search or offset/limit for the rest]"
+`;
+
+exports[`extractPageContent text format > emits title, metadata and excerpt as plain text 1`] = `
+"How Tidal Bores Reshape Estuaries
+
+Author: Dana Whitfield | Site: Coastal Review | Published: 2024-11-02T08:30:00Z
+
+Tidal bores look like a single wave, but they carry sediment budgets that reshape estuaries over decades.
+
+A tidal bore is the leading edge of an incoming tide travelling up a river against the current. It looks like a single breaking wave, sometimes only a few centimetres high, yet it moves more water than a small river carries in an hour.
+
+Researchers have tracked bores in the Severn, the Qiantang, and the Amazon for decades. The measurements agree on one point: the bore is not just a curiosity of fluid dynamics, it is a sediment pump.
+Why sediment matters
+
+Sediment carried by a bore settles in slack water behind the wave front. Over a season the deposits raise the bed of the channel, which in turn changes where the next bore breaks. The feedback loop is slow but persistent.
+Coarse sand settles first, within hundreds of metres of the front.
+Fine silt travels further and builds the fluid mud layer upstream.
+Organic matter binds the deposits once vegetation returns.
+Measuring the front
+
+Field teams use pressure transducers and acoustic Doppler profilers to log the passage of a bore. A typical deployment returns a velocity profile such as u(z) = u* / k * ln(z / z0), which is then fitted to a log law.
+"The bore does the work of a dredger, and it does it for free. The problem is that we never asked where it puts the material."
+What happens next
+
+Estuary managers now model bores explicitly rather than treating them as noise in the tidal signal. The third-generation bore model couples the wave front to bed roughness, and early results suggest the coupling halves the error in long-run deposition forecasts.
+
+The remaining question is biological. If the fluid mud layer thickens, does the benthic community recover between bore seasons, or does it need several quiet years?"
+`;
+
+exports[`extractPageContent text format > strips markdown syntax and keeps table cells readable 1`] = `
+"Retention policy reference | Storage Docs
+
+Bucket-level retention tiers, their minimum lock periods and per-object limits.
+
+Retention policy reference
+
+A retention policy prevents objects from being deleted or overwritten for a fixed period. Policies are set per bucket and apply to every object written afterwards.
+Retention tiers
+
+The table below lists the supported tiers. The minimum lock period is enforced by the service; shorter values are rejected with 400 InvalidRetentionPeriod.
+
+| Tier | Minimum lock | Maximum lock | Object size limit | Early delete fee |
+| --- | --- | --- | --- | --- |
+| standard | 1 day | 3 years | 5 TiB | none |
+| compliance | 90 days | 10 years | 5 TiB | prorated storage |
+| archive | 180 days | 7 years | 500 GiB | retrieval cost |
+Enabling a policy
+
+Set the tier with the CLI and confirm the resulting lock period:
+
+storage bucket retention set --bucket media --tier compliance
+storage bucket retention describe --bucket media
+
+Policies take effect for new writes only. Objects written before the change keep their previous retention state until it expires, which is why the migration notes recommend a two-week window.
+Limits
+One policy per bucket; changing tiers does not shorten existing locks.
+Up to 100 lifecycle rules per bucket, each referencing a retention tier.
+Legal holds override retention and can only be released by an account owner."
+`;

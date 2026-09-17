@@ -7,6 +7,8 @@ import url from 'node:url'
 import vm from 'node:vm'
 import type {
   BrowserErrorCode,
+  BrowserExtractFormat,
+  BrowserExtractImagesMode,
   BrowserJson,
   BrowserRequest,
   BrowserPageOperation,
@@ -22,6 +24,7 @@ import {
   type SnapshotOutputLine,
 } from './aria-snapshot.js'
 import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
+import { boundExtractArtifactText, extractPageContent, windowExtractedText, withExtractArtifactText } from './page-extract.js'
 import { getChromium } from './playwright-import.js'
 import { waitForPageLoad } from './wait-for-page-load.js'
 import { ManagedPlaywrightFacade } from './managed-executor-facade.js'
@@ -53,6 +56,61 @@ const MAX_NETWORK_ENTRIES = 500
 // Keep image payloads below the newline protocol's 8 MiB envelope budget.
 const MAX_INLINE_IMAGE_BASE64 = 4 * 1024 * 1024
 const MAX_EXECUTE_CODE_LENGTH = 1_000_000
+/** Images one assets manifest lists; a page can carry thousands. */
+const MAX_EXTRACT_ASSET_ENTRIES = 200
+/** Model-facing budget for a serialized assets manifest, aligned with the extract preview. */
+const MAX_EXTRACT_ASSETS_BYTES = 40_000
+/** Images one `images: 'save'` request fetches bytes for. */
+const MAX_SAVED_ASSETS = 20
+/** Per-image byte cap, aligned with the artifact store limits. */
+const MAX_SAVED_ASSET_BYTES = 16 * 1024 * 1024
+/**
+ * Base64 budget for what one response may carry back, and the same budget in
+ * image bytes. The worker->relay envelope is 8 MiB and the same response also
+ * carries the persisted body (`value.artifactText`, up to 2 MiB), the preview
+ * text and the assets manifest, so the image payload has to stay inside what
+ * is left: 4 MiB of base64 (3 MiB of image bytes) plus a 2 MiB body plus the
+ * preview and listing stays under the envelope. This is the per-request image
+ * budget on this backend, and it is much smaller than the Firefox channel's
+ * 64 MiB, which has a frame budget of its own. Images that no longer fit are
+ * reported as per-image failures instead of breaking the whole response.
+ */
+const MAX_SAVED_ASSET_BASE64_BYTES = 4 * 1024 * 1024
+/** The same budget in image bytes; base64 is 4/3 of the bytes it carries. */
+const MAX_SAVED_ASSET_REQUEST_BYTES = (MAX_SAVED_ASSET_BASE64_BYTES / 4) * 3
+const MAX_ASSET_FETCH_TIMEOUT_MS = 10_000
+const ASSET_URL_MAX_LENGTH = 2_048
+const ASSET_ALT_MAX_LENGTH = 512
+const ASSET_SRCSET_MAX_LENGTH = 2_048
+/**
+ * Page-side read is asked for one entry more than the manifest may list, so a
+ * page with more images than the cap is reported as truncated instead of
+ * looking complete.
+ */
+const MAX_COLLECTED_ASSET_ENTRIES = MAX_EXTRACT_ASSET_ENTRIES + 1
+
+/**
+ * Image types the artifact store can name. Anything else is reported as a
+ * failed asset rather than handed to a store that would reject the request.
+ */
+const SAVED_ASSET_MIME_TYPES = new Set<string>([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif',
+  'image/svg+xml',
+])
+
+/** Extension fallback for responses that do not declare an image content type. */
+const ASSET_MIME_TYPE_EXTENSIONS: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  svg: 'image/svg+xml',
+}
 
 const SAFE_NODE_GLOBALS = {
   AbortController,
@@ -117,6 +175,63 @@ interface RawConsole {
   warn: (...args: unknown[]) => void
   error: (...args: unknown[]) => void
   debug: (...args: unknown[]) => void
+}
+
+/** One image the page reports, as the manifest exposes it to the model. */
+type ExtractedAsset = {
+  /** Absolute URL the browser resolved for the `src` attribute. */
+  src: string
+  /** URL the browser actually chose (srcset candidate), when it reports one. */
+  currentSrc: string
+  srcset: string
+  alt: string
+  naturalWidth: number
+  naturalHeight: number
+}
+
+/** Bytes fetched for one image, ready to travel to the relay as base64. */
+type SavedAsset = {
+  base64: string
+  mimeType: string
+  src: string
+  /**
+   * Every URL the page uses for this image — its `src` attribute and the
+   * srcset candidate the browser chose — so the relay can rewrite whichever
+   * one the extracted body kept.
+   */
+  sourceUrls?: string[]
+  alt?: string
+}
+
+type FailedAsset = {
+  src: string
+  reason: string
+}
+
+/**
+ * Page-side globals this worker reads through `page.evaluate`. The runtime is
+ * type-checked without the DOM lib, so the page API surface is described
+ * structurally instead of pulled in globally.
+ */
+type PageImageElement = {
+  src: string
+  currentSrc: string
+  naturalWidth: number
+  naturalHeight: number
+  getAttribute: (name: string) => string | null
+}
+
+type PageSideGlobals = {
+  document: { images: ArrayLike<PageImageElement> }
+  fetch: (input: string, init: { credentials: string }) => Promise<PageSideResponse>
+  btoa: (value: string) => string
+}
+
+type PageSideResponse = {
+  ok: boolean
+  status: number
+  headers: { get: (name: string) => string | null }
+  arrayBuffer: () => Promise<ArrayBuffer>
 }
 
 class ManagedExecutorOperationError extends Error {
@@ -632,6 +747,18 @@ export class ManagedExecutorWorkerRuntime {
         return this.logs({ state: this.requirePageState({ page }), limit: operation.limit })
       case 'page.execute':
         return await this.executeJavaScript({ page, code: operation.code, deadline, markSideEffectsStarted })
+      case 'page.extract':
+        return await this.extract({
+          page,
+          format: operation.format,
+          images: operation.images,
+          selector: operation.selector,
+          search: operation.search,
+          offset: operation.offset,
+          limit: operation.limit,
+          persist: operation.path !== undefined,
+          deadline,
+        })
       default:
         return assertNever(operation)
     }
@@ -893,6 +1020,316 @@ export class ManagedExecutorWorkerRuntime {
       images,
       artifacts,
     }
+  }
+
+  /**
+   * page.extract reads content, never page structure: the browser side only
+   * produces high-fidelity HTML and the Node-side pipeline turns it into
+   * Markdown or plain text, so both backends share one extraction.
+   *
+   * `format: 'html'` skips the pipeline but not the window budget — a raw
+   * document can be far larger than any model-facing payload. When the caller
+   * persists the result (`path`), the whole extraction travels in
+   * `value.artifactText` for the relay to write, and is stripped there before
+   * the response reaches the model.
+   *
+   * Images are a separate channel: the DOM manifest travels in `value.assets`,
+   * fetched bytes travel in `value.savedAssets` for the relay to persist, and
+   * nothing here ever feeds `data.images` (the model-inline channel).
+   */
+  private async extract({
+    page,
+    format,
+    images = 'none',
+    selector,
+    search,
+    offset,
+    limit,
+    persist,
+    deadline,
+  }: {
+    page: Page
+    format: BrowserExtractFormat
+    images?: BrowserExtractImagesMode
+    selector?: string
+    search?: string
+    offset?: number
+    limit?: number
+    persist: boolean
+    deadline: number
+  }): Promise<BrowserResultData> {
+    if (format === 'assets-manifest') {
+      return await this.extractAssetsManifest({ page, images, search, offset, limit, persist, deadline })
+    }
+    const html = selector
+      ? await page.locator(selector).evaluate(
+          (element) => {
+            return element.outerHTML
+          },
+          { timeout: this.nativeOperationTimeout({ deadline, maximumMs: MAX_SELECTOR_TIMEOUT_MS }) },
+        )
+      : await page.content()
+    const totalBytes = Buffer.byteLength(html, 'utf8')
+
+    if (format === 'html') {
+      const preview = windowExtractedText({ text: html, search, offset, limit })
+      const pageTitle = await page.title()
+      const value: Record<string, BrowserJson> = {
+        format,
+        truncated: preview.truncated,
+        totalBytes,
+        ...(pageTitle ? { title: pageTitle } : {}),
+      }
+      return {
+        text: preview.text,
+        value: withExtractArtifactText({
+          value: await this.withExtractImages({ page, images, value, deadline }),
+          persisted: persist ? boundExtractArtifactText({ text: html }) : undefined,
+        }),
+      }
+    }
+
+    const extracted = await extractPageContent({
+      html,
+      url: page.url(),
+      format,
+      ...(persist ? { full: true } : { search, offset, limit }),
+    })
+    // A persisted extraction is complete; the model still gets the window it
+    // asked for, and never the whole document inline.
+    const preview = persist ? windowExtractedText({ text: extracted.text, search, offset, limit }) : extracted
+    const value: Record<string, BrowserJson> = {
+      format,
+      truncated: preview.truncated,
+      totalBytes: extracted.totalBytes,
+      ...(extracted.title ? { title: extracted.title } : {}),
+      ...(extracted.metadata ? { metadata: { ...extracted.metadata } } : {}),
+    }
+    return {
+      text: preview.text,
+      value: withExtractArtifactText({
+        value: await this.withExtractImages({ page, images, value, deadline }),
+        persisted: persist ? boundExtractArtifactText({ text: extracted.text }) : undefined,
+      }),
+    }
+  }
+
+  /**
+   * The manifest format: a DOM-only image inventory that fetches no bytes. The
+   * preview listing goes through the same window budget as every other format,
+   * and the JSON manifest is bounded separately, so a gallery page cannot hand
+   * the model a payload larger than any other extraction.
+   */
+  private async extractAssetsManifest({
+    page,
+    images,
+    search,
+    offset,
+    limit,
+    persist,
+    deadline,
+  }: {
+    page: Page
+    images: BrowserExtractImagesMode
+    search?: string
+    offset?: number
+    limit?: number
+    persist: boolean
+    deadline: number
+  }): Promise<BrowserResultData> {
+    const assets = await this.collectExtractAssets({ page })
+    const manifest = boundAssetManifest({ assets })
+    const listing = formatAssetManifestText({ assets: manifest.assets, truncated: manifest.truncated })
+    const preview = windowExtractedText({ text: listing, search, offset, limit })
+    const pageTitle = await page.title()
+    const value: Record<string, BrowserJson> = {
+      format: 'assets-manifest',
+      truncated: preview.truncated,
+      totalBytes: Buffer.byteLength(listing, 'utf8'),
+      assetCount: manifest.assets.length,
+      assets: manifest.assets,
+      ...(manifest.truncated ? { assetsTruncated: true } : {}),
+      ...(pageTitle ? { title: pageTitle } : {}),
+    }
+    return {
+      text: preview.text,
+      value: withExtractArtifactText({
+        // The manifest is inherent to this format, so only the byte channel of
+        // `images: 'save'` is added on top of it.
+        value: await this.withExtractImages({ page, images, value, deadline, assets }),
+        persisted: persist ? boundExtractArtifactText({ text: listing }) : undefined,
+      }),
+    }
+  }
+
+  /**
+   * Attach the image channel the caller asked for. `none` leaves the payload
+   * alone; `urls` adds the DOM manifest; `save` adds the same manifest plus the
+   * fetched bytes, always in `value.savedAssets` so the relay — not the model —
+   * owns them. Both image modes report the same inventory, so a caller can see
+   * what was there next to what was saved.
+   */
+  private async withExtractImages({
+    page,
+    images,
+    value,
+    deadline,
+    assets,
+  }: {
+    page: Page
+    images: BrowserExtractImagesMode
+    value: Record<string, BrowserJson>
+    deadline: number
+    /** Manifest the caller already enumerated; avoids a second page read. */
+    assets?: ExtractedAsset[]
+  }): Promise<Record<string, BrowserJson>> {
+    if (images === 'none') {
+      return value
+    }
+    const collected = assets ?? (await this.collectExtractAssets({ page }))
+    const manifest = boundAssetManifest({ assets: collected })
+    const counted: Record<string, BrowserJson> = {
+      ...value,
+      assetCount: manifest.assets.length,
+      assets: manifest.assets,
+      ...(manifest.truncated ? { assetsTruncated: true } : {}),
+    }
+    if (images === 'urls') {
+      return counted
+    }
+    return await this.withSavedAssets({ page, assets: manifest.assets, value: counted, deadline })
+  }
+
+  /**
+   * Fetch bytes for the first images of the manifest. Every image is
+   * independent: a refused, oversized or unsupported one lands in
+   * `failedAssets` and never fails the request, and the bounded `savedAssets`
+   * payload keeps a single response inside the worker envelope. Images the
+   * 20-image bound left untried are counted in `assetsNotFetched`, the way the
+   * Firefox backend reports them.
+   */
+  private async withSavedAssets({
+    page,
+    assets,
+    value,
+    deadline,
+  }: {
+    page: Page
+    assets: ExtractedAsset[]
+    value: Record<string, BrowserJson>
+    deadline: number
+  }): Promise<Record<string, BrowserJson>> {
+    const savedAssets: SavedAsset[] = []
+    const failedAssets: FailedAsset[] = []
+    const attempted = assets.slice(0, MAX_SAVED_ASSETS)
+    let savedBytes = 0
+
+    for (const asset of attempted) {
+      const src = asset.currentSrc || asset.src
+      const failure = (reason: string): void => {
+        failedAssets.push({ src, reason })
+      }
+      try {
+        if (savedBytes >= MAX_SAVED_ASSET_REQUEST_BYTES) {
+          failure(`saving stopped: the ${MAX_SAVED_ASSET_REQUEST_BYTES} byte per-request saved-image budget is already used up`)
+          continue
+        }
+        const fetched = await this.fetchAssetBytes({ page, url: src, deadline })
+        const bytes = Buffer.byteLength(fetched.base64, 'base64')
+        if (bytes > MAX_SAVED_ASSET_BYTES) {
+          failure(`image of ${bytes} bytes exceeds the ${MAX_SAVED_ASSET_BYTES} byte per-image limit`)
+          continue
+        }
+        if (!SAVED_ASSET_MIME_TYPES.has(fetched.mimeType)) {
+          failure(`unsupported image type ${fetched.mimeType}`)
+          continue
+        }
+        if (savedBytes + bytes > MAX_SAVED_ASSET_REQUEST_BYTES) {
+          failure(`image of ${bytes} bytes would exceed the ${MAX_SAVED_ASSET_REQUEST_BYTES} byte per-request saved-image budget`)
+          continue
+        }
+        savedAssets.push({
+          base64: fetched.base64,
+          mimeType: fetched.mimeType,
+          src,
+          ...sourceUrls({ asset }),
+          ...(asset.alt ? { alt: asset.alt } : {}),
+        })
+        savedBytes += bytes
+      } catch (error) {
+        failure(errorMessage(error))
+      }
+    }
+
+    const notFetched = assets.length - attempted.length
+    return {
+      ...value,
+      savedAssets,
+      ...(failedAssets.length > 0 ? { failedAssets } : {}),
+      ...(notFetched > 0 ? { assetsNotFetched: notFetched } : {}),
+    }
+  }
+
+  /**
+   * Fetch one image. The page goes first so the request carries the page's
+   * cookies and origin, which is what same-origin and CORS-enabled images need;
+   * a page-side refusal — cross-origin without CORS headers, or the page's own
+   * CSP — falls back to a Node-side fetch, which sends no cookies but reaches
+   * public CDNs. The fallback never touches a loopback, private or link-local
+   * address: without that bound a page could name any URL in its markup and
+   * have the runtime probe the machine and its network for it.
+   */
+  private async fetchAssetBytes({
+    page,
+    url,
+    deadline,
+  }: {
+    page: Page
+    url: string
+    deadline: number
+  }): Promise<{ base64: string; mimeType: string }> {
+    const timeoutMs = this.nativeOperationTimeout({ deadline, maximumMs: MAX_ASSET_FETCH_TIMEOUT_MS })
+    if (timeoutMs <= 0) {
+      throw new Error('the request deadline is exhausted')
+    }
+    let pageFailure = ''
+    try {
+      const fetched = await page.evaluate(fetchAssetInPage, { url, timeoutMs, maxBytes: MAX_SAVED_ASSET_BYTES })
+      return { base64: fetched.base64, mimeType: resolveAssetMimeType({ declared: fetched.mimeType, url }) }
+    } catch (error) {
+      pageFailure = errorMessage(error)
+    }
+    if (isPrivateAssetFetchHost({ url })) {
+      throw new Error(
+        `page fetch failed (${pageFailure}); the runtime will not fetch a loopback, private or link-local address on the page's behalf`,
+      )
+    }
+    try {
+      const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) })
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+      const declaredBytes = Number(response.headers.get('content-length') ?? '')
+      if (Number.isFinite(declaredBytes) && declaredBytes > MAX_SAVED_ASSET_BYTES) {
+        throw new Error(`image of ${declaredBytes} bytes exceeds the ${MAX_SAVED_ASSET_BYTES} byte per-image limit`)
+      }
+      const buffer = Buffer.from(await response.arrayBuffer())
+      return {
+        base64: buffer.toString('base64'),
+        mimeType: resolveAssetMimeType({ declared: response.headers.get('content-type'), url }),
+      }
+    } catch (error) {
+      throw new Error(`page fetch failed (${pageFailure}); node fetch failed (${errorMessage(error)})`)
+    }
+  }
+
+  private async collectExtractAssets({ page }: { page: Page }): Promise<ExtractedAsset[]> {
+    return await page.evaluate(collectPageAssets, {
+      maxEntries: MAX_COLLECTED_ASSET_ENTRIES,
+      urlMaxLength: ASSET_URL_MAX_LENGTH,
+      altMaxLength: ASSET_ALT_MAX_LENGTH,
+      srcsetMaxLength: ASSET_SRCSET_MAX_LENGTH,
+    })
   }
 
   private network({
@@ -1530,6 +1967,286 @@ function appendImage({
   if (base64.length <= MAX_INLINE_IMAGE_BASE64) {
     images.push({ data: base64, mimeType })
   }
+}
+
+/**
+ * Runs in the page: enumerate `<img>` elements for the assets manifest.
+ * `data:` sources have no fetchable bytes and an image without a resolved URL
+ * (lazy placeholders before their script runs) has nothing to report, so both
+ * are skipped. The function is self-contained because it is serialized into the
+ * page and cannot reach any module here.
+ */
+function collectPageAssets(input: {
+  maxEntries: number
+  urlMaxLength: number
+  altMaxLength: number
+  srcsetMaxLength: number
+}): ExtractedAsset[] {
+  const { document: pageDocument } = globalThis as unknown as PageSideGlobals
+  const assets: ExtractedAsset[] = []
+  for (const image of Array.from(pageDocument.images)) {
+    const currentSrc = (image.currentSrc || '').trim()
+    const src = (image.src || '').trim()
+    const resolved = currentSrc || src
+    if (!resolved || resolved.startsWith('data:')) {
+      continue
+    }
+    const alt = (image.getAttribute('alt') || '').trim()
+    const srcset = (image.getAttribute('srcset') || '').trim()
+    assets.push({
+      src: src.length > input.urlMaxLength ? src.slice(0, input.urlMaxLength) : src,
+      currentSrc: currentSrc.length > input.urlMaxLength ? currentSrc.slice(0, input.urlMaxLength) : currentSrc,
+      srcset: srcset.length > input.srcsetMaxLength ? srcset.slice(0, input.srcsetMaxLength) : srcset,
+      alt: alt.length > input.altMaxLength ? alt.slice(0, input.altMaxLength) : alt,
+      naturalWidth: Number.isFinite(image.naturalWidth) ? image.naturalWidth : 0,
+      naturalHeight: Number.isFinite(image.naturalHeight) ? image.naturalHeight : 0,
+    })
+    if (assets.length >= input.maxEntries) {
+      break
+    }
+  }
+  return assets
+}
+
+/**
+ * Runs in the page: fetch one image with the page's cookies, bounded by a
+ * page-side timeout so a stalled response cannot hold the whole request. A
+ * declared size over the per-image limit is refused before the body is read,
+ * because decoding a huge image into a string and then into base64 multiplies
+ * it several times over.
+ */
+async function fetchAssetInPage(input: {
+  url: string
+  timeoutMs: number
+  maxBytes: number
+}): Promise<{ base64: string; mimeType: string }> {
+  const { fetch: pageFetch, btoa: pageBtoa } = globalThis as unknown as PageSideGlobals
+  const request = (async () => {
+    const response = await pageFetch(input.url, { credentials: 'include' })
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+    const declaredBytes = Number(response.headers.get('content-length') || '')
+    if (Number.isFinite(declaredBytes) && declaredBytes > input.maxBytes) {
+      throw new Error(`image of ${declaredBytes} bytes exceeds the ${input.maxBytes} byte per-image limit`)
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    let binary = ''
+    // Chunked so a multi-megabyte image never lands in one argument list.
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+    }
+    return { base64: pageBtoa(binary), mimeType: response.headers.get('content-type') || '' }
+  })()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`page fetch timed out after ${input.timeoutMs} ms`))
+    }, input.timeoutMs)
+  })
+  try {
+    return await Promise.race([request, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function resolveAssetMimeType({ declared, url }: { declared?: string | null; url: string }): string {
+  const normalized = (declared ?? '').split(';')[0].trim().toLowerCase()
+  if (SAVED_ASSET_MIME_TYPES.has(normalized)) {
+    return normalized
+  }
+  // A CDN that serves `application/octet-stream` still names the file in its
+  // URL, and the store needs a type it can name a file with.
+  const pathname = url.split(/[?#]/)[0]
+  const lastSegment = pathname.slice(pathname.lastIndexOf('/') + 1)
+  const dot = lastSegment.lastIndexOf('.')
+  const extension = dot === -1 ? '' : lastSegment.slice(dot + 1).toLowerCase()
+  return ASSET_MIME_TYPE_EXTENSIONS[extension] ?? normalized
+}
+
+/**
+ * Every URL the page names this image by: the `src` attribute and the srcset
+ * candidate whose bytes were fetched. Only attached when they differ, because
+ * the fetch URL always travels as `src`.
+ */
+function sourceUrls({ asset }: { asset: ExtractedAsset }): { sourceUrls?: string[] } {
+  const urls = Array.from(new Set([asset.src, asset.currentSrc])).filter((url) => {
+    return url.length > 0
+  })
+  return urls.length > 1 ? { sourceUrls: urls } : {}
+}
+
+/** Address ranges the runtime-side fetch must not reach: "this host", private, loopback, link-local. */
+const BLOCKED_IPV4_RANGES: Array<{ address: number; prefixBits: number }> = [
+  { address: ipv4Address({ a: 0, b: 0, c: 0, d: 0 }), prefixBits: 8 },
+  { address: ipv4Address({ a: 10, b: 0, c: 0, d: 0 }), prefixBits: 8 },
+  { address: ipv4Address({ a: 127, b: 0, c: 0, d: 0 }), prefixBits: 8 },
+  { address: ipv4Address({ a: 169, b: 254, c: 0, d: 0 }), prefixBits: 16 },
+  { address: ipv4Address({ a: 172, b: 16, c: 0, d: 0 }), prefixBits: 12 },
+  { address: ipv4Address({ a: 192, b: 168, c: 0, d: 0 }), prefixBits: 16 },
+]
+
+function ipv4Address({ a, b, c, d }: { a: number; b: number; c: number; d: number }): number {
+  return a * 256 ** 3 + b * 256 ** 2 + c * 256 + d
+}
+
+function isBlockedIpv4Address(address: number): boolean {
+  return BLOCKED_IPV4_RANGES.some((range) => {
+    const block = 2 ** (32 - range.prefixBits)
+    return Math.floor(address / block) === Math.floor(range.address / block)
+  })
+}
+
+/**
+ * Whether the runtime-side fallback fetch would reach the machine itself or a
+ * private network. The URL is page-derived, so only what a page can name
+ * literally is checked: an IPv4 host, a bracketed IPv6 host with its loopback,
+ * unspecified, unique-local, link-local and IPv4-mapped forms, and `localhost`
+ * with its subdomains. Short, decimal, hexadecimal and octal IPv4 spellings
+ * (`127.1`, `2130706433`, `0x7f000001`) do not need their own checks: the URL
+ * parser normalizes every one of them to a dotted quad, which is what the
+ * range check below reads.
+ *
+ * Boundaries: a public host name that resolves to a private address is not
+ * caught here — that needs a resolution-time check with its own rebinding
+ * window, while the page-side fetch can reach such an origin with the page's
+ * own credentials anyway; the runtime only declines to do it on the page's
+ * behalf. A redirect from a public URL to a private one is followed for the
+ * same reason the fallback exists: refusing redirects would break the CDNs it
+ * is here for.
+ */
+function isPrivateAssetFetchHost({ url }: { url: string }): boolean {
+  let host: string
+  try {
+    host = new URL(url).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1)
+  }
+  if (host === 'localhost' || host.endsWith('.localhost')) {
+    return true
+  }
+  if (host.includes(':')) {
+    return isPrivateIpv6Host({ host })
+  }
+  const address = parseIpv4Literal({ host })
+  return address === null ? false : isBlockedIpv4Address(address)
+}
+
+function isPrivateIpv6Host({ host }: { host: string }): boolean {
+  const groups = parseIpv6Groups({ host })
+  if (!groups) {
+    return false
+  }
+  // fe80::/10 link-local and fc00::/7 unique-local by their leading bits.
+  const leading = groups[0]
+  if ((leading & 0xffc0) === 0xfe80 || (leading & 0xfe00) === 0xfc00) {
+    return true
+  }
+  // `::`, `::1` and the IPv4-mapped/compatible forms carry their host in the
+  // low 32 bits; `::` reads as 0.0.0.0 and `::1` lands inside 0.0.0.0/8.
+  const carriesIpv4 = groups[5] === 0 || groups[5] === 0xffff
+  if (!carriesIpv4 || !groups.slice(0, 5).every((group) => { return group === 0 })) {
+    return false
+  }
+  return isBlockedIpv4Address(groups[6] * 65536 + groups[7])
+}
+
+/** The eight 16-bit groups of an IPv6 literal, or null when the host is not one. */
+function parseIpv6Groups({ host }: { host: string }): number[] | null {
+  const halves = host.split('::')
+  if (halves.length > 2) {
+    return null
+  }
+  const head = parseIpv6GroupsPart({ part: halves[0] })
+  const tail = halves.length === 2 ? parseIpv6GroupsPart({ part: halves[1] }) : []
+  if (!head || !tail) {
+    return null
+  }
+  if (halves.length === 1) {
+    return head.length === 8 ? head : null
+  }
+  if (head.length + tail.length > 7) {
+    return null
+  }
+  return [...head, ...Array.from({ length: 8 - head.length - tail.length }, () => { return 0 }), ...tail]
+}
+
+function parseIpv6GroupsPart({ part }: { part: string }): number[] | null {
+  if (part.length === 0) {
+    return []
+  }
+  const groups: number[] = []
+  for (const group of part.split(':')) {
+    if (group.length === 0 || group.length > 4 || !/^[0-9a-f]+$/.test(group)) {
+      return null
+    }
+    groups.push(Number.parseInt(group, 16))
+  }
+  return groups
+}
+
+/** The dotted-quad value of an IPv4 host, or null when the host is not one. */
+function parseIpv4Literal({ host }: { host: string }): number | null {
+  const parts = host.split('.')
+  if (parts.length !== 4) {
+    return null
+  }
+  let address = 0
+  for (const part of parts) {
+    if (!/^[0-9]{1,3}$/.test(part)) {
+      return null
+    }
+    const value = Number.parseInt(part, 10)
+    if (value > 255) {
+      return null
+    }
+    address = address * 256 + value
+  }
+  return address
+}
+
+/**
+ * Bound the manifest to what one response may carry: the entry cap comes from
+ * the page-side read, the byte cap keeps the JSON channel inside the same
+ * budget as the extract preview.
+ */
+function boundAssetManifest({ assets }: { assets: ExtractedAsset[] }): { assets: ExtractedAsset[]; truncated: boolean } {
+  const bounded: ExtractedAsset[] = []
+  let bytes = 0
+  for (const asset of assets.slice(0, MAX_EXTRACT_ASSET_ENTRIES)) {
+    const entryBytes = Buffer.byteLength(JSON.stringify(asset), 'utf8') + 1
+    if (bytes + entryBytes > MAX_EXTRACT_ASSETS_BYTES) {
+      break
+    }
+    bounded.push(asset)
+    bytes += entryBytes
+  }
+  return { assets: bounded, truncated: bounded.length < assets.length }
+}
+
+/** Model-facing listing of the manifest; the structured form stays in `value.assets`. */
+function formatAssetManifestText({
+  assets,
+  truncated,
+}: {
+  assets: ExtractedAsset[]
+  truncated: boolean
+}): string {
+  if (assets.length === 0) {
+    return 'No images found'
+  }
+  const header = `${assets.length} image${assets.length === 1 ? '' : 's'} found${truncated ? ' (listing the first ones)' : ''}`
+  const lines = assets.map((asset) => {
+    const url = asset.currentSrc || asset.src
+    const size = asset.naturalWidth > 0 && asset.naturalHeight > 0 ? ` ${asset.naturalWidth}x${asset.naturalHeight}` : ''
+    const alt = asset.alt ? ` alt="${asset.alt}"` : ''
+    return `- ${url}${size}${alt}`
+  })
+  return [header, ...lines].join('\n')
 }
 
 function resolveArtifactPath({ requestedPath, cwd }: { requestedPath: string; cwd: string | null }): string {

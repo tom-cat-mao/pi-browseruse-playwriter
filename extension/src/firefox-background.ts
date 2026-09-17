@@ -15,15 +15,18 @@ import type {
   BrowserTab,
   BrowserTabCandidate,
 } from 'playwriter/src/browser-protocol'
+import type { FirefoxAssetFetchRequest, FirefoxAssetFetchResponse } from 'playwriter/src/firefox-executor-protocol'
+import { FIREFOX_ASSET_REQUEST_METHOD, MAX_FIREFOX_ASSET_REASON_LENGTH } from 'playwriter/src/firefox-executor-protocol'
 import { parseBrowserDomRequest } from 'playwriter/src/browser-dom-validation'
 import { getFirefoxApi } from './firefox-api'
 import type { FirefoxApi, FirefoxTab, FirefoxNavigationDetails } from './firefox-api'
+import { fetchFirefoxAssets } from './firefox-asset-fetch'
 import { keepFirefoxBackgroundActive } from './firefox-keepalive'
 import { KeyedSerialQueue } from './keyed-queue'
 import { FirefoxNavigationState } from './firefox-navigation'
 import type { FirefoxNavigationSignal } from './firefox-navigation'
 import { FirefoxNetwork } from './firefox-network'
-import { parseFirefoxBrowserRequest } from './firefox-request-validation'
+import { parseFirefoxAssetRequest, parseFirefoxBrowserRequest } from './firefox-request-validation'
 import {
   FIREFOX_CAPABILITIES,
   FirefoxResourceError,
@@ -456,7 +459,7 @@ class FirefoxBackground {
       return
     }
     if (!Number.isSafeInteger(message.id) || Number(message.id) < 0) return
-    let response: BrowserResponse
+    let response: BrowserResponse | FirefoxAssetFetchResponse
     if (message.method === 'browserRequest') {
       const request = parseFirefoxBrowserRequest(message.params)
       response = request
@@ -473,6 +476,15 @@ class FirefoxBackground {
             requestId: this.rawRequestId(message.params),
             error: new FirefoxResourceError({ code: 'invalid-request', message: 'Malformed Firefox DOM request' }),
           })
+    } else if (message.method === FIREFOX_ASSET_REQUEST_METHOD) {
+      const request = parseFirefoxAssetRequest(message.params)
+      response = request
+        ? await this.assets(request)
+        : {
+            requestId: this.rawRequestId(message.params),
+            assets: [],
+            error: 'Malformed Firefox asset request',
+          }
     } else {
       options.socket.send(
         JSON.stringify({ id: message.id, error: 'Firefox ordinary extension does not implement CDP commands' }),
@@ -481,6 +493,26 @@ class FirefoxBackground {
     }
     if (this.socket === options.socket && options.socket.readyState === WebSocket.OPEN)
       options.socket.send(JSON.stringify({ id: message.id, result: response }))
+  }
+
+  /**
+   * Fetches image bytes for the tab that asked for them. The channel is bound to
+   * an owned, ready tab so a session can only save images from a page it holds,
+   * and a failure is reported for the whole batch instead of throwing.
+   */
+  private async assets(request: FirefoxAssetFetchRequest): Promise<FirefoxAssetFetchResponse> {
+    try {
+      ownedFirefoxTab({
+        registry: this.registry,
+        sessionId: request.sessionId,
+        tabId: request.tabId,
+        browserEpoch: request.browserEpoch,
+      })
+      return await fetchFirefoxAssets({ request })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { requestId: request.requestId, assets: [], error: (message || 'image fetch failed').slice(0, MAX_FIREFOX_ASSET_REASON_LENGTH) }
+    }
   }
 
   private rawRequestId(raw: unknown): string {

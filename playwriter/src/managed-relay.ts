@@ -30,16 +30,29 @@ import { FirefoxExecutorPool } from './firefox-executor-pool.js'
 import { parseBrowserDomRequest } from './browser-dom-validation.js'
 import fs from 'node:fs'
 import path from 'node:path'
+import { ArtifactStore, ArtifactStoreError } from './artifact-store.js'
+import {
+  FIREFOX_ASSET_REQUEST_TIMEOUT_MS,
+  parseFirefoxAssetFetchRequest,
+  parseFirefoxAssetFetchResponse,
+  type FirefoxAssetFetchRequest,
+  type FirefoxAssetFetchResponse,
+} from './firefox-executor-protocol.js'
 import { RuntimeNetworkCaptureStore } from './runtime-network-capture.js'
 import { parseBrowserTabCandidateId } from './browser-protocol.js'
 import {
   BROWSER_PROTOCOL_VERSION,
+  type BrowserArtifact,
   type BrowserCapabilities,
   type BrowserBackend,
+  type BrowserFeatureFlags,
   type BrowserDomRequest,
   type BrowserErrorCode,
+  type BrowserExtractFormat,
+  type BrowserExtractImagesMode,
   type BrowserGroup,
   type BrowserInventory,
+  type BrowserJson,
   type BrowserOperation,
   type BrowserPageOperation,
   type BrowserProfile,
@@ -68,7 +81,12 @@ const CODE_MAX_LENGTH = 1_000_000
 const VALUE_MAX_LENGTH = 1_000_000
 const URL_MAX_LENGTH = 8_192
 const MESSAGE_MAX_LENGTH = 2_000
+/** Upper bound for page.extract offset/limit; line count is capped by the pipeline. */
+const EXTRACT_MAX_OFFSET = 1_000_000
 const INVENTORY_ARRAY_MAX_LENGTH = 10_000
+const FEATURE_FLAGS_MAX_ENTRIES = 64
+const FEATURE_NAME_MAX_LENGTH = 64
+const FEATURE_VALUE_MAX_LENGTH = 200
 
 /** Navigation targets accepted from Pi. Anything else (javascript:, data:, chrome://,
  *  chrome-extension:, devtools:, file:, blob:, view-source:) is rejected as malformed. */
@@ -206,6 +224,23 @@ export type ManagedRelayOptions = {
       request: BrowserDomRequest
       timeoutMs: number
     }) => Promise<unknown>
+    /**
+     * Image bytes for a Firefox `page.extract` with images:'save'. Only the
+     * extension background can fetch a page image with the browser's cookies
+     * and without CORS, so the request travels on the same connection the DOM
+     * requests use. The answer is bounded by the asset channel's own frame
+     * budget rather than the response limit, because its bytes are written to
+     * the artifact store and never reach a client. Optional: a runtime without
+     * it reports every image as a failed image instead of dropping the
+     * extraction.
+     */
+    sendBrowserAssetRequest?: (options: {
+      profileId: string
+      stableKey: string
+      connectionId: string
+      request: FirefoxAssetFetchRequest
+      timeoutMs: number
+    }) => Promise<unknown>
     sendCdpCommand?: (options: {
       profileId: string
       stableKey: string
@@ -222,6 +257,8 @@ export type ManagedRelayOptions = {
   closeManagedClient: (options: { clientId: string; code: number; reason: string }) => void
   /** Test seam / custom wiring for the isolated executor pool. */
   poolFactory?: () => Promise<ManagedExecutorPoolContract>
+  /** Test seam / custom wiring for the artifact store that owns local writes. */
+  artifactStore?: ArtifactStore
   now?: () => number
 }
 
@@ -408,7 +445,12 @@ const OPERATION_KINDS = new Set<BrowserOperation['kind']>([
   'page.network',
   'page.logs',
   'page.execute',
+  'page.extract',
 ])
+
+const EXTRACT_FORMATS: BrowserExtractFormat[] = ['markdown', 'text', 'html', 'assets-manifest']
+
+const EXTRACT_IMAGES_MODES: BrowserExtractImagesMode[] = ['none', 'urls', 'save']
 
 const REQUEST_FIELDS = new Set(['requestId', 'sessionId', 'operation', 'cwd', 'timeoutMs'])
 
@@ -851,6 +893,58 @@ function parseBrowserOperation(value: unknown): ParseResult<BrowserOperation> {
         value: { kind: 'page.logs', tabId: tabId.value, ...(limit.value !== undefined ? { limit: limit.value } : {}) },
       }
     }
+    case 'page.extract': {
+      const fields = withFields(['tabId', 'format', 'selector', 'search', 'offset', 'limit', 'path', 'images'])
+      if (!fields.ok) {
+        return fields
+      }
+      const tabId = readString(value, 'tabId', { maxLength: IDENTIFIER_MAX_LENGTH })
+      if (!tabId.ok) {
+        return tabId
+      }
+      const format = value.format
+      if (typeof format !== 'string' || !EXTRACT_FORMATS.includes(format as BrowserExtractFormat)) {
+        return { ok: false, message: `"format" must be one of ${EXTRACT_FORMATS.join(', ')}` }
+      }
+      const images = value.images
+      if (images !== undefined && (typeof images !== 'string' || !EXTRACT_IMAGES_MODES.includes(images as BrowserExtractImagesMode))) {
+        return { ok: false, message: `"images" must be one of ${EXTRACT_IMAGES_MODES.join(', ')}` }
+      }
+      const selector = readOptionalString(value, 'selector', { maxLength: SELECTOR_MAX_LENGTH, trim: false })
+      if (!selector.ok) {
+        return selector
+      }
+      const search = readOptionalString(value, 'search', { maxLength: MESSAGE_MAX_LENGTH, trim: false })
+      if (!search.ok) {
+        return search
+      }
+      const offset = readOptionalInteger(value, 'offset', { min: 0, max: EXTRACT_MAX_OFFSET })
+      if (!offset.ok) {
+        return offset
+      }
+      const limit = readOptionalInteger(value, 'limit', { min: 0, max: EXTRACT_MAX_OFFSET })
+      if (!limit.ok) {
+        return limit
+      }
+      const extractPath = readOptionalString(value, 'path', { maxLength: URL_MAX_LENGTH, trim: false })
+      if (!extractPath.ok) {
+        return extractPath
+      }
+      return {
+        ok: true,
+        value: {
+          kind: 'page.extract',
+          tabId: tabId.value,
+          format: format as BrowserExtractFormat,
+          ...(images !== undefined ? { images: images as BrowserExtractImagesMode } : {}),
+          ...(selector.value !== undefined ? { selector: selector.value } : {}),
+          ...(search.value !== undefined ? { search: search.value } : {}),
+          ...(offset.value !== undefined ? { offset: offset.value } : {}),
+          ...(limit.value !== undefined ? { limit: limit.value } : {}),
+          ...(extractPath.value !== undefined ? { path: extractPath.value } : {}),
+        },
+      }
+    }
     default: {
       return { ok: false, message: `unknown operation kind "${kind}"` }
     }
@@ -1046,6 +1140,28 @@ function parseTabValue({ value, index, backend = 'cdp' }: {
   }
 }
 
+/**
+ * `capabilities.features` is a forward-compatible matrix: only its shape is
+ * checked, so a newer extension adding feature names keeps working, while a
+ * malformed payload is still rejected instead of being cached unvalidated.
+ */
+function isCapabilityFeatures(value: unknown): value is BrowserFeatureFlags {
+  if (!isRecord(value)) {
+    return false
+  }
+  const entries = Object.entries(value)
+  if (entries.length > FEATURE_FLAGS_MAX_ENTRIES) {
+    return false
+  }
+  return entries.every(([name, features]) => {
+    return name.length > 0 && name.length <= FEATURE_NAME_MAX_LENGTH && Array.isArray(features) &&
+      features.length <= FEATURE_FLAGS_MAX_ENTRIES &&
+      features.every((feature) => {
+        return typeof feature === 'string' && feature.length <= FEATURE_VALUE_MAX_LENGTH
+      })
+  })
+}
+
 function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabilities> {
   if (!isRecord(value) || value.protocolVersion !== BROWSER_PROTOCOL_VERSION) {
     return { ok: false, message: 'inventory capabilities must have the supported protocolVersion' }
@@ -1058,7 +1174,7 @@ function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabili
     executeMode: ['playwright', 'dom-compatible'],
     evaluateWorld: ['page', 'isolated'],
   }
-  const allowed = new Set(['protocolVersion', ...requiredFlags, 'existingTabControl', ...Object.keys(choices), 'limitations', 'supportedOperations'])
+  const allowed = new Set(['protocolVersion', ...requiredFlags, 'existingTabControl', ...Object.keys(choices), 'limitations', 'supportedOperations', 'features'])
   const extra = assertNoExtraFields(value, allowed, 'BrowserCapabilities')
   if (!extra.ok) {
     return extra
@@ -1088,6 +1204,9 @@ function parseInventoryCapabilities(value: unknown): ParseResult<BrowserCapabili
       return typeof operation !== 'string' || !operation.startsWith('page.') || !OPERATION_KINDS.has(operation as BrowserOperation['kind'])
     }))) {
     return { ok: false, message: 'capabilities.supportedOperations contains an invalid page operation' }
+  }
+  if (value.features !== undefined && !isCapabilityFeatures(value.features)) {
+    return { ok: false, message: 'capabilities.features must map feature names to bounded string arrays' }
   }
   return { ok: true, value: value as unknown as BrowserCapabilities }
 }
@@ -1235,6 +1354,34 @@ export function parseBrowserResponse(value: unknown): ParseResult<BrowserRespons
 // ---------------------------------------------------------------------------
 // Capabilities
 // ---------------------------------------------------------------------------
+
+/**
+ * Page operations the runtime can route to a Chrome profile. The Chrome
+ * extension does not report `supportedOperations` — the relay owns the CDP
+ * executor that runs them — so these profiles get this list instead. A profile
+ * that advertises its own operations (Firefox does) keeps its own.
+ */
+const CHROME_SUPPORTED_PAGE_OPERATIONS: BrowserPageOperation['kind'][] = [
+  'page.navigate',
+  'page.back',
+  'page.snapshot',
+  'page.click',
+  'page.fill',
+  'page.evaluate',
+  'page.screenshot',
+  'page.network',
+  'page.logs',
+  'page.execute',
+  'page.extract',
+]
+
+/**
+ * Image modes this runtime serves for a Chrome profile. The relay owns the CDP
+ * executor that enumerates images and fetches their bytes, so a Chrome profile
+ * reports them here instead of advertising them itself; a WebExtension profile
+ * has to advertise `features.assets` because its browser side does the work.
+ */
+const CHROME_ASSET_FEATURES: BrowserExtractImagesMode[] = ['urls', 'save']
 
 export function buildBrowserCapabilities({ isolatedExecution }: { isolatedExecution: boolean }): BrowserCapabilities {
   return {
@@ -1463,6 +1610,11 @@ export function listManagedProfiles(
   { isolatedExecution }: { isolatedExecution: boolean },
 ): BrowserProfile[] {
   const capabilities = buildBrowserCapabilities({ isolatedExecution })
+  const defaultCapabilities: BrowserCapabilities = {
+    ...capabilities,
+    supportedOperations: [...CHROME_SUPPORTED_PAGE_OPERATIONS],
+    features: { assets: [...CHROME_ASSET_FEATURES] },
+  }
   return Array.from(state.profiles.values())
     .sort((a, b) => {
       return a.profileId.localeCompare(b.profileId)
@@ -1474,7 +1626,7 @@ export function listManagedProfiles(
         label: profile.label,
         connected: profile.connected,
         browserEpoch: profile.browserEpoch,
-        capabilities: profile.capabilities ? { ...profile.capabilities, isolatedExecution } : capabilities,
+        capabilities: profile.capabilities ? { ...profile.capabilities, isolatedExecution } : defaultCapabilities,
       }
     })
 }
@@ -1608,6 +1760,95 @@ class ManagedInputQueue {
   }
 }
 
+/**
+ * Page title of an extraction payload, reported as the artifact label. A page
+ * title is untrusted input, so it is only ever a descriptor field.
+ */
+function readExtractTitle(value: Record<string, BrowserJson>): string {
+  const title = value.title
+  return typeof title === 'string' && title.trim() ? title.trim() : 'page extract'
+}
+
+/** Drop the persisted body so it never travels on to the model. */
+function omitExtractArtifactText(value: Record<string, BrowserJson>): Record<string, BrowserJson> {
+  const modelValue: Record<string, BrowserJson> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key !== 'artifactText') {
+      modelValue[key] = entry
+    }
+  }
+  return modelValue
+}
+
+/** Drop the fetched image bytes so they never travel on to the model. */
+function omitSavedAssets(value: Record<string, BrowserJson>): Record<string, BrowserJson> {
+  const modelValue: Record<string, BrowserJson> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key !== 'savedAssets') {
+      modelValue[key] = entry
+    }
+  }
+  return modelValue
+}
+
+/**
+ * One image the browser side fetched, checked before it is trusted enough to
+ * reach the store. The URL is page-derived, so it is only ever a descriptor
+ * field and never a path.
+ */
+function readSavedAsset({ value, index }: { value: BrowserJson; index: number }): {
+  base64: string
+  mimeType: string
+  src: string
+  sourceUrls?: string[]
+  alt?: string
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ManagedTransportError({
+      code: 'internal-error', message: `page.extract savedAssets[${index}] is not an object`, outcome: 'unknown',
+    })
+  }
+  const { base64, mimeType, src, alt, sourceUrls } = value
+  if (typeof base64 !== 'string' || typeof mimeType !== 'string' || typeof src !== 'string' ||
+    (alt !== undefined && typeof alt !== 'string')) {
+    throw new ManagedTransportError({
+      code: 'internal-error', message: `page.extract savedAssets[${index}] is missing its image payload`, outcome: 'unknown',
+    })
+  }
+  if (sourceUrls !== undefined && (!Array.isArray(sourceUrls) || sourceUrls.length > MAX_SAVED_ASSET_URLS ||
+    !sourceUrls.every((url) => { return typeof url === 'string' && url.length > 0 && url.length <= MAX_SAVED_ASSET_URL_LENGTH }))) {
+    throw new ManagedTransportError({
+      code: 'internal-error', message: `page.extract savedAssets[${index}] has a malformed URL list`, outcome: 'unknown',
+    })
+  }
+  return {
+    base64, mimeType, src,
+    ...(sourceUrls !== undefined ? { sourceUrls: sourceUrls as string[] } : {}),
+    ...(typeof alt === 'string' && alt ? { alt } : {}),
+  }
+}
+
+/** Bounds on the URL list a saved image may carry, one entry per spelling the page uses. */
+const MAX_SAVED_ASSET_URLS = 8
+const MAX_SAVED_ASSET_URL_LENGTH = 8_192
+
+/**
+ * Point every stored image URL at the artifact it was written to. Matching on
+ * `](url` — the Markdown image destination — is an exact replacement of the URL
+ * the relay actually fetched, independent of whether the extraction pipeline
+ * normalized or escaped the alt text, and tolerant of a link title after the
+ * URL. A page names one image by more than one URL (its `src` attribute and the
+ * srcset candidate the browser chose), so every spelling the browser reported
+ * is rewritten. URLs that never reached the store are left as they are.
+ */
+function rewriteStoredImageUrls({ text, replacements }: { text: string; replacements: Map<string, string> }): string {
+  let result = text
+  for (const [src, path] of replacements) {
+    result = result.split(`](${src}`).join(`](${path}`)
+  }
+  return result
+}
+
 // ---------------------------------------------------------------------------
 // Managed relay
 // ---------------------------------------------------------------------------
@@ -1627,6 +1868,7 @@ export class ManagedRelay {
   private pool: ManagedExecutorPoolContract | null = null
   private poolLoadPromise: Promise<ManagedExecutorPoolContract | null> | null = null
   private firefoxPool: FirefoxExecutorPool | null = null
+  private artifactStoreInstance: ArtifactStore | null = null
   private disposed = false
 
   constructor(options: ManagedRelayOptions) {
@@ -2006,7 +2248,8 @@ export class ManagedRelay {
         case 'page.evaluate':
         case 'page.screenshot':
         case 'page.logs':
-        case 'page.execute': {
+        case 'page.execute':
+        case 'page.extract': {
           return await this.executePageOperation({ request, operation, timeoutMs, deadlineAt, clientSignal })
         }
         case 'page.network': {
@@ -2181,6 +2424,14 @@ export class ManagedRelay {
     if (!routable.ok) {
       return routable.response
     }
+    const images = this.requireExtractImages({
+      requestId: request.requestId,
+      operation,
+      profile: routable.profile,
+    })
+    if (!images.ok) {
+      return images.response
+    }
     const profileId = tabResult.profile.profileId
     const pending = this.createPending({
       sessionId: request.sessionId,
@@ -2278,7 +2529,11 @@ export class ManagedRelay {
           outcome: 'unknown',
         })
       }
-      return parsed.value
+      return this.savePageExtractArtifact({
+        response: this.persistExtractImages({ response: parsed.value, operation, sessionId: request.sessionId }),
+        operation,
+        sessionId: request.sessionId,
+      })
     } catch (error) {
       return failureResponse(request.requestId, this.describeRequestError({ error, pending }))
     } finally {
@@ -2296,7 +2551,19 @@ export class ManagedRelay {
     deadlineAt: number
   }): Promise<BrowserResponse> {
     const { operation } = request
-    if (profile.capabilities?.supportedOperations && !profile.capabilities.supportedOperations.includes(operation.kind)) {
+    // A Firefox profile advertises the page operations its extension answers.
+    // `page.extract` additionally demands that advertisement: a profile without
+    // one predates the operation (and its serialized-document selector) and must
+    // be told `unsupported-capability` instead of ever receiving the request.
+    const advertised = profile.capabilities?.supportedOperations
+    if (operation.kind === 'page.extract' && !advertised?.includes('page.extract')) {
+      throw new ManagedTransportError({
+        code: 'unsupported-capability',
+        message: 'Firefox profile does not advertise page.extract; update the browser extension',
+        outcome: 'not-started',
+      })
+    }
+    if (advertised && !advertised.includes(operation.kind)) {
       throw new ManagedTransportError({
         code: 'unsupported-capability', message: `Firefox profile does not support ${operation.kind}`, outcome: 'not-started',
       })
@@ -2308,7 +2575,7 @@ export class ManagedRelay {
     }
     this.assertFirefoxLease({ request, profile, tab, pending })
     const timeoutMs = this.remainingTimeout({ deadlineAt, pending })
-    if (operation.kind !== 'page.execute') {
+    if (operation.kind !== 'page.execute' && operation.kind !== 'page.extract') {
       pending.started = true
       const promise = this.options.transport.sendBrowserRequest({
         profileId: profile.profileId,
@@ -2319,7 +2586,7 @@ export class ManagedRelay {
       promise.catch(() => {})
       const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
       const response = this.parseFirefoxResponse({ value, requestId: request.requestId })
-      return this.saveFirefoxScreenshot({ response, operation })
+      return this.saveFirefoxScreenshot({ response, operation, sessionId: request.sessionId })
     }
     if (!this.options.transport.sendBrowserDomRequest) {
       throw new ManagedTransportError({
@@ -2328,11 +2595,66 @@ export class ManagedRelay {
     }
     this.firefoxPool ??= new FirefoxExecutorPool()
     pending.started = true
+    const assetTransport = this.options.transport.sendBrowserAssetRequest
     return await this.firefoxPool.execute({
       request: { ...request, operation, timeoutMs },
       tab,
       connectionEpoch: profile.connectionId ?? '',
       signal: pending.controller.signal,
+      // Bytes are not a page read and never come back to this process: the
+      // extension fetches them, the worker summarizes them, and `savedAssets`
+      // is what the relay then writes. Without a transport for them the pool
+      // reports each image as a failed image, so the extraction still lands.
+      ...(assetTransport
+        ? {
+            sendAssetRequest: async (value: FirefoxAssetFetchRequest): Promise<FirefoxAssetFetchResponse> => {
+              const assetRequest = parseFirefoxAssetFetchRequest(value)
+              if (!assetRequest) {
+                throw new ManagedTransportError({
+                  code: 'invalid-request', message: 'Firefox worker returned an invalid asset request', outcome: 'not-started',
+                })
+              }
+              this.assertFirefoxLease({ request, profile, tab, pending })
+              if (assetRequest.sessionId !== request.sessionId || assetRequest.tabId !== tab.tabId ||
+                assetRequest.browserEpoch !== tab.browserEpoch) {
+                throw new ManagedTransportError({
+                  code: 'ownership-mismatch', message: 'Firefox worker asset request escaped its assigned tab', outcome: 'not-started',
+                })
+              }
+              if (!profile.connectionId) {
+                throw new ManagedTransportError({
+                  code: 'profile-disconnected', message: 'Firefox asset transport disconnected', outcome: 'not-started',
+                })
+              }
+              // Image bytes take longer than a DOM read, so the wait is the
+              // channel's own bound (still capped by the request deadline).
+              const assetTimeoutMs = Math.min(FIREFOX_ASSET_REQUEST_TIMEOUT_MS, this.remainingTimeout({ deadlineAt, pending }))
+              pending.domRequestIds.add(assetRequest.requestId)
+              try {
+                const promise = assetTransport({
+                  profileId: profile.profileId,
+                  stableKey: profile.stableKey,
+                  connectionId: profile.connectionId,
+                  request: assetRequest,
+                  timeoutMs: assetTimeoutMs,
+                })
+                promise.catch(() => {})
+                const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
+                const response = parseFirefoxAssetFetchResponse(value)
+                if (!response || response.requestId !== assetRequest.requestId) {
+                  // Never trust a mismatched or oversized answer: the bytes are
+                  // about to be written, so the worker is told instead.
+                  throw new ManagedTransportError({
+                    code: 'internal-error', message: 'Firefox extension returned a malformed or mismatched asset response', outcome: 'unknown',
+                  })
+                }
+                return response
+              } finally {
+                pending.domRequestIds.delete(assetRequest.requestId)
+              }
+            },
+          }
+        : {}),
       sendDomRequest: async (value: BrowserDomRequest) => {
         const domRequest = parseBrowserDomRequest(value)
         if (!domRequest) {
@@ -2376,7 +2698,7 @@ export class ManagedRelay {
           promise.catch(() => {})
           const value = await this.awaitWithAbort({ promise, signal: pending.controller.signal })
           const response = this.parseFirefoxResponse({ value, requestId: domRequest.requestId })
-          return nestedOperation ? this.saveFirefoxScreenshot({ response, operation: nestedOperation }) : response
+          return nestedOperation ? this.saveFirefoxScreenshot({ response, operation: nestedOperation, sessionId: request.sessionId }) : response
         } finally {
           pending.domRequestIds.delete(domRequest.requestId)
         }
@@ -2416,7 +2738,11 @@ export class ManagedRelay {
     return this.enforceResponseLimit(parsed.value, requestId)
   }
 
-  private saveFirefoxScreenshot({ response, operation }: { response: BrowserResponse; operation: BrowserPageOperation }): BrowserResponse {
+  private saveFirefoxScreenshot({ response, operation, sessionId }: {
+    response: BrowserResponse
+    operation: BrowserPageOperation
+    sessionId: string
+  }): BrowserResponse {
     if (!response.ok || operation.kind !== 'page.screenshot') {
       return response
     }
@@ -2438,9 +2764,165 @@ export class ManagedRelay {
       const outputPath = path.normalize(operation.path)
       fs.mkdirSync(path.dirname(outputPath), { recursive: true })
       fs.writeFileSync(outputPath, buffer)
-      artifacts.push({ path: outputPath, mimeType: 'image/png' })
+      artifacts.push({ path: outputPath, mimeType: 'image/png', bytes: buffer.length })
+    } else {
+      artifacts.push(this.saveArtifact({ buffer, mimeType: 'image/png', label: 'screenshot', sessionId }))
     }
     return { ...response, data: { ...response.data, artifacts } }
+  }
+
+  /**
+   * page.extract with `path`: the worker returns the whole extraction in
+   * `value.artifactText` so the relay — which owns the artifact store and the
+   * runtime data directory — writes the bytes and hands the model a descriptor.
+   * The full text is stripped from the response, so the model keeps only the
+   * bounded preview in `text`.
+   */
+  private savePageExtractArtifact({ response, operation, sessionId }: {
+    response: BrowserResponse
+    operation: BrowserPageOperation
+    sessionId: string
+  }): BrowserResponse {
+    if (!response.ok || operation.kind !== 'page.extract' || operation.path === undefined) {
+      return response
+    }
+    const value = response.data.value
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'page.extract returned no payload to persist', outcome: 'unknown',
+      })
+    }
+    const artifactText = value.artifactText
+    if (typeof artifactText !== 'string' || artifactText.length === 0) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'page.extract returned no extracted text to persist', outcome: 'unknown',
+      })
+    }
+    const artifact = this.saveArtifact({
+      buffer: Buffer.from(artifactText, 'utf8'),
+      mimeType: operation.format === 'html' ? 'text/html' : 'text/markdown',
+      label: readExtractTitle(value),
+      sessionId,
+      targetPath: operation.path,
+    })
+    return {
+      ...response,
+      data: {
+        ...response.data,
+        value: omitExtractArtifactText(value),
+        artifacts: [...(response.data.artifacts ?? []), artifact],
+      },
+    }
+  }
+
+  /**
+   * `images: 'save'`: the browser side collects image bytes because only it can
+   * reach the page's cookies, and sends them in `value.savedAssets` because it
+   * has no store access. The relay writes each image into the artifact store,
+   * hands the model descriptors instead, rewrites the URLs of the stored images
+   * to their local artifact paths — in the body that is about to be persisted
+   * and in the preview text the model reads — and drops the byte payload before
+   * the response leaves the relay.
+   *
+   * One image that cannot be written (over a store limit once a session has
+   * filled up, or a type the store cannot name) is reported next to the
+   * browser-side failures instead of failing the request.
+   */
+  private persistExtractImages({ response, operation, sessionId }: {
+    response: BrowserResponse
+    operation: BrowserPageOperation
+    sessionId: string
+  }): BrowserResponse {
+    // Only a save request owns `savedAssets`: every other value on the wire is
+    // page-derived data (page.evaluate, page.execute) that must travel untouched.
+    if (!response.ok || operation.kind !== 'page.extract' || operation.images !== 'save') {
+      return response
+    }
+    const value = response.data.value
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return response
+    }
+    const savedAssets = value.savedAssets
+    if (savedAssets === undefined) {
+      return response
+    }
+    if (!Array.isArray(savedAssets)) {
+      throw new ManagedTransportError({
+        code: 'internal-error', message: 'page.extract returned a malformed saved asset list', outcome: 'unknown',
+      })
+    }
+
+    const artifacts: BrowserArtifact[] = []
+    const replacements = new Map<string, string>()
+    const storeFailures: BrowserJson[] = []
+    for (const [index, entry] of savedAssets.entries()) {
+      const asset = readSavedAsset({ value: entry, index })
+      try {
+        const artifact = this.artifactStore().write({
+          buffer: Buffer.from(asset.base64, 'base64'),
+          mimeType: asset.mimeType,
+          label: asset.alt ?? 'image',
+          sourceUrl: asset.src,
+          sessionId,
+        })
+        artifacts.push(artifact)
+        // The body may name this image by any of its URLs, so every one of
+        // them points at the artifact the bytes were written to.
+        for (const url of [asset.src, ...(asset.sourceUrls ?? [])]) {
+          replacements.set(url, artifact.path)
+        }
+      } catch (error) {
+        if (!(error instanceof ArtifactStoreError)) {
+          throw error
+        }
+        storeFailures.push({ src: asset.src, reason: error.message })
+      }
+    }
+
+    const modelValue = omitSavedAssets(value)
+    if (typeof modelValue.artifactText === 'string') {
+      modelValue.artifactText = rewriteStoredImageUrls({ text: modelValue.artifactText, replacements })
+    }
+    if (storeFailures.length > 0) {
+      const reported = Array.isArray(value.failedAssets) ? value.failedAssets : []
+      modelValue.failedAssets = [...reported, ...storeFailures]
+    }
+    const text = response.data.text
+    return {
+      ...response,
+      data: {
+        ...response.data,
+        ...(text !== undefined ? { text: rewriteStoredImageUrls({ text, replacements }) } : {}),
+        value: modelValue,
+        artifacts: [...(response.data.artifacts ?? []), ...artifacts],
+      },
+    }
+  }
+
+  private saveArtifact(options: {
+    buffer: Buffer
+    mimeType: string
+    label: string
+    sessionId: string
+    targetPath?: string
+  }): BrowserArtifact {
+    try {
+      return this.artifactStore().write(options)
+    } catch (error) {
+      if (error instanceof ArtifactStoreError) {
+        throw new ManagedTransportError({ code: error.code, message: error.message, outcome: 'unknown' })
+      }
+      throw error
+    }
+  }
+
+  private artifactStore(): ArtifactStore {
+    const configured = this.options.artifactStore
+    if (configured) {
+      return configured
+    }
+    this.artifactStoreInstance ??= new ArtifactStore({})
+    return this.artifactStoreInstance
   }
 
   private async executeNetworkOperation({
@@ -3652,6 +4134,39 @@ export class ManagedRelay {
         break
       }
       this.dedup.delete(oldest)
+    }
+  }
+
+  /**
+   * `page.extract` images are gated on the browser side that has to serve them.
+   * A Chrome profile is served by this runtime's own CDP executor, so the mode
+   * is always allowed; a WebExtension profile must advertise it in
+   * `capabilities.features.assets`, and a profile that does not is refused here
+   * — before any page traffic leaves the runtime — the way `page.extract`
+   * itself is refused for a profile that predates it.
+   */
+  private requireExtractImages({
+    requestId,
+    operation,
+    profile,
+  }: {
+    requestId: string
+    operation: BrowserPageOperation
+    profile: ManagedProfileSnapshot
+  }): { ok: true } | { ok: false; response: BrowserResponse } {
+    if (operation.kind !== 'page.extract' || operation.images === undefined || operation.images === 'none') {
+      return { ok: true }
+    }
+    if (profile.backend !== 'webextension' || (profile.capabilities?.features?.assets ?? []).includes(operation.images)) {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      response: failureResponse(requestId, {
+        code: 'unsupported-capability',
+        message: `profile ${profile.profileId} does not advertise page.extract images '${operation.images}'; update the browser extension`,
+        outcome: 'not-started',
+      }),
     }
   }
 

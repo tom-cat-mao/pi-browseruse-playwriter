@@ -4,22 +4,120 @@ import fs from 'node:fs'
 import url from 'node:url'
 import path from 'node:path'
 import vm from 'node:vm'
-import type { BrowserDomCommand, BrowserErrorCode, BrowserImage, BrowserResultData, BrowserResponse } from './browser-protocol.js'
+import type { BrowserDomCommand, BrowserErrorCode, BrowserImage, BrowserJson, BrowserPageInfo, BrowserResultData, BrowserResponse } from './browser-protocol.js'
 import { parseBrowserDomCommand } from './browser-dom-validation.js'
 import {
+  MAX_FIREFOX_ASSET_COUNT,
   parseFirefoxWorkerCommand,
   validateFirefoxMessageSize,
+  type FirefoxAssetFetchRequest,
+  type FirefoxAssetFetchResponse,
+  type FirefoxAssetTarget,
   type FirefoxWorkerCommand,
   type FirefoxWorkerExecution,
+  type FirefoxWorkerExtract,
   type FirefoxWorkerMessage,
 } from './firefox-executor-protocol.js'
 import { truncateString } from './managed-executor-protocol.js'
+import { boundExtractArtifactText, extractPageContent, windowExtractedText, withExtractArtifactText } from './page-extract.js'
 
 interface PendingDom {
   executionId: string
   resolve: (data: BrowserResultData) => void
   reject: (error: Error) => void
 }
+
+interface PendingAssetFetch {
+  executionId: string
+  resolve: (response: FirefoxAssetFetchResponse) => void
+  reject: (error: Error) => void
+}
+
+/**
+ * One image as the page reports it: the URL its `src` attribute resolves to and
+ * the URL the browser actually chose (a srcset candidate), the same two fields
+ * the Chrome backend reads.
+ */
+type AssetManifestEntry = {
+  src: string
+  currentSrc: string
+  srcset: string
+  alt: string
+  naturalWidth: number
+  naturalHeight: number
+}
+
+interface AssetManifest {
+  assets: AssetManifestEntry[]
+  /** True when the page held more images than the manifest cap keeps. */
+  truncated: boolean
+}
+
+type SavedAsset = {
+  base64: string
+  mimeType: string
+  src: string
+  /**
+   * Every URL the page uses for this image — its `src` attribute and the srcset
+   * candidate the bytes were fetched from — so the relay can rewrite whichever
+   * one the extracted body kept.
+   */
+  sourceUrls?: string[]
+  alt?: string
+}
+
+type FailedAsset = {
+  src: string
+  reason: string
+}
+
+interface AssetOutcomes {
+  saved: SavedAsset[]
+  failed: FailedAsset[]
+}
+
+/** One image to fetch: the URL the channel fetches, plus every URL the page names it by. */
+type AssetFetchTarget = FirefoxAssetTarget & {
+  /** Carried to the saved asset so the relay can rewrite the body's URL for this image. */
+  sourceUrls?: string[]
+}
+
+/** Cap on the manifest itself; only MAX_FIREFOX_ASSET_COUNT images may be fetched. */
+const MAX_MANIFEST_ASSETS = 200
+/** Model-facing budget for the serialized manifest, aligned with the Chrome backend and the extract preview. */
+const MAX_MANIFEST_BYTES = 40_000
+/** Field clamps, aligned with the Chrome backend's page-side image read. */
+const MAX_MANIFEST_URL_LENGTH = 2_048
+const MAX_MANIFEST_SRCSET_LENGTH = 2_048
+const MAX_MANIFEST_ALT_LENGTH = 512
+const ASSET_SCHEME_REASON = 'unsupported image URL scheme: only http(s) images can be saved'
+
+/**
+ * Runs through the existing DOM `evaluate` command, the same page-side path
+ * `page.evaluate` uses, so the manifest reports what the page actually shows
+ * (`currentSrc` after srcset selection) next to the `src` attribute the
+ * extracted body keeps, the same two URLs the Chrome backend reports. Fields
+ * are clamped in the page for the same reason the Chrome backend clamps them
+ * there: a page with a huge `srcset` on every image must not turn one DOM read
+ * into a message that exceeds the transport budget and fails the extraction.
+ */
+const ENUMERATE_IMAGES_CODE = `
+  const clip = (value, max) => (value.length > max ? value.slice(0, max) : value);
+  return {
+    items: Array.from(document.images).map((image) => {
+      const currentSrc = typeof image.currentSrc === 'string' ? image.currentSrc : '';
+      const src = typeof image.src === 'string' ? image.src : '';
+      return {
+        src: clip(src, ${MAX_MANIFEST_URL_LENGTH}),
+        currentSrc: clip(currentSrc, ${MAX_MANIFEST_URL_LENGTH}),
+        srcset: clip(image.getAttribute('srcset') || '', ${MAX_MANIFEST_SRCSET_LENGTH}),
+        alt: clip(image.getAttribute('alt') || '', ${MAX_MANIFEST_ALT_LENGTH}),
+        naturalWidth: Number.isFinite(image.naturalWidth) ? image.naturalWidth : 0,
+        naturalHeight: Number.isFinite(image.naturalHeight) ? image.naturalHeight : 0,
+      };
+    }),
+  };
+`
 
 class FirefoxDomError extends Error {
   readonly code: BrowserErrorCode
@@ -103,12 +201,13 @@ export function startFirefoxExecutorWorker(): void {
     unhandledError ??= error
   })
   const pending = new Map<string, PendingDom>()
+  const pendingAssets = new Map<string, PendingAssetFetch>()
   let activeId: string | null = null
   let nextRpcId = 0
   let nextTimerId = 0
   const requestDom = (options: { id: string; command: BrowserDomCommand }): Promise<BrowserResultData> => {
     if (activeId !== options.id) {
-      return Promise.reject(new FirefoxCapabilityError('Firefox execute request has ended'))
+      return Promise.reject(new FirefoxCapabilityError('Firefox executor request has ended'))
     }
     const command = parseBrowserDomCommand(options.command)
     if (!command) {
@@ -123,37 +222,69 @@ export function startFirefoxExecutorWorker(): void {
     void promise.catch(() => {})
     return promise
   }
-  const execute = async (command: Extract<FirefoxWorkerCommand, { type: 'execute' }>): Promise<void> => {
-    if (activeId) {
-      throw new Error('Firefox executor received concurrent execute commands')
+  /**
+   * Asset bytes only exist inside the extension (background fetch with cookies
+   * and host permissions), so the worker asks for them over its own IPC channel
+   * and waits for an answer bound to the same command lease.
+   */
+  const requestAssets = (options: { id: string; request: FirefoxAssetFetchRequest }): Promise<FirefoxAssetFetchResponse> => {
+    if (activeId !== options.id) {
+      return Promise.reject(new FirefoxCapabilityError('Firefox executor request has ended'))
     }
-    activeId = command.id
+    nextRpcId += 1
+    const rpcId = String(nextRpcId)
+    const promise = new Promise<FirefoxAssetFetchResponse>((resolve, reject) => {
+      pendingAssets.set(rpcId, { executionId: options.id, resolve, reject })
+      sendMessage({ type: 'asset-request', id: options.id, rpcId, request: options.request })
+    })
+    void promise.catch(() => {})
+    return promise
+  }
+  /**
+   * A worker serves one command at a time, and every DOM RPC stays bound to
+   * that command's lease so a cancelled request can never be answered later.
+   */
+  const beginCommand = (id: string): {
+    lease: ExecutionLease
+    send: (command: BrowserDomCommand) => Promise<BrowserResultData>
+  } => {
+    if (activeId) {
+      throw new Error('Firefox executor received concurrent commands')
+    }
+    activeId = id
     const lease = new ExecutionLease()
+    const send = async (domCommand: BrowserDomCommand): Promise<BrowserResultData> => {
+      lease.assertActive()
+      const promise = requestDom({ id, command: domCommand })
+      lease.requests.add(promise)
+      try {
+        return await promise
+      } finally {
+        lease.requests.delete(promise)
+      }
+    }
+    return { lease, send }
+  }
+  const execute = async (command: Extract<FirefoxWorkerCommand, { type: 'execute' }>): Promise<void> => {
+    const { lease, send: sendDom } = beginCommand(command.id)
     const logs: string[] = []
     const images: BrowserImage[] = []
     const artifacts: NonNullable<BrowserResultData['artifacts']> = []
     const timerIds = new Map<number, NodeJS.Timeout>()
     unhandledError = undefined
     const send = async (domCommand: BrowserDomCommand): Promise<BrowserResultData> => {
-      lease.assertActive()
-      const promise = requestDom({ id: command.id, command: domCommand })
-      lease.requests.add(promise)
-      try {
-        const data = await promise
-        if (data.images) {
-          const bytes = [...images, ...data.images].reduce((size, image) => { return size + image.data.length }, 0)
-          if (bytes > 6 * 1024 * 1024) {
-            throw new Error('Firefox execute image results exceed the 6 MiB output budget; capture fewer screenshots per request')
-          }
-          images.push(...data.images)
+      const data = await sendDom(domCommand)
+      if (data.images) {
+        const bytes = [...images, ...data.images].reduce((size, image) => { return size + image.data.length }, 0)
+        if (bytes > 6 * 1024 * 1024) {
+          throw new Error('Firefox execute image results exceed the 6 MiB output budget; capture fewer screenshots per request')
         }
-        if (data.artifacts) {
-          artifacts.push(...data.artifacts)
-        }
-        return data
-      } finally {
-        lease.requests.delete(promise)
+        images.push(...data.images)
       }
+      if (data.artifacts) {
+        artifacts.push(...data.artifacts)
+      }
+      return data
     }
     let response: BrowserResponse
     let started = false
@@ -271,6 +402,42 @@ export function startFirefoxExecutorWorker(): void {
     }
     sendMessage({ type: 'response', id: command.id, response })
   }
+  /**
+   * page.extract reads content, never page structure: the extension only
+   * serializes the document (or the one strictly matched element) and this
+   * worker runs the shared Node pipeline, so both backends extract identically
+   * and the relay never blocks on parsing.
+   */
+  const extract = async (command: Extract<FirefoxWorkerCommand, { type: 'extract' }>): Promise<void> => {
+    const { lease, send } = beginCommand(command.id)
+    const assets: AssetReader = {
+      enumerate: async () => {
+        const data = await send({ method: 'evaluate', code: ENUMERATE_IMAGES_CODE })
+        return { manifest: readAssetManifest({ value: data.value }), ...(data.pageInfo ? { pageInfo: data.pageInfo } : {}) }
+      },
+      save: async (input) => {
+        lease.assertActive()
+        return await saveAssets({
+          targets: input.targets,
+          plannedFailed: input.failed,
+          execution: command.execution,
+          fetchOnce: async (request: FirefoxAssetFetchRequest) => {
+            return await requestAssets({ id: command.id, request })
+          },
+        })
+      },
+    }
+    let response: BrowserResponse
+    try {
+      response = { requestId: command.execution.requestId, ok: true, data: await extractionData({ execution: command.execution, send, assets }) }
+    } catch (error) {
+      response = extractFailure({ execution: command.execution, error })
+    } finally {
+      lease.release()
+      activeId = null
+    }
+    sendMessage({ type: 'response', id: command.id, response })
+  }
   process.on('message', (value: unknown) => {
     try {
       validateFirefoxMessageSize(value)
@@ -291,7 +458,16 @@ export function startFirefoxExecutorWorker(): void {
         }
         return
       }
-      void execute(command).catch((error) => {
+      if (command.type === 'asset-response') {
+        const waiting = pendingAssets.get(command.rpcId)
+        if (!waiting || waiting.executionId !== command.id || activeId !== command.id) {
+          return
+        }
+        pendingAssets.delete(command.rpcId)
+        waiting.resolve(command.response)
+        return
+      }
+      void (command.type === 'extract' ? extract(command) : execute(command)).catch((error) => {
         process.stderr.write(`Firefox executor failed: ${messageOf(error)}\n`)
         process.exit(1)
       })
@@ -380,6 +556,343 @@ function messageOf(error: unknown): string {
     return error.message
   }
   return String(error)
+}
+
+/**
+ * Extraction only reads the document, so a failure is reported as not-started
+ * unless the DOM transport itself could not tell whether the read happened.
+ */
+function extractFailure({ execution, error }: { execution: FirefoxWorkerExtract; error: unknown }): BrowserResponse {
+  return {
+    requestId: execution.requestId, ok: false,
+    error: {
+      code: readErrorCode(error),
+      message: truncateString({ value: `Firefox page.extract: ${messageOf(error)}`, maxLength: 20_000 }),
+      outcome: error instanceof FirefoxDomError && error.outcome === 'unknown' ? 'unknown' : 'not-started',
+    },
+  }
+}
+
+/** How extraction reaches page images: a DOM manifest read and, for 'save', extension-fetched bytes. */
+interface AssetReader {
+  enumerate(): Promise<AssetManifestRead>
+  save(input: { targets: AssetFetchTarget[]; failed: FailedAsset[] }): Promise<AssetOutcomes>
+}
+
+interface AssetManifestRead {
+  manifest: AssetManifest
+  /** The DOM read reports the tab it came from, like every other Firefox DOM response. */
+  pageInfo?: BrowserPageInfo
+}
+
+/**
+ * Serialized document plus one strictly matched element scope, run through the shared pipeline.
+ * Image handling reads the DOM manifest first and only fetches bytes when the caller asked to save them.
+ */
+async function extractionData({ execution, send, assets }: {
+  execution: FirefoxWorkerExtract
+  send: (command: BrowserDomCommand) => Promise<BrowserResultData>
+  assets: AssetReader
+}): Promise<BrowserResultData> {
+  const { format, selector, search, offset, limit, images, persist } = execution
+  const saving = images === 'save'
+  const read = format === 'assets-manifest' || (images !== undefined && images !== 'none') ? await assets.enumerate() : undefined
+  const manifest = read?.manifest
+  const selected = manifest && saving ? selectAssetTargets({ manifest }) : undefined
+  const outcomes = selected ? await assets.save({ targets: selected.targets, failed: selected.failed }) : undefined
+  const notFetched = selected?.notFetched ?? 0
+
+  if (format === 'assets-manifest') {
+    const listing = manifestListing({ assets: manifest?.assets ?? [], truncated: manifest?.truncated ?? false })
+    const preview = windowExtractedText({ text: listing, offset, limit })
+    return {
+      text: preview.text,
+      value: withExtractArtifactText({
+        value: {
+          format,
+          truncated: preview.truncated,
+          totalBytes: Buffer.byteLength(listing, 'utf8'),
+          assetCount: manifest?.assets.length ?? 0,
+          assets: manifest?.assets ?? [],
+          ...(manifest?.truncated ? { assetsTruncated: true } : {}),
+          ...(read?.pageInfo?.title ? { title: read.pageInfo.title } : {}),
+          ...assetValue({ outcomes, notFetched }),
+        },
+        persisted: persist ? boundExtractArtifactText({ text: listing }) : undefined,
+      }),
+      ...(read?.pageInfo ? { pageInfo: read.pageInfo } : {}),
+    }
+  }
+
+  const content = await send({ method: 'page', action: 'content', ...(selector ? { selector } : {}) })
+  if (typeof content.value !== 'string') {
+    throw new Error('Firefox returned no serialized document to extract')
+  }
+  const html = content.value
+  const totalBytes = Buffer.byteLength(html, 'utf8')
+  // The read reports the tab it came from; the Chrome worker attaches the same
+  // envelope to every result, so a consumer sees one response shape per backend.
+  const pageInfo = content.pageInfo
+  // The image channel reports the same fields the Chrome backend reports, so a
+  // consumer sees one manifest shape per backend.
+  const manifestValue = manifest
+    ? {
+        assetCount: manifest.assets.length,
+        assets: manifest.assets,
+        ...(manifest.truncated ? { assetsTruncated: true } : {}),
+      }
+    : {}
+
+  if (format === 'html') {
+    const preview = windowExtractedText({ text: html, search, offset, limit })
+    return {
+      text: preview.text,
+      value: withExtractArtifactText({
+        value: {
+          format,
+          truncated: preview.truncated,
+          totalBytes,
+          ...(pageInfo?.title ? { title: pageInfo.title } : {}),
+          ...manifestValue,
+          ...assetValue({ outcomes, notFetched }),
+        },
+        persisted: persist ? boundExtractArtifactText({ text: html }) : undefined,
+      }),
+      ...(pageInfo ? { pageInfo } : {}),
+    }
+  }
+
+  const extracted = await extractPageContent({
+    html,
+    ...(pageInfo?.url ? { url: pageInfo.url } : {}),
+    format,
+    ...(persist ? { full: true } : { search, offset, limit }),
+  })
+  // A persisted extraction is complete; the model still gets the window it
+  // asked for, and never the whole document inline.
+  const preview = persist ? windowExtractedText({ text: extracted.text, search, offset, limit }) : extracted
+  return {
+    text: preview.text,
+    value: withExtractArtifactText({
+      value: {
+        format,
+        truncated: preview.truncated,
+        totalBytes: extracted.totalBytes,
+        ...(extracted.title ? { title: extracted.title } : {}),
+        ...(extracted.metadata ? { metadata: { ...extracted.metadata } } : {}),
+        ...manifestValue,
+        ...assetValue({ outcomes, notFetched }),
+      },
+      persisted: persist ? boundExtractArtifactText({ text: extracted.text }) : undefined,
+    }),
+    ...(pageInfo ? { pageInfo } : {}),
+  }
+}
+
+/** Asset bytes are only added to the value when the caller asked for them. */
+function assetValue({ outcomes, notFetched }: { outcomes?: AssetOutcomes; notFetched: number }): Record<string, BrowserJson> {
+  return {
+    ...(outcomes && outcomes.saved.length > 0 ? { savedAssets: outcomes.saved.map(savedAssetJson) } : {}),
+    ...(outcomes && outcomes.failed.length > 0 ? { failedAssets: outcomes.failed.map(failedAssetJson) } : {}),
+    ...(notFetched > 0 ? { assetsNotFetched: notFetched } : {}),
+  }
+}
+
+function savedAssetJson(asset: SavedAsset): BrowserJson {
+  return {
+    base64: asset.base64,
+    mimeType: asset.mimeType,
+    src: asset.src,
+    ...(asset.sourceUrls ? { sourceUrls: asset.sourceUrls } : {}),
+    ...(asset.alt ? { alt: asset.alt } : {}),
+  }
+}
+
+function failedAssetJson(asset: FailedAsset): BrowserJson {
+  return { src: asset.src, reason: asset.reason }
+}
+
+/** The URL whose bytes a fetch would get: the srcset candidate the browser chose, else the `src` attribute. */
+function assetFetchUrl(asset: AssetManifestEntry): string {
+  return asset.currentSrc || asset.src
+}
+
+/**
+ * Every URL the page names this image by: the `src` attribute and the srcset
+ * candidate whose bytes were fetched. Only attached when they differ, because
+ * the fetch URL always travels as `src`.
+ */
+function sourceUrls({ asset }: { asset: AssetManifestEntry }): { sourceUrls?: string[] } {
+  const urls = Array.from(new Set([asset.src, asset.currentSrc])).filter((url) => {
+    return url.length > 0
+  })
+  return urls.length > 1 ? { sourceUrls: urls } : {}
+}
+
+/**
+ * Read the page's image inventory into the model-facing manifest: clamped
+ * fields, the entry cap and the byte budget the Chrome backend applies too, so
+ * a gallery page cannot hand the model a payload larger than any other
+ * extraction. A manifest cut by either bound reports itself as truncated.
+ */
+function readAssetManifest({ value }: { value: unknown }): AssetManifest {
+  const items = isRecord(value) && Array.isArray(value.items) ? value.items : undefined
+  if (!items) {
+    throw new Error('Firefox returned no image manifest for this page')
+  }
+  const entries: AssetManifestEntry[] = []
+  let bytes = 0
+  let truncated = false
+  for (const item of items) {
+    if (!isRecord(item) || typeof item.src !== 'string' || typeof item.currentSrc !== 'string') {
+      continue
+    }
+    const entry: AssetManifestEntry = {
+      src: clampAssetField({ value: item.src.trim(), maximum: MAX_MANIFEST_URL_LENGTH }),
+      currentSrc: clampAssetField({ value: item.currentSrc.trim(), maximum: MAX_MANIFEST_URL_LENGTH }),
+      srcset: typeof item.srcset === 'string' ? clampAssetField({ value: item.srcset.trim(), maximum: MAX_MANIFEST_SRCSET_LENGTH }) : '',
+      alt: typeof item.alt === 'string' ? clampAssetField({ value: item.alt.trim(), maximum: MAX_MANIFEST_ALT_LENGTH }) : '',
+      naturalWidth: naturalDimension(item.naturalWidth),
+      naturalHeight: naturalDimension(item.naturalHeight),
+    }
+    // Inline bytes are page-local, not something the extension can fetch.
+    const fetchUrl = assetFetchUrl(entry)
+    if (!fetchUrl || fetchUrl.startsWith('data:')) {
+      continue
+    }
+    if (entries.length === MAX_MANIFEST_ASSETS) {
+      truncated = true
+      break
+    }
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8') + 1
+    if (bytes + entryBytes > MAX_MANIFEST_BYTES) {
+      truncated = true
+      break
+    }
+    entries.push(entry)
+    bytes += entryBytes
+  }
+  return { assets: entries, truncated }
+}
+
+function clampAssetField({ value, maximum }: { value: string; maximum: number }): string {
+  return value.length > maximum ? value.slice(0, maximum) : value
+}
+
+function naturalDimension(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
+}
+
+/** One line per image, in the same listing the Chrome backend produces. */
+function manifestListing({ assets, truncated }: { assets: AssetManifestEntry[]; truncated: boolean }): string {
+  if (assets.length === 0) {
+    return 'No images found'
+  }
+  const header = `${assets.length} image${assets.length === 1 ? '' : 's'} found${truncated ? ' (listing the first ones)' : ''}`
+  const lines = assets.map((asset) => {
+    const url = assetFetchUrl(asset)
+    const size = asset.naturalWidth > 0 && asset.naturalHeight > 0 ? ` ${asset.naturalWidth}x${asset.naturalHeight}` : ''
+    const alt = asset.alt ? ` alt="${asset.alt}"` : ''
+    return `- ${url}${size}${alt}`
+  })
+  return [header, ...lines].join('\n')
+}
+
+/**
+ * Only http(s) images can be fetched by the extension background, and only the
+ * channel's target bound is attempted; an image that is never attempted is
+ * reported rather than silently dropped.
+ */
+function selectAssetTargets({ manifest }: { manifest: AssetManifest }): { targets: AssetFetchTarget[]; failed: FailedAsset[]; notFetched: number } {
+  const targets: AssetFetchTarget[] = []
+  const failed: FailedAsset[] = []
+  let notFetched = 0
+  for (const asset of manifest.assets) {
+    const src = assetFetchUrl(asset)
+    if (!isFetchableAssetUrl(src)) {
+      failed.push({ src, reason: ASSET_SCHEME_REASON })
+      continue
+    }
+    if (targets.length === MAX_FIREFOX_ASSET_COUNT) {
+      notFetched += 1
+      continue
+    }
+    targets.push({ src, ...(asset.alt ? { alt: asset.alt } : {}), ...sourceUrls({ asset }) })
+  }
+  return { targets, failed, notFetched }
+}
+
+function isFetchableAssetUrl(value: string): boolean {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Bytes come from one bounded channel round trip, and a failed image is data:
+ * it never fails the extraction or its sibling images.
+ */
+async function saveAssets({ targets, plannedFailed, execution, fetchOnce }: {
+  targets: AssetFetchTarget[]
+  /** Images the DOM manifest listed but the channel can never fetch. */
+  plannedFailed: FailedAsset[]
+  execution: FirefoxWorkerExtract
+  fetchOnce: (request: FirefoxAssetFetchRequest) => Promise<FirefoxAssetFetchResponse>
+}): Promise<AssetOutcomes> {
+  if (targets.length === 0) {
+    return { saved: [], failed: [...plannedFailed] }
+  }
+  const failure = (reason: string): AssetOutcomes => {
+    return {
+      saved: [],
+      failed: [...plannedFailed, ...targets.map((target) => { return { src: target.src, reason } })],
+    }
+  }
+  let response: FirefoxAssetFetchResponse
+  try {
+    response = await fetchOnce({
+      requestId: `${execution.requestId}:assets`,
+      sessionId: execution.sessionId,
+      tabId: execution.tabId,
+      browserEpoch: execution.browserEpoch,
+      // The channel only reads the URL to fetch and the alt text; the other URL
+      // spellings stay on this side for the relay's rewrite.
+      targets: targets.map((target) => { return { src: target.src, ...(target.alt ? { alt: target.alt } : {}) } }),
+    })
+  } catch (error) {
+    return failure(messageOf(error))
+  }
+  if (response.error) {
+    return failure(response.error)
+  }
+  const outcomes = new Map(response.assets.map((asset) => { return [asset.src, asset] }))
+  const saved: SavedAsset[] = []
+  const failed: FailedAsset[] = [...plannedFailed]
+  for (const target of targets) {
+    const asset = outcomes.get(target.src)
+    if (!asset) {
+      failed.push({ src: target.src, reason: 'the extension returned no result for this image' })
+      continue
+    }
+    if (!asset.ok) {
+      failed.push({ src: asset.src, reason: asset.reason })
+      continue
+    }
+    saved.push({
+      base64: asset.base64,
+      mimeType: asset.mimeType,
+      src: asset.src,
+      ...(target.sourceUrls ? { sourceUrls: target.sourceUrls } : {}),
+      ...(target.alt ? { alt: target.alt } : {}),
+    })
+  }
+  return { saved, failed }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function wrapExecutionCode(code: string): string {

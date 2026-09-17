@@ -87,8 +87,63 @@ function textOf(content: ContentBlock[]): string {
     .join("\n");
 }
 
+/** A managed tab whose profile is the one the extract gate inspects. */
+const extractTab = {
+  tabId: "tab-1",
+  groupId: "grp-1",
+  sessionId: "s",
+  profileId: "profile-1",
+  url: "https://example.com/article",
+  title: "Example article",
+  state: "ready",
+  browserEpoch: "e",
+  revision: 1,
+  chromeTabId: 7,
+};
+
+/** A profile advertising exactly the given page operations (or none at all). */
+function profileWith(supportedOperations: string[] | undefined, browser = "chrome") {
+  return {
+    ...validProfile,
+    browser,
+    capabilities: {
+      ...validCapabilities,
+      ...(supportedOperations ? { supportedOperations } : {}),
+    },
+  };
+}
+
+/**
+ * A webextension (Firefox) profile advertising the given asset modes; with no
+ * `assetModes` it advertises no features at all, like a peer that predates the
+ * matrix. Its page operations are advertised unless `supportedOperations` says
+ * otherwise.
+ */
+function firefoxProfile({
+  assetModes,
+  supportedOperations = ["page.snapshot", "page.extract"],
+}: {
+  assetModes?: string[];
+  supportedOperations?: string[];
+}) {
+  return {
+    ...validProfile,
+    browser: "firefox",
+    capabilities: {
+      ...validCapabilities,
+      backend: "webextension",
+      inputMode: "dom",
+      snapshotMode: "dom-aria",
+      executeMode: "dom-compatible",
+      evaluateWorld: "isolated",
+      supportedOperations,
+      ...(assetModes ? { features: { extract: ["markdown"], assets: assetModes } } : {}),
+    },
+  };
+}
+
 describe("extension factory registration", () => {
-  it("registers the 12 managed tools and no browser_save_as_pdf", () => {
+  it("registers the 13 managed tools and no browser_save_as_pdf", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     expect(tools.map((t) => t.name).sort()).toEqual(
@@ -98,6 +153,7 @@ describe("extension factory registration", () => {
         "browser_tabs",
         "browser_navigate",
         "browser_snapshot",
+        "browser_extract",
         "browser_click",
         "browser_fill",
         "browser_evaluate",
@@ -136,6 +192,18 @@ describe("extension factory registration", () => {
     factory(pi as never);
     const click = tools.find((t) => t.name === "browser_click")!;
     expect(Object.keys(click.parameters.properties ?? {}).sort()).toEqual(["selector", "snapshotId", "tabId"].sort());
+  });
+
+  it("declares browser_extract with tabId plus the extraction window, images and export options", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const extract = tools.find((t) => t.name === "browser_extract")!;
+    expect(Object.keys(extract.parameters.properties ?? {}).sort()).toEqual(
+      ["format", "images", "limit", "offset", "path", "search", "tabId"].sort(),
+    );
+    const properties = extract.parameters.properties as Record<string, { enum?: readonly string[] }>;
+    expect(properties.format.enum).toEqual(["markdown", "text", "html", "assets-manifest"]);
+    expect(properties.images.enum).toEqual(["none", "urls", "save"]);
   });
 });
 
@@ -1331,6 +1399,714 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     expect(folded).toContain("…illhh1cdkl18");
     const expanded = renderResultText(tabs, result, { expanded: true, args: { action: "create" } });
     expect(expanded).toContain("ptab-mtwn3svh-5illhh1cdkl18");
+  });
+
+  it("sends page.extract for the given tab and defaults the format to markdown", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.snapshot", "page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "# Example\n\nline two", value: { format: "markdown", truncated: false, totalBytes: 15 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute("call-extract", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    const operations = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: { kind: string } }).operation);
+    expect(operations.map((op) => op.kind)).toEqual(["tabs.list", "page.extract"]);
+    expect(operations[1]).toEqual({ kind: "page.extract", tabId: "tab-1", format: "markdown" });
+    expect(textOf(result.content)).toContain("line two");
+  });
+
+  it("refuses browser_extract up front when the tab's profile does not advertise page.extract", async () => {
+    const operations: string[] = [];
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) {
+        return { json: { profiles: [profileWith(["page.snapshot", "page.evaluate"], "firefox")] } };
+      }
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      operations.push(body.operation.kind);
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: { text: "reached the browser" } } };
+    });
+    const extract = toolByName("browser_extract");
+    await expect(
+      extract.execute("call-gate", { tabId: "tab-1" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/does not advertise page\.extract/);
+    // The gate is a read-only precheck: the extraction itself is never sent.
+    expect(operations).toEqual(["tabs.list"]);
+  });
+
+  it("does not block browser_extract when the profile advertises no operation list", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(undefined)] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "extracted anyway", value: { format: "markdown", truncated: false, totalBytes: 16 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute("call-no-list", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    expect(textOf(result.content)).toContain("extracted anyway");
+  });
+
+  it("leaves an unknown tabId to the runtime instead of the capability gate", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: false,
+          error: { code: "resource-not-found", message: "tab tab-1 not found", outcome: "not-started" },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    await expect(
+      extract.execute("call-missing-tab", { tabId: "tab-1" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/code=resource-not-found/);
+  });
+
+  it("reports the extract window, page metadata and the written artifact in model content", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            text: "# Example\n\nline two",
+            value: {
+              format: "markdown",
+              truncated: true,
+              totalBytes: 52_311,
+              title: "Example article",
+              metadata: { siteName: "example.com", author: "A. Writer" },
+            },
+            artifacts: [
+              {
+                path: "/tmp/ex-artifacts/example-article.md",
+                mimeType: "text/markdown",
+                bytes: 52_311,
+                label: "Example article",
+              },
+            ],
+          },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-extract-artifact",
+      {
+        tabId: "tab-1",
+        format: "markdown",
+        search: "line",
+        offset: 10,
+        limit: 20,
+        path: "/tmp/ex-artifacts/example-article.md",
+      },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const post = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: unknown }).operation)
+      .find((operation) => (operation as { kind: string }).kind === "page.extract");
+    expect(post).toEqual({
+      kind: "page.extract",
+      tabId: "tab-1",
+      format: "markdown",
+      search: "line",
+      offset: 10,
+      limit: 20,
+      path: "/tmp/ex-artifacts/example-article.md",
+    });
+
+    const text = textOf(result.content);
+    expect(text).toContain("# Example");
+    expect(text).toContain("format=markdown");
+    expect(text).toContain('title="Example article"');
+    expect(text).toContain("site=example.com");
+    expect(text).toContain("author=A. Writer");
+    expect(text).toContain("52311 bytes of extracted content");
+    expect(text).toContain('window search="line" offset=10 limit=20');
+    expect(text).toContain("truncated=true");
+    expect(text).toContain("a window of the extraction, not the whole document");
+    expect(text).toContain("artifacts: /tmp/ex-artifacts/example-article.md (text/markdown, 52311 bytes)");
+
+    const folded = renderResultText(extract, result, { expanded: false, args: { tabId: "tab-1" } });
+    expect(folded).toContain("markdown · 3 line(s)");
+    expect(folded).toContain("# Example");
+    expect(folded).toContain('"Example article"');
+    expect(folded).toContain("site=example.com");
+    expect(folded).toContain("truncated");
+    expect(folded).toContain("/tmp/ex-artifacts/example-article.md (52311 bytes)");
+    const expanded = renderResultText(extract, result, { expanded: true, args: { tabId: "tab-1" } });
+    expect(expanded).toContain("line two");
+  });
+
+  it("marks a complete extraction as not truncated", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "whole document", value: { format: "text", truncated: false, totalBytes: 14 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-complete",
+      { tabId: "tab-1", format: "text" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain("format=text");
+    expect(text).toContain("truncated=false");
+    expect(text).not.toContain("a window of the extraction");
+  });
+
+  it("sends format assets-manifest with the requested images mode", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { value: { format: "assets-manifest", truncated: false, totalBytes: 0, assets: [] } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    await extract.execute(
+      "call-assets-manifest",
+      { tabId: "tab-1", format: "assets-manifest", images: "urls" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const post = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: unknown }).operation)
+      .find((operation) => (operation as { kind: string }).kind === "page.extract");
+    expect(post).toEqual({ kind: "page.extract", tabId: "tab-1", format: "assets-manifest", images: "urls" });
+  });
+
+  it("omits the images mode on the wire when it is none", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "no images", value: { format: "markdown", truncated: false, totalBytes: 10 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    await extract.execute(
+      "call-images-none",
+      { tabId: "tab-1", images: "none" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const post = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: unknown }).operation)
+      .find((operation) => (operation as { kind: string }).kind === "page.extract");
+    expect(post).toEqual({ kind: "page.extract", tabId: "tab-1", format: "markdown" });
+  });
+
+  it("refuses an images mode the Firefox profile does not advertise, before anything is downloaded", async () => {
+    const operations: string[] = [];
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [firefoxProfile({ assetModes: ["urls"] })] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      operations.push(body.operation.kind);
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return { json: { requestId: body.requestId, ok: true, data: { text: "reached the browser" } } };
+    });
+    const extract = toolByName("browser_extract");
+    const failure = await extract
+      .execute("call-gate-save", { tabId: "tab-1", images: "save" }, undefined, undefined, makeCtx())
+      .then(
+        () => undefined,
+        (error: Error) => error,
+      );
+    expect(failure?.message).toContain('does not advertise the asset mode "save"');
+    // The profile is named so the model can tell which browser build to fix.
+    expect(failure?.message).toContain("Default (firefox, profile-1)");
+    expect(failure?.message).toContain("advertised asset modes: urls");
+    // The gate is a read-only precheck: nothing is downloaded, nothing is sent.
+    expect(operations).toEqual(["tabs.list"]);
+  });
+
+  it("sends the images mode to a Firefox profile that advertises it", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) {
+        return { json: { profiles: [firefoxProfile({ assetModes: ["urls", "save"] })] } };
+      }
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            text: "saved",
+            value: { format: "markdown", truncated: false, totalBytes: 5, failedAssets: [] },
+          },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-gate-ok",
+      { tabId: "tab-1", images: "save" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const post = server.requests
+      .filter((r) => r.url === "/browser/v1/request")
+      .map((r) => (r.body as { operation: unknown }).operation)
+      .find((operation) => (operation as { kind: string }).kind === "page.extract");
+    expect(post).toEqual({ kind: "page.extract", tabId: "tab-1", format: "markdown", images: "save" });
+    // An empty failedAssets is a report, not a warning: nothing to warn about.
+    expect(textOf(result.content)).not.toContain("failed assets");
+  });
+
+  it("leaves images:none ungated on a Firefox profile that advertises no features", async () => {
+    const operations: string[] = [];
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [firefoxProfile({})] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      operations.push(body.operation.kind);
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: { text: "extracted", value: { format: "markdown", truncated: false, totalBytes: 9 } },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    await extract.execute("call-none-ungated", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    expect(operations).toEqual(["tabs.list", "page.extract"]);
+  });
+
+  it("leaves the images mode to the runtime when the tab's profile is not listed", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [] } };
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: false,
+          error: {
+            code: "unsupported-capability",
+            message: "images save is not supported by this backend",
+            outcome: "not-started",
+          },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    // No capabilities to judge from: the request goes out and the runtime's own
+    // unsupported-capability answer is what the model sees.
+    await expect(
+      extract.execute("call-relay-fallback", { tabId: "tab-1", images: "save" }, undefined, undefined, makeCtx()),
+    ).rejects.toThrow(/code=unsupported-capability/);
+  });
+
+  it("reports the image manifest for format assets-manifest and for images:urls", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) return { json: { profiles: [profileWith(["page.extract"])] } };
+      const body = req.body as { requestId: string; operation: { kind: string; format?: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      if (body.operation.format === "assets-manifest") {
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: true,
+            data: {
+              value: {
+                format: "assets-manifest",
+                truncated: false,
+                totalBytes: 0,
+                assetCount: 3,
+                // The manifest entries carry the intrinsic size under the wire
+                // names both workers emit (collectPageAssets in the Chrome
+                // worker, readAssetManifest in the Firefox worker).
+                assets: [
+                  {
+                    src: "https://example.com/a.png",
+                    currentSrc: "https://example.com/a.png",
+                    srcset: "",
+                    alt: "Chart",
+                    naturalWidth: 640,
+                    naturalHeight: 480,
+                  },
+                  {
+                    src: "https://example.com/b.png",
+                    currentSrc: "",
+                    srcset: "",
+                    alt: "",
+                    naturalWidth: 0,
+                    naturalHeight: 0,
+                  },
+                  {
+                    // srcset-only image: no src attribute; the listing falls
+                    // back to the rendered candidate in currentSrc.
+                    src: "",
+                    currentSrc: "https://example.com/c-2x.png",
+                    srcset: "https://example.com/c.png 1x, https://example.com/c-2x.png 2x",
+                    alt: "Srcset only",
+                    naturalWidth: 0,
+                    naturalHeight: 0,
+                  },
+                ],
+              },
+            },
+          },
+        };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            text: "# Example\n\n![Chart](https://example.com/img-0.png)",
+            value: {
+              format: "markdown",
+              truncated: false,
+              totalBytes: 41,
+              assetCount: 8,
+              assets: Array.from({ length: 8 }, (_, i) => {
+                return { src: `https://example.com/img-${i}.png`, naturalWidth: 0, naturalHeight: 0 };
+              }),
+            },
+          },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+
+    const manifest = await extract.execute(
+      "call-manifest",
+      { tabId: "tab-1", format: "assets-manifest" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const manifestText = textOf(manifest.content);
+    expect(manifestText).toContain("format=assets-manifest");
+    expect(manifestText).toContain(
+      'assets: 3 image(s) · https://example.com/a.png alt="Chart" 640x480 · https://example.com/b.png · https://example.com/c-2x.png alt="Srcset only"',
+    );
+    // naturalWidth/naturalHeight are what the runtime sends: reading width/height
+    // instead left every entry without a size. A zero pair means the image
+    // reported no loaded dimensions, so no size is printed at all.
+    expect(manifestText).not.toContain("0x0");
+    const manifestRow = renderResultText(extract, manifest, {
+      expanded: false,
+      args: { tabId: "tab-1", format: "assets-manifest" },
+    });
+    // The manifest IS the payload here, so the row carries the listing.
+    expect(manifestRow).toContain("assets-manifest · assets: 3 image(s) · https://example.com/a.png");
+
+    const urls = await extract.execute(
+      "call-urls",
+      { tabId: "tab-1", images: "urls" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const urlsText = textOf(urls.content);
+    expect(urlsText).toContain("images=urls");
+    expect(urlsText).toContain("assets: 8 image(s) · https://example.com/img-0.png");
+    expect(urlsText).toContain("… 3 more");
+    const urlsRow = renderResultText(extract, urls, { expanded: false, args: { tabId: "tab-1", images: "urls" } });
+    expect(urlsRow).toContain("markdown · 3 line(s)");
+    expect(urlsRow).toContain("8 image(s)");
+  });
+
+  it("says a truncated manifest is truncated instead of presenting the listing as the whole page", async () => {
+    runtimeHandler(() => ({
+      text: "3 images found (listing the first ones)",
+      value: {
+        format: "assets-manifest",
+        truncated: false,
+        totalBytes: 120,
+        assetCount: 3,
+        assetsTruncated: true,
+        assets: [
+          { src: "https://example.com/img-0.png", alt: "Hero", naturalWidth: 1200, naturalHeight: 630 },
+          { src: "https://example.com/img-1.png", alt: "", naturalWidth: 0, naturalHeight: 0 },
+          { src: "https://example.com/img-2.png", alt: "", naturalWidth: 0, naturalHeight: 0 },
+        ],
+      },
+    }));
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-truncated-manifest",
+      { tabId: "tab-1", format: "assets-manifest" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain(
+      'assets: 3 image(s) (manifest truncated at 3 — the page has more images than this listing) · ' +
+        'https://example.com/img-0.png alt="Hero" 1200x630 · https://example.com/img-1.png · https://example.com/img-2.png',
+    );
+    // The raw counters stay in the structured value for the model to read.
+    expect(JSON.stringify(result.details.value)).toContain('"assetsTruncated":true');
+
+    const row = renderResultText(extract, result, {
+      expanded: false,
+      args: { tabId: "tab-1", format: "assets-manifest" },
+    });
+    expect(row).toContain("manifest truncated at 3");
+  });
+
+  it("reports how many images a save run left over the per-request limit when it returns no manifest", async () => {
+    // The relay writes the bytes, strips `savedAssets`, and may hand the model
+    // the counters without an `assets` array to read.
+    runtimeHandler(() => ({
+      text: "# Example\n\n![Hero](/home/u/.pi-browser-use/artifacts/hero.png)",
+      value: {
+        format: "markdown",
+        truncated: false,
+        totalBytes: 60,
+        assetCount: 40,
+        assetsNotFetched: 20,
+      },
+      artifacts: [
+        {
+          path: "/home/u/.pi-browser-use/artifacts/hero.png",
+          mimeType: "image/png",
+          bytes: 1024,
+          label: "Hero",
+          sourceUrl: "https://example.com/img-0.png",
+        },
+      ],
+    }));
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-save-limit",
+      { tabId: "tab-1", images: "save" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain("images=save");
+    expect(text).toContain(
+      "assets: 40 image(s) (20 image(s) not attempted — over the per-request save limit)",
+    );
+    expect(text).not.toContain("failed assets");
+
+    const row = renderResultText(extract, result, { expanded: false, args: { tabId: "tab-1", images: "save" } });
+    expect(row).toContain("40 image(s)");
+  });
+
+  it("lists saved image artifacts with their alt text and warns about failed images", async () => {
+    server.setHandler((req) => {
+      if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+      if (req.url.endsWith("/profiles")) {
+        return { json: { profiles: [firefoxProfile({ assetModes: ["urls", "save"] })] } };
+      }
+      const body = req.body as { requestId: string; operation: { kind: string } };
+      if (body.operation.kind === "tabs.list") {
+        return { json: { requestId: body.requestId, ok: true, data: { tabs: [extractTab] } } };
+      }
+      return {
+        json: {
+          requestId: body.requestId,
+          ok: true,
+          data: {
+            text: "# Example\n\n![Chart](/home/u/.pi-browser-use/artifacts/chart.png)",
+            value: {
+              format: "markdown",
+              truncated: false,
+              totalBytes: 120,
+              assetCount: 1,
+              assets: [
+                {
+                  src: "https://example.com/a.png",
+                  currentSrc: "https://example.com/a.png",
+                  srcset: "",
+                  alt: "Chart",
+                  naturalWidth: 640,
+                  naturalHeight: 480,
+                },
+              ],
+              failedAssets: [{ src: "https://example.com/broken.png", reason: "HTTP 403" }],
+            },
+            artifacts: [
+              {
+                path: "/home/u/.pi-browser-use/artifacts/chart.png",
+                mimeType: "image/png",
+                bytes: 2048,
+                label: "Chart",
+                sourceUrl: "https://example.com/a.png",
+              },
+            ],
+          },
+        },
+      };
+    });
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute(
+      "call-save",
+      { tabId: "tab-1", images: "save" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const text = textOf(result.content);
+    expect(text).toContain("images=save");
+    expect(text).toContain('assets: 1 image(s) · https://example.com/a.png alt="Chart" 640x480');
+    expect(text).toContain(
+      'artifacts: /home/u/.pi-browser-use/artifacts/chart.png (image/png, 2048 bytes) "Chart"',
+    );
+    expect(text).toContain(
+      "failed assets: 1 image(s) not saved · https://example.com/broken.png (HTTP 403) — the text keeps their original remote URLs",
+    );
+    expect(text).toContain("![Chart](/home/u/.pi-browser-use/artifacts/chart.png)");
+
+    const folded = renderResultText(extract, result, { expanded: false, args: { tabId: "tab-1", images: "save" } });
+    expect(folded).toContain("markdown · 3 line(s)");
+    expect(folded).toContain("1 image(s)");
+    expect(folded).toContain("chart.png (2048 bytes)");
+    expect(folded).toContain("1 failed");
+
+    const expanded = renderResultText(extract, result, { expanded: true, args: { tabId: "tab-1", images: "save" } });
+    expect(expanded).toContain(
+      'artifact: /home/u/.pi-browser-use/artifacts/chart.png (image/png, 2048 bytes) "Chart"',
+    );
+  });
+
+  it("bounds the artifact descriptors printed in model content", async () => {
+    runtimeHandler(() => ({
+      text: "saved",
+      value: { format: "markdown", truncated: false, totalBytes: 5 },
+      artifacts: Array.from({ length: 12 }, (_, i) => {
+        return { path: `/artifacts/img-${i}.png`, mimeType: "image/png", bytes: 100 + i, label: `image ${i}` };
+      }),
+    }));
+    const extract = toolByName("browser_extract");
+    const result = await extract.execute("call-many-artifacts", { tabId: "tab-1" }, undefined, undefined, makeCtx());
+    const text = textOf(result.content);
+    expect(text).toContain("/artifacts/img-9.png");
+    expect(text).toContain("… 2 more");
+    expect(text).not.toContain("img-10.png");
+  });
+
+  it("projects the extract and assets feature matrix into profile content and hides unrelated keys", async () => {
+    runtimeHandler(() => ({
+      profiles: [
+        {
+          ...validProfile,
+          browser: "firefox",
+          capabilities: {
+            ...validCapabilities,
+            supportedOperations: ["page.snapshot", "page.extract"],
+            features: { extract: ["markdown", "text"], assets: ["urls"], unknownFeature: ["v2"] },
+          },
+        },
+      ],
+    }));
+    const profiles = toolByName("browser_profiles");
+    const result = await profiles.execute("call-features", {}, undefined, undefined, makeCtx());
+    const content = JSON.parse(textOf(result.content)) as {
+      profiles: Array<{ capabilities: Record<string, unknown> }>;
+    };
+    expect(content.profiles[0].capabilities.features).toEqual({
+      extract: ["markdown", "text"],
+      assets: ["urls"],
+    });
+    expect(content.profiles[0].capabilities.supportedOperations).toEqual(["page.snapshot", "page.extract"]);
+  });
+
+  it("keeps the compact profile shape when a peer advertises no features", async () => {
+    runtimeHandler(() => ({ profiles: [profileWith(["page.snapshot"])] }));
+    const profiles = toolByName("browser_profiles");
+    const result = await profiles.execute("call-no-features", {}, undefined, undefined, makeCtx());
+    const content = JSON.parse(textOf(result.content)) as {
+      profiles: Array<{ capabilities: Record<string, unknown> }>;
+    };
+    expect(content.profiles[0].capabilities).not.toHaveProperty("features");
   });
 });
 

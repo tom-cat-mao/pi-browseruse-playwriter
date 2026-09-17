@@ -5,11 +5,33 @@ import type {
   BrowserErrorCode,
   BrowserGroup,
   BrowserInventory,
+  BrowserPageOperation,
   BrowserRequest,
   BrowserResponse,
   BrowserTab,
 } from 'playwriter/src/browser-protocol'
 import type { FirefoxTab } from './firefox-api'
+
+/**
+ * Page operations this extension answers, exactly the `page.*` keys its request
+ * validator accepts. The runtime gates Firefox page operations on this list and
+ * routes `page.extract` only to a peer that advertises it, so an extension that
+ * predates the operation is told `unsupported-capability` instead of receiving a
+ * request it cannot parse.
+ */
+export const FIREFOX_SUPPORTED_PAGE_OPERATIONS: BrowserPageOperation['kind'][] = [
+  'page.navigate',
+  'page.back',
+  'page.snapshot',
+  'page.click',
+  'page.fill',
+  'page.evaluate',
+  'page.screenshot',
+  'page.network',
+  'page.logs',
+  'page.execute',
+  'page.extract',
+]
 
 export const FIREFOX_CAPABILITIES: BrowserCapabilities = {
   protocolVersion: BROWSER_PROTOCOL_VERSION,
@@ -23,6 +45,16 @@ export const FIREFOX_CAPABILITIES: BrowserCapabilities = {
   snapshotMode: 'dom-aria',
   executeMode: 'dom-compatible',
   evaluateWorld: 'isolated',
+  supportedOperations: [...FIREFOX_SUPPORTED_PAGE_OPERATIONS],
+  /**
+   * Image bytes are fetched by this extension's background, so `page.extract`
+   * with images:'save' is advertised here: an extension that predates the
+   * channel advertises nothing and the runtime refuses the mode instead of
+   * sending a request it cannot answer.
+   */
+  features: {
+    assets: ['urls', 'save'],
+  },
   limitations: [
     'Firefox uses DOM interaction; input events are not browser-native trusted input.',
     'Snapshots use DOM/ARIA instead of the browser accessibility tree.',

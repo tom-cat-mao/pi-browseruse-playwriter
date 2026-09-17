@@ -21,7 +21,11 @@ import path from 'node:path'
 import url from 'node:url'
 import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
+import { ArtifactStore } from './artifact-store.js'
 import { ManagedExecutorPool } from './managed-executor-pool.js'
+import { extractPageContent, windowExtractedText } from './page-extract.js'
+import { FIREFOX_ASSET_REQUEST_METHOD, MAX_FIREFOX_ASSET_BASE64_LENGTH } from './firefox-executor-protocol.js'
+import type { FirefoxAssetFetchRequest, FirefoxAssetFetchResponse } from './firefox-executor-protocol.js'
 import {
   RUNTIME_NETWORK_MAX_BYTES,
   RUNTIME_NETWORK_MAX_CAPTURES,
@@ -49,6 +53,7 @@ import {
   type BrowserDomRequest,
   type BrowserGroup,
   type BrowserInventory,
+  type BrowserJson,
   type BrowserRequest,
   type BrowserResponse,
   type BrowserResultData,
@@ -61,7 +66,23 @@ import {
 const EXTENSION_ORIGIN = 'chrome-extension://pebbngnfojnignonigcnkdilknapkgid'
 const FIREFOX_ORIGIN = 'moz-extension://25702a91-8a38-4e41-bdf7-7e4e545e1246'
 
-function firefoxInventory(): BrowserInventory {
+/**
+ * Page operations a current Firefox extension advertises. `advertiseOperations:
+ * false` keeps the deployed 0.0.139 shape, which reports no supportedOperations
+ * at all.
+ */
+const FIREFOX_ADVERTISED_OPERATIONS = [
+  'page.navigate', 'page.back', 'page.snapshot', 'page.click', 'page.fill', 'page.evaluate',
+  'page.screenshot', 'page.network', 'page.logs', 'page.execute', 'page.extract',
+] as const
+
+function firefoxInventory({
+  advertiseOperations = false,
+  features,
+}: {
+  advertiseOperations?: boolean
+  features?: Record<string, string[]>
+} = {}): BrowserInventory {
   return {
     protocolVersion: 1,
     backend: 'webextension',
@@ -69,6 +90,8 @@ function firefoxInventory(): BrowserInventory {
       protocolVersion: 1, managedGroups: true, persistentOwnership: true, explicitTabs: true,
       isolatedExecution: true, existingTabControl: true, backend: 'webextension', inputMode: 'dom',
       snapshotMode: 'dom-aria', executeMode: 'dom-compatible', evaluateWorld: 'isolated',
+      ...(advertiseOperations ? { supportedOperations: [...FIREFOX_ADVERTISED_OPERATIONS] } : {}),
+      ...(features ? { features } : {}),
       limitations: ['DOM input is not trusted browser input'],
     },
     profileId: 'profile-1', browserEpoch: 'epoch-1', revision: 1,
@@ -270,7 +293,7 @@ type TestPool = ManagedExecutorPoolContract & {
   resolveAll: () => Promise<void>
 }
 
-function createTestPool(): TestPool {
+function createTestPool({ respond }: { respond?: (request: BrowserRequest) => BrowserResponse | undefined } = {}): TestPool {
   const executions: TestPool['executions'] = []
   const cancels: TestPool['cancels'] = []
   const releasedSessions: string[] = []
@@ -345,6 +368,10 @@ function createTestPool(): TestPool {
           }
           setTimeout(release, 20)
         })
+        const override = respond?.(request)
+        if (override) {
+          return override
+        }
         return { requestId: request.requestId, ok: true, data: { text: `executed ${request.operation.kind}` } }
       } finally {
         concurrent -= 1
@@ -411,6 +438,9 @@ type FakeExtensionOptions = {
 class FakeExtension {
   readonly received: BrowserRequest[] = []
   readonly domRequests: BrowserDomRequest[] = []
+  /** Asset batches the runtime asked this connection for; only a peer that implements
+   * the channel method ever records one. */
+  readonly assetRequests: FirefoxAssetFetchRequest[] = []
   readonly forwardCommands: Array<{ method: string; params?: unknown; sessionId?: string }> = []
   readonly closed: Promise<{ code: number; reason: string }>
   readonly inventoryByGroup = new Map<string, BrowserGroup>()
@@ -419,6 +449,7 @@ class FakeExtension {
   holdForwardCommands = false
   onRequest?: (request: BrowserRequest) => BrowserResponse | Promise<BrowserResponse>
   onDomRequest?: (request: BrowserDomRequest) => BrowserResponse | Promise<BrowserResponse>
+  onAssetRequest?: (request: FirefoxAssetFetchRequest) => FirefoxAssetFetchResponse | Promise<FirefoxAssetFetchResponse>
   private readonly ws: WebSocket
   private readonly held: Array<() => void> = []
   private readonly heldForwardCommands: Array<() => void> = []
@@ -499,6 +530,20 @@ class FakeExtension {
         requestId: request.requestId,
         ok: true,
         data: { value: request.command.method === 'page' ? 'Firefox fixture' : null },
+      }
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ id: message.id, result }))
+      }
+      return
+    }
+    if (message.method === FIREFOX_ASSET_REQUEST_METHOD) {
+      const request = message.params as FirefoxAssetFetchRequest
+      this.assetRequests.push(request)
+      const result = this.onAssetRequest ? await this.onAssetRequest(request) : {
+        requestId: request.requestId,
+        assets: request.targets.map((target) => {
+          return { src: target.src, ok: true as const, base64: Buffer.from('image-bytes').toString('base64'), mimeType: 'image/png' }
+        }),
       }
       if (this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ id: message.id, result }))
@@ -1159,6 +1204,18 @@ describe('managed inventory registry', () => {
     expect(apply({ ...inventory, tabs: [...inventory.tabs, { ...inventory.tabs[0], tabId: 'duplicate-physical-id' }] }).accepted).toBe(false)
     expect(apply({ ...inventory, backend: undefined }).accepted).toBe(false)
   })
+  test('passes the optional feature matrix through and ignores unknown feature names', () => {
+    const inventory = firefoxInventory()
+    const features = { extract: ['markdown', 'text'], 'future-thing': ['whatever'] }
+    const parsed = parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, features } })
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) {
+      throw new Error(parsed.message)
+    }
+    expect(parsed.value.capabilities?.features).toEqual(features)
+    expect(parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, features: { extract: 'markdown' } } }).ok).toBe(false)
+    expect(parseBrowserInventory({ ...inventory, capabilities: { ...inventory.capabilities, features: [] } }).ok).toBe(false)
+  })
   test('profiles, groups and tabs come from the extension inventory and are session filtered', async () => {
     const relay = await startTrackedRelay({ poolFactory: async () => createTestPool() })
     const extension = await connectTrackedExtension({ port: relay.port, installId: 'profile-1', email: 'a@b.c' })
@@ -1197,10 +1254,29 @@ describe('managed inventory registry', () => {
             "capabilities": {
               "existingTabControl": true,
               "explicitTabs": true,
+              "features": {
+                "assets": [
+                  "urls",
+                  "save",
+                ],
+              },
               "isolatedExecution": true,
               "managedGroups": true,
               "persistentOwnership": true,
               "protocolVersion": 1,
+              "supportedOperations": [
+                "page.navigate",
+                "page.back",
+                "page.snapshot",
+                "page.click",
+                "page.fill",
+                "page.evaluate",
+                "page.screenshot",
+                "page.network",
+                "page.logs",
+                "page.execute",
+                "page.extract",
+              ],
             },
             "connected": true,
             "label": "a@b.c",
@@ -3925,6 +4001,1341 @@ describe('managed queue re-validation', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Firefox screenshot artifacts
+// ---------------------------------------------------------------------------
+
+describe('managed Firefox screenshot artifacts', () => {
+  test('a screenshot without a path lands in the artifact store and keeps the PNG check', async () => {
+    const directory = createExecutorTestDirectory('firefox-screenshot-artifacts-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j7AoAAAAASUVORK5CYII='
+    let mimeType = 'image/png'
+    const relay = new ManagedRelay({
+      host: '127.0.0.1',
+      port: 1,
+      artifactStore,
+      hasConnectedExtensions: () => {
+        return true
+      },
+      closeManagedClient: () => {},
+      transport: {
+        sendBrowserRequest: async ({ request }) => {
+          if (request.operation.kind === 'tab.resolve') {
+            return { requestId: request.requestId, ok: true, data: { tab: firefoxInventory().tabs[0] } }
+          }
+          if (request.operation.kind === 'page.screenshot') {
+            return { requestId: request.requestId, ok: true, data: { images: [{ mimeType, data: png }] } }
+          }
+          return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+        },
+      },
+    })
+    try {
+      relay.noteConnectionOpened({ connectionId: 'firefox-connection' })
+      const inventory = { ...firefoxInventory(), revision: 2 }
+      expect(
+        relay.handleInventory({
+          connectionId: 'firefox-connection',
+          info: { browser: 'Firefox', installId: 'profile-1', stableKey: 'install:Firefox:profile-1' },
+          inventory,
+        }).accepted,
+      ).toBe(true)
+
+      const screenshot = await relay.handleRequest({
+        requestId: 'firefox-store-screenshot',
+        sessionId: 'session-1',
+        operation: { kind: 'page.screenshot', tabId: 'firefox-tab' },
+      })
+      expect(screenshot.ok).toBe(true)
+      if (!screenshot.ok) {
+        throw new Error('expected a successful Firefox screenshot')
+      }
+      const artifacts = screenshot.data.artifacts ?? []
+      expect(artifacts).toHaveLength(1)
+      expect(artifacts[0]).toMatchObject({
+        mimeType: 'image/png',
+        bytes: Buffer.from(png, 'base64').length,
+        label: 'screenshot',
+      })
+      expect(artifacts[0]?.path.startsWith(artifactStore.getRootDir() + path.sep)).toBe(true)
+      expect(fs.readFileSync(artifacts[0]?.path ?? '').toString('base64')).toBe(png)
+      expect(screenshot.data.images).toEqual([{ mimeType: 'image/png', data: png }])
+      expect(fs.readdirSync(directory)).toEqual(['artifacts'])
+
+      mimeType = 'image/jpeg'
+      const rejected = await relay.handleRequest({
+        requestId: 'firefox-store-screenshot-not-png',
+        sessionId: 'session-1',
+        operation: { kind: 'page.screenshot', tabId: 'firefox-tab' },
+      })
+      expect(rejected).toMatchObject({ ok: false, error: { code: 'internal-error', outcome: 'unknown' } })
+      expect(fs.readdirSync(artifactStore.getRootDir())).toHaveLength(1)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// page.extract artifacts
+// ---------------------------------------------------------------------------
+
+function chromeInventory(): BrowserInventory {
+  return makeInventory({
+    groups: [makeGroup({ groupId: 'chrome-group', sessionId: 'session-1' })],
+    tabs: [makeTab({ tabId: 'chrome-tab', groupId: 'chrome-group', sessionId: 'session-1' })],
+  })
+}
+
+/** The Chrome worker is replaced by this seam; the relay itself runs for real. */
+function startExtractRelay({
+  artifactStore,
+  respond,
+}: {
+  artifactStore: ArtifactStore
+  respond: (request: BrowserRequest) => BrowserResponse | undefined
+}): ManagedRelay {
+  const pool = createTestPool({ respond })
+  return new ManagedRelay({
+    host: '127.0.0.1',
+    port: 1,
+    artifactStore,
+    poolFactory: async () => pool,
+    hasConnectedExtensions: () => {
+      return true
+    },
+    closeManagedClient: () => {},
+    transport: {
+      sendBrowserRequest: async ({ request }) => {
+        if (request.operation.kind === 'tab.resolve') {
+          return { requestId: request.requestId, ok: true, data: { tab: chromeInventory().tabs[0] } }
+        }
+        return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+      },
+    },
+  })
+}
+
+function connectChromeProfile(relay: ManagedRelay): void {
+  relay.noteConnectionOpened({ connectionId: 'chrome-connection' })
+  const accepted = relay.handleInventory({
+    connectionId: 'chrome-connection',
+    info: { browser: 'Chrome', installId: 'profile-1', stableKey: 'install:Chrome:profile-1' },
+    inventory: chromeInventory(),
+  })
+  expect(accepted.accepted).toBe(true)
+}
+
+describe('managed page.extract artifacts', () => {
+  test('persists the whole extraction at the requested path and keeps a bounded preview', async () => {
+    const directory = createExecutorTestDirectory('page-extract-artifacts-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'storage-docs.md')
+    const fullMarkdown = `# Storage Docs\n\n${'retention detail '.repeat(5_000)}`
+    const previewText = '# Storage Docs\n\nretention detail retention detail'
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: previewText,
+            value: {
+              format: request.operation.format,
+              truncated: true,
+              totalBytes: Buffer.byteLength(fullMarkdown, 'utf8'),
+              title: 'Storage Docs',
+              metadata: { siteName: 'Storage Docs' },
+              artifactText: fullMarkdown,
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-persist',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: outputPath },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      expect(response.data.text).toBe(previewText)
+      expect(response.data.artifacts).toEqual([
+        {
+          path: outputPath,
+          mimeType: 'text/markdown',
+          bytes: Buffer.byteLength(fullMarkdown, 'utf8'),
+          label: 'Storage Docs',
+        },
+      ])
+      expect(response.data.value).toEqual({
+        format: 'markdown',
+        truncated: true,
+        totalBytes: Buffer.byteLength(fullMarkdown, 'utf8'),
+        title: 'Storage Docs',
+        metadata: { siteName: 'Storage Docs' },
+      })
+      // The persisted body must not travel on to the model.
+      expect(JSON.stringify(response.data)).not.toContain('artifactText')
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(fullMarkdown)
+      expect(fs.readdirSync(artifactStore.getRootDir())).toEqual(['storage-docs.md'])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('resolves a relative extract path under the artifacts root', async () => {
+    const directory = createExecutorTestDirectory('page-extract-relative-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const relativePath = path.join('exports', 'relative.md')
+    const outputPath = path.join(artifactStore.getRootDir(), relativePath)
+    const fullMarkdown = '# Relative\n\nBody\n'
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: '# Relative\n\nBody',
+            value: { format: request.operation.format, title: 'Relative', artifactText: fullMarkdown },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-relative-path',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: relativePath },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      expect(response.data.artifacts).toEqual([
+        { path: outputPath, mimeType: 'text/markdown', bytes: Buffer.byteLength(fullMarkdown, 'utf8'), label: 'Relative' },
+      ])
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(fullMarkdown)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('writes html extractions as html and refuses a target outside the artifacts root', async () => {
+    const directory = createExecutorTestDirectory('page-extract-html-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const htmlPath = path.join(artifactStore.getRootDir(), 'nested', 'page.html')
+    const serializedHtml = '<html><body><p>Retention</p></body></html>'
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        const value: Record<string, BrowserJson> = {
+          format: request.operation.format,
+          truncated: false,
+          totalBytes: serializedHtml.length,
+        }
+        if (request.operation.path !== undefined) {
+          value.artifactText = serializedHtml
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: '<html><body><p>Retention</p></body></html>',
+            value,
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const html = await relay.handleRequest({
+        requestId: 'extract-html',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'html', path: htmlPath },
+      })
+      expect(html).toMatchObject({
+        ok: true,
+        data: { artifacts: [{ path: htmlPath, mimeType: 'text/html', bytes: serializedHtml.length }] },
+      })
+      expect(fs.readFileSync(htmlPath, 'utf8')).toBe(serializedHtml)
+
+      // Without a path the extraction stays in memory: no artifact, no write.
+      const inline = await relay.handleRequest({
+        requestId: 'extract-inline',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown' },
+      })
+      expect(inline).toMatchObject({ ok: true, data: { text: '<html><body><p>Retention</p></body></html>' } })
+      if (!inline.ok) {
+        throw new Error('expected a successful inline page.extract')
+      }
+      expect(inline.data.artifacts).toBeUndefined()
+      expect(fs.readdirSync(artifactStore.getRootDir())).toEqual(['nested'])
+
+      const outside = await relay.handleRequest({
+        requestId: 'extract-outside',
+        sessionId: 'session-1',
+        operation: {
+          kind: 'page.extract',
+          tabId: 'chrome-tab',
+          format: 'markdown',
+          path: path.join(directory, 'outside.md'),
+        },
+      })
+      expect(outside).toMatchObject({ ok: false, error: { code: 'invalid-request', outcome: 'unknown' } })
+      expect(fs.existsSync(path.join(directory, 'outside.md'))).toBe(false)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('fails instead of dropping a requested file when the backend returns no text to persist', async () => {
+    const directory = createExecutorTestDirectory('page-extract-missing-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: { text: 'preview', value: { format: request.operation.format, truncated: false, totalBytes: 7 } },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-missing-text',
+        sessionId: 'session-1',
+        operation: {
+          kind: 'page.extract',
+          tabId: 'chrome-tab',
+          format: 'markdown',
+          path: path.join(artifactStore.getRootDir(), 'missing.md'),
+        },
+      })
+
+      expect(response).toMatchObject({ ok: false, error: { code: 'internal-error', outcome: 'unknown' } })
+      const written = fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []
+      expect(written).toEqual([])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Firefox page.extract
+// ---------------------------------------------------------------------------
+
+const FIREFOX_EXTRACT_URL = 'https://example.test/storage'
+const FIREFOX_EXTRACT_TITLE = 'Storage documentation'
+
+function firefoxExtractDocument(): string {
+  const paragraphs = Array.from({ length: 1_500 }, (_value, index) => {
+    return `<p>Retention detail ${index}: the export keeps every revision for thirty days before the purge.</p>`
+  }).join('')
+  return `<!doctype html><html lang="en"><head><title>${FIREFOX_EXTRACT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
+}
+
+/**
+ * The Firefox worker runs for real behind this relay; only the extension side of
+ * the transport is a peer that records what would have reached the browser.
+ */
+function startFirefoxExtractRelay({ artifactStore, documentHtml, inventory, pageImages = [], assetAnswer, withoutAssetTransport = false }: {
+  artifactStore: ArtifactStore
+  documentHtml: string
+  inventory: BrowserInventory
+  /** Images the DOM evaluate read reports, which is how the manifest path is reached. */
+  pageImages?: Record<string, BrowserJson>[]
+  /** The extension side of the asset byte channel: what one batch is answered with. */
+  assetAnswer?: (request: FirefoxAssetFetchRequest) => FirefoxAssetFetchResponse | Promise<FirefoxAssetFetchResponse>
+  /** A runtime that cannot carry asset bytes at all. */
+  withoutAssetTransport?: boolean
+}): {
+  relay: ManagedRelay
+  domRequests: BrowserDomRequest[]
+  operations: string[]
+  assetRequests: FirefoxAssetFetchRequest[]
+  assetTimeouts: number[]
+} {
+  const domRequests: BrowserDomRequest[] = []
+  const operations: string[] = []
+  const assetRequests: FirefoxAssetFetchRequest[] = []
+  const assetTimeouts: number[] = []
+  const relay = new ManagedRelay({
+    host: '127.0.0.1',
+    port: 1,
+    artifactStore,
+    hasConnectedExtensions: () => {
+      return true
+    },
+    closeManagedClient: () => {},
+    transport: {
+      sendBrowserRequest: async ({ request }) => {
+        operations.push(request.operation.kind)
+        if (request.operation.kind === 'tab.resolve') {
+          return { requestId: request.requestId, ok: true, data: { tab: inventory.tabs[0] } }
+        }
+        return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+      },
+      ...(withoutAssetTransport ? {} : {
+        sendBrowserAssetRequest: async ({ request, timeoutMs }) => {
+          assetRequests.push(request)
+          assetTimeouts.push(timeoutMs)
+          return await (assetAnswer?.(request) ?? {
+            requestId: request.requestId,
+            assets: request.targets.map((target) => {
+              return { src: target.src, ok: true as const, base64: Buffer.from('image-bytes').toString('base64'), mimeType: 'image/png' }
+            }),
+          })
+        },
+      }),
+      sendBrowserDomRequest: async ({ request }) => {
+        domRequests.push(request)
+        if (request.command.method === 'evaluate') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: { items: pageImages },
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        if (request.command.method === 'page' && request.command.action === 'content') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: documentHtml,
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        return { requestId: request.requestId, ok: true, data: { value: null } }
+      },
+    },
+  })
+  relay.noteConnectionOpened({ connectionId: 'firefox-connection' })
+  const accepted = relay.handleInventory({
+    connectionId: 'firefox-connection',
+    info: { browser: 'Firefox', installId: 'profile-1', stableKey: 'install:Firefox:profile-1' },
+    inventory,
+  })
+  expect(accepted.accepted).toBe(true)
+  return { relay, domRequests, operations, assetRequests, assetTimeouts }
+}
+
+describe('managed Firefox page.extract', () => {
+  test('refuses page.extract for a profile that does not advertise it without reading the page', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-unadvertised-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, domRequests, operations } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxExtractDocument(),
+      inventory: firefoxInventory(),
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-unadvertised',
+        sessionId: 'session-1',
+        operation: {
+          kind: 'page.extract',
+          tabId: 'firefox-tab',
+          format: 'markdown',
+          path: path.join(artifactStore.getRootDir(), 'unadvertised.md'),
+        },
+      })
+
+      expect(response).toMatchObject({ ok: false, error: {
+        code: 'unsupported-capability',
+        message: 'Firefox profile does not advertise page.extract; update the browser extension',
+        outcome: 'not-started',
+      } })
+      // Only the ownership re-check reaches the extension: no page.extract, and no DOM read at all.
+      expect(operations).toEqual(['tab.resolve'])
+      expect(domRequests).toHaveLength(0)
+      expect(fs.existsSync(artifactStore.getRootDir())).toBe(false)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('extracts through the real Firefox worker and persists the whole document for the relay to write', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-artifacts-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'firefox-storage.md')
+    const html = firefoxExtractDocument()
+    const { relay, domRequests, operations } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: html,
+      inventory: firefoxInventory({ advertiseOperations: true }),
+    })
+    try {
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      expect(full.title).toBe(FIREFOX_EXTRACT_TITLE)
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-persist',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, offset: 0, limit: 40 },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful Firefox page.extract')
+      }
+      // The model keeps the bounded window; the file gets the whole extraction.
+      expect(response.data.text).toBe(windowExtractedText({ text: full.text, offset: 0, limit: 40 }).text)
+      expect(response.data.value).toMatchObject({ format: 'markdown', title: FIREFOX_EXTRACT_TITLE, truncated: true })
+      expect(JSON.stringify(response.data)).not.toContain('artifactText')
+      expect(response.data.artifacts).toEqual([{
+        path: outputPath,
+        mimeType: 'text/markdown',
+        bytes: Buffer.byteLength(full.text, 'utf8'),
+        label: FIREFOX_EXTRACT_TITLE,
+      }])
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(full.text)
+      expect(domRequests.map((request) => { return request.command })).toEqual([{ method: 'page', action: 'content' }])
+      expect(operations).not.toContain('page.extract')
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Firefox page.extract images
+// ---------------------------------------------------------------------------
+
+const FIREFOX_IMAGE_URL = 'https://cdn.example.com/chart.png'
+
+function firefoxImageDocument(): string {
+  return `<!doctype html><html lang="en"><head><title>${FIREFOX_EXTRACT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1><p>Retention keeps every revision for thirty days before the purge.</p><img src="${FIREFOX_IMAGE_URL}" alt="Chart"><p>Exports run nightly.</p></article></main></body></html>`
+}
+
+function firefoxPageImage({ src = FIREFOX_IMAGE_URL, alt = 'Chart' }: { src?: string; alt?: string } = {}): Record<string, BrowserJson> {
+  return { src, currentSrc: src, srcset: '', alt, naturalWidth: 800, naturalHeight: 600 }
+}
+
+/**
+ * The whole chain over the real extension connection: relay server, extension
+ * websocket, isolated worker, artifact store and URL rewriting. Only the far end
+ * of the browser websocket is a peer.
+ */
+describe('managed Firefox image bytes over the extension connection', () => {
+  test('asks the extension for bytes by method name and stores what it answers', async () => {
+    const dataDir = createExecutorTestDirectory('firefox-images-data-')
+    const previousDataDir = process.env.PI_BROWSER_DATA_DIR
+    process.env.PI_BROWSER_DATA_DIR = dataDir
+    const relay = await startTrackedRelay()
+    try {
+      const extension = await connectTrackedExtension({
+        port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+      })
+      extension.sendInventory(firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }))
+      await waitForCondition(() => {
+        return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+      }, { message: 'Firefox inventory accepted' })
+
+      const html = firefoxImageDocument()
+      extension.onDomRequest = (request) => {
+        if (request.command.method === 'evaluate') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: { items: [firefoxPageImage()] },
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        if (request.command.method === 'page' && request.command.action === 'content') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: html,
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        return { requestId: request.requestId, ok: true, data: { value: null } }
+      }
+      const imageBytes = Buffer.from('relay-chart-bytes')
+      extension.onAssetRequest = (request) => {
+        return {
+          requestId: request.requestId,
+          assets: request.targets.map((target) => {
+            return { src: target.src, ok: true as const, base64: imageBytes.toString('base64'), mimeType: 'image/png' }
+          }),
+        }
+      }
+      const artifactsRoot = path.join(dataDir, 'artifacts')
+      const outputPath = path.join(artifactsRoot, 'firefox-storage.md')
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      expect(full.text).toContain(`(${FIREFOX_IMAGE_URL})`)
+
+      const response = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-images-live',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, images: 'save' },
+      } })
+
+      const result = response.body as BrowserResponse
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        throw new Error(`expected a successful Firefox page.extract with images, got ${JSON.stringify(result)}`)
+      }
+      // The extension only records a batch when the runtime used the channel method.
+      expect(extension.assetRequests).toHaveLength(1)
+      expect(extension.assetRequests[0]).toMatchObject({
+        sessionId: 'session-1', tabId: 'firefox-tab', browserEpoch: 'epoch-1',
+        targets: [{ src: FIREFOX_IMAGE_URL, alt: 'Chart' }],
+      })
+      const artifacts = result.data.artifacts ?? []
+      expect(artifacts).toHaveLength(2)
+      const stored = artifacts[0]
+      expect(stored).toMatchObject({ mimeType: 'image/png', bytes: imageBytes.length, label: 'Chart', sourceUrl: FIREFOX_IMAGE_URL })
+      expect(path.dirname(stored.path)).toBe(artifactsRoot)
+      expect(fs.readFileSync(stored.path)).toEqual(imageBytes)
+      const persistedBody = full.text.split(`](${FIREFOX_IMAGE_URL}`).join(`](${stored.path}`)
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(persistedBody)
+      expect(result.data.text).toBe(persistedBody)
+      // The bytes never travel on to the model over the HTTP surface either.
+      expect(JSON.stringify(result.data)).not.toContain('savedAssets')
+      expect(JSON.stringify(result.data)).not.toContain(imageBytes.toString('base64'))
+    } finally {
+      if (previousDataDir === undefined) {
+        delete process.env.PI_BROWSER_DATA_DIR
+      } else {
+        process.env.PI_BROWSER_DATA_DIR = previousDataDir
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("asks the extension for nothing when the caller only wants image URLs", async () => {
+    const dataDir = createExecutorTestDirectory('firefox-images-urls-data-')
+    const previousDataDir = process.env.PI_BROWSER_DATA_DIR
+    process.env.PI_BROWSER_DATA_DIR = dataDir
+    const relay = await startTrackedRelay()
+    try {
+      const extension = await connectTrackedExtension({
+        port: relay.port, installId: 'profile-1', browser: 'Firefox', origin: FIREFOX_ORIGIN, firefox: {},
+      })
+      extension.sendInventory(firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }))
+      await waitForCondition(() => {
+        return relay.logs.some((line) => { return line.includes('inventory profile=profile-1') })
+      }, { message: 'Firefox inventory accepted' })
+
+      const html = firefoxImageDocument()
+      extension.onDomRequest = (request) => {
+        if (request.command.method === 'evaluate') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: { items: [firefoxPageImage()] },
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        if (request.command.method === 'page' && request.command.action === 'content') {
+          return { requestId: request.requestId, ok: true, data: {
+            value: html,
+            pageInfo: { tabId: request.tabId, url: FIREFOX_EXTRACT_URL, title: FIREFOX_EXTRACT_TITLE },
+          } }
+        }
+        return { requestId: request.requestId, ok: true, data: { value: null } }
+      }
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+
+      const response = await browserRequest({ port: relay.port, request: {
+        requestId: 'firefox-images-urls-live',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'urls' },
+      } })
+
+      const result = response.body as BrowserResponse
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        throw new Error(`expected a successful Firefox page.extract with image URLs, got ${JSON.stringify(result)}`)
+      }
+      expect(result.data.text).toBe(full.text)
+      expect(result.data.value).toMatchObject({
+        assetCount: 1,
+        assets: [{ src: FIREFOX_IMAGE_URL, alt: 'Chart' }],
+      })
+      // A listing moves no bytes: the extension never sees the channel method.
+      expect(extension.assetRequests).toEqual([])
+      expect(JSON.stringify(result.data)).not.toContain('savedAssets')
+      expect(fs.existsSync(path.join(dataDir, 'artifacts'))).toBe(false)
+    } finally {
+      if (previousDataDir === undefined) {
+        delete process.env.PI_BROWSER_DATA_DIR
+      } else {
+        process.env.PI_BROWSER_DATA_DIR = previousDataDir
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * The Firefox image channel: the worker asks the extension background for bytes
+ * over the transport, and the relay writes what comes back. Only the extension
+ * side of the transport is a peer here.
+ */
+describe('managed Firefox page.extract images', () => {
+  test('persists the bytes the extension fetched and rewrites their URLs in the body and the preview', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'firefox-storage.md')
+    const html = firefoxImageDocument()
+    const imageBytes = Buffer.from('chart-bytes')
+    const { relay, domRequests, operations, assetRequests, assetTimeouts } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: html,
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      assetAnswer: (request) => {
+        return {
+          requestId: request.requestId,
+          assets: request.targets.map((target) => {
+            return { src: target.src, ok: true as const, base64: imageBytes.toString('base64'), mimeType: 'image/png' }
+          }),
+        }
+      },
+    })
+    try {
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      // The pipeline has to keep the image for the rewrite to be observable.
+      expect(full.text).toContain(`(${FIREFOX_IMAGE_URL})`)
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error(`expected a successful Firefox page.extract with images, got ${JSON.stringify(response)}`)
+      }
+      expect(assetRequests).toHaveLength(1)
+      // The channel carries the lease it belongs to, and only the page's own images.
+      expect(assetRequests[0]).toMatchObject({
+        sessionId: 'session-1', tabId: 'firefox-tab', browserEpoch: 'epoch-1',
+        targets: [{ src: FIREFOX_IMAGE_URL, alt: 'Chart' }],
+      })
+      expect(assetTimeouts[0]).toBeGreaterThan(0)
+      expect(assetTimeouts[0]).toBeLessThanOrEqual(30_000)
+      // The manifest is a DOM read, then the document read.
+      expect(domRequests.map((request) => { return request.command.method })).toEqual(['evaluate', 'page'])
+      const artifacts = response.data.artifacts ?? []
+      expect(artifacts).toHaveLength(2)
+      const stored = artifacts[0]
+      expect(stored).toMatchObject({ mimeType: 'image/png', bytes: imageBytes.length, label: 'Chart', sourceUrl: FIREFOX_IMAGE_URL })
+      expect(fs.readFileSync(stored.path)).toEqual(imageBytes)
+      // The persisted body points at the stored image, and so does the preview.
+      const persistedBody = full.text.split(`](${FIREFOX_IMAGE_URL}`).join(`](${stored.path}`)
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(persistedBody)
+      expect(response.data.text).toBe(persistedBody)
+      expect(artifacts[1]).toMatchObject({ path: outputPath, mimeType: 'text/markdown', label: FIREFOX_EXTRACT_TITLE })
+      // The bytes and the URL list never travel on to the model.
+      const modelPayload = JSON.stringify(response.data)
+      expect(modelPayload).not.toContain('savedAssets')
+      expect(modelPayload).not.toContain(imageBytes.toString('base64'))
+      expect(operations).not.toContain('page.extract')
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('lists the manifest the page reported when only the URLs are asked for', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-urls-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, domRequests, assetRequests } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxImageDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage(), firefoxPageImage({ src: 'data:image/png;base64,AAAA' })],
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images-urls',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'urls' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful Firefox page.extract with image URLs')
+      }
+      // Same manifest fields the Chrome backend reports, inline bytes skipped.
+      expect(response.data.value).toMatchObject({
+        assetCount: 1,
+        assets: [{ src: FIREFOX_IMAGE_URL, currentSrc: FIREFOX_IMAGE_URL, srcset: '', alt: 'Chart', naturalWidth: 800, naturalHeight: 600 }],
+      })
+      expect(JSON.stringify(response.data.value)).not.toContain('data:image/png')
+      expect(assetRequests).toHaveLength(0)
+      expect(domRequests.map((request) => { return request.command.method })).toEqual(['evaluate', 'page'])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('reports every image as failed when the runtime cannot carry asset bytes', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-missing-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'firefox-storage.md')
+    const html = firefoxImageDocument()
+    const { relay, assetRequests } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: html,
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      withoutAssetTransport: true,
+    })
+    try {
+      const full = await extractPageContent({ html, url: FIREFOX_EXTRACT_URL, format: 'markdown', full: true })
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images-missing',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      // The extraction still lands: a missing byte channel is a per-image failure.
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected the extraction to survive a missing asset channel')
+      }
+      expect(response.data.value).toMatchObject({
+        failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('cannot fetch image bytes') }],
+      })
+      expect(response.data.value).not.toHaveProperty('savedAssets')
+      expect(assetRequests).toHaveLength(0)
+      expect(response.data.artifacts).toEqual([{
+        path: outputPath,
+        mimeType: 'text/markdown',
+        bytes: Buffer.byteLength(full.text, 'utf8'),
+        label: FIREFOX_EXTRACT_TITLE,
+      }])
+      // Nothing was stored, so the document keeps the page's own URL.
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(full.text)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('degrades a failed asset fetch into per-image failures instead of failing the extraction', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-timeout-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, assetTimeouts } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxImageDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      assetAnswer: () => {
+        throw new Error('browserAssetRequest failed: Extension request timeout after 30000ms: browserAssetRequest')
+      },
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'firefox-extract-images-timeout',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected the extraction to survive a timed-out asset fetch')
+      }
+      expect(response.data.value).toMatchObject({
+        failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('browserAssetRequest failed') }],
+      })
+      expect(response.data.text).toContain('Storage documentation')
+      expect(assetTimeouts).toHaveLength(1)
+      expect(assetTimeouts[0]).toBeLessThanOrEqual(30_000)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('refuses an oversized or mismatched asset answer instead of writing it', async () => {
+    const directory = createExecutorTestDirectory('firefox-extract-images-refused-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const oversizedBase64 = 'A'.repeat(MAX_FIREFOX_ASSET_BASE64_LENGTH + 1)
+    const { relay } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxImageDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+      pageImages: [firefoxPageImage()],
+      assetAnswer: (request) => {
+        return {
+          requestId: 'a different request',
+          assets: [{ src: FIREFOX_IMAGE_URL, ok: true, base64: oversizedBase64, mimeType: 'image/png' }],
+        }
+      },
+    })
+    try {
+      const mismatched = await relay.handleRequest({
+        requestId: 'firefox-extract-images-mismatched',
+        sessionId: 'session-1',
+        timeoutMs: 30_000,
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+      })
+      expect(mismatched.ok).toBe(true)
+      if (!mismatched.ok) {
+        throw new Error('expected the extraction to survive a mismatched asset answer')
+      }
+      expect(mismatched.data.value).toMatchObject({
+        failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('malformed or mismatched asset response') }],
+      })
+      expect(fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []).toEqual([])
+
+      // The same answer with the right requestId is refused for its size: a
+      // channel payload the runtime cannot accept is never written either.
+      const oversizedRelay = startFirefoxExtractRelay({
+        artifactStore,
+        documentHtml: firefoxImageDocument(),
+        inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls', 'save'] } }),
+        pageImages: [firefoxPageImage()],
+        assetAnswer: (request) => {
+          return {
+            requestId: request.requestId,
+            assets: [{ src: FIREFOX_IMAGE_URL, ok: true, base64: oversizedBase64, mimeType: 'image/png' }],
+          }
+        },
+      })
+      try {
+        const oversizedResponse = await oversizedRelay.relay.handleRequest({
+          requestId: 'firefox-extract-images-oversized',
+          sessionId: 'session-1',
+          timeoutMs: 30_000,
+          operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+        })
+        expect(oversizedResponse.ok).toBe(true)
+        if (!oversizedResponse.ok) {
+          throw new Error('expected the extraction to survive an oversized asset answer')
+        }
+        expect(oversizedResponse.data.value).toMatchObject({
+          failedAssets: [{ src: FIREFOX_IMAGE_URL, reason: expect.stringContaining('malformed or mismatched asset response') }],
+        })
+        expect(fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []).toEqual([])
+      } finally {
+        await oversizedRelay.relay.dispose()
+      }
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// page.extract images
+// ---------------------------------------------------------------------------
+
+describe('managed page.extract images', () => {
+  test('persists saved images and rewrites their URLs in the body and the preview', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'storage-docs.md')
+    const imageUrl = 'https://cdn.example.com/chart.png'
+    const imageBytes = Buffer.from('chart-bytes')
+    const artifactText = `# Storage Docs\n\n![Chart](${imageUrl})\n\nretention detail\n`
+    const previewText = `# Storage Docs\n\n![Chart](${imageUrl})`
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: previewText,
+            value: {
+              format: request.operation.format,
+              truncated: true,
+              totalBytes: Buffer.byteLength(artifactText, 'utf8'),
+              title: 'Storage Docs',
+              assetCount: 1,
+              savedAssets: [
+                { base64: imageBytes.toString('base64'), mimeType: 'image/png', src: imageUrl, alt: 'Chart' },
+              ],
+              artifactText,
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-images',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      const artifacts = response.data.artifacts ?? []
+      expect(artifacts).toHaveLength(2)
+      const [stored, document] = artifacts
+      expect(stored).toMatchObject({ mimeType: 'image/png', bytes: imageBytes.length, label: 'Chart', sourceUrl: imageUrl })
+      expect(path.dirname(stored.path)).toBe(artifactStore.getRootDir())
+      expect(path.basename(stored.path)).toMatch(/^chart-[a-z0-9]+-[0-9a-f]+\.png$/)
+      expect(fs.readFileSync(stored.path)).toEqual(imageBytes)
+      // The persisted body points at the stored image, and so does the preview.
+      const persistedBody = `# Storage Docs\n\n![Chart](${stored.path})\n\nretention detail\n`
+      expect(document).toEqual({
+        path: outputPath,
+        mimeType: 'text/markdown',
+        bytes: Buffer.byteLength(persistedBody, 'utf8'),
+        label: 'Storage Docs',
+      })
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(persistedBody)
+      expect(response.data.text).toBe(`# Storage Docs\n\n![Chart](${stored.path})`)
+      // The bytes themselves never travel on to the model.
+      const modelPayload = JSON.stringify(response.data)
+      expect(modelPayload).not.toContain('savedAssets')
+      expect(modelPayload).not.toContain(imageBytes.toString('base64'))
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('rewrites the src attribute URL of an image whose bytes came from its srcset candidate', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-srcset-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const outputPath = path.join(artifactStore.getRootDir(), 'srcset-docs.md')
+    const attributeUrl = 'https://cdn.example.com/photo.jpg'
+    const candidateUrl = 'https://cdn.example.com/photo-2x.jpg'
+    const imageBytes = Buffer.from('photo-bytes')
+    // The body keeps the `src` attribute while the browser fetched the srcset
+    // candidate, which is the gap this covers.
+    const artifactText = `# Photos\n\n![Photo](${attributeUrl})\n\ncaption\n`
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: `# Photos\n\n![Photo](${attributeUrl})`,
+            value: {
+              format: request.operation.format,
+              truncated: false,
+              totalBytes: Buffer.byteLength(artifactText, 'utf8'),
+              assetCount: 1,
+              savedAssets: [{
+                base64: imageBytes.toString('base64'),
+                mimeType: 'image/png',
+                src: candidateUrl,
+                sourceUrls: [attributeUrl, candidateUrl],
+                alt: 'Photo',
+              }],
+              artifactText,
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-images-srcset',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', path: outputPath, images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      const [stored] = response.data.artifacts ?? []
+      // The descriptor names the URL the bytes came from, and both spellings of
+      // the image point at the file the bytes were written to.
+      expect(stored).toMatchObject({ mimeType: 'image/png', label: 'Photo', sourceUrl: candidateUrl })
+      expect(fs.readFileSync(outputPath, 'utf8')).toBe(`# Photos\n\n![Photo](${stored.path})\n\ncaption\n`)
+      expect(response.data.text).toBe(`# Photos\n\n![Photo](${stored.path})`)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('refuses a malformed URL list instead of trusting it', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-urls-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: 'body',
+            value: {
+              format: request.operation.format,
+              truncated: false,
+              totalBytes: 4,
+              savedAssets: [{
+                base64: Buffer.from('bytes').toString('base64'),
+                mimeType: 'image/png',
+                src: 'https://cdn.example.com/chart.png',
+                sourceUrls: ['https://cdn.example.com/chart.png', 7],
+              }],
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-images-bad-urls',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', images: 'save' },
+      })
+
+      expect(response).toMatchObject({
+        ok: false,
+        error: { code: 'internal-error', message: 'page.extract savedAssets[0] has a malformed URL list', outcome: 'unknown' },
+      })
+      expect(fs.existsSync(artifactStore.getRootDir()) ? fs.readdirSync(artifactStore.getRootDir()) : []).toEqual([])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps the other images and reports the one the artifact store refuses', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-refused-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const imageUrl = 'https://cdn.example.com/chart.png'
+    const refusedUrl = 'https://cdn.example.com/vector.avif'
+    const imageBytes = Buffer.from('chart-bytes')
+    const relay = startExtractRelay({
+      artifactStore,
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: {
+            text: `![Chart](${imageUrl})`,
+            value: {
+              format: request.operation.format,
+              truncated: false,
+              totalBytes: 20,
+              savedAssets: [
+                { base64: imageBytes.toString('base64'), mimeType: 'image/png', src: imageUrl },
+                { base64: Buffer.from('avif-bytes').toString('base64'), mimeType: 'image/avif', src: refusedUrl },
+              ],
+              failedAssets: [{ src: 'https://cdn.example.com/gone.png', reason: 'node fetch failed' }],
+            },
+          },
+        }
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      const response = await relay.handleRequest({
+        requestId: 'extract-images-refused',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', images: 'save' },
+      })
+
+      expect(response.ok).toBe(true)
+      if (!response.ok) {
+        throw new Error('expected a successful page.extract')
+      }
+      expect(response.data.artifacts).toHaveLength(1)
+      const value = response.data.value
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('expected a structured extract value')
+      }
+      expect(value.savedAssets).toBeUndefined()
+      expect(value.failedAssets).toEqual([
+        { src: 'https://cdn.example.com/gone.png', reason: 'node fetch failed' },
+        expect.objectContaining({ src: refusedUrl, reason: expect.stringContaining('unsupported artifact mimeType image/avif') }),
+      ])
+      expect(fs.readdirSync(artifactStore.getRootDir())).toHaveLength(1)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('refuses a webextension profile that does not advertise the requested images mode without any traffic', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-unadvertised-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, domRequests, operations } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxExtractDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true }),
+    })
+    try {
+      const response = await relay.handleRequest({
+        requestId: 'extract-images-unadvertised',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+      })
+
+      expect(response).toMatchObject({
+        ok: false,
+        error: {
+          code: 'unsupported-capability',
+          message: "profile profile-1 does not advertise page.extract images 'save'; update the browser extension",
+          outcome: 'not-started',
+        },
+      })
+      // Not even the ownership re-check leaves the relay: nothing reaches the browser.
+      expect(operations).toEqual([])
+      expect(domRequests).toHaveLength(0)
+      expect(fs.existsSync(artifactStore.getRootDir())).toBe(false)
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('gates each images mode on its own advertisement', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-modes-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const { relay, domRequests } = startFirefoxExtractRelay({
+      artifactStore,
+      documentHtml: firefoxExtractDocument(),
+      inventory: firefoxInventory({ advertiseOperations: true, features: { assets: ['urls'] } }),
+    })
+    try {
+      const listed = await relay.handleRequest({
+        requestId: 'extract-images-urls',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'urls' },
+      })
+      expect(listed).toMatchObject({ ok: true })
+
+      const saved = await relay.handleRequest({
+        requestId: 'extract-images-save',
+        sessionId: 'session-1',
+        operation: { kind: 'page.extract', tabId: 'firefox-tab', format: 'markdown', images: 'save' },
+      })
+      expect(saved).toMatchObject({
+        ok: false,
+        error: {
+          code: 'unsupported-capability',
+          message: "profile profile-1 does not advertise page.extract images 'save'; update the browser extension",
+          outcome: 'not-started',
+        },
+      })
+      // Only the advertised mode reached the browser: the URL listing is a
+      // manifest read plus the document read, and the refused save read nothing.
+      expect(domRequests.map((request) => { return request.command })).toEqual([
+        { method: 'evaluate', code: expect.any(String) },
+        { method: 'page', action: 'content' },
+      ])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('lets a Chrome profile use every images mode without advertising anything', async () => {
+    const directory = createExecutorTestDirectory('page-extract-images-chrome-')
+    const artifactStore = new ArtifactStore({ rootDir: path.join(directory, 'artifacts') })
+    const pooled: string[] = []
+    const pool = createTestPool({
+      respond: (request) => {
+        if (request.operation.kind !== 'page.extract') {
+          return undefined
+        }
+        pooled.push(request.operation.images ?? 'none')
+        return {
+          requestId: request.requestId,
+          ok: true,
+          data: { text: 'preview', value: { format: request.operation.format, truncated: false, totalBytes: 7 } },
+        }
+      },
+    })
+    const relay = new ManagedRelay({
+      host: '127.0.0.1',
+      port: 1,
+      artifactStore,
+      poolFactory: async () => pool,
+      hasConnectedExtensions: () => {
+        return true
+      },
+      closeManagedClient: () => {},
+      transport: {
+        sendBrowserRequest: async ({ request }) => {
+          if (request.operation.kind === 'tab.resolve') {
+            return { requestId: request.requestId, ok: true, data: { tab: chromeInventory().tabs[0] } }
+          }
+          return { requestId: request.requestId, ok: true, data: { text: 'ok' } }
+        },
+      },
+    })
+    try {
+      connectChromeProfile(relay)
+      // The Chrome profile reports no capabilities at all, exactly like the
+      // deployed extension: the runtime owns the asset modes for it.
+      expect(relay.listProfiles()[0].capabilities).toMatchObject({
+        supportedOperations: expect.arrayContaining(['page.extract']),
+        features: { assets: ['urls', 'save'] },
+      })
+      for (const images of ['urls', 'save'] as const) {
+        const response = await relay.handleRequest({
+          requestId: `extract-images-chrome-${images}`,
+          sessionId: 'session-1',
+          operation: { kind: 'page.extract', tabId: 'chrome-tab', format: 'markdown', images },
+        })
+        expect(response).toMatchObject({ ok: true })
+      }
+      expect(pooled).toEqual(['urls', 'save'])
+    } finally {
+      await relay.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Managed CDP scoping
 // ---------------------------------------------------------------------------
 
@@ -4771,8 +6182,106 @@ describe('managed request parsing', () => {
     ).toMatchObject({ ok: false })
   })
 
-  test('inventory parsing keeps the in-place origin and the source tab of a popup', () => {
-    const parsed = parseBrowserInventory(
+  test('parses page.extract fields and rejects a format the protocol does not define', () => {
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: {
+          kind: 'page.extract',
+          tabId: 't',
+          format: 'markdown',
+          selector: 'main article',
+          search: 'retention',
+          offset: 0,
+          limit: 20,
+          path: '/tmp/anything-not-written-here.md',
+        },
+      }),
+    ).toMatchObject({
+      ok: true,
+      value: {
+        operation: {
+          kind: 'page.extract',
+          tabId: 't',
+          format: 'markdown',
+          selector: 'main article',
+          search: 'retention',
+          offset: 0,
+          limit: 20,
+          path: '/tmp/anything-not-written-here.md',
+        },
+      },
+    })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'text' },
+      }),
+    ).toMatchObject({ ok: true, value: { operation: { kind: 'page.extract', format: 'text' } } })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'pdf' },
+      }),
+    ).toMatchObject({ ok: false, message: expect.stringContaining('"format"') })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't' },
+      }),
+    ).toMatchObject({ ok: false })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', offset: -1 },
+      }),
+    ).toMatchObject({ ok: false })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', maxChars: 10 },
+      }),
+    ).toMatchObject({ ok: false })
+  })
+
+  test('parses the images mode of page.extract and rejects a mode the protocol does not define', () => {
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', images: 'save' },
+      }),
+    ).toMatchObject({ ok: true, value: { operation: { kind: 'page.extract', format: 'markdown', images: 'save' } } })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'assets-manifest', images: 'none' },
+      }),
+    ).toMatchObject({ ok: true, value: { operation: { images: 'none' } } })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', images: 'all' },
+      }),
+    ).toMatchObject({ ok: false, message: expect.stringContaining('"images"') })
+    expect(
+      parseBrowserRequest({
+        requestId: 'r',
+        sessionId: 's',
+        operation: { kind: 'page.extract', tabId: 't', format: 'markdown', images: true },
+      }),
+    ).toMatchObject({ ok: false, message: expect.stringContaining('"images"') })
+  })
+
+  test('inventory parsing keeps the in-place origin and the source tab of a popup', () => {    const parsed = parseBrowserInventory(
       makeInventory({
         groups: [makeGroup({ groupId: 'g1', sessionId: 's1', origin: 'existing' })],
         tabs: [makeTab({ tabId: 't1', groupId: 'g1', sessionId: 's1', origin: 'existing', sourceTabId: 't0' })],

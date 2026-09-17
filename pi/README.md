@@ -55,6 +55,7 @@ used.
 | `browser_tabs` | list/create/attach/activate/close/release tabs; `discover` lists real open tabs with Pi-side `offset`/`limit` paging (active tabs first, `nextOffset`/`truncated` reported) |
 | `browser_navigate` | navigate a `tabId` to a URL, or `action:"back"` through real browser history |
 | `browser_snapshot` | accessibility tree for a `tabId` with `aria-ref=eN` refs + `snapshotId` (default readable tree; `full` requests the complete tree, output bounded) |
+| `browser_extract` | extract a tab's content as `markdown` (default) / `text` / `html` / `assets-manifest` — no refs; `search`, `offset`/`limit` window the result, `path` saves the full extraction as an artifact, `images` (`none`/`urls`/`save`) lists or downloads the page's images |
 | `browser_click` | click by ref (`aria-ref=eN`/`@eN` + `snapshotId`) or strict CSS |
 | `browser_fill` | set input/textarea/contenteditable text (clear-and-insert) |
 | `browser_evaluate` | run JS against a tab's DOM (`document`/`window`, async; isolated world on Firefox) |
@@ -75,6 +76,31 @@ and `tabId`. `browser_profiles` puts optional backend metadata into the model's
 `evaluateWorld`, `supportedOperations`, and `limitations`. Older Chrome profiles
 can omit these fields. The compact human row marks a Firefox profile as using
 DOM input; ordinary actions do not repeat a long warning.
+
+Content extraction is advertised the same per-profile way: `browser_profiles`
+reports the optional `features` matrix (only the feature keys this build can act
+on — currently `extract` and `assets` — are projected into model content, so an
+unrelated or unknown key is not noise in the model's context). `browser_extract`
+is served by the target tab's profile: Chrome profiles advertise `page.extract`
+today, while a Firefox profile that does not advertise it makes the call fail
+with a clear error instead of returning an empty extraction. The export path is
+confined to the runtime's artifacts directory; a path outside it is refused.
+
+Image handling is gated one level deeper, on `features.assets`. `images:"urls"`
+returns the page's image manifest — one entry per image with `src`, `alt`,
+`naturalWidth` and `naturalHeight`, the intrinsic pixel size the runtime
+reports — without downloading anything, and `images:"save"` downloads the
+images through the runtime, saves them as artifacts and rewrites the saved
+Markdown image URLs to those local paths, reporting any image it could not
+fetch in `failedAssets`. The model-facing `assets:` line states when the runtime
+had to cut the listing short (`assetsTruncated`, next to the `assetCount` it
+carries) and, for `save`, how many images were left over the per-request fetch
+limit without ever being attempted (`assetsNotFetched`).
+Both modes need the target profile to advertise them: a Firefox (webextension)
+profile whose add-on does not advertise the matching asset mode is refused
+before anything is downloaded, while Chrome is served by the runtime and a peer
+that advertises no capabilities at all is left to the runtime's own
+`unsupported-capability` answer.
 
 Firefox profiles report `webextension` / `dom` / `dom-aria` / `dom-compatible`
 / `isolated`. Input is performed through DOM APIs, so sites that require

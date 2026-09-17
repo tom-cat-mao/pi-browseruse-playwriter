@@ -50,7 +50,9 @@ export function parseBrowserDomCommand(value: unknown): BrowserDomCommand | null
         validLocatorArgs({ action: value.action, args: value.args })
       break
     case 'page':
-      valid = fields({ value, keys: ['method', 'action'] }) && ['title', 'url', 'content', 'readyState'].includes(String(value.action))
+      valid = fields({ value, keys: ['method', 'action', 'selector'] }) &&
+        ['title', 'url', 'content', 'readyState'].includes(String(value.action)) &&
+        (value.selector === undefined || (value.action === 'content' && nonemptyString(value.selector)))
       break
     case 'invalidate':
     case 'dispose':

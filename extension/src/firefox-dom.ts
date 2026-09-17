@@ -92,7 +92,33 @@ declare const exportFunction:
 
 const MAX_SNAPSHOT_LINES = 500
 const MAX_SNAPSHOT_CHARS = 60000
+/** Budget for an evaluated or locator read value: a selection of fields, never a whole document. */
 const MAX_JSON_CHARS = 1_000_000
+/**
+ * The `page.content` read is not an evaluation: it is the serialized document
+ * the extraction pipeline parses, and a real long-form page (an article on
+ * en.wikipedia.org, for example) serializes to 1-3 MB of markup, past the
+ * generic 1 MB guard. This is a self-imposed guard, not a platform limit, so the
+ * read gets its own budget derived from the narrowest downstream bound instead
+ * of from taste:
+ *
+ * - 6,000,000 characters of ASCII-dominant markup serialize to about 6 MiB of
+ *   UTF-8, which fits inside the 8 MiB worker<->pool IPC frame that
+ *   firefox-executor-protocol.ts enforces on this very response;
+ * - the extension IPC path is not the constraint: neither
+ *   userScripts.execute nor runtime.sendMessage/onUserScriptMessage documents a
+ *   hard message size limit (both move structured clones), and community
+ *   measurements put the practical Firefox extension IPC ceiling near 30 MB;
+ * - a persisted extraction keeps its own 2 MB text budget downstream, so a
+ *   wider read cannot widen what one extraction hands over.
+ *
+ * The guard compares JSON string length, so a page whose markup is mostly
+ * non-ASCII is still measured by characters rather than by bytes; such a page
+ * reaches the byte-bounded IPC frame check instead of this one.
+ *
+ * Exported so the boundary tests can pin the serialized-document budget.
+ */
+export const MAX_CONTENT_JSON_CHARS = 6_000_000
 const INTERACTIVE_ROLES = new Set([
   'button',
   'checkbox',
@@ -132,7 +158,12 @@ const READ_ACTIONS = new Set<BrowserDomLocatorAction>([
   'waitFor',
 ])
 
-export function browserJson(value: unknown): BrowserJson {
+/** The wider budget the serialized-document read gets; every other command keeps `MAX_JSON_CHARS`. */
+function jsonBudgetFor(command: BrowserDomCommand): number {
+  return command.method === 'page' && command.action === 'content' ? MAX_CONTENT_JSON_CHARS : MAX_JSON_CHARS
+}
+
+export function browserJson(value: unknown, maxChars = MAX_JSON_CHARS): BrowserJson {
   const seen = new Set<object>()
   const convert = (current: unknown, depth: number): BrowserJson => {
     if (depth > 64) throw new FirefoxDomError({ message: 'The returned value exceeds the JSON nesting limit.' })
@@ -166,9 +197,16 @@ export function browserJson(value: unknown): BrowserJson {
     }
   }
   const result = convert(value, 0)
-  if (JSON.stringify(result).length > MAX_JSON_CHARS)
-    throw new FirefoxDomError({ message: 'The returned JSON exceeds 1 MB; return a smaller selection of fields.' })
+  if (JSON.stringify(result).length > maxChars)
+    throw new FirefoxDomError({
+      message: `The returned JSON exceeds ${jsonBudgetLabel({ maxChars })}; return a smaller selection of fields.`,
+    })
   return result
+}
+
+/** Name a budget the way it is derived: whole decimal megabytes, or its exact length when it is not one. */
+function jsonBudgetLabel({ maxChars }: { maxChars: number }): string {
+  return maxChars % 1_000_000 === 0 ? `${maxChars / 1_000_000} MB` : `${maxChars} characters`
 }
 
 function stringArg(options: { args: BrowserJson[]; index?: number; name: string }): string {
@@ -960,10 +998,12 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
       if (command.action === 'title') return { value: document.title }
       if (command.action === 'readyState') return { value: document.readyState }
       if (command.action === 'url') return { value: document.URL }
-      if (command.action === 'content')
+      if (command.action === 'content') {
+        if (command.selector) return { value: strictElement(locate({ selector: command.selector })).outerHTML }
         return {
           value: `${document.doctype ? new view.XMLSerializer().serializeToString(document.doctype) : ''}${document.documentElement.outerHTML}`,
         }
+      }
       throw new FirefoxDomError({ code: 'invalid-request', message: 'Unknown page read action.' })
     }
     if (command.method === 'evaluate') {
@@ -1089,7 +1129,7 @@ export function createFirefoxDomDriver(document: Document): FirefoxDomDriver {
         checkActive(execution)
         const data = await execute({ execution, evaluator, frameIdForElement })
         checkActive(execution)
-        if (data.value !== undefined) data.value = browserJson(data.value)
+        if (data.value !== undefined) data.value = browserJson(data.value, jsonBudgetFor(request.command))
         return {
           requestId: request.requestId,
           ok: true,
