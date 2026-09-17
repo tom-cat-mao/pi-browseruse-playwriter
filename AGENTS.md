@@ -10,8 +10,11 @@ Pi Browser Use（tom-cat-mao/pi-browseruse-playwriter）是 remorses/playwriter 
 fork，保留 MIT 许可与上游署名。它让 Pi agent 通过本机 Chrome 扩展操作用户真实的标签
 与登录态；浏览器不离开本机，也没有云端浏览器。
 
-当前没有任何 npm 发布，也没有 Chrome Web Store 上架：不要写"已发布"，不要使用旧商店
-ID。fork 开发扩展 ID 是 `eeklahpecooapnailfaebkjjembkjhhg`，不是上游的
+发行现状：推送 `extension@*` tag 由 `.github/workflows/extension-release.yml` 构建并发布
+GitHub Release，产物含 Chrome ZIP、Firefox ZIP、未签名开发 XPI（`-unsigned.xpi`）与
+AMO unlisted 已签名 XPI（各自带 `.sha256`）。仍没有 npm 发布，也没有 Chrome Web Store
+上架：不要写"已上架商店"或"已发布到 npm"，不要使用旧商店 ID。fork 开发扩展 ID 是
+`eeklahpecooapnailfaebkjjembkjhhg`，不是上游的
 `jfeammnjpkecdekppnclgkkffahnhfhe` / `pebbngnfojnignonigcnkdilknapkgid`。
 
 | 路径          | 包                                          | 说明                                                          |
@@ -97,10 +100,13 @@ pnpm --filter @tom-cat/pi-browser-use-extension typecheck
 pnpm --filter @tom-cat/pi-browser-use-extension load-check
 ```
 
-- 一次构建 runtime 与扩展：`pnpm build`（runtime 构建会生成 `playwriter/dist/extension`）。
+- 一次构建 runtime 与扩展：`pnpm build`（runtime 构建会生成 `playwriter/dist/extension`
+  与 `playwriter/dist/extension-firefox`）。
 - 本地打包扩展（需要先有 `playwriter/dist/extension`）：`pnpm package:extension`，
   产物在 `dist-release/`（ZIP + `.sha256`）；`pnpm release` 是同一步骤的别名，只做本地
-  打包，不发布。
+  打包，不发布。Firefox 侧：`pnpm package:firefox` 产出 Firefox ZIP 与未签名 XPI，
+  `pnpm sign:firefox` 走 AMO unlisted 签名（需要 `AMO_JWT_ISSUER` /
+  `AMO_JWT_SECRET`；`--dry-run` 只校验、不发请求）。
 - 扩展开发构建：`pnpm --filter mcp-extension build`（fork 身份 + 19989，输出
   `extension/dist`），只构建，不自动加载或重载扩展。
 - `pnpm reload` 会被 `scripts/legacy-action-guard.mjs` 拒绝，不要绕过；应用 fork 构建用
@@ -150,9 +156,14 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
 - 仅开发指引/文档改动通常不加 changeset，除非同时改变了公共包行为。
 - fork 的 `@xmorse/playwright-core` 只有在公共 API/行为变化时才写 changeset，且必须
   先更新 playwright 的 doc/override 源再跑生成器；不要手改生成的 `types.d.ts`。
-- 发布现状：没有 npm/商店发布；推送 `extension@*` tag 会自动构建并发布 GitHub
-  Release，所以 tag/release 只允许在用户明确发布授权下进行；在开发/修复分支上默认
-  不推送 tag、不创建 Release。
+- 发布现状：推送 `extension@*` tag 由 `.github/workflows/extension-release.yml` 构建并
+  发布 GitHub Release（Chrome ZIP、Firefox ZIP、未签名开发 XPI、AMO unlisted 已签名
+  XPI 及各自 `.sha256`；AMO 凭证取自仓库 secrets `AMO_JWT_ISSUER` /
+  `AMO_JWT_SECRET`，`workflow_dispatch` 只创建 Draft）。工作流校验 tag 与
+  `extension/manifest.json` 版本一致；AMO 同一版本号只能签名一次，
+  `scripts/sign-firefox-extension.mjs` 对已签名版本走下载路径，重推同一 tag 因此安全。
+  仍没有 npm 发布，也没有 Chrome Web Store 上架。tag/release 只允许在用户明确发布授权下
+  进行；在开发/修复分支上默认不推送 tag、不创建 Release。
 
 ## TypeScript 与代码风格
 
@@ -174,8 +185,9 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
 
 ## 延伸阅读
 
-- `README.md`：安装与发行现状；`pi/README.md`：Pi 包与工具说明；`pi/skills/SKILL.md`：
-  模型侧用法（source of truth）。
+- 文档同步：`README.md`（英文 canonical，安装与发行现状）与 `README.zh-CN.md`（中文镜像）
+  必须同步更新，改一边必须改另一边；`pi/README.md` 只做概述、不得复制工具细节，模型侧
+  用法以 `pi/skills/SKILL.md`（source of truth）为准。
 - `docs/exec/browser-runtime-contract.md`：HTTP/WS 契约（目标态，当前实现以代码为准）；
   `docs/exec/` 下的计划与验收文档只描述具体任务（含被取代方案），不是长期指令；
   `docs/exec/extension-distribution-plan.md` 是可复用的发行清单。
