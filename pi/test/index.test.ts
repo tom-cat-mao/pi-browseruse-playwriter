@@ -5,6 +5,7 @@
  * can assert that structured resources (groupId/tabId/snapshotId/evaluate value)
  * actually land in the tool `content` the LLM sees — not just in `details`.
  */
+import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import factory from "../extensions/index.ts";
 import * as bootstrap from "../extensions/bootstrap.ts";
@@ -166,18 +167,71 @@ describe("extension factory registration", () => {
     expect(tools.some((t) => t.name === "browser_save_as_pdf")).toBe(false);
   });
 
-  it("gives every tool a promptSnippet, self-naming guidelines, and renderers", () => {
+  it("gives every tool a promptSnippet and renderers", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     for (const tool of tools) {
       expect(tool.promptSnippet, tool.name).toBeTruthy();
-      for (const guideline of tool.promptGuidelines ?? []) {
-        expect(guideline, `${tool.name} guideline names its tool`).toContain(tool.name);
-      }
       expect(typeof tool.execute).toBe("function");
       expect(typeof tool.renderCall).toBe("function");
       expect(typeof tool.renderResult).toBe("function");
     }
+  });
+
+  /**
+   * Guidelines are injected into the system prompt on every turn, so they stay
+   * limited to cross-tool orchestration; single-tool semantics belong to the
+   * tool description, which ships with the tool schema. A bloated or duplicated
+   * guideline list is a regression, not a documentation preference.
+   */
+  it("keeps the resident guidelines small, unique, and tool-addressed", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const guidelines = tools.flatMap((tool) => tool.promptGuidelines ?? []);
+    expect(guidelines.length).toBeGreaterThanOrEqual(8);
+    expect(guidelines.length).toBeLessThanOrEqual(12);
+    expect(new Set(guidelines).size).toBe(guidelines.length);
+    expect(guidelines.join("").length).toBeLessThanOrEqual(3000);
+    for (const guideline of guidelines) {
+      expect(guideline, guideline).toMatch(/browser_[a-z]+/);
+    }
+  });
+
+  it("keeps the cross-tool disciplines in the guidelines", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const guidelines = tools.flatMap((tool) => tool.promptGuidelines ?? []).join("\n");
+    for (const discipline of [
+      "profileId", // profiles -> groups -> tabs id chain
+      "groupId",
+      "tabId",
+      "discover", // attach a tab the user already has open
+      "attach",
+      "nextOffset", // discover pagination
+      "sourceTabId", // a link that opened a new tab
+      "activate",
+      "back", // real browser history
+      "snapshotId", // refs need the snapshot they came from
+      "invalidates", // evaluate/execute invalidate the latest snapshot
+      "observe", // observe -> act -> observe
+      "release", // session hygiene
+      "outcome=unknown", // cancelled/timed out actions are never replayed
+    ]) {
+      expect(guidelines, `guidelines mention ${discipline}`).toContain(discipline);
+    }
+  });
+
+  it("ships the browser-use skill with the frontmatter pi needs to register it", () => {
+    const skill = fs.readFileSync(new URL("../skills/SKILL.md", import.meta.url), "utf8");
+    const frontmatter = skill.match(/^---\n([\s\S]*?)\n---\n/);
+    expect(frontmatter).toBeTruthy();
+    const lines = frontmatter![1];
+    // pi falls back to the directory name without a name, and drops the skill
+    // entirely when the description is missing or over the spec limit.
+    expect(lines).toMatch(/^name:\s*browser-use\s*$/m);
+    const description = lines.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? "";
+    expect(description.length).toBeGreaterThan(0);
+    expect(description.length).toBeLessThanOrEqual(1024);
   });
 
   it("exposes a /browser-status command and a session_shutdown hook", () => {
