@@ -25,10 +25,22 @@ function longDocumentHtml(): string {
   return `<!doctype html><html lang="en"><head><title>${EXTRACT_DOCUMENT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
 }
 
-/** Larger than the 1 MB an evaluated value may return: a real long-form article serializes this way. */
+/**
+ * Larger than the 1 MB an evaluated value may return: a real long-form article
+ * serializes this way.
+ *
+ * The bytes come from a few thousand-character paragraphs, not from thousands
+ * of short ones: the extraction pipeline's cost grows with the DOM node count
+ * far faster than with the byte count, and 5,000 small paragraphs of the same
+ * total size pushed the extraction past its 5 s execution deadline on a slow CI
+ * runner. The test is about a document too large for an evaluated value, so the
+ * same bytes in 200 nodes keep its intent.
+ */
 function wideDocumentHtml(): string {
-  const paragraphs = Array.from({ length: 5_000 }, (_value, index) => {
-    return `<p>Section ${index} of the retention policy: the exporter keeps every revision of a stored document for thirty days, then purges the oldest revisions in the order they were written until the store is back under its configured quota.</p>`
+  const sentence = 'the exporter keeps every revision of a stored document for thirty days, then purges the oldest revisions in the order they were written until the store is back under its configured quota. '
+  const paragraphBody = sentence.repeat(30)
+  const paragraphs = Array.from({ length: 200 }, (_value, index) => {
+    return `<p>Section ${index} of the retention policy: ${paragraphBody}</p>`
   }).join('')
   return `<!doctype html><html lang="en"><head><title>${EXTRACT_DOCUMENT_TITLE}</title></head><body><main><article><h1>Storage documentation</h1>${paragraphs}</article></main></body></html>`
 }
