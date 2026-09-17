@@ -13,6 +13,7 @@
     "cli:legacy": "pnpm --filter @tom-cat/pi-browser-runtime cli:legacy",
     "package:extension": "node scripts/package-extension.mjs",
     "package:firefox": "node scripts/package-extension.mjs --firefox",
+    "sign:firefox": "node scripts/sign-firefox-extension.mjs",
     "build": "pnpm --filter @tom-cat/pi-browser-runtime --filter mcp-extension build",
     "build:firefox": "bun playwriter/scripts/build-extension-bundle.ts --firefox",
     "reload": "node scripts/legacy-action-guard.mjs reload",
@@ -29,7 +30,8 @@
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^8.0.13",
-    "vitest": "^4.0.8"
+    "vitest": "^4.0.8",
+    "web-ext": "10.6.0"
   },
   "repository": "https://github.com/remorses/",
   "author": "remorses <beats.by.morse@gmail.com>",

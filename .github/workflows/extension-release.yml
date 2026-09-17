@@ -25,7 +25,9 @@ concurrency:
 jobs:
   package:
     if: github.repository == 'tom-cat-mao/pi-browseruse-playwriter'
-    timeout-minutes: 20
+    # Build and packaging take a few minutes; the AMO signing step can wait up to
+    # five minutes for validation plus ten minutes for approval on top of that.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - name: Check out requested ref
@@ -79,6 +81,18 @@ jobs:
       - name: Create Firefox extension ZIP, checksum and unsigned XPI
         run: pnpm package:firefox
 
+      # AMO stores at most one submission per version number, so this step is idempotent
+      # for reruns of the same tag: scripts/sign-firefox-extension.mjs asks AMO for the
+      # version first and, when an earlier run already signed it, downloads that
+      # signature instead of submitting the version again. Every other outcome (missing
+      # secrets, validation or rejection, network failure) fails the job instead of
+      # publishing a release whose XPI cannot be installed permanently.
+      - name: Sign Firefox extension via AMO
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: pnpm sign:firefox
+
       - name: Upload extension release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,10 +103,12 @@ jobs:
           CHROME_ZIP="dist-release/pi-browser-use-extension-$EXTENSION_VERSION.zip"
           FIREFOX_ZIP="dist-release/pi-browser-use-firefox-extension-$EXTENSION_VERSION.zip"
           FIREFOX_XPI="dist-release/pi-browser-use-firefox-extension-$EXTENSION_VERSION-unsigned.xpi"
+          FIREFOX_SIGNED_XPI="dist-release/pi-browser-use-firefox-extension-$EXTENSION_VERSION.xpi"
           ASSETS=(
             "$CHROME_ZIP" "$CHROME_ZIP.sha256"
             "$FIREFOX_ZIP" "$FIREFOX_ZIP.sha256"
             "$FIREFOX_XPI" "$FIREFOX_XPI.sha256"
+            "$FIREFOX_SIGNED_XPI" "$FIREFOX_SIGNED_XPI.sha256"
           )
           if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --repo "$REPO" --clobber
@@ -110,5 +126,5 @@ jobs:
               --title "Extension $EXTENSION_VERSION" \
               "${OPTIONS[@]}" \
               --latest=false \
-              --notes "Prebuilt Pi Browser Use extension. Download the versioned ZIP, extract it to a permanent directory, then use Developer mode > Load unpacked at chrome://extensions. The Firefox ZIP is the same extension built for Firefox 139+: it is unsigned, so load it as a temporary add-on at about:debugging or sign it yourself; permanent installation requires AMO signing. SHA256 checksums included. Pi and the companion runtime are installed separately."
+              --notes "Prebuilt Pi Browser Use extension. Download the versioned ZIP, extract it to a permanent directory, then use Developer mode > Load unpacked at chrome://extensions. The Firefox ZIP is the same extension built for Firefox 139+. Artifacts named -unsigned are unsigned development builds and only load as temporary add-ons at about:debugging; the .xpi without that suffix is signed for the AMO unlisted channel and installs permanently in Firefox and Zen. SHA256 checksums included. Pi and the companion runtime are installed separately."
           fi
