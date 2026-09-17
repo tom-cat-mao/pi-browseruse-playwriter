@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.7.0
+
+### Minor Changes
+
+- 206cde8: Serve `page.extract` image assets on the Firefox backend through an extension byte channel.
+
+  `format: 'assets-manifest'` now enumerates the page's images instead of reporting `unsupported-capability`: the worker reads them with the existing DOM `evaluate` command (the page-side path `page.evaluate` uses, so `currentSrc`, `srcset`, `alt` and natural dimensions are what the page actually shows), keeps up to 200 images per manifest within the same 40,000-byte budget as the Chrome backend, clamps `src`, `srcset` and `alt` to that backend's field lengths, skips inline `data:` and empty sources, and returns them as `value.assets` with a one-line-per-image preview. `images: 'urls'` attaches the same manifest to a `markdown`/`text`/`html` extraction without moving any bytes.
+
+  `images: 'save'` fetches bytes where a browser-only fetch is possible: the extension background loads each image with the browser's cookies and its `<all_urls>` host permissions (no CORS, no page-context workaround), and answers base64 with the served `mimeType`. The channel is bounded — 20 images per extraction, 16 MiB per image, 64 MiB in total — and isolated per image: a 404, a non-image content type, an oversized body or a page-local `blob:` source lands in `value.failedAssets` with a reason while its siblings still save. Images that the 20-image bound leaves untried are counted in `value.assetsNotFetched`. The worker reports `value.savedAssets` (`base64`, `mimeType`, `alt`, `src`) for the relay to persist; when the runtime cannot carry the channel, every image is reported as a failed image rather than failing the extraction.
+
+  Firefox profiles now advertise `capabilities.features.assets: ['urls', 'save']`, so a runtime that gates image modes refuses them for an extension that predates the channel instead of sending a request it cannot answer. Asset payloads travel in their own IPC frame budget derived from the byte limits above; every other Firefox message keeps the 8 MiB limit.
+
+  The relay carries the channel end to end over the extension connection it already uses for Firefox DOM work: the worker's batch is forwarded as a `browserAssetRequest` websocket request, the answer is validated against the channel bounds before anything is trusted, and `value.savedAssets` is then written through the artifact store exactly like a Chrome save — descriptors and rewritten local image URLs go back in the persisted body and the preview, while the base64 payload is dropped before the response reaches the model. A saved image is named with a mime type the store can write (the served type, or the one the URL implies), so a CDN that answers `application/octet-stream` still lands as a real image file. The batch wait is the channel's own bound, longer than a DOM read but still capped by the request deadline; a missing transport, a refused or timed-out fetch, and a malformed, mismatched or oversized answer are all reported as per-image failures, so the extraction and its document artifact still arrive.
+
+- bceec1b: Add an HTML-to-Markdown extraction pipeline for the managed runtime.
+
+  The new `page-extract` module turns page HTML into Markdown or plain text on the Node side: it extracts the main content with Defuddle, keeps data tables as Markdown pipe tables, rewrites relative links against the page URL, and reports title, author, site, published time and excerpt metadata. Callers can filter the result to lines matching a search term with five lines of context, page through it with `offset`/`limit`, and tell from `truncated`/`totalBytes` when they are reading a window instead of the whole extraction.
+
+  It is a pure module with no browser or relay dependency.
+
+- 2ecbf48: Serve `page.extract` end to end on the Firefox backend.
+
+  The Firefox DOM driver can now serialize either the whole document or exactly one strictly matched element for a `page.content` read, and the isolated Firefox worker runs the same Node-side extraction pipeline as Chrome: `markdown`, plain `text` and the windowed `html` format, each bounded to 40,000 characters with `title`, `metadata`, `truncated`, `totalBytes` and the tab `pageInfo`. A selector that is not a single match fails instead of extracting the first element. With `path`, the whole extraction travels back as `value.artifactText` for the relay to write, while the model receives only the bounded preview.
+
+  The relay routes `page.extract` to the Firefox executor behind a capability gate: only a profile that advertises `page.extract` in `capabilities.supportedOperations` is asked for it, so an older extension (which reports no list at all) gets a clean `unsupported-capability` and never receives the request. Firefox profiles now advertise their page operations, and a Firefox extraction with `path` is persisted through the artifact store with the same descriptor shape as Chrome.
+
+- d0afdc0: Serve `page.extract` end to end on the Chrome backend.
+
+  The managed executor now implements `page.extract` for Chrome profiles: it reads the page HTML (or the strict `selector` match) with a read-only CDP call and runs the Node-side extraction pipeline, returning `markdown`, plain `text` or the serialized `html` with `title`, `metadata`, `truncated` and `totalBytes`. Results are bounded to 40,000 characters like `page.snapshot`, so a single over-long page cannot flood the model, and the `text` format no longer leaks Markdown syntax from the assembled title, metadata line or excerpt.
+
+  The relay validates and routes `page.extract`, writes the full extraction through the artifact store when the caller passes `path` (Markdown as `.md`, HTML as `.html`, still confined to the runtime artifacts directory), and returns an artifact descriptor while the model keeps only the bounded preview. Chrome profiles now advertise `page.extract` in `capabilities.supportedOperations`.
+
+- be305ed: Fetch, persist and rewrite page images for `page.extract`.
+
+  `page.extract` now takes `images: 'none' | 'urls' | 'save'` (default `none`). `format: 'assets-manifest'` returns the page's image inventory — resolved `src`, `currentSrc`, `srcset`, `alt` and natural size per image, skipping `data:` and unresolved sources — in `value.assets` with an `assetCount` and a model-readable listing, bounded to 200 entries and to the extract preview budget. `images: 'urls'` attaches the same manifest to any other format.
+
+  `images: 'save'` reports that same inventory first, then fetches bytes for at most 20 images, each fetched by the page first so the request carries the page's cookies, and falling back to a runtime-side fetch when the page refuses (cross-origin without CORS headers, or the page's own CSP). That fallback only reaches public addresses: a loopback, private, link-local or `localhost` image is reported as a failure instead, so a page cannot make the runtime probe the machine and its own network. Bytes are capped at 16 MiB per image and at 3 MiB per request, the largest payload the 8 MiB worker→relay envelope leaves once the persisted body travels in it. Images beyond the 20-image bound are counted in `value.assetsNotFetched`; one that cannot be fetched, is too large or is a type the artifact store cannot name is reported in `failedAssets` and never fails the rest of the extraction.
+
+  The relay writes every saved asset through the artifact store (`label` from the image `alt`, `sourceUrl` from its URL), returns the same artifact descriptors as a screenshot, rewrites the URL of every stored image to its local artifact path — both the `src` attribute and the srcset candidate the browser chose, plus any recorded aliases, on both backends — in the persisted body and in the preview text the model reads, and strips the byte payload before the response leaves the runtime.
+
+  Image modes are gated where they are served: a Chrome profile is always allowed because this runtime's own CDP executor fetches the bytes, while a WebExtension profile must advertise the mode in `capabilities.features.assets` and is otherwise refused with `unsupported-capability` before any page traffic leaves the runtime. Chrome profiles now advertise `features: { assets: ['urls', 'save'] }` alongside their supported operations.
+
+### Patch Changes
+
+- 6756639: Keep the real image URL in a MediaWiki `page.extract` instead of the file description page.
+
+  Parsoid markup puts `resource="…/wiki/File:X.jpg"` on every article image: an RDFa pointer at the file description page, not at the image bytes. Defuddle's generic lazy-load transform scans each image attribute for a value that looks more like the real image URL and prefers an absolute one, so the Markdown carried `![](https://…/wiki/File:X.jpg)` while the bytes URL survived only in `srcset` — whose `2x` density descriptors the same transform's image selection skips. On a real Wikipedia article that left the URL-to-artifact rewrite matching 1 image out of 12. The attribute is now removed from the document handed to both extraction passes, so an image keeps the URL its `src`/`srcset` actually serves. `format: 'html'` still returns the page exactly as it was serialized, `resource` included.
+
+- abe8c57: Keep the body of a selector-scoped `page.extract` instead of reporting it as an empty document.
+
+  A `selector` returns one element's `outerHTML`, so the extraction pipeline received a bare `<div>`/`<section>` rather than a document. Defuddle then scored the fragment on its own class and id, and a container whose name carries no article keyword scored as boilerplate: a 2.4k character body came back as 0 characters with `ok` and `truncated: false`, so the model saw a successful extraction with no content and no way to tell why. Inputs without an `<html>` or `<body>` tag are now wrapped in a minimal document before extraction — carrying the title the caller passes, when it has one — which also gives the sparse-content retry a `<body>` to fall back to.
+
+  Extraction now also fails explicitly instead of losing content silently: when a document with 4,000 or more visible characters extracts to 200 characters or fewer, `page.extract` fails with `execution-failed` and a message naming both counts, rather than returning near-empty text that looks complete.
+
+- 2d05228: Harden the `page.extract` image channel on both backends.
+
+  The runtime-side fallback fetch for a Chrome image refuses loopback, private and link-local targets — including short, decimal and hexadecimal IPv4 spellings and `localhost` — instead of fetching them on the page's behalf; such an image is reported in `failedAssets` with the reason.
+
+  Image byte budgets are now stated where they bind: a Chrome request carries at most 3 MiB of image bytes (4 MiB of base64) because the saved images share the 8 MiB worker→relay envelope with the persisted body, and the message for an image that does not fit says so instead of blaming the number of images. The Firefox manifest is bounded to the same 40,000 bytes and field lengths as the Chrome one, so a page with huge `srcset` values cannot fail its own extraction, and a Firefox worker now has the heap a full 64 MiB batch needs (such a batch arrives in one ~85 MiB base64 frame) instead of dying with the whole extraction as `outcome-unknown`.
+
+  Both backends now report every URL the page used for a saved image (`src` plus the chosen srcset candidate and any other aliases), and the relay rewrites all of them to the artifact path, so a Markdown body that kept the `src` attribute of an image whose bytes came from another candidate no longer points at the remote URL.
+
+- 7d0ec5e: Stop refusing Firefox pages whose serialized HTML is larger than 1 MB.
+
+  The Firefox DOM driver capped every JSON result it returns at 1,000,000 characters — a guard it imposed on itself, not a platform limit — so a `page.content` read of a real long-form page (`page.extract` on an English Wikipedia article, for example) failed with `The returned JSON exceeds 1 MB` before any extraction ran. The serialized-document read now has its own 6,000,000-character budget, derived from the narrowest downstream bound: 6 MiB of ASCII-dominant markup fits the 8 MiB worker-to-pool IPC frame that validates this same response, Firefox's structured-clone IPC has no documented hard message limit (community measurements put it near 30 MB), and a persisted extraction keeps its own 2 MB text budget. Evaluated values, locator reads and snapshot text keep the 1 MB guard, and a document past the new budget is refused with its own limit named.
+
+- 5f01cfd: Report every URL the page used for an image on the Firefox `page.extract` image channel, so the relay's URL rewrite binds the `src` attribute too.
+
+  A Firefox `images: 'save'` run now enumerates an image's `src` attribute and the srcset candidate the browser chose as separate fields, the way the Chrome backend reads them, and a saved asset carries `sourceUrls` — both spellings, deduplicated and only attached when they differ — next to the URL whose bytes were fetched. The relay rewrites every one of them to the artifact path in the persisted body and in the preview, so a Markdown body that kept the `src` attribute of an image whose bytes came from its srcset candidate no longer points at the remote URL. This closes the rewrite gap the Chrome backend had already closed.
+
+  The Firefox manifest (`value.assets`) reports those same two URLs, so an image whose `src` attribute and chosen candidate differ now reports both there as well, and a srcset-only image with no `src` attribute is listed instead of dropped.
+
+- 3dea107: Resolve a relative `page.extract` `path` against the artifacts root instead of the runtime process cwd.
+
+  `ArtifactStore` honored only absolute target paths in practice: a relative one such as `foo.md` was resolved against the runtime's working directory, so it always escaped the artifacts root and the write failed with `artifact path escapes the artifacts directory`. A relative path now resolves against the artifacts root — `foo.md` lands at `<artifacts>/foo.md` and `a/b.md` creates `a/` inside it — while an absolute path keeps its meaning and the confinement check is unchanged: a target that climbs out of the root (`../x`, or an absolute path outside it) is still refused before any directory is created.
+
+- 34ea60a: Route browser bytes through a first-class artifact store and forward the optional capabilities feature matrix.
+  - Add `artifact-store.ts`: writes payloads under `<dataDir>/artifacts`, names files from a sanitized label plus a timestamp/random suffix, maps mime types to png/jpg/webp/gif/svg extensions (unknown mime types are rejected), enforces a per-file and per-session byte budget, and confines every write to the artifacts root with a realpath check.
+  - Firefox screenshots now go through that store: an explicit absolute `path` is still written exactly where the caller asked, while a screenshot without a path is persisted under `<dataDir>/artifacts` and reported as an artifact descriptor with `bytes` and `label`. PNG validation for screenshots is unchanged.
+  - `capabilities.features` (`Record<string, readonly string[]>` from newer extensions) is validated by shape and passed through instead of being rejected as an unexpected field; unknown feature names remain ignored.
+
 ## 0.6.0
 
 ### Minor Changes

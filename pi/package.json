@@ -1,6 +1,6 @@
 {
   "name": "@tom-cat/pi-browser-use-extension",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi tools for the user's existing Chrome or Firefox tabs and login sessions through a local managed runtime and browser extension.",
   "type": "module",
   "license": "MIT",

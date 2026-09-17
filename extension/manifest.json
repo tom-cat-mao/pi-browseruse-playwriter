@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Browser Use",
-  "version": "0.0.139",
+  "version": "0.0.140",
   "description": "Connect Pi Browser Use to your Chrome tabs for local Pi agent browser automation.",
   "permissions": [
     "debugger",
@@ -16,7 +16,9 @@
     "identity.email",
     "webNavigation"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"

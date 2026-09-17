@@ -1,7 +1,7 @@
 {
   "name": "@tom-cat/pi-browser-runtime",
   "description": "Self-hosted browser runtime for the Pi browser-use tools. Fork of the playwriter relay with managed sessions, explicit tabs and an isolated executor.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
