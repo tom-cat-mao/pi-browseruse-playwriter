@@ -47,6 +47,7 @@ console.log(`commands (${commands.length}): ${commands.join(", ")}`);
 console.log(`events: ${events.join(", ")}`);
 
 const expected = [
+  "browser",
   "browser_profiles", "browser_groups", "browser_tabs", "browser_navigate", "browser_snapshot",
   "browser_extract", "browser_click", "browser_fill", "browser_evaluate", "browser_screenshot",
   "browser_network", "browser_logs", "browser_execute",
