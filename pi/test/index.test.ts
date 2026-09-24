@@ -277,7 +277,7 @@ describe("extension factory registration", () => {
       total += tool.description.length;
       expect(tool.description.length, tool.name).toBeLessThanOrEqual(520);
     }
-    // 13 fleet descriptions (3667) + the 451-char gateway = 4118.
+    // 13 fleet descriptions (3655 chars) + the gateway (449) = 4104 chars.
     expect(total).toBeLessThanOrEqual(4150);
   });
 
