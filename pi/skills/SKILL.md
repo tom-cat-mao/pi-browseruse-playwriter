@@ -11,6 +11,10 @@ release/close, and cancellation outcomes each live in that tool's own descriptio
 `browser_*` guidelines carry only cross-tool orchestration. This skill carries only backend detail
 those two do not, so read the topic file you need — on demand, not up front.
 
+The `browser_*` tools are dormant by default — they enter the prompt only after a browser task
+starts and the model calls the parameter-less `browser` gateway tool, which activates the whole
+fleet. A user who sets `PI_BROWSER_TOOLS=always` keeps every tool resident instead.
+
 Keep the loop in mind anyway: snapshot to read, one acting tool, then a fresh snapshot to
 verify — pages redirect and change, so never chain actions blindly.
 

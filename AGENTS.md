@@ -191,6 +191,8 @@ pnpm --filter @tom-cat/pi-browser-use-extension load-check
   promptGuidelines（跨工具编排，只放这里），两处不重复；`pi/skills/SKILL.md` 是按需加载的
   skill 索引，后端差异参考按主题拆在 `pi/skills/` 的 extract.md / firefox.md / tabs.md 里
   （SKILL.md 必须保持有效 frontmatter：name + description，缺失即不会被 pi 注册）。
+  文本分层之外，`browser_*` 工具舰队默认休眠、不进 provider tools[] / `<tools>`，由常驻的
+  无参 `browser` 网关工具按需激活；`PI_BROWSER_TOOLS=always` 关闭休眠恢复全量常驻。
 - `docs/exec/browser-runtime-contract.md`：HTTP/WS 契约（目标态，当前实现以代码为准）；
   `docs/exec/` 下的计划与验收文档只描述具体任务（含被取代方案），不是长期指令；
   `docs/exec/extension-distribution-plan.md` 是可复用的发行清单。

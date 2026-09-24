@@ -10,6 +10,10 @@ logic: the tools report facts and the Pi LLM owns every decision. Model-side usa
 ships with the tool descriptions and guidelines; the on-demand
 [`skills/SKILL.md`](./skills/SKILL.md) index and its topic files carry the backend detail.
 
+The `browser_*` fleet is dormant by default: the model sees one always-resident `browser`
+gateway tool and calls it first to activate the rest. `PI_BROWSER_TOOLS=always` in the
+environment keeps every tool resident instead.
+
 ## Install
 
 No npm release yet: install from a source checkout after building the runtime.
