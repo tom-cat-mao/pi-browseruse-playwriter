@@ -8,7 +8,8 @@ exports, the three `images` modes, and the capability gate that can refuse the c
 - Formats: `markdown` (default), plain `text`, the raw `html`, or `assets-manifest` — the page's
   image listing instead of text.
 - It returns no element refs and no snapshotId and is not a structure operation: use
-  `browser_snapshot` when you need to click/fill, `browser_extract` when you need the content.
+  `browser_snapshot` (or a strict selector on the acting tool) when you need to click/fill,
+  `browser_extract` when you need the content.
 - It reads without touching the page, so it does not invalidate the latest snapshot.
 
 ## Bounded output and windowing

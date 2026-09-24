@@ -204,10 +204,11 @@ describe("extension factory registration", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     const guidelines = tools.flatMap((tool) => tool.promptGuidelines ?? []);
-    expect(guidelines.length).toBe(6);
+    expect(guidelines.length).toBe(7);
     // The split is deliberate: one guideline each for the id chain and tabs, two
-    // for the snapshot/ref loop, one for cancellation. Adding a tool with
-    // guidelines in one place and forgetting the other is the regression here.
+    // for the snapshot/ref loop plus the act-without-a-snapshot shortcut, one for
+    // cancellation. Adding a tool with guidelines in one place and forgetting the
+    // other is the regression here.
     const counts = new Map<string, number>();
     for (const tool of tools) {
       const count = tool.promptGuidelines?.length ?? 0;
@@ -217,11 +218,12 @@ describe("extension factory registration", () => {
       browser_profiles: 1,
       browser_groups: 1,
       browser_tabs: 1,
-      browser_snapshot: 2,
+      browser_snapshot: 3,
       browser_execute: 1,
     });
     expect(new Set(guidelines).size).toBe(guidelines.length);
-    expect(guidelines.join("").length).toBeLessThanOrEqual(1180);
+    // 7 guidelines of measured resident text (1452 chars).
+    expect(guidelines.join("").length).toBeLessThanOrEqual(1500);
     for (const guideline of guidelines) {
       expect(guideline, guideline).toMatch(/browser_[a-z]+/);
     }
@@ -287,8 +289,8 @@ describe("extension factory registration", () => {
       total += tool.description.length;
       expect(tool.description.length, tool.name).toBeLessThanOrEqual(520);
     }
-    // 13 fleet descriptions (3655 chars) + the gateway (449) = 4104 chars.
-    expect(total).toBeLessThanOrEqual(4150);
+    // 13 fleet descriptions (3811 chars) + the gateway (449) = 4260 chars.
+    expect(total).toBeLessThanOrEqual(4300);
   });
 
   it("ships the browser-use skill with the frontmatter pi needs to register it", () => {
@@ -318,6 +320,37 @@ describe("extension factory registration", () => {
     expect(Object.keys(click.parameters.properties ?? {}).sort()).toEqual(["selector", "snapshotId", "tabId"].sort());
   });
 
+  it("declares browser_snapshot with the tree window plus interactiveOnly", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const snapshot = tools.find((t) => t.name === "browser_snapshot")!;
+    expect(Object.keys(snapshot.parameters.properties ?? {}).sort()).toEqual(
+      ["full", "interactiveOnly", "search", "selector", "tabId"].sort(),
+    );
+  });
+
+  /**
+   * Acting tools take plain selectors, so a nameable control needs no snapshot
+   * round-trip. The engines the runtime accepts belong to the acting tool's own
+   * description; the orchestration ("skip the snapshot") belongs to the cross-tool
+   * guidelines. Losing either half is invisible until the model pays for a
+   * snapshot it did not need, or fails to find one it does.
+   */
+  it("documents plain Playwright selectors on the acting tools and the skip-snapshot rule in the guidelines", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const descriptionOf = (name: string): string => tools.find((tool) => tool.name === name)!.description;
+
+    for (const name of ["browser_click", "browser_fill"]) {
+      expect(descriptionOf(name), name).toContain("text=");
+      expect(descriptionOf(name), name).toContain("role=");
+      expect(descriptionOf(name), name).toContain("no snapshot");
+    }
+    const snapshotGuidelines = tools.find((tool) => tool.name === "browser_snapshot")!.promptGuidelines!.join("\n");
+    expect(snapshotGuidelines).toContain("Skip browser_snapshot");
+    expect(snapshotGuidelines).toContain("snapshot→ref");
+  });
+
   it("declares browser_extract with tabId plus the extraction window, images and export options", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
@@ -341,6 +374,23 @@ describe("extension factory registration", () => {
  * each fixture session must start dormant.
  */
 describe("browser tool dormancy (gateway activation)", () => {
+  // Activation warms the shared runtime in the background, so every test here
+  // points the runtime client at a fixture listener: a unit test must never probe
+  // — let alone launch on — the real default port.
+  let server: TestServer;
+  const savedEnv = { ...process.env };
+
+  beforeEach(async () => {
+    server = await startTestServer(() => ({ json: validCapabilities }));
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    bootstrap.reset();
+  });
+  afterEach(async () => {
+    await server.close();
+    process.env = { ...savedEnv };
+    bootstrap.reset();
+  });
+
   function beforeAgentStartHandler() {
     const { pi, handlers } = makeMockPi();
     factory(pi as never);
@@ -511,6 +561,63 @@ describe("browser tool dormancy (gateway activation)", () => {
       );
     expect(residentChars).toBeLessThanOrEqual(600);
   });
+
+  /**
+   * Activation arms the fleet first and warms the runtime afterwards: the
+   * gateway result must not wait for the probe, and the one warm-up per session
+   * is never repeated by an idempotent activation.
+   */
+  it("warms the runtime in the background instead of blocking activation", async () => {
+    let capabilitiesServed = false;
+    server.setHandler(async (req) => {
+      if (req.url.endsWith("/capabilities")) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        capabilitiesServed = true;
+        return { json: validCapabilities };
+      }
+      return { json: {} };
+    });
+    const { pi, tools } = makeMockPi(["browser", "read"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+    const ctx = makeCtx("session-warm");
+
+    const result = await gateway.execute("call-1", {}, undefined, undefined, ctx);
+
+    expect(textOf(result.content)).toContain("browser_* tools are now active.");
+    // The probe was still in flight when activation returned.
+    expect(capabilitiesServed).toBe(false);
+    await vi.waitFor(() => {
+      expect(capabilitiesServed).toBe(true);
+    });
+    // The warm-up memoized its result, so a later test cannot observe a write
+    // this one left in flight (the fixture is closed in afterEach).
+    await vi.waitFor(() => {
+      expect(bootstrap.boundCapabilities()).not.toBeNull();
+    });
+    await gateway.execute("call-2", {}, undefined, undefined, ctx);
+    expect(server.requests.filter((r) => r.url.endsWith("/capabilities"))).toHaveLength(1);
+  });
+
+  /**
+   * A broken runtime must not fail the activation that found it: the warm-up
+   * swallows its own failure (no unhandled rejection) and memoizes nothing, so
+   * the first real tool call still tries and reports the runtime's own error.
+   */
+  it("activates even when the runtime answers but is unusable", async () => {
+    server.setHandler(() => ({ json: { hello: "not a runtime" } }));
+    const { pi, tools } = makeMockPi(["browser", "read"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+
+    const result = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-cold"));
+
+    expect(textOf(result.content)).toContain("browser_* tools are now active.");
+    await vi.waitFor(() => {
+      expect(server.requests.filter((r) => r.url.endsWith("/capabilities"))).toHaveLength(1);
+    });
+    expect(bootstrap.boundCapabilities()).toBeNull();
+  });
 });
 
 describe("tool execution shaping (real HTTP runtime)", () => {
@@ -600,6 +707,24 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     const t = textOf(res.content);
     expect(t).toContain("snap-1");
     expect(t).toContain("aria-ref=e5");
+  });
+
+  it("passes interactiveOnly to page.snapshot and omits it when unset", async () => {
+    runtimeHandler(() => ({ text: "- button \"Login\" [aria-ref=e5]", snapshotId: "snap-1" }));
+    const snap = toolByName("browser_snapshot");
+
+    await snap.execute("call-snap-1", { tabId: "tab-7", interactiveOnly: true }, undefined, undefined, makeCtx());
+    expect(server.requests.find((r) => r.url === "/browser/v1/request")?.body).toMatchObject({
+      operation: { kind: "page.snapshot", tabId: "tab-7", interactiveOnly: true },
+    });
+
+    await snap.execute("call-snap-2", { tabId: "tab-7" }, undefined, undefined, makeCtx());
+    const posts = server.requests.filter((r) => r.url === "/browser/v1/request");
+    // Unset means absent, never `interactiveOnly: false` on the wire.
+    expect((posts.at(-1)?.body as { operation: unknown }).operation).toEqual({
+      kind: "page.snapshot",
+      tabId: "tab-7",
+    });
   });
 
   it("surfaces an evaluate value into content", async () => {
