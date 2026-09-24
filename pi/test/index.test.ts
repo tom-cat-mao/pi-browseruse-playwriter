@@ -188,10 +188,10 @@ describe("extension factory registration", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     const guidelines = tools.flatMap((tool) => tool.promptGuidelines ?? []);
-    expect(guidelines.length).toBeGreaterThanOrEqual(8);
-    expect(guidelines.length).toBeLessThanOrEqual(12);
+    expect(guidelines.length).toBeGreaterThanOrEqual(4);
+    expect(guidelines.length).toBeLessThanOrEqual(8);
     expect(new Set(guidelines).size).toBe(guidelines.length);
-    expect(guidelines.join("").length).toBeLessThanOrEqual(3000);
+    expect(guidelines.join("").length).toBeLessThanOrEqual(1600);
     for (const guideline of guidelines) {
       expect(guideline, guideline).toMatch(/browser_[a-z]+/);
     }
@@ -207,18 +207,32 @@ describe("extension factory registration", () => {
       "tabId",
       "discover", // attach a tab the user already has open
       "attach",
-      "nextOffset", // discover pagination
       "sourceTabId", // a link that opened a new tab
       "activate",
-      "back", // real browser history
       "snapshotId", // refs need the snapshot they came from
       "invalidates", // evaluate/execute invalidate the latest snapshot
       "observe", // observe -> act -> observe
-      "release", // session hygiene
       "outcome=unknown", // cancelled/timed out actions are never replayed
     ]) {
       expect(guidelines, `guidelines mention ${discipline}`).toContain(discipline);
     }
+  });
+
+  /**
+   * Descriptions ride in the provider's tools[] array on every request, so they
+   * are resident text as well: each one states its own tool only, and the whole
+   * set stays inside the measured envelope. Longer-form detail belongs to the
+   * on-demand skill, not to the schema.
+   */
+  it("keeps the tool descriptions within the resident budget", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    let total = 0;
+    for (const tool of tools) {
+      total += tool.description.length;
+      expect(tool.description.length, tool.name).toBeLessThanOrEqual(520);
+    }
+    expect(total).toBeLessThanOrEqual(3600);
   });
 
   it("ships the browser-use skill with the frontmatter pi needs to register it", () => {
