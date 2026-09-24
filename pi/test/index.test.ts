@@ -57,11 +57,15 @@ function renderResultText(
     .join("\n");
 }
 
-function makeMockPi() {
+function makeMockPi(initialActiveTools: string[] = ["read", "bash"]) {
   const tools: RegisteredTool[] = [];
   const commands: string[] = [];
   const events: string[] = [];
   const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  // Live loadout + registry, so the gateway's setActiveTools() call can be
+  // asserted exactly: the loadout may only ever grow by the fleet.
+  const setActiveToolsCalls: string[][] = [];
+  let activeTools = [...initialActiveTools];
   const pi = {
     registerTool: vi.fn((tool: RegisteredTool) => {
       tools.push(tool);
@@ -73,8 +77,14 @@ function makeMockPi() {
       events.push(event);
       handlers.set(event, handler);
     }),
+    getActiveTools: vi.fn(() => [...activeTools]),
+    getAllTools: vi.fn(() => tools.map((tool) => ({ name: tool.name }))),
+    setActiveTools: vi.fn((names: string[]) => {
+      activeTools = [...names];
+      setActiveToolsCalls.push([...names]);
+    }),
   };
-  return { pi, tools, commands, events, handlers };
+  return { pi, tools, commands, events, handlers, setActiveToolsCalls, activeTools: () => [...activeTools] };
 }
 
 function makeCtx(sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") {
@@ -325,9 +335,10 @@ describe("extension factory registration", () => {
  * The `browser` gateway keeps the fleet dormant: the request loadout is the one
  * switch that removes a tool's schema, its <tools> snippet, and its <rules>
  * guidelines together, so these tests drive the real before_agent_start handler
- * that pi calls per request. Each test uses its own session id because the
- * activation flag is session-scoped module state, and each fixture session must
- * start dormant.
+ * that pi calls per request — and the gateway's execute, which restores the
+ * fleet in the live loadout for the rest of that run. Each test uses its own
+ * session id because the activation flag is session-scoped module state, and
+ * each fixture session must start dormant.
  */
 describe("browser tool dormancy (gateway activation)", () => {
   function beforeAgentStartHandler() {
@@ -361,7 +372,7 @@ describe("browser tool dormancy (gateway activation)", () => {
     expect(dormant.systemPromptOptions.selectedTools).not.toContain("browser_tabs");
 
     const first = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-active"));
-    expect(textOf(first.content)).toContain("browser_* tools are active from the next request");
+    expect(textOf(first.content)).toContain("browser_* tools are now active.");
     expect(textOf(first.content)).toContain("browser_tabs discover+attach");
 
     // The same session now keeps the whole fleet in every later request.
@@ -379,7 +390,7 @@ describe("browser tool dormancy (gateway activation)", () => {
   });
 
   it("never filters when PI_BROWSER_TOOLS=always", async () => {
-    const { pi, tools, handlers } = makeMockPi();
+    const { pi, tools, handlers, setActiveToolsCalls } = makeMockPi();
     factory(pi as never);
     const gateway = tools.find((t) => t.name === "browser")!;
     vi.stubEnv("PI_BROWSER_TOOLS", "always");
@@ -390,9 +401,41 @@ describe("browser tool dormancy (gateway activation)", () => {
 
       const result = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-always"));
       expect(textOf(result.content)).toBe("browser_* tools are already active (PI_BROWSER_TOOLS=always).");
+      expect(setActiveToolsCalls).toEqual([]);
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  /**
+   * The gateway must not only arm the next request: the loadout that carried the
+   * call was already filtered, so it has to restore the fleet in the live set —
+   * appended to whatever was already on, never re-enabling a disabled tool.
+   */
+  it("puts the fleet back into the live loadout for the same run", async () => {
+    const { pi, tools, setActiveToolsCalls, activeTools } = makeMockPi(["browser", "read", "bash"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+
+    const first = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-live"));
+    expect(textOf(first.content)).toContain("browser_* tools are now active.");
+    expect(setActiveToolsCalls).toEqual([["browser", "read", "bash", ...FLEET_TOOL_NAMES]]);
+    expect(activeTools()).toEqual(["browser", "read", "bash", ...FLEET_TOOL_NAMES]);
+
+    // A repeat call is a no-op for the loadout as well as for the session flag.
+    const again = await gateway.execute("call-2", {}, undefined, undefined, makeCtx("session-live"));
+    expect(textOf(again.content)).toBe("browser_* tools are already active.");
+    expect(setActiveToolsCalls).toHaveLength(1);
+    expect(activeTools()).toEqual(["browser", "read", "bash", ...FLEET_TOOL_NAMES]);
+  });
+
+  it("leaves an already-complete loadout untouched", async () => {
+    const { pi, tools, setActiveToolsCalls } = makeMockPi(["browser", ...FLEET_TOOL_NAMES, "read"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+
+    await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-complete"));
+    expect(setActiveToolsCalls).toEqual([]);
   });
 
   /**

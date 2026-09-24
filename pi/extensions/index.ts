@@ -1203,6 +1203,18 @@ export default function (pi: ExtensionAPI) {
 
   // --- gateway (always resident) --------------------------------------------
 
+  /**
+   * Fleet names that exist in the registry but are missing from `active`, the
+   * live loadout. getAllTools() is the registry, NOT the active set: it is read
+   * only to learn the fleet's names, while getActiveTools() seeds the result, so
+   * a tool the user switched off is never switched back on here.
+   */
+  function missingFleetToolNames(active: string[]): string[] {
+    return (pi.getAllTools?.() ?? [])
+      .map((tool) => tool.name)
+      .filter((name) => name.startsWith(FLEET_TOOL_PREFIX) && !active.includes(name));
+  }
+
   pi.registerTool({
     name: GATEWAY_TOOL_NAME,
     label: "Browser",
@@ -1226,11 +1238,21 @@ export default function (pi: ExtensionAPI) {
         return { content: [text("browser_* tools are already active.")], details: { activated: false } };
       }
       activateSession(sessionId);
+      // The loadout of the request that carried this call was filtered before the
+      // call could land, so the live set is still missing the fleet: put it back
+      // here and the next turn of this same run can already call browser_tabs.
+      // Guarded because a harness without the loadout actions predates the
+      // dormancy filter (there the fleet is resident and there is nothing to do).
+      if (typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
+        const active = pi.getActiveTools();
+        const missing = missingFleetToolNames(active);
+        if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+      }
       return {
         content: [
           text(
-            "browser_* tools are active from the next request. Start with browser_profiles → browser_groups create → " +
-              "browser_tabs create, or browser_tabs discover+attach to join a tab the user already has open.",
+            "browser_* tools are now active. Start with browser_profiles → browser_groups create → browser_tabs " +
+              "create, or browser_tabs discover+attach to join a tab the user already has open.",
           ),
         ],
         details: { activated: true },
