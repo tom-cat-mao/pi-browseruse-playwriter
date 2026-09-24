@@ -14,18 +14,18 @@ fail explicitly instead of degrading.
 
 ## browser_execute on Firefox
 
-- The runtime sandbox runs a `dom-compatible` subset of Playwright; other APIs are limited to that
+- It runs `dom-compatible` Playwright code in the runtime sandbox: other APIs are limited to that
   documented subset and fail explicitly when unsupported.
-- `page.keyboard.press`/`page.keyboard.type` are DOM-only and act on the focused element; Chrome's
-  raw keyboard/mouse/touchscreen objects are not available there either.
-- The optional `timeout` is capped by the runtime at 120000 ms.
+- The optional `timeout` is capped by the runtime at 120000 ms. Wait timeout: default 5000 ms;
+  explicit timeouts and `page.setDefaultTimeout` accept 1–5000 ms, and every wait is also bounded by
+  the execute call's remaining deadline.
+- Input is DOM-only: `page.keyboard.press`/`page.keyboard.type` act on the focused element, and
+  Chrome's raw keyboard/mouse/touchscreen objects are not available here either. DOM input cannot
+  create trusted native browser input, so a site may reject an action whose element was found —
+  re-observe the outcome instead of repeating it or widening permissions.
 
-## Firefox execute micro-semantics
+### Firefox execute micro-semantics
 
-`browser_execute` on Firefox runs `dom-compatible` Playwright code in the runtime sandbox:
-
-- Wait timeout: default 5000 ms; explicit timeouts and `page.setDefaultTimeout` accept
-  1–5000 ms, and every wait is also bounded by the execute call's remaining deadline.
 - `page.waitForURL` takes a URL string with optional `*`/`**` wildcards, never a regular
   expression. With `waitUntil` it waits for the URL and then the load state, applying the
   wait limit to each phase.
@@ -39,8 +39,6 @@ fail explicitly instead of degrading.
   in the current execute and use `refToLocator({ page, ref })` — which returns `null` when
   the ref is absent. Preserve the returned selector's snapshot suffix: bare refs are never
   attached to the latest snapshot automatically.
-- DOM input cannot create trusted native browser input, so a site may reject an action whose
-  element was found. Re-observe the outcome instead of repeating it or widening permissions.
 - Logs and network capture start when the tab is instrumented or capture is explicitly
   started; earlier activity is not reconstructed. Read the capture metadata and limitation
   messages before reading an empty result as "nothing happened".

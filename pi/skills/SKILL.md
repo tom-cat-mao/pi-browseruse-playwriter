@@ -7,9 +7,9 @@ description: Drive the user's real Chrome or Firefox tabs through the browser_* 
 
 The operating discipline is resident elsewhere and is not repeated here: profiles → groups → tabs
 with explicit ids, the observe → act → observe loop, refs with their snapshotId, discover/attach,
-release/close, and cancellation outcomes live in the `browser_*` guidelines in the system prompt,
-and each tool's own semantics live in its description. This skill carries only backend detail those
-two do not, so read the topic file you need — on demand, not up front.
+release/close, and cancellation outcomes each live in that tool's own description, while the
+`browser_*` guidelines carry only cross-tool orchestration. This skill carries only backend detail
+those two do not, so read the topic file you need — on demand, not up front.
 
 Keep the loop in mind anyway: snapshot to read, one acting tool, then a fresh snapshot to
 verify — pages redirect and change, so never chain actions blindly.

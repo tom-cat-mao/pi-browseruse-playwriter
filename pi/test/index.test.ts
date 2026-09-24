@@ -188,8 +188,22 @@ describe("extension factory registration", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     const guidelines = tools.flatMap((tool) => tool.promptGuidelines ?? []);
-    expect(guidelines.length).toBeGreaterThanOrEqual(4);
-    expect(guidelines.length).toBeLessThanOrEqual(8);
+    expect(guidelines.length).toBe(6);
+    // The split is deliberate: one guideline each for the id chain and tabs, two
+    // for the snapshot/ref loop, one for cancellation. Adding a tool with
+    // guidelines in one place and forgetting the other is the regression here.
+    const counts = new Map<string, number>();
+    for (const tool of tools) {
+      const count = tool.promptGuidelines?.length ?? 0;
+      if (count > 0) counts.set(tool.name, count);
+    }
+    expect(Object.fromEntries(counts)).toEqual({
+      browser_profiles: 1,
+      browser_groups: 1,
+      browser_tabs: 1,
+      browser_snapshot: 2,
+      browser_execute: 1,
+    });
     expect(new Set(guidelines).size).toBe(guidelines.length);
     expect(guidelines.join("").length).toBeLessThanOrEqual(1600);
     for (const guideline of guidelines) {
@@ -216,6 +230,30 @@ describe("extension factory registration", () => {
     ]) {
       expect(guidelines, `guidelines mention ${discipline}`).toContain(discipline);
     }
+  });
+
+  /**
+   * Disciplines that moved out of the guidelines into a single tool's description
+   * have no other home in the resident text: a silent drop is invisible until the
+   * model misuses that tool, so assert the migrated words by name.
+   */
+  it("keeps the disciplines that moved out of the guidelines in the descriptions", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const descriptionOf = (name: string): string => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      expect(tool, name).toBeTruthy();
+      return tool!.description;
+    };
+
+    const tabs = descriptionOf("browser_tabs");
+    expect(tabs).toContain("nextOffset");
+    expect(tabs).toContain("release");
+
+    // The word boundaries keep this from matching unrelated words like "backend".
+    expect(descriptionOf("browser_navigate")).toMatch(/\bback\b/);
+
+    expect(descriptionOf("browser_network")).toContain("start replaces");
   });
 
   /**

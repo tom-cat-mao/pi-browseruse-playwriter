@@ -1797,7 +1797,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Capture a managed tab's network responses: start before the triggering action, list (optional url substring " +
       "filter), or stop. Stopping does not clear the evidence: retained entries stay queryable, and the state " +
-      "(active/stopped/interrupted/not-started) is reported truthfully. Bound to one tab.",
+      "(active/stopped/interrupted/not-started) is reported truthfully. Bound to one tab; start replaces the " +
+      "previous capture.",
     promptSnippet: "Capture and inspect a tab's network requests",
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
