@@ -12,7 +12,9 @@ ships with the tool descriptions and guidelines; the on-demand
 
 The `browser_*` fleet is dormant by default: the model sees one always-resident `browser`
 gateway tool and calls it first to activate the rest. `PI_BROWSER_TOOLS=always` in the
-environment keeps every tool resident instead.
+environment keeps every tool resident instead. Dormancy needs pi ≥ 0.87, whose
+`before_agent_start` event carries the request's `selectedTools`; an older pi simply
+keeps the fleet resident — no error.
 
 ## Install
 
@@ -31,8 +33,11 @@ a ZIP installs neither the Pi package nor the runtime.
 
 Once installed, the package registers:
 
-- **13 `browser_*` tools** — profiles, groups and tabs, page reading and actions,
-  screenshots, network/console capture, content extraction, an execute escape hatch.
+- **`browser`** — the parameter-less gateway tool, always resident: calling it activates
+  this session's 13 `browser_*` tools (idempotent).
+- **13 `browser_*` tools** — dormant until the gateway activates them: profiles, groups and
+  tabs, page reading and actions, screenshots, network/console capture, content extraction,
+  an execute escape hatch.
 - **`/browser-status`** — an inspect-only command reporting runtime reachability,
   capabilities and connected profiles. It creates nothing.
 - **A `session_shutdown` hook** — releases this Pi session's workers when the session
@@ -60,6 +65,7 @@ Pi session ──browser_* tools──▶ Pi package ──HTTP v1──▶ mana
 
 | Tool | One line |
 |---|---|
+| `browser` | always resident, parameter-less gateway: activates the 13 dormant `browser_*` tools for this session (idempotent) |
 | `browser_profiles` | read-only listing of installed profiles, connection state and backend capabilities (`profileId` comes from here) |
 | `browser_groups` | list/create/rename/close this session's named groups; a group is bound to one profile for its lifetime |
 | `browser_tabs` | list/create/close/release managed tabs; `discover`/`attach` takes over a tab the user already has open (in place, no reload or move), `activate` focuses one |
@@ -103,6 +109,7 @@ The Pi package reads these from the environment (a manual runtime honors the sam
 | `PI_BROWSER_TOKEN` | bearer token, if the runtime requires auth | none |
 | `PI_BROWSER_DATA_DIR` | runtime data dir (logs, `artifacts/`) | `~/.pi-browser-use` |
 | `PI_BROWSER_RUNTIME_PATH` | runtime CLI entry to launch (`.ts` via `tsx`, otherwise `node`) | packaged `pi-browser-runtime` bin |
+| `PI_BROWSER_TOOLS` | set to `always` to turn dormancy off and keep every `browser_*` tool resident | unset (dormant until the gateway is called) |
 
 A `PI_BROWSER_HOST` outside loopback is a remote runtime — no local daemon is spawned, and `npx playwriter` is never used.
 
