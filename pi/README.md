@@ -34,8 +34,8 @@ a ZIP installs neither the Pi package nor the runtime.
 Once installed, the package registers:
 
 - **`browser`** — the parameter-less gateway tool, always resident: calling it activates
-  this session's 13 `browser_*` tools (idempotent).
-- **13 `browser_*` tools** — dormant until the gateway activates them: profiles, groups and
+  this session's 14 `browser_*` tools (idempotent).
+- **14 `browser_*` tools** — dormant until the gateway activates them: profiles, groups and
   tabs, page reading and actions, screenshots, network/console capture, content extraction,
   an execute escape hatch.
 - **`/browser-status`** — an inspect-only command reporting runtime reachability,
@@ -65,7 +65,7 @@ Pi session ──browser_* tools──▶ Pi package ──HTTP v1──▶ mana
 
 | Tool | One line |
 |---|---|
-| `browser` | always resident, parameter-less gateway: activates the 13 dormant `browser_*` tools for this session (idempotent) |
+| `browser` | always resident, parameter-less gateway: activates the 14 dormant `browser_*` tools for this session (idempotent) |
 | `browser_profiles` | read-only listing of installed profiles, connection state and backend capabilities (`profileId` comes from here) |
 | `browser_groups` | list/create/rename/close this session's named groups; a group is bound to one profile for its lifetime |
 | `browser_tabs` | list/create/close/release managed tabs; `discover`/`attach` takes over a tab the user already has open (in place, no reload or move), `activate` focuses one |
@@ -73,6 +73,7 @@ Pi session ──browser_* tools──▶ Pi package ──HTTP v1──▶ mana
 | `browser_snapshot` | read the tab as an accessibility tree with `aria-ref=eN` refs plus a `snapshotId`, optionally scoped to one matching element |
 | `browser_click` | click by snapshot ref + `snapshotId`, or by a strict single-match CSS/role selector |
 | `browser_fill` | replace an input/textarea/contenteditable value |
+| `browser_fill_form` | fill many fields of one form in one deterministic call: every strict selector is resolved first (nothing is filled unless all of them resolve), then one `page.fill` per field, reported field by field |
 | `browser_evaluate` | run JS in the tab and return a value; isolated world on Firefox |
 | `browser_execute` | escape hatch: a Playwright snippet bound to the tab's `page` in an isolated worker |
 | `browser_extract` | export page content as markdown/text/html or an image manifest — windowed reads, optional full extraction and saved images written to artifacts |

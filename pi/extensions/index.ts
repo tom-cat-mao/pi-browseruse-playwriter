@@ -53,6 +53,7 @@ import type {
 } from "@tom-cat/pi-browser-runtime/browser-protocol";
 import * as runtime from "./bootstrap.ts";
 import { RuntimeRequestError, type BrowserRuntimeClient } from "./runtime-client.ts";
+import { fillForm, MAX_FILL_FORM_FIELDS } from "./fill-form.ts";
 import {
   byteLen,
   clampBytes,
@@ -1220,7 +1221,7 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Activate this session's browser tools (browser_profiles, browser_groups, browser_tabs, browser_navigate, " +
-      "browser_snapshot, browser_extract, browser_click, browser_fill, browser_evaluate, browser_screenshot, " +
+      "browser_snapshot, browser_extract, browser_click, browser_fill, browser_fill_form, browser_evaluate, browser_screenshot, " +
       "browser_network, browser_logs, browser_execute). They stay dormant to keep the prompt small — call this first " +
       "whenever the task involves the user's browser tabs or pages: reading, driving, filling forms, or extracting " +
       "web content. Idempotent.",
@@ -1799,6 +1800,59 @@ export default function (pi: ExtensionAPI) {
       `[${shortId(a.tabId)}] ${preview(a.selector, 48)} ← "${preview(a.value, 40)}"`,
     ),
     renderResult: makeRenderResult((view) => `✓ filled${pageSuffix(view)}`),
+  });
+
+  // --- page: fill form (one deterministic batch) ----------------------------
+  // Composition lives in fill-form.ts: resolve every strict selector first, then
+  // one page.fill per field. Nothing here decides anything — it hands the batch
+  // the runtime client and the session identity.
+
+  pi.registerTool({
+    name: "browser_fill_form",
+    label: "Browser Fill Form",
+    description:
+      "Fill many fields of one form in one deterministic call. Every strict selector (CSS, or text=/role=/internal:label= " +
+      "as browser_fill takes on that tab) is resolved before anything is typed: if one matches zero or more than one element, " +
+      "nothing is filled and every failing selector is reported. Then one page.fill per field, in order (max 30). No snapshot " +
+      "refs (aria-ref=eN / @eN). Stops at the first failed fill; outcome=unknown may have partially applied.",
+    promptSnippet: "Fill many fields of one form in one deterministic batch",
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Managed tab" }),
+      fields: Type.Array(
+        Type.Object({
+          selector: Type.String({ description: "strict CSS/text=/role=/internal:label=" }),
+          value: Type.String({ description: "replaces the field's content" }),
+        }),
+        { minItems: 1, maxItems: MAX_FILL_FORM_FIELDS, description: "one entry per field, filled in order" },
+      ),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      if (signal?.aborted) throw new Error("request cancelled before it started");
+      await runtime.ensureRuntime(signal);
+      if (signal?.aborted) throw new Error("request cancelled before it started");
+      return fillForm({
+        client: runtime.getClient(),
+        sessionId: runtime.sessionId(ctx),
+        cwd: ctx.cwd,
+        signal,
+        toolCallId,
+        tabId: params.tabId,
+        fields: params.fields,
+      });
+    },
+    renderCall: makeRenderCall("browser fill form", (a) => {
+      const count = Array.isArray(a.fields) ? a.fields.length : 0;
+      return `[${shortId(a.tabId)}] ${count} field(s)`;
+    }),
+    renderResult: makeRenderResult((view) => {
+      const filled = typeof view.details.filled === "number" ? view.details.filled : 0;
+      const total = Array.isArray(view.details.fields) ? view.details.fields.length : 0;
+      const status = str(view.details.status);
+      if (status === "filled") return `✓ filled ${filled}/${total} field(s)${pageSuffix(view)}`;
+      if (status === "partial") return `filled ${filled}/${total} field(s) — stopped mid-form${pageSuffix(view)}`;
+      if (status === "failed") return `nothing filled — the first fill failed${pageSuffix(view)}`;
+      return `nothing filled — ${str(view.details.issue) ? preview(view.details.issue, 64) : "unresolved selectors"}${pageSuffix(view)}`;
+    }),
   });
 
   // --- page: evaluate -------------------------------------------------------
