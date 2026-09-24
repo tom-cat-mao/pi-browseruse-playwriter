@@ -6,8 +6,9 @@ Chrome or Firefox** — their own tabs, cookies and login sessions — through a
 launched and no cloud service is involved.
 
 The package is transport and tooling only — no agent loop, HITL, captcha or confirmation
-logic: the tools report facts and the Pi LLM owns every decision. Model-side usage
-discipline is [`skills/SKILL.md`](./skills/SKILL.md), shipped with the package.
+logic: the tools report facts and the Pi LLM owns every decision. Model-side usage discipline
+ships with the tool descriptions and guidelines; the on-demand
+[`skills/SKILL.md`](./skills/SKILL.md) index and its topic files carry the backend detail.
 
 ## Install
 
@@ -114,7 +115,8 @@ Tests exercise the wire contract, response validation and output bounds against 
 
 ## Read more
 
-- [`skills/SKILL.md`](./skills/SKILL.md) — model-side tool usage, the source of truth for the tools.
+- [`skills/SKILL.md`](./skills/SKILL.md) — the on-demand skill index; `extract.md`,
+  `firefox.md` and `tabs.md` hold the backend detail the resident prompt leaves out.
 - [Repository README](../README.md) — extension install, release status, build commands.
 - [Browser runtime contract](../docs/exec/browser-runtime-contract.md) — the HTTP/WS contract all three pieces implement.
 - [Firefox guide](../docs/exec/firefox-extension-guide.md) — the DOM backend's supported operations and limits.
