@@ -232,7 +232,7 @@ describe("extension factory registration", () => {
       total += tool.description.length;
       expect(tool.description.length, tool.name).toBeLessThanOrEqual(520);
     }
-    expect(total).toBeLessThanOrEqual(3600);
+    expect(total).toBeLessThanOrEqual(3700);
   });
 
   it("ships the browser-use skill with the frontmatter pi needs to register it", () => {

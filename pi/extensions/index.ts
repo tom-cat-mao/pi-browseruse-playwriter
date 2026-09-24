@@ -1744,14 +1744,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   // --- page: screenshot -----------------------------------------------------
+  // The inline image depends on the model being able to see images; a text-only
+  // model still gets the text summary, so the description states that premise.
 
   pi.registerTool({
     name: "browser_screenshot",
     label: "Browser Screenshot",
     description:
-      "Screenshot a managed tab. The image returns inline and is saved when a path is given; fullPage captures the whole " +
-      "scrollable page, labels overlays interactive-element labels. Use it for visual questions only — browser_snapshot " +
-      "is cheaper for text.",
+      "Screenshot a managed tab. The image returns inline (when the model can see images) and is saved when a path is " +
+      "given; fullPage captures the whole scrollable page, labels overlays interactive-element labels. Use it for visual " +
+      "questions only — browser_snapshot is cheaper for text.",
     promptSnippet: "Screenshot a managed tab",
     parameters: Type.Object({
       tabId: Type.String({ description: "Target managed tab" }),
