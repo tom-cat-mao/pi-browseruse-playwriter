@@ -105,6 +105,34 @@ const MAX_DETAIL_LOGS_BYTES = 3_000;
 const MAX_DETAIL_LOG_LINES = 20;
 const MAX_RENDER_ARG_BYTES = 4_000;
 
+// --- dormant browser fleet ---------------------------------------------------
+// Pi builds each request's loadout from `systemPromptOptions.selectedTools`, so
+// dropping a tool there removes its schema, its snippet, and its guidelines from
+// that request at once. The `browser` gateway stays resident; the browser_* fleet
+// is hidden until the model calls the gateway in this Pi session — or forever
+// when PI_BROWSER_TOOLS=always. Activation lives in memory keyed by sessionId
+// (never a module-global boolean), so sessions cannot activate each other.
+const GATEWAY_TOOL_NAME = "browser";
+const FLEET_TOOL_PREFIX = "browser_";
+const MAX_ACTIVATED_SESSIONS = 16;
+const activatedSessions = new Set<string>();
+
+/** PI_BROWSER_TOOLS=always keeps the whole fleet resident in every session. */
+function browserToolsAlwaysOn(): boolean {
+  return (process.env.PI_BROWSER_TOOLS ?? "").trim().toLowerCase() === "always";
+}
+
+/** Mark one session active; refresh recency and evict at the session bound. */
+function activateSession(sessionId: string): void {
+  activatedSessions.delete(sessionId);
+  activatedSessions.add(sessionId);
+  while (activatedSessions.size > MAX_ACTIVATED_SESSIONS) {
+    const oldest = activatedSessions.values().next().value;
+    if (oldest === undefined) break;
+    activatedSessions.delete(oldest);
+  }
+}
+
 // --- optional result metadata (frozen protocol fields) -----------------------
 
 /** Capture lifecycle states as published by the frozen protocol. */
@@ -1173,6 +1201,69 @@ export default function (pi: ExtensionAPI) {
   // carry cross-tool orchestration only, and longer-form detail lives in the
   // on-demand skill rather than here.
 
+  // --- gateway (always resident) --------------------------------------------
+
+  /**
+   * Fleet names that exist in the registry but are missing from `active`, the
+   * live loadout. getAllTools() is the registry, NOT the active set: it is read
+   * only to learn the fleet's names, while getActiveTools() seeds the result, so
+   * a tool the user switched off is never switched back on here.
+   */
+  function missingFleetToolNames(active: string[]): string[] {
+    return (pi.getAllTools?.() ?? [])
+      .map((tool) => tool.name)
+      .filter((name) => name.startsWith(FLEET_TOOL_PREFIX) && !active.includes(name));
+  }
+
+  pi.registerTool({
+    name: GATEWAY_TOOL_NAME,
+    label: "Browser",
+    description:
+      "Activate this session's browser tools (browser_profiles, browser_groups, browser_tabs, browser_navigate, " +
+      "browser_snapshot, browser_extract, browser_click, browser_fill, browser_evaluate, browser_screenshot, " +
+      "browser_network, browser_logs, browser_execute). They stay dormant to keep the prompt small — call this first " +
+      "whenever the task involves the user's browser tabs or pages: reading, driving, filling forms, or extracting " +
+      "web content. Idempotent.",
+    promptSnippet: "Activate the browser_* tools for this session",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (browserToolsAlwaysOn()) {
+        return {
+          content: [text("browser_* tools are already active (PI_BROWSER_TOOLS=always).")],
+          details: { activated: true },
+        };
+      }
+      const sessionId = runtime.sessionId(ctx);
+      if (activatedSessions.has(sessionId)) {
+        return { content: [text("browser_* tools are already active.")], details: { activated: false } };
+      }
+      activateSession(sessionId);
+      // The loadout of the request that carried this call was filtered before the
+      // call could land, so the live set is still missing the fleet: put it back
+      // here and the next turn of this same run can already call browser_tabs.
+      // Guarded because a harness without the loadout actions predates the
+      // dormancy filter (there the fleet is resident and there is nothing to do).
+      if (typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
+        const active = pi.getActiveTools();
+        const missing = missingFleetToolNames(active);
+        if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+      }
+      return {
+        content: [
+          text(
+            "browser_* tools are now active. Start with browser_profiles → browser_groups create → browser_tabs " +
+              "create, or browser_tabs discover+attach to join a tab the user already has open.",
+          ),
+        ],
+        details: { activated: true },
+      };
+    },
+    renderCall: makeRenderCall("browser", () => ""),
+    renderResult: makeRenderResult((view) =>
+      view.details.activated === false ? "✓ browser tools already active" : "✓ browser tools activated",
+    ),
+  });
+
   // --- profiles -------------------------------------------------------------
 
   pi.registerTool({
@@ -1183,8 +1274,7 @@ export default function (pi: ExtensionAPI) {
       "backend capabilities; a profileId from this list is required to create a group.",
     promptSnippet: "List available browser profiles",
     promptGuidelines: [
-      "browser_profiles is the capability gate: that profile's capabilities decide what its browser can serve " +
-      "— re-read it instead of assuming a backend supports something.",
+      "browser_profiles is the capability gate: a profile's capabilities decide what it serves — re-read rather than assume.",
     ],
     parameters: Type.Object({}),
     async execute(toolCallId, _params, signal, _onUpdate, ctx) {
@@ -1213,15 +1303,14 @@ export default function (pi: ExtensionAPI) {
       "group binds to one fixed profile; same-name groups are allowed.",
     promptSnippet: "List/create/rename/close this session's tab groups",
     promptGuidelines: [
-      "The resource chain is explicit: browser_groups create (name + profileId from browser_profiles) → browser_tabs " +
-      "create (that groupId + url) → every page tool takes the returned tabId. There is no implicit current tab and " +
-      "no matching by URL or title.",
+      "Ids are explicit: browser_groups create (name + profileId from browser_profiles) → browser_tabs create " +
+      "(groupId + url) → page tools take the returned tabId; never guess a current tab or match by URL/title.",
     ],
     parameters: Type.Object({
       action: StringEnum(["list", "create", "rename", "close"] as const),
-      profileId: Type.Optional(Type.String({ description: "create (required) or list filter" })),
-      name: Type.Optional(Type.String({ description: "create/rename (required): the group name" })),
-      groupId: Type.Optional(Type.String({ description: "rename/close (required)" })),
+      profileId: Type.Optional(Type.String({ description: "create/list" })),
+      name: Type.Optional(Type.String({ description: "create/rename" })),
+      groupId: Type.Optional(Type.String({ description: "rename/close" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       const op = ((): BrowserOperation => {
@@ -1272,30 +1361,27 @@ export default function (pi: ExtensionAPI) {
       "the tab back).",
     promptSnippet: "List/create/attach/activate/close/release tabs, or discover the tabs already open",
     promptGuidelines: [
-      "When the user points at a page they already have open: browser_tabs discover, then attach that candidateId in " +
-      "place (no reload/move/regroup); when a link opened a new tab, find it with browser_tabs list " +
-      "sourceTabId=<the tab you clicked in> and return with browser_tabs activate.",
+      "User points at an open page: browser_tabs discover, then attach that candidateId in place (no " +
+      "reload/move/regroup); a link that opened a tab: browser_tabs list sourceTabId=<the clicked tab>, then " +
+      "browser_tabs activate.",
     ],
     parameters: Type.Object({
       action: StringEnum(["list", "discover", "attach", "activate", "create", "close", "release"] as const),
-      groupId: Type.Optional(Type.String({ description: "create (required) or list filter" })),
-      url: Type.Optional(Type.String({ description: "create (required): initial URL" })),
-      tabId: Type.Optional(Type.String({ description: "close/release/activate (required)" })),
-      sourceTabId: Type.Optional(Type.String({ description: "list: only tabs opened from this tabId" })),
-      candidateId: Type.Optional(Type.String({ description: "attach (required): a candidateId from discover" })),
-      profileId: Type.Optional(Type.String({ description: "discover: only this profile" })),
-      windowId: Type.Optional(Type.Integer({ description: "discover: only this browser window" })),
-      query: Type.Optional(Type.String({ description: "discover: only tabs whose title or URL contains this text" })),
-      includeManaged: Type.Optional(Type.Boolean({ description: "discover: set false to hide tabs already under this session's control" })),
-      offset: Type.Optional(
-        Type.Integer({ minimum: 0, description: "discover: skip this many candidates (Pi-side paging; use nextOffset)" }),
-      ),
+      // The tool description above already maps every action to its fields, so a
+      // field only carries a description when that mapping does not state it —
+      // this schema is resident text the moment the fleet is active.
+      groupId: Type.Optional(Type.String()),
+      url: Type.Optional(Type.String()),
+      tabId: Type.Optional(Type.String({ description: "close/release/activate" })),
+      sourceTabId: Type.Optional(Type.String()),
+      candidateId: Type.Optional(Type.String()),
+      profileId: Type.Optional(Type.String({ description: "discover" })),
+      windowId: Type.Optional(Type.Integer({ description: "discover" })),
+      query: Type.Optional(Type.String({ description: "discover: title/URL text" })),
+      includeManaged: Type.Optional(Type.Boolean({ description: "discover: false hides managed tabs" })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "discover: use nextOffset" })),
       limit: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          maximum: MAX_DISCOVER_LIMIT,
-          description: "discover: page size (default 20)",
-        }),
+        Type.Integer({ minimum: 1, maximum: MAX_DISCOVER_LIMIT, description: "discover: default 20" }),
       ),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -1387,10 +1473,10 @@ export default function (pi: ExtensionAPI) {
       "browser history, never a re-navigation of the old URL. If a link opened a new tab, use browser_tabs activate.",
     promptSnippet: "Navigate a managed tab, or go back in its history",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      url: Type.Optional(Type.String({ description: "URL to open (required for action \"goto\")" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      url: Type.Optional(Type.String({ description: "goto: URL" })),
       action: Type.Optional(
-        StringEnum(["goto", "back"] as const, { description: "goto (default) or back (browser history)" }),
+        StringEnum(["goto", "back"] as const, { description: "goto (default) or back" }),
       ),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -1434,18 +1520,17 @@ export default function (pi: ExtensionAPI) {
       "element. Output is bounded; full asks for the whole tree.",
     promptSnippet: "Read a managed tab as an accessibility tree",
     promptGuidelines: [
-      "browser_snapshot owns the refs: browser_click/browser_fill need an aria-ref=eN from the latest snapshot " +
-      "together with its snapshotId, and any browser_evaluate or browser_execute invalidates that snapshot " +
-      "conservatively — even a read-only one — so re-snapshot before the next ref-based action.",
-      "Work observe → act → observe: browser_navigate or browser_snapshot to load and read, one acting tool, then a " +
-      "fresh snapshot (or evaluate) to verify — pages redirect and change, so never chain actions blindly or re-click " +
-      "something that did not react.",
+      "browser_snapshot owns the refs: browser_click/browser_fill need an aria-ref=eN plus the snapshotId it came " +
+      "from; any browser_evaluate/browser_execute invalidates the snapshot (even read-only), so re-snapshot before " +
+      "the next ref action.",
+      "Work observe → act → observe: browser_navigate/browser_snapshot to load and read, one acting tool, then a " +
+      "fresh snapshot or evaluate to verify — pages change, so never chain blindly or re-click a dead control.",
     ],
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      search: Type.Optional(Type.String({ description: "Only include nodes matching this text" })),
-      selector: Type.Optional(Type.String({ description: "Scope to a single matching CSS selector" })),
-      full: Type.Optional(Type.Boolean({ description: "Request the complete tree (output stays bounded)" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      search: Type.Optional(Type.String({ description: "node text filter" })),
+      selector: Type.Optional(Type.String({ description: "CSS scope" })),
+      full: Type.Optional(Type.Boolean({ description: "whole tree" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1553,28 +1638,22 @@ export default function (pi: ExtensionAPI) {
       "page.extract-capable profile (see browser_profiles).",
     promptSnippet: "Extract a managed tab's content as markdown/text/html or an image manifest",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
+      tabId: Type.String({ description: "Managed tab" }),
       format: Type.Optional(
         StringEnum(["markdown", "text", "html", "assets-manifest"] as const, {
-          description:
-            "Extraction format (default: markdown); assets-manifest lists the page's images instead of text",
+          description: "Extraction format (default: markdown)",
         }),
       ),
       images: Type.Optional(
         StringEnum(["none", "urls", "save"] as const, {
-          description:
-            "Image handling (default: none). urls adds the manifest without downloading; save downloads and rewrites markdown image URLs to the local artifact paths",
+          description: "none (default)|urls|save; urls=manifest, save=download",
         }),
       ),
-      search: Type.Optional(
-        Type.String({ description: "Keep only lines matching this text, with surrounding context" }),
-      ),
-      offset: Type.Optional(Type.Integer({ minimum: 0, description: "Skip this many lines (paging)" })),
-      limit: Type.Optional(Type.Integer({ minimum: 1, description: "Max lines to return (paging)" })),
+      search: Type.Optional(Type.String({ description: "line text filter" })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "lines to skip" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, description: "max lines" })),
       path: Type.Optional(
-        Type.String({
-          description: "Export path for the full extraction, confined to the runtime's artifacts directory",
-        }),
+        Type.String({ description: "artifacts-dir export path" }),
       ),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -1662,9 +1741,9 @@ export default function (pi: ExtensionAPI) {
       "guess.",
     promptSnippet: "Click an element by ref or CSS selector",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      selector: Type.String({ description: "aria-ref=eN, @eN, or a strict CSS/role selector" }),
-      snapshotId: Type.Optional(Type.String({ description: "Required when selector is an aria ref" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      selector: Type.String(),
+      snapshotId: Type.Optional(Type.String({ description: "for aria refs" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1694,10 +1773,10 @@ export default function (pi: ExtensionAPI) {
       "read the value with browser_evaluate, concatenate and fill that.",
     promptSnippet: "Fill inputs and rich-text editors",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      selector: Type.String({ description: "aria-ref=eN, @eN, or a strict CSS selector" }),
-      value: Type.String({ description: "Text to insert (replaces content)" }),
-      snapshotId: Type.Optional(Type.String({ description: "Required when selector is an aria ref" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      selector: Type.String(),
+      value: Type.String({ description: "replaces content" }),
+      snapshotId: Type.Optional(Type.String({ description: "for aria refs" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1730,8 +1809,8 @@ export default function (pi: ExtensionAPI) {
       "permission); for Node/Playwright use browser_execute.",
     promptSnippet: "Run JavaScript in a managed tab's page",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      code: Type.String({ description: "JS code, async/await supported" }),
+      tabId: Type.String({ description: "Managed tab" }),
+      code: Type.String(),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({ ctx, toolCallId, signal, operation: { kind: "page.evaluate", tabId: params.tabId, code: params.code } });
@@ -1756,10 +1835,10 @@ export default function (pi: ExtensionAPI) {
       "questions only — browser_snapshot is cheaper for text.",
     promptSnippet: "Screenshot a managed tab",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      path: Type.Optional(Type.String({ description: "Absolute output path" })),
-      fullPage: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page" })),
-      labels: Type.Optional(Type.Boolean({ description: "Overlay interactive-element labels" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      path: Type.Optional(Type.String({ description: "absolute path" })),
+      fullPage: Type.Optional(Type.Boolean()),
+      labels: Type.Optional(Type.Boolean()),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1801,9 +1880,9 @@ export default function (pi: ExtensionAPI) {
       "previous capture.",
     promptSnippet: "Capture and inspect a tab's network requests",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
+      tabId: Type.String({ description: "Managed tab" }),
       action: StringEnum(["start", "list", "stop"] as const),
-      filter: Type.Optional(Type.String({ description: "URL substring filter for list" })),
+      filter: Type.Optional(Type.String()),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1852,8 +1931,8 @@ export default function (pi: ExtensionAPI) {
       "failed requests, and runtime exceptions; no listeners needed.",
     promptSnippet: "Read a managed tab's buffered console logs",
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, description: "Max log lines to return" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, description: "max lines" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1879,14 +1958,13 @@ export default function (pi: ExtensionAPI) {
       "Errors return verbatim.",
     promptSnippet: "Run a Playwright snippet against a managed tab (escape hatch)",
     promptGuidelines: [
-      "A call that is cancelled or times out reports outcome=not-started or outcome=unknown; outcome=unknown means it " +
-      "may have partially happened — re-observe with browser_snapshot before assuming anything, and never replay the " +
-      "action.",
+      "A cancelled/timed-out call reports outcome=not-started or outcome=unknown; unknown may have partially " +
+      "happened — re-observe with browser_snapshot, never replay the action.",
     ],
     parameters: Type.Object({
-      tabId: Type.String({ description: "Target managed tab" }),
-      code: Type.String({ description: "Playwright JS code, async/await supported" }),
-      timeout: Type.Optional(Type.Integer({ minimum: 1000, description: "Timeout in ms (runtime caps at 120000)" })),
+      tabId: Type.String({ description: "Managed tab" }),
+      code: Type.String(),
+      timeout: Type.Optional(Type.Integer({ minimum: 1000, description: "ms (runtime caps 120000)" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1941,11 +2019,28 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // --- dormancy filter ------------------------------------------------------
+  // Pure filtering: no resources are created and nothing is sent anywhere. A
+  // session that has called the gateway (or PI_BROWSER_TOOLS=always) is left
+  // untouched so its prompt stays byte-identical across requests.
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (browserToolsAlwaysOn()) return;
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    if (sessionId && activatedSessions.has(sessionId)) return;
+    // `selectedTools` is optional in older pi type definitions and always
+    // present from 0.87 on: treat a missing list as "nothing to filter" (an
+    // older harness has no loadout to rewrite) instead of emptying it.
+    const selectedTools = event.systemPromptOptions.selectedTools;
+    if (!selectedTools?.some((name) => name.startsWith(FLEET_TOOL_PREFIX))) return;
+    event.systemPromptOptions.selectedTools = selectedTools.filter((name) => !name.startsWith(FLEET_TOOL_PREFIX));
+  });
+
   // session.release only: frees this session's workers/CDP clients. Never
   // deletes groups/tabs or changes persistent ownership; never stops the runtime.
   // Only THIS session's page context is dropped — other sessions keep theirs.
   pi.on("session_shutdown", async (_event, ctx) => {
     const sessionId = runtime.sessionId(ctx);
+    activatedSessions.delete(sessionId);
     pageContext.clear(sessionId);
     await runtime.releaseSession(ctx, `shutdown:${sessionId}`).catch(() => {});
     runtime.reset();
