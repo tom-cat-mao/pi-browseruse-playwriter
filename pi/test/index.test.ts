@@ -9,8 +9,9 @@ import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import factory from "../extensions/index.ts";
 import * as bootstrap from "../extensions/bootstrap.ts";
-import { MAX_FILL_FORM_FIELDS, validateFillFormFields, type FillFormValidation } from "../extensions/fill-form.ts";
+import { fillForm, MAX_FILL_FORM_FIELDS, validateFillFormFields, type FillFormValidation } from "../extensions/fill-form.ts";
 import { PageContextStore } from "../extensions/page-context.ts";
+import { BrowserRuntimeClient } from "../extensions/runtime-client.ts";
 import { startTestServer, validCapabilities, validProfile, type TestServer } from "./test-server.ts";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -2592,9 +2593,12 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     /** Wire runtime for the batch: per-selector resolution and fill verdicts. */
     function batchHandler({
       resolveFailure,
+      resolveError,
       fillFailure,
     }: {
       resolveFailure?: (selector: string) => string | undefined;
+      /** A batch-level refusal of the probe itself (e.g. unsupported-capability). */
+      resolveError?: { code: string; message: string; outcome?: "not-started" | "unknown" };
       fillFailure?: (
         selector: string,
       ) => { message: string; code?: string; outcome?: "not-started" | "unknown" } | undefined;
@@ -2605,6 +2609,19 @@ describe("tool execution shaping (real HTTP runtime)", () => {
         const body = req.body as WireOp;
         const selector = body.operation.selector ?? "";
         if (body.operation.kind === "page.extract") {
+          if (resolveError) {
+            return {
+              json: {
+                requestId: body.requestId,
+                ok: false,
+                error: {
+                  code: resolveError.code,
+                  message: resolveError.message,
+                  outcome: resolveError.outcome ?? "not-started",
+                },
+              },
+            };
+          }
           const message = resolveFailure?.(selector);
           if (message) {
             return {
@@ -2745,6 +2762,9 @@ describe("tool execution shaping (real HTTP runtime)", () => {
       const text = textBlocks(result.content)[0];
       expect(text).toContain("Nothing was filled");
       expect(text).toContain("2 of 3 selector(s) did not resolve");
+      // The summary already opens with "Nothing was filled": the issue must not
+      // repeat it.
+      expect(report.issue).toBe("2 of 3 selector(s) did not resolve to exactly one element");
     });
 
     it("rejects snapshot refs before sending a single page op", async () => {
@@ -2869,6 +2889,84 @@ describe("tool execution shaping (real HTTP runtime)", () => {
       ).rejects.toThrow(/filled nothing: resolving field 1 \("#a"\) failed/);
       // The batch stops at the first transport failure: no second resolve, no fill.
       expect(wireKinds()).toEqual(["page.extract"]);
+    });
+
+    it("fails the call when the probe itself is unsupported instead of blaming every selector", async () => {
+      batchHandler({
+        resolveError: {
+          code: "unsupported-capability",
+          message: "Firefox profile does not support page.extract",
+          outcome: "not-started",
+        },
+      });
+      const tool = toolByName("browser_fill_form");
+
+      await expect(
+        tool.execute(
+          "call-unsupported",
+          { tabId: batchTabId, fields: fieldsOf("#a", "#b") },
+          undefined,
+          undefined,
+          makeCtx(),
+        ),
+      ).rejects.toThrow(
+        'filled nothing: resolving field 1 ("#a") failed — Firefox profile does not support page.extract · code=unsupported-capability · outcome=not-started',
+      );
+      // The refusal is about the probe, not the selectors: one attempt, no fill,
+      // and no per-field blame hiding the real cause.
+      expect(wireKinds()).toEqual(["page.extract"]);
+    });
+
+    it("stops the resolve pass at its batch budget and blames only the fields it never probed", async () => {
+      const probeDelayMs = 250;
+      // Every probe costs at least 250ms, so a 600ms budget trips before the
+      // sixth field instead of burning 30 selector timeouts on a broken batch.
+      server.setHandler(async (req) => {
+        const body = req.body as WireOp;
+        if (body.operation.kind === "page.extract") {
+          await new Promise((resolve) => {
+            setTimeout(resolve, probeDelayMs);
+          });
+          return {
+            json: { requestId: body.requestId, ok: true, data: { text: '<input id="a">', pageInfo: batchPageInfo } },
+          };
+        }
+        return {
+          json: { requestId: body.requestId, ok: true, data: { text: "Filled", pageInfo: batchPageInfo } },
+        };
+      });
+
+      // Driven through the exported batch: the budget is internal, not a
+      // tool-schema knob.
+      const result = await fillForm({
+        client: new BrowserRuntimeClient({ baseUrl: server.baseUrl }),
+        sessionId: "session-budget",
+        cwd: undefined,
+        signal: undefined,
+        toolCallId: "call-budget",
+        tabId: batchTabId,
+        fields: fieldsOf("#a", "#b", "#c", "#d", "#e", "#f"),
+        resolveBudgetMs: 600,
+      });
+
+      const report = reportOf(result.content);
+      // Timing: probes at ~0/250/500ms, the next check trips at ~750ms.
+      const extracts = wireKinds().filter((kind) => kind === "page.extract");
+      expect(extracts.length).toBeGreaterThan(0);
+      expect(extracts.length).toBeLessThan(6);
+      expect(wireKinds()).not.toContain("page.fill");
+      expect(report.status).toBe("rejected");
+      expect(report.filled).toBe(0);
+      // One probe per field the budget did not cut off: the un-probed tail is
+      // blamed with the budget, the probed prefix stays un-attempted.
+      expect(report.notAttempted).toBe(extracts.length);
+      const stopped = report.fields.filter((field) => {
+        return field.status === "failed";
+      });
+      expect(stopped).toHaveLength(6 - extracts.length);
+      for (const field of stopped) {
+        expect(field.error).toContain("resolution stopped early: exceeded the 0.6s batch resolve budget");
+      }
     });
 
     it("renders the batch row and the folded call line from its report", async () => {

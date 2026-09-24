@@ -26,6 +26,19 @@ import { clampBytes, preview, stripTerminalControls } from "./ui-format.ts";
 /** Schema bound: the batch is sequential, so an unbounded list outlives any deadline. */
 export const MAX_FILL_FORM_FIELDS = 30;
 
+/**
+ * Wall-clock ceiling for the resolve pass (internal, NOT part of the tool
+ * schema): 30 strict probes against a fully broken batch would otherwise stack
+ * up ~150s of selector timeouts before the first fill is even tried.
+ */
+const DEFAULT_RESOLVE_BUDGET_MS = 30_000;
+
+/** `30_000` -> `30s`, `600` -> `0.6s`: the budget as the model reads it. */
+function formatResolveBudget(budgetMs: number): string {
+  const seconds = budgetMs / 1000;
+  return `${Number.isInteger(seconds) ? seconds : Number(seconds.toFixed(1))}s`;
+}
+
 // Model-facing content stays bounded by construction: at most MAX_FILL_FORM_FIELDS
 // entries of a clamped selector + clamped error. `details` keeps the untruncated
 // text for the UI.
@@ -264,9 +277,12 @@ function buildReport({
  * fill NOTHING. A fill failure stops the batch — the page is no longer the state
  * the remaining selectors were resolved against, so they are reported as
  * `not-attempted` rather than chained blindly. A transport failure during
- * resolution throws (nothing was filled and nothing else could run); a transport
- * failure during fills is reported per field instead, so the caller still learns
- * which fields were already written.
+ * resolution — or the relay refusing the probe itself — throws (nothing was
+ * filled and nothing else could run); a transport failure during fills is
+ * reported per field instead, so the caller still learns which fields were
+ * already written. The resolve pass is bounded by `resolveBudgetMs`: once it is
+ * exceeded, the fields that were never probed are reported with the budget as
+ * their error instead of waiting out every selector timeout.
  */
 export async function fillForm(options: {
   client: BrowserRuntimeClient;
@@ -277,8 +293,11 @@ export async function fillForm(options: {
   toolCallId: string;
   tabId: string;
   fields: FillFormField[];
+  /** Internal: overrides DEFAULT_RESOLVE_BUDGET_MS for this batch (tests, callers). */
+  resolveBudgetMs?: number;
 }): Promise<{ content: FillFormContentBlock[]; details: Json }> {
   const { client, sessionId, cwd, signal, toolCallId, tabId, fields } = options;
+  const resolveBudgetMs = options.resolveBudgetMs ?? DEFAULT_RESOLVE_BUDGET_MS;
 
   const validation = validateFillFormFields({ fields });
   if (!validation.ok) {
@@ -316,7 +335,18 @@ export async function fillForm(options: {
   // matches is a failure, and ANY failure means nothing gets filled.
   const resolutionFailures = new Map<number, string>();
   let pageInfo: Json | undefined;
+  const resolveStartedAt = Date.now();
   for (const [index, field] of fields.entries()) {
+    // After the first probe, a batch that keeps burning time on selectors it may
+    // never fill is cut off: the fields not reached are reported honestly as
+    // un-probed instead of inheriting a per-field timeout each.
+    if (index > 0 && Date.now() - resolveStartedAt > resolveBudgetMs) {
+      const budgetError = `resolution stopped early: exceeded the ${formatResolveBudget(resolveBudgetMs)} batch resolve budget`;
+      for (let remaining = index; remaining < fields.length; remaining++) {
+        resolutionFailures.set(remaining, budgetError);
+      }
+      break;
+    }
     try {
       const data = await call({
         index,
@@ -325,10 +355,12 @@ export async function fillForm(options: {
       });
       if (!pageInfo && isRecord(data.pageInfo)) pageInfo = data.pageInfo;
     } catch (e) {
-      if (isTransportFailure(e)) {
-        // Not a fact about this selector: nothing in the batch can resolve while
-        // the runtime is unreachable or the exchange timed out, and nothing has
-        // been filled yet — fail the call instead of blaming every field.
+      // Not a fact about this selector: nothing in the batch can resolve while
+      // the runtime is unreachable, the exchange timed out, or the relay refuses
+      // the probe itself (`unsupported-capability` on a profile/backend that has
+      // no page.extract), and nothing has been filled yet — fail the call with
+      // the real cause instead of blaming every field.
+      if (isTransportFailure(e) || (e instanceof RuntimeRequestError && e.code === "unsupported-capability")) {
         throw new Error(
           `browser_fill_form filled nothing: resolving field ${index + 1} ("${preview(field.selector, 60)}") failed — ${describeFailure(e)}`,
           { cause: e },
@@ -341,8 +373,7 @@ export async function fillForm(options: {
     return buildReport({
       tabId,
       status: "rejected",
-      issue:
-        `${resolutionFailures.size} of ${fields.length} selector(s) did not resolve to exactly one element; nothing was filled`,
+      issue: `${resolutionFailures.size} of ${fields.length} selector(s) did not resolve to exactly one element`,
       fields: fields.map((field, index) => {
         const error = resolutionFailures.get(index);
         return { selector: field.selector, status: error ? ("failed" as const) : ("not-attempted" as const), ...(error ? { error } : {}) };
