@@ -1,5 +1,19 @@
 # @tom-cat/pi-browser-use-extension
 
+## 0.5.0
+
+### Minor Changes
+
+- 94ffba0: `browser_snapshot` takes an optional `interactiveOnly` that narrows the tree to the actionable controls, for when targets are all that is needed instead of the readable page text.
+
+  `browser_click` and `browser_fill` now document that their `selector` is a plain Playwright selector (CSS, `text=`, `role=`) that needs no snapshot, and the cross-tool guidelines tell the model to act directly on a control it can name by visible text, role, or label rather than snapshotting first. Snapshot→ref remains the path for unknown pages, content reads, and strict selectors that error. Activating the `browser` gateway now also pre-warms the runtime in the background, so the first browser tool call of a session no longer pays the cold start.
+
+- dc31b95: Add `browser_fill_form`: fill many fields of one form in a single deterministic call, with no model in the loop.
+
+  The batch resolves every strict selector before it types anything, through the same single-match path `browser_fill` uses (CSS and `text=` / `role=` / `internal:label=` on the CDP backend, CSS and `role=` on the DOM backend). A selector that matches zero or several elements is a failure: nothing is filled, and every failing selector is reported by name with the runtime's own error. When resolution passes, the tool issues one `page.fill` per field, in order, and reports each field as `filled`, `failed`, or `not-attempted` — the first failed fill stops the batch, and an `outcome=unknown` on it is carried into the model-visible result instead of being swallowed.
+
+  Snapshot refs (`aria-ref=eN`, `@eN`) are refused up front with an explanation: every fill invalidates the latest snapshot, so a ref from one `snapshotId` would be dead for every field after the first. Batches are bounded to 30 fields, and a refused batch leaves the page untouched — the resolution probe is a read that never replaces the tab's latest snapshot.
+
 ## 0.4.0
 
 ### Minor Changes
