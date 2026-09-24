@@ -1251,6 +1251,11 @@ export default function (pi: ExtensionAPI) {
       // the session un-flagged, so a retry can still finish the activation
       // instead of the filter hiding the fleet for the rest of the session.
       activateSession(sessionId);
+      // Once per session, warm the shared runtime in the background so the first
+      // real browser tool call does not pay the cold start. Fire-and-forget:
+      // activation neither waits for it nor fails when the runtime is down — the
+      // next tool call awaits the same shared launch anyway.
+      void runtime.ensureRuntime().catch(() => {});
       return {
         content: [
           text(
@@ -1520,7 +1525,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Read a managed tab as a readable accessibility tree with element refs (aria-ref=eN). Default is the readable " +
       "tree, not interactive-only, so it can be large — narrow with search or a strict CSS selector matching one " +
-      "element. Output is bounded; full asks for the whole tree.",
+      "element, or interactiveOnly for just the actionable controls. Output is bounded; full asks for the whole tree.",
     promptSnippet: "Read a managed tab as an accessibility tree",
     promptGuidelines: [
       "browser_snapshot owns the refs: browser_click/browser_fill need an aria-ref=eN plus the snapshotId it came " +
@@ -1528,12 +1533,16 @@ export default function (pi: ExtensionAPI) {
       "the next ref action.",
       "Work observe → act → observe: browser_navigate/browser_snapshot to load and read, one acting tool, then a " +
       "fresh snapshot or evaluate to verify — pages change, so never chain blindly or re-click a dead control.",
+      "Skip browser_snapshot when browser_click/browser_fill have a nameable target (visible text, role, or label): " +
+      "call the acting tool directly with a strict selector; use snapshot→ref when the page is unknown, you must read " +
+      "content, or a strict selector errors, then snapshot to find the right target.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Managed tab" }),
       search: Type.Optional(Type.String({ description: "node text filter" })),
       selector: Type.Optional(Type.String({ description: "CSS scope" })),
       full: Type.Optional(Type.Boolean({ description: "whole tree" })),
+      interactiveOnly: Type.Optional(Type.Boolean({ description: "only actionable controls" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1546,11 +1555,12 @@ export default function (pi: ExtensionAPI) {
           ...(params.search ? { search: params.search } : {}),
           ...(params.selector ? { selector: params.selector } : {}),
           ...(params.full ? { full: params.full } : {}),
+          ...(params.interactiveOnly ? { interactiveOnly: params.interactiveOnly } : {}),
         },
       });
     },
     renderCall: makeRenderCall("browser snapshot", (a) =>
-      `[${shortId(a.tabId)}]${a.selector ? ` selector=${preview(a.selector, 40)}` : ""}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.full ? " full" : ""}`,
+      `[${shortId(a.tabId)}]${a.selector ? ` selector=${preview(a.selector, 40)}` : ""}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.full ? " full" : ""}${a.interactiveOnly ? " interactive-only" : ""}`,
     ),
     renderResult: makeRenderResult((view) => {
       const lines = view.text ? view.text.split("\n").length : 0;
@@ -1740,8 +1750,8 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Click",
     description:
       "Click an element in a managed tab. Pass either a snapshot ref (aria-ref=eN or @eN) with the snapshotId it came " +
-      "from, or a plain CSS/role selector. Selectors match strictly — zero or multiple matches is an error, never a " +
-      "guess.",
+      "from, or a plain Playwright selector — CSS, text=, or role= — which needs no snapshot. Selectors match " +
+      "strictly — zero or multiple matches is an error, never a guess.",
     promptSnippet: "Click an element by ref or CSS selector",
     parameters: Type.Object({
       tabId: Type.String({ description: "Managed tab" }),
@@ -1772,8 +1782,8 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Fill",
     description:
       "Set text into an input/textarea/contenteditable; existing content is replaced. Target by " +
-      "snapshot ref (aria-ref=eN / @eN with its snapshotId) or a strict selector matching one element. To append, " +
-      "read the value with browser_evaluate, concatenate and fill that.",
+      "snapshot ref (aria-ref=eN / @eN with its snapshotId) or a plain Playwright selector — CSS, text=, or role= — " +
+      "matching one element with no snapshot. To append, read the value with browser_evaluate, concatenate and fill that.",
     promptSnippet: "Fill inputs and rich-text editors",
     parameters: Type.Object({
       tabId: Type.String({ description: "Managed tab" }),

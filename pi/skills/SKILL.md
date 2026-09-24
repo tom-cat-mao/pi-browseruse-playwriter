@@ -16,7 +16,8 @@ starts and the model calls the parameter-less `browser` gateway tool, which acti
 fleet. A user who sets `PI_BROWSER_TOOLS=always` keeps every tool resident instead.
 
 Keep the loop in mind anyway: snapshot to read, one acting tool, then a fresh snapshot to
-verify — pages redirect and change, so never chain actions blindly.
+verify — pages redirect and change, so never chain actions blindly. The loop is not a rule to
+snapshot first: a control you can name can be acted on directly with a strict selector.
 
 ## Topic files
 
