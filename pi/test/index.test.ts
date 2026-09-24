@@ -361,6 +361,24 @@ describe("browser tool dormancy (gateway activation)", () => {
     }
   });
 
+  /**
+   * No session means no way back: the gateway throws without a session id, so
+   * filtering such a loadout would hide the fleet for good. Both a harness that
+   * omits `sessionManager` and one whose getSessionId() yields nothing keep the
+   * tools resident.
+   */
+  it("never filters a loadout when there is no session id", async () => {
+    const handler = beforeAgentStartHandler();
+    const selected = [...FLEET_TOOL_NAMES, "browser", "read"];
+    const contexts = [{}, { sessionManager: { getSessionId: () => undefined } }];
+
+    for (const ctx of contexts) {
+      const event = makeLoadoutEvent(selected);
+      await handler(event, ctx);
+      expect(event.systemPromptOptions.selectedTools).toEqual(selected);
+    }
+  });
+
   it("activates the fleet for the calling session only, and is idempotent", async () => {
     const { pi, tools, handlers } = makeMockPi();
     factory(pi as never);
@@ -427,6 +445,36 @@ describe("browser tool dormancy (gateway activation)", () => {
     expect(textOf(again.content)).toBe("browser_* tools are already active.");
     expect(setActiveToolsCalls).toHaveLength(1);
     expect(activeTools()).toEqual(["browser", "read", "bash", ...FLEET_TOOL_NAMES]);
+  });
+
+  /**
+   * The activation flag is what keeps the filter quiet, so it must only be set
+   * after the live loadout really took the fleet: a write that throws has to
+   * leave the session dormant-but-retryable, never flagged with the tools still
+   * hidden in the next request.
+   */
+  it("retries the activation after a loadout write throws", async () => {
+    const { pi, tools, handlers, setActiveToolsCalls, activeTools } = makeMockPi(["browser", "read"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+    const ctx = makeCtx("session-retry");
+
+    pi.setActiveTools.mockImplementationOnce(() => {
+      throw new Error("loadout write failed");
+    });
+    await expect(gateway.execute("call-1", {}, undefined, undefined, ctx)).rejects.toThrow("loadout write failed");
+    expect(setActiveToolsCalls).toEqual([]);
+
+    // The flag stayed unset, so the session is still filtered …
+    const dormant = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read"]);
+    await handlers.get("before_agent_start")!(dormant, ctx);
+    expect(dormant.systemPromptOptions.selectedTools).toEqual(["browser", "read"]);
+
+    // … and the retry finishes the job for the rest of the run.
+    const retry = await gateway.execute("call-2", {}, undefined, undefined, ctx);
+    expect(textOf(retry.content)).toContain("browser_* tools are now active.");
+    expect(setActiveToolsCalls).toEqual([["browser", "read", ...FLEET_TOOL_NAMES]]);
+    expect(activeTools()).toEqual(["browser", "read", ...FLEET_TOOL_NAMES]);
   });
 
   it("leaves an already-complete loadout untouched", async () => {

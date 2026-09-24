@@ -1237,7 +1237,6 @@ export default function (pi: ExtensionAPI) {
       if (activatedSessions.has(sessionId)) {
         return { content: [text("browser_* tools are already active.")], details: { activated: false } };
       }
-      activateSession(sessionId);
       // The loadout of the request that carried this call was filtered before the
       // call could land, so the live set is still missing the fleet: put it back
       // here and the next turn of this same run can already call browser_tabs.
@@ -1248,6 +1247,10 @@ export default function (pi: ExtensionAPI) {
         const missing = missingFleetToolNames(active);
         if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
       }
+      // Flagged only once the live loadout write has landed: a throw above leaves
+      // the session un-flagged, so a retry can still finish the activation
+      // instead of the filter hiding the fleet for the rest of the session.
+      activateSession(sessionId);
       return {
         content: [
           text(
@@ -2025,8 +2028,12 @@ export default function (pi: ExtensionAPI) {
   // untouched so its prompt stays byte-identical across requests.
   pi.on("before_agent_start", async (event, ctx) => {
     if (browserToolsAlwaysOn()) return;
+    // A harness with no started session has no usable gateway either (the
+    // gateway throws there), so filtering would hide the fleet with no way back:
+    // leave such a loadout alone and keep the tools resident.
     const sessionId = ctx.sessionManager?.getSessionId?.();
-    if (sessionId && activatedSessions.has(sessionId)) return;
+    if (!sessionId) return;
+    if (activatedSessions.has(sessionId)) return;
     // `selectedTools` is optional in older pi type definitions and always
     // present from 0.87 on: treat a missing list as "nothing to filter" (an
     // older harness has no loadout to rewrite) instead of emptying it.
