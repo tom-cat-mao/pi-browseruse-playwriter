@@ -81,6 +81,28 @@ function makeCtx(sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") {
   return { sessionManager: { getSessionId: () => sessionId }, cwd: "/tmp", model: { input: ["text"] } };
 }
 
+/** The 13 dormant page tools the `browser` gateway activates. */
+const FLEET_TOOL_NAMES = [
+  "browser_profiles",
+  "browser_groups",
+  "browser_tabs",
+  "browser_navigate",
+  "browser_snapshot",
+  "browser_extract",
+  "browser_click",
+  "browser_fill",
+  "browser_evaluate",
+  "browser_screenshot",
+  "browser_network",
+  "browser_logs",
+  "browser_execute",
+];
+
+/** A before_agent_start event carrying one request's tool loadout. */
+function makeLoadoutEvent(selectedTools: string[]) {
+  return { type: "before_agent_start", systemPromptOptions: { selectedTools: [...selectedTools] } };
+}
+
 function textOf(content: ContentBlock[]): string {
   return content
     .filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -144,26 +166,10 @@ function firefoxProfile({
 }
 
 describe("extension factory registration", () => {
-  it("registers the 13 managed tools and no browser_save_as_pdf", () => {
+  it("registers the browser gateway plus the 13 dormant tools, and no browser_save_as_pdf", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
-    expect(tools.map((t) => t.name).sort()).toEqual(
-      [
-        "browser_profiles",
-        "browser_groups",
-        "browser_tabs",
-        "browser_navigate",
-        "browser_snapshot",
-        "browser_extract",
-        "browser_click",
-        "browser_fill",
-        "browser_evaluate",
-        "browser_screenshot",
-        "browser_network",
-        "browser_logs",
-        "browser_execute",
-      ].sort(),
-    );
+    expect(tools.map((t) => t.name).sort()).toEqual(["browser", ...FLEET_TOOL_NAMES].sort());
     expect(tools.some((t) => t.name === "browser_save_as_pdf")).toBe(false);
   });
 
@@ -205,7 +211,7 @@ describe("extension factory registration", () => {
       browser_execute: 1,
     });
     expect(new Set(guidelines).size).toBe(guidelines.length);
-    expect(guidelines.join("").length).toBeLessThanOrEqual(1600);
+    expect(guidelines.join("").length).toBeLessThanOrEqual(1180);
     for (const guideline of guidelines) {
       expect(guideline, guideline).toMatch(/browser_[a-z]+/);
     }
@@ -260,7 +266,8 @@ describe("extension factory registration", () => {
    * Descriptions ride in the provider's tools[] array on every request, so they
    * are resident text as well: each one states its own tool only, and the whole
    * set stays inside the measured envelope. Longer-form detail belongs to the
-   * on-demand skill, not to the schema.
+   * on-demand skill, not to the schema. The gateway's own description counts
+   * here; the fleet only pays it when a session activates the tools.
    */
   it("keeps the tool descriptions within the resident budget", () => {
     const { pi, tools } = makeMockPi();
@@ -270,7 +277,8 @@ describe("extension factory registration", () => {
       total += tool.description.length;
       expect(tool.description.length, tool.name).toBeLessThanOrEqual(520);
     }
-    expect(total).toBeLessThanOrEqual(3700);
+    // 13 fleet descriptions (3667) + the 451-char gateway = 4118.
+    expect(total).toBeLessThanOrEqual(4150);
   });
 
   it("ships the browser-use skill with the frontmatter pi needs to register it", () => {
@@ -310,6 +318,107 @@ describe("extension factory registration", () => {
     const properties = extract.parameters.properties as Record<string, { enum?: readonly string[] }>;
     expect(properties.format.enum).toEqual(["markdown", "text", "html", "assets-manifest"]);
     expect(properties.images.enum).toEqual(["none", "urls", "save"]);
+  });
+});
+
+/**
+ * The `browser` gateway keeps the fleet dormant: the request loadout is the one
+ * switch that removes a tool's schema, its <tools> snippet, and its <rules>
+ * guidelines together, so these tests drive the real before_agent_start handler
+ * that pi calls per request. Each test uses its own session id because the
+ * activation flag is session-scoped module state, and each fixture session must
+ * start dormant.
+ */
+describe("browser tool dormancy (gateway activation)", () => {
+  function beforeAgentStartHandler() {
+    const { pi, handlers } = makeMockPi();
+    factory(pi as never);
+    const handler = handlers.get("before_agent_start");
+    expect(handler).toBeTruthy();
+    return handler!;
+  }
+
+  it("filters the whole dormant fleet out of the loadout and keeps everything else", async () => {
+    const handler = beforeAgentStartHandler();
+    const event = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read", "bash"]);
+
+    await handler(event, makeCtx("session-filter"));
+
+    expect(event.systemPromptOptions.selectedTools).toEqual(["browser", "read", "bash"]);
+    for (const name of FLEET_TOOL_NAMES) {
+      expect(event.systemPromptOptions.selectedTools, name).not.toContain(name);
+    }
+  });
+
+  it("activates the fleet for the calling session only, and is idempotent", async () => {
+    const { pi, tools, handlers } = makeMockPi();
+    factory(pi as never);
+    const handler = handlers.get("before_agent_start")!;
+    const gateway = tools.find((t) => t.name === "browser")!;
+
+    const dormant = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read"]);
+    await handler(dormant, makeCtx("session-active"));
+    expect(dormant.systemPromptOptions.selectedTools).not.toContain("browser_tabs");
+
+    const first = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-active"));
+    expect(textOf(first.content)).toContain("browser_* tools are active from the next request");
+    expect(textOf(first.content)).toContain("browser_tabs discover+attach");
+
+    // The same session now keeps the whole fleet in every later request.
+    const active = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read"]);
+    await handler(active, makeCtx("session-active"));
+    expect(active.systemPromptOptions.selectedTools).toEqual([...FLEET_TOOL_NAMES, "browser", "read"]);
+
+    // Another session is untouched by that activation.
+    const other = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read"]);
+    await handler(other, makeCtx("session-other"));
+    expect(other.systemPromptOptions.selectedTools).toEqual(["browser", "read"]);
+
+    const again = await gateway.execute("call-2", {}, undefined, undefined, makeCtx("session-active"));
+    expect(textOf(again.content)).toBe("browser_* tools are already active.");
+  });
+
+  it("never filters when PI_BROWSER_TOOLS=always", async () => {
+    const { pi, tools, handlers } = makeMockPi();
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+    vi.stubEnv("PI_BROWSER_TOOLS", "always");
+    try {
+      const event = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read"]);
+      await handlers.get("before_agent_start")!(event, makeCtx("session-always"));
+      expect(event.systemPromptOptions.selectedTools).toEqual([...FLEET_TOOL_NAMES, "browser", "read"]);
+
+      const result = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-always"));
+      expect(textOf(result.content)).toBe("browser_* tools are already active (PI_BROWSER_TOOLS=always).");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  /**
+   * Dormant is not free: whatever survives the filter is paid on every request
+   * of a browser-less session, so the resident browser text (the gateway's
+   * description + snippet + guidelines) gets its own ceiling.
+   */
+  it("keeps the dormant resident browser text small", async () => {
+    const { pi, tools, handlers } = makeMockPi();
+    factory(pi as never);
+    const event = makeLoadoutEvent([...FLEET_TOOL_NAMES, "browser", "read", "bash"]);
+    await handlers.get("before_agent_start")!(event, makeCtx("session-budget"));
+
+    const resident = event.systemPromptOptions.selectedTools!;
+    expect(resident).toContain("browser");
+    const residentChars = tools
+      .filter((tool) => resident.includes(tool.name))
+      .reduce(
+        (total, tool) =>
+          total +
+          tool.description.length +
+          (tool.promptSnippet?.length ?? 0) +
+          (tool.promptGuidelines ?? []).join("").length,
+        0,
+      );
+    expect(residentChars).toBeLessThanOrEqual(600);
   });
 });
 
