@@ -9,7 +9,9 @@ import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import factory from "../extensions/index.ts";
 import * as bootstrap from "../extensions/bootstrap.ts";
+import { fillForm, MAX_FILL_FORM_FIELDS, validateFillFormFields, type FillFormValidation } from "../extensions/fill-form.ts";
 import { PageContextStore } from "../extensions/page-context.ts";
+import { BrowserRuntimeClient } from "../extensions/runtime-client.ts";
 import { startTestServer, validCapabilities, validProfile, type TestServer } from "./test-server.ts";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -91,7 +93,7 @@ function makeCtx(sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") {
   return { sessionManager: { getSessionId: () => sessionId }, cwd: "/tmp", model: { input: ["text"] } };
 }
 
-/** The 13 dormant page tools the `browser` gateway activates. */
+/** The 14 dormant page tools the `browser` gateway activates. */
 const FLEET_TOOL_NAMES = [
   "browser_profiles",
   "browser_groups",
@@ -101,6 +103,7 @@ const FLEET_TOOL_NAMES = [
   "browser_extract",
   "browser_click",
   "browser_fill",
+  "browser_fill_form",
   "browser_evaluate",
   "browser_screenshot",
   "browser_network",
@@ -176,7 +179,7 @@ function firefoxProfile({
 }
 
 describe("extension factory registration", () => {
-  it("registers the browser gateway plus the 13 dormant tools, and no browser_save_as_pdf", () => {
+  it("registers the browser gateway plus the 14 dormant tools, and no browser_save_as_pdf", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     expect(tools.map((t) => t.name).sort()).toEqual(["browser", ...FLEET_TOOL_NAMES].sort());
@@ -204,10 +207,11 @@ describe("extension factory registration", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
     const guidelines = tools.flatMap((tool) => tool.promptGuidelines ?? []);
-    expect(guidelines.length).toBe(6);
+    expect(guidelines.length).toBe(7);
     // The split is deliberate: one guideline each for the id chain and tabs, two
-    // for the snapshot/ref loop, one for cancellation. Adding a tool with
-    // guidelines in one place and forgetting the other is the regression here.
+    // for the snapshot/ref loop plus the act-without-a-snapshot shortcut, one for
+    // cancellation. Adding a tool with guidelines in one place and forgetting the
+    // other is the regression here.
     const counts = new Map<string, number>();
     for (const tool of tools) {
       const count = tool.promptGuidelines?.length ?? 0;
@@ -217,11 +221,12 @@ describe("extension factory registration", () => {
       browser_profiles: 1,
       browser_groups: 1,
       browser_tabs: 1,
-      browser_snapshot: 2,
+      browser_snapshot: 3,
       browser_execute: 1,
     });
     expect(new Set(guidelines).size).toBe(guidelines.length);
-    expect(guidelines.join("").length).toBeLessThanOrEqual(1180);
+    // 7 guidelines of measured resident text (1452 chars).
+    expect(guidelines.join("").length).toBeLessThanOrEqual(1500);
     for (const guideline of guidelines) {
       expect(guideline, guideline).toMatch(/browser_[a-z]+/);
     }
@@ -287,8 +292,8 @@ describe("extension factory registration", () => {
       total += tool.description.length;
       expect(tool.description.length, tool.name).toBeLessThanOrEqual(520);
     }
-    // 13 fleet descriptions (3655 chars) + the gateway (449) = 4104 chars.
-    expect(total).toBeLessThanOrEqual(4150);
+    // 14 fleet descriptions (4265 chars) + the gateway (468) = 4733 chars.
+    expect(total).toBeLessThanOrEqual(4800);
   });
 
   it("ships the browser-use skill with the frontmatter pi needs to register it", () => {
@@ -318,6 +323,37 @@ describe("extension factory registration", () => {
     expect(Object.keys(click.parameters.properties ?? {}).sort()).toEqual(["selector", "snapshotId", "tabId"].sort());
   });
 
+  it("declares browser_snapshot with the tree window plus interactiveOnly", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const snapshot = tools.find((t) => t.name === "browser_snapshot")!;
+    expect(Object.keys(snapshot.parameters.properties ?? {}).sort()).toEqual(
+      ["full", "interactiveOnly", "search", "selector", "tabId"].sort(),
+    );
+  });
+
+  /**
+   * Acting tools take plain selectors, so a nameable control needs no snapshot
+   * round-trip. The engines the runtime accepts belong to the acting tool's own
+   * description; the orchestration ("skip the snapshot") belongs to the cross-tool
+   * guidelines. Losing either half is invisible until the model pays for a
+   * snapshot it did not need, or fails to find one it does.
+   */
+  it("documents plain Playwright selectors on the acting tools and the skip-snapshot rule in the guidelines", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const descriptionOf = (name: string): string => tools.find((tool) => tool.name === name)!.description;
+
+    for (const name of ["browser_click", "browser_fill"]) {
+      expect(descriptionOf(name), name).toContain("text=");
+      expect(descriptionOf(name), name).toContain("role=");
+      expect(descriptionOf(name), name).toContain("no snapshot");
+    }
+    const snapshotGuidelines = tools.find((tool) => tool.name === "browser_snapshot")!.promptGuidelines!.join("\n");
+    expect(snapshotGuidelines).toContain("Skip browser_snapshot");
+    expect(snapshotGuidelines).toContain("snapshot→ref");
+  });
+
   it("declares browser_extract with tabId plus the extraction window, images and export options", () => {
     const { pi, tools } = makeMockPi();
     factory(pi as never);
@@ -328,6 +364,28 @@ describe("extension factory registration", () => {
     const properties = extract.parameters.properties as Record<string, { enum?: readonly string[] }>;
     expect(properties.format.enum).toEqual(["markdown", "text", "html", "assets-manifest"]);
     expect(properties.images.enum).toEqual(["none", "urls", "save"]);
+  });
+
+  /**
+   * The batch tool takes an array, and its size bound lives in the schema as
+   * well as in the module: a drift between the two would either reject a legal
+   * batch in Pi or let an unbounded one through to the runtime.
+   */
+  it("declares browser_fill_form with tabId plus a bounded fields array of {selector, value}", () => {
+    const { pi, tools } = makeMockPi();
+    factory(pi as never);
+    const fillForm = tools.find((t) => t.name === "browser_fill_form")!;
+    expect(Object.keys(fillForm.parameters.properties ?? {}).sort()).toEqual(["fields", "tabId"]);
+    const fields = (fillForm.parameters.properties as Record<string, {
+      type?: string;
+      minItems?: number;
+      maxItems?: number;
+      items?: { required?: string[] };
+    }>).fields;
+    expect(fields.type).toBe("array");
+    expect(fields.minItems).toBe(1);
+    expect(fields.maxItems).toBe(30);
+    expect(fields.items?.required).toEqual(["selector", "value"]);
   });
 });
 
@@ -341,6 +399,23 @@ describe("extension factory registration", () => {
  * each fixture session must start dormant.
  */
 describe("browser tool dormancy (gateway activation)", () => {
+  // Activation warms the shared runtime in the background, so every test here
+  // points the runtime client at a fixture listener: a unit test must never probe
+  // — let alone launch on — the real default port.
+  let server: TestServer;
+  const savedEnv = { ...process.env };
+
+  beforeEach(async () => {
+    server = await startTestServer(() => ({ json: validCapabilities }));
+    process.env.PI_BROWSER_HOST = server.baseUrl;
+    bootstrap.reset();
+  });
+  afterEach(async () => {
+    await server.close();
+    process.env = { ...savedEnv };
+    bootstrap.reset();
+  });
+
   function beforeAgentStartHandler() {
     const { pi, handlers } = makeMockPi();
     factory(pi as never);
@@ -511,6 +586,63 @@ describe("browser tool dormancy (gateway activation)", () => {
       );
     expect(residentChars).toBeLessThanOrEqual(600);
   });
+
+  /**
+   * Activation arms the fleet first and warms the runtime afterwards: the
+   * gateway result must not wait for the probe, and the one warm-up per session
+   * is never repeated by an idempotent activation.
+   */
+  it("warms the runtime in the background instead of blocking activation", async () => {
+    let capabilitiesServed = false;
+    server.setHandler(async (req) => {
+      if (req.url.endsWith("/capabilities")) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        capabilitiesServed = true;
+        return { json: validCapabilities };
+      }
+      return { json: {} };
+    });
+    const { pi, tools } = makeMockPi(["browser", "read"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+    const ctx = makeCtx("session-warm");
+
+    const result = await gateway.execute("call-1", {}, undefined, undefined, ctx);
+
+    expect(textOf(result.content)).toContain("browser_* tools are now active.");
+    // The probe was still in flight when activation returned.
+    expect(capabilitiesServed).toBe(false);
+    await vi.waitFor(() => {
+      expect(capabilitiesServed).toBe(true);
+    });
+    // The warm-up memoized its result, so a later test cannot observe a write
+    // this one left in flight (the fixture is closed in afterEach).
+    await vi.waitFor(() => {
+      expect(bootstrap.boundCapabilities()).not.toBeNull();
+    });
+    await gateway.execute("call-2", {}, undefined, undefined, ctx);
+    expect(server.requests.filter((r) => r.url.endsWith("/capabilities"))).toHaveLength(1);
+  });
+
+  /**
+   * A broken runtime must not fail the activation that found it: the warm-up
+   * swallows its own failure (no unhandled rejection) and memoizes nothing, so
+   * the first real tool call still tries and reports the runtime's own error.
+   */
+  it("activates even when the runtime answers but is unusable", async () => {
+    server.setHandler(() => ({ json: { hello: "not a runtime" } }));
+    const { pi, tools } = makeMockPi(["browser", "read"]);
+    factory(pi as never);
+    const gateway = tools.find((t) => t.name === "browser")!;
+
+    const result = await gateway.execute("call-1", {}, undefined, undefined, makeCtx("session-cold"));
+
+    expect(textOf(result.content)).toContain("browser_* tools are now active.");
+    await vi.waitFor(() => {
+      expect(server.requests.filter((r) => r.url.endsWith("/capabilities"))).toHaveLength(1);
+    });
+    expect(bootstrap.boundCapabilities()).toBeNull();
+  });
 });
 
 describe("tool execution shaping (real HTTP runtime)", () => {
@@ -600,6 +732,24 @@ describe("tool execution shaping (real HTTP runtime)", () => {
     const t = textOf(res.content);
     expect(t).toContain("snap-1");
     expect(t).toContain("aria-ref=e5");
+  });
+
+  it("passes interactiveOnly to page.snapshot and omits it when unset", async () => {
+    runtimeHandler(() => ({ text: "- button \"Login\" [aria-ref=e5]", snapshotId: "snap-1" }));
+    const snap = toolByName("browser_snapshot");
+
+    await snap.execute("call-snap-1", { tabId: "tab-7", interactiveOnly: true }, undefined, undefined, makeCtx());
+    expect(server.requests.find((r) => r.url === "/browser/v1/request")?.body).toMatchObject({
+      operation: { kind: "page.snapshot", tabId: "tab-7", interactiveOnly: true },
+    });
+
+    await snap.execute("call-snap-2", { tabId: "tab-7" }, undefined, undefined, makeCtx());
+    const posts = server.requests.filter((r) => r.url === "/browser/v1/request");
+    // Unset means absent, never `interactiveOnly: false` on the wire.
+    expect((posts.at(-1)?.body as { operation: unknown }).operation).toEqual({
+      kind: "page.snapshot",
+      tabId: "tab-7",
+    });
   });
 
   it("surfaces an evaluate value into content", async () => {
@@ -2413,6 +2563,500 @@ describe("tool execution shaping (real HTTP runtime)", () => {
       profiles: Array<{ capabilities: Record<string, unknown> }>;
     };
     expect(content.profiles[0].capabilities).not.toHaveProperty("features");
+  });
+
+  /**
+   * browser_fill_form is the one tool that composes several runtime ops. It must
+   * resolve EVERY strict selector before the first fill, give each op its own
+   * requestId (the relay dedups by sessionId+requestId and rejects a reused id
+   * with a different payload), and report per-field outcomes — including the
+   * fields it never reached.
+   */
+  describe("browser_fill_form", () => {
+    type WireOp = {
+      requestId: string;
+      operation: { kind: string; selector?: string; value?: string; snapshotId?: string };
+    };
+    type FieldOutcome = { selector: string; status: string; error?: string };
+    type Report = {
+      status: string;
+      filled: number;
+      failed: number;
+      notAttempted: number;
+      issue?: string;
+      fields: FieldOutcome[];
+    };
+
+    const batchTabId = "tab-batch";
+    const batchPageInfo = { tabId: batchTabId, url: "https://example.com/signup", title: "Sign up" };
+
+    /** Wire runtime for the batch: per-selector resolution and fill verdicts. */
+    function batchHandler({
+      resolveFailure,
+      resolveError,
+      fillFailure,
+    }: {
+      resolveFailure?: (selector: string) => string | undefined;
+      /** A batch-level refusal of the probe itself (e.g. unsupported-capability). */
+      resolveError?: { code: string; message: string; outcome?: "not-started" | "unknown" };
+      fillFailure?: (
+        selector: string,
+      ) => { message: string; code?: string; outcome?: "not-started" | "unknown" } | undefined;
+    } = {}) {
+      server.setHandler((req) => {
+        if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+        if (req.url.endsWith("/profiles")) return { json: { profiles: [validProfile] } };
+        const body = req.body as WireOp;
+        const selector = body.operation.selector ?? "";
+        if (body.operation.kind === "page.extract") {
+          if (resolveError) {
+            return {
+              json: {
+                requestId: body.requestId,
+                ok: false,
+                error: {
+                  code: resolveError.code,
+                  message: resolveError.message,
+                  outcome: resolveError.outcome ?? "not-started",
+                },
+              },
+            };
+          }
+          const message = resolveFailure?.(selector);
+          if (message) {
+            return {
+              json: {
+                requestId: body.requestId,
+                ok: false,
+                error: { code: "execution-failed", message, outcome: "not-started" },
+              },
+            };
+          }
+          return {
+            json: {
+              requestId: body.requestId,
+              ok: true,
+              data: { text: '<input id="a">', pageInfo: batchPageInfo },
+            },
+          };
+        }
+        if (body.operation.kind === "page.fill") {
+          const failure = fillFailure?.(selector);
+          if (failure) {
+            return {
+              json: {
+                requestId: body.requestId,
+                ok: false,
+                error: {
+                  code: failure.code ?? "execution-failed",
+                  message: failure.message,
+                  outcome: failure.outcome ?? "not-started",
+                },
+              },
+            };
+          }
+          return {
+            json: {
+              requestId: body.requestId,
+              ok: true,
+              data: { text: "Filled the selected element", value: { url: batchPageInfo.url }, pageInfo: batchPageInfo },
+            },
+          };
+        }
+        return {
+          json: {
+            requestId: body.requestId,
+            ok: false,
+            error: { code: "invalid-request", message: `unexpected ${body.operation.kind}`, outcome: "not-started" },
+          },
+        };
+      });
+    }
+
+    /** The page ops actually sent, in wire order. */
+    function wireOps(): WireOp[] {
+      return server.requests
+        .filter((request) => request.url === "/browser/v1/request")
+        .map((request) => request.body as WireOp);
+    }
+
+    function wireKinds(): string[] {
+      return wireOps().map((op) => op.operation.kind);
+    }
+
+    /** The batch report is the text block after the one-line summary. */
+    function reportOf(content: ContentBlock[]): Report {
+      const texts = content.filter((c): c is { type: "text"; text: string } => c.type === "text");
+      return JSON.parse(texts[1].text) as Report;
+    }
+
+    function fieldsOf(...selectors: string[]): Array<{ selector: string; value: string }> {
+      return selectors.map((selector) => {
+        return { selector, value: `value for ${selector}` };
+      });
+    }
+
+    function textBlocks(content: ContentBlock[]): string[] {
+      return content.filter((c): c is { type: "text"; text: string } => c.type === "text").map((c) => c.text);
+    }
+
+    it("resolves every selector before the first fill, one unique requestId per op", async () => {
+      batchHandler();
+      const tool = toolByName("browser_fill_form");
+      const selectors = ["#name", 'role=textbox[name="Email"]', "text=Company"];
+      const result = await tool.execute(
+        "call-fill-form",
+        { tabId: batchTabId, fields: fieldsOf(...selectors) },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+
+      expect(wireKinds()).toEqual(["page.extract", "page.extract", "page.extract", "page.fill", "page.fill", "page.fill"]);
+      const ops = wireOps();
+      expect(new Set(ops.map((op) => op.requestId)).size).toBe(ops.length);
+      expect(ops.filter((op) => op.operation.kind === "page.fill").map((op) => op.operation.selector)).toEqual(selectors);
+      // Plain selectors only: no op of the batch may carry a snapshotId.
+      expect(ops.every((op) => op.operation.snapshotId === undefined)).toBe(true);
+
+      const report = reportOf(result.content);
+      expect(report.status).toBe("filled");
+      expect(report.filled).toBe(3);
+      expect(report.failed).toBe(0);
+      expect(report.notAttempted).toBe(0);
+      expect(report.fields.map((field) => field.status)).toEqual(["filled", "filled", "filled"]);
+      expect(textBlocks(result.content)[0]).toContain("Filled all 3 field(s)");
+      // The report carries selectors and outcomes, never the field values.
+      expect(textOf(result.content)).not.toContain("value for #name");
+      expect(result.details.pageInfo).toEqual(batchPageInfo);
+    });
+
+    it("fills NOTHING and reports every unresolved selector when any selector fails", async () => {
+      batchHandler({
+        resolveFailure: (selector) => {
+          if (selector === "#missing") return "Timeout 5000ms exceeded waiting for locator('#missing')";
+          if (selector === ".ambiguous") return "strict mode violation: locator('.ambiguous') resolved to 2 elements";
+          return undefined;
+        },
+      });
+      const tool = toolByName("browser_fill_form");
+      const result = await tool.execute(
+        "call-reject",
+        { tabId: batchTabId, fields: fieldsOf("#ok", "#missing", ".ambiguous") },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+
+      expect(wireKinds()).toEqual(["page.extract", "page.extract", "page.extract"]);
+      const report = reportOf(result.content);
+      expect(report.status).toBe("rejected");
+      expect(report.filled).toBe(0);
+      expect(report.failed).toBe(2);
+      expect(report.notAttempted).toBe(1);
+      expect(report.fields.map((field) => field.status)).toEqual(["not-attempted", "failed", "failed"]);
+      // Every failing selector is reported, with the runtime's own code/outcome.
+      expect(report.fields[1].error).toContain("#missing");
+      expect(report.fields[1].error).toContain("code=execution-failed");
+      expect(report.fields[2].error).toContain("resolved to 2 elements");
+      const text = textBlocks(result.content)[0];
+      expect(text).toContain("Nothing was filled");
+      expect(text).toContain("2 of 3 selector(s) did not resolve");
+      // The summary already opens with "Nothing was filled": the issue must not
+      // repeat it.
+      expect(report.issue).toBe("2 of 3 selector(s) did not resolve to exactly one element");
+    });
+
+    it("rejects snapshot refs before sending a single page op", async () => {
+      batchHandler();
+      const tool = toolByName("browser_fill_form");
+      const result = await tool.execute(
+        "call-refs",
+        { tabId: batchTabId, fields: fieldsOf("#plain", "aria-ref=e3", "  @e5") },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+
+      expect(wireOps()).toEqual([]);
+      const report = reportOf(result.content);
+      expect(report.status).toBe("rejected");
+      expect(report.issue).toContain("snapshot refs are not supported");
+      expect(report.issue).toContain("aria-ref=e3");
+      expect(report.issue).toContain("@e5");
+      expect(report.fields).toHaveLength(3);
+      expect(report.fields.every((field) => field.status === "not-attempted")).toBe(true);
+      expect(textBlocks(result.content)[0]).toContain("Nothing was filled");
+    });
+
+    it("stops at the first failed fill and reports filled / failed / not attempted", async () => {
+      batchHandler({
+        fillFailure: (selector) => {
+          return selector === "#email" ? { message: "Element is not editable" } : undefined;
+        },
+      });
+      const tool = toolByName("browser_fill_form");
+      const result = await tool.execute(
+        "call-stop",
+        { tabId: batchTabId, fields: fieldsOf("#name", "#email", "#phone") },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+
+      // The third field is never sent: the page is no longer the state its
+      // selector was resolved against.
+      expect(wireKinds()).toEqual(["page.extract", "page.extract", "page.extract", "page.fill", "page.fill"]);
+      const report = reportOf(result.content);
+      expect(report.status).toBe("partial");
+      expect(report.filled).toBe(1);
+      expect(report.failed).toBe(1);
+      expect(report.notAttempted).toBe(1);
+      expect(report.fields.map((field) => field.status)).toEqual(["filled", "failed", "not-attempted"]);
+      expect(report.fields[1].error).toContain("not editable");
+      const text = textBlocks(result.content)[0];
+      expect(text).toContain("stopped at field 2");
+      expect(text).toContain("the 1 field(s) after it were not attempted");
+    });
+
+    it("carries outcome=unknown through and says the fill may have partially applied", async () => {
+      batchHandler({
+        fillFailure: () => {
+          return { message: "request aborted before a response arrived", code: "outcome-unknown", outcome: "unknown" };
+        },
+      });
+      const tool = toolByName("browser_fill_form");
+      const result = await tool.execute(
+        "call-unknown",
+        { tabId: batchTabId, fields: fieldsOf("#a") },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+
+      const report = reportOf(result.content);
+      expect(report.status).toBe("failed");
+      expect(report.filled).toBe(0);
+      expect(report.fields[0].error).toContain("code=outcome-unknown");
+      expect(report.fields[0].error).toContain("outcome=unknown");
+      expect(textBlocks(result.content)[2]).toContain("may have partially applied");
+      expect(result.details.partiallyApplied).toBe(true);
+    });
+
+    it("refuses an empty batch, an oversize batch and an empty selector without a page op", async () => {
+      batchHandler();
+      const tool = toolByName("browser_fill_form");
+      const oversize = Array.from({ length: 31 }, (_unused, index) => {
+        return { selector: `#field-${index}`, value: "x" };
+      });
+      const cases: Array<{ toolCallId: string; fields: unknown[]; expected: string }> = [
+        { toolCallId: "call-empty", fields: [], expected: "at least one" },
+        { toolCallId: "call-oversize", fields: oversize, expected: "limited to 30" },
+        { toolCallId: "call-blank", fields: [{ selector: "   ", value: "x" }], expected: "empty selector" },
+      ];
+
+      for (const testCase of cases) {
+        const result = await tool.execute(
+          testCase.toolCallId,
+          { tabId: batchTabId, fields: testCase.fields },
+          undefined,
+          undefined,
+          makeCtx(),
+        );
+        const report = reportOf(result.content);
+        expect(report.status, testCase.toolCallId).toBe("rejected");
+        expect(report.issue, testCase.toolCallId).toContain(testCase.expected);
+      }
+      expect(wireOps()).toEqual([]);
+    });
+
+    it("fails the call on a transport failure during resolution instead of blaming every selector", async () => {
+      server.setHandler((req) => {
+        if (req.url.endsWith("/capabilities")) return { json: validCapabilities };
+        if (req.url.endsWith("/profiles")) return { json: { profiles: [validProfile] } };
+        return { status: 503, json: { error: "unavailable" } };
+      });
+      const tool = toolByName("browser_fill_form");
+
+      await expect(
+        tool.execute(
+          "call-transport",
+          { tabId: batchTabId, fields: fieldsOf("#a", "#b") },
+          undefined,
+          undefined,
+          makeCtx(),
+        ),
+      ).rejects.toThrow(/filled nothing: resolving field 1 \("#a"\) failed/);
+      // The batch stops at the first transport failure: no second resolve, no fill.
+      expect(wireKinds()).toEqual(["page.extract"]);
+    });
+
+    it("fails the call when the probe itself is unsupported instead of blaming every selector", async () => {
+      batchHandler({
+        resolveError: {
+          code: "unsupported-capability",
+          message: "Firefox profile does not support page.extract",
+          outcome: "not-started",
+        },
+      });
+      const tool = toolByName("browser_fill_form");
+
+      await expect(
+        tool.execute(
+          "call-unsupported",
+          { tabId: batchTabId, fields: fieldsOf("#a", "#b") },
+          undefined,
+          undefined,
+          makeCtx(),
+        ),
+      ).rejects.toThrow(
+        'filled nothing: resolving field 1 ("#a") failed — Firefox profile does not support page.extract · code=unsupported-capability · outcome=not-started',
+      );
+      // The refusal is about the probe, not the selectors: one attempt, no fill,
+      // and no per-field blame hiding the real cause.
+      expect(wireKinds()).toEqual(["page.extract"]);
+    });
+
+    it("stops the resolve pass at its batch budget and blames only the fields it never probed", async () => {
+      const probeDelayMs = 250;
+      // Every probe costs at least 250ms, so a 600ms budget trips before the
+      // sixth field instead of burning 30 selector timeouts on a broken batch.
+      server.setHandler(async (req) => {
+        const body = req.body as WireOp;
+        if (body.operation.kind === "page.extract") {
+          await new Promise((resolve) => {
+            setTimeout(resolve, probeDelayMs);
+          });
+          return {
+            json: { requestId: body.requestId, ok: true, data: { text: '<input id="a">', pageInfo: batchPageInfo } },
+          };
+        }
+        return {
+          json: { requestId: body.requestId, ok: true, data: { text: "Filled", pageInfo: batchPageInfo } },
+        };
+      });
+
+      // Driven through the exported batch: the budget is internal, not a
+      // tool-schema knob.
+      const result = await fillForm({
+        client: new BrowserRuntimeClient({ baseUrl: server.baseUrl }),
+        sessionId: "session-budget",
+        cwd: undefined,
+        signal: undefined,
+        toolCallId: "call-budget",
+        tabId: batchTabId,
+        fields: fieldsOf("#a", "#b", "#c", "#d", "#e", "#f"),
+        resolveBudgetMs: 600,
+      });
+
+      const report = reportOf(result.content);
+      // Timing: probes at ~0/250/500ms, the next check trips at ~750ms.
+      const extracts = wireKinds().filter((kind) => kind === "page.extract");
+      expect(extracts.length).toBeGreaterThan(0);
+      expect(extracts.length).toBeLessThan(6);
+      expect(wireKinds()).not.toContain("page.fill");
+      expect(report.status).toBe("rejected");
+      expect(report.filled).toBe(0);
+      // One probe per field the budget did not cut off: the un-probed tail is
+      // blamed with the budget, the probed prefix stays un-attempted.
+      expect(report.notAttempted).toBe(extracts.length);
+      const stopped = report.fields.filter((field) => {
+        return field.status === "failed";
+      });
+      expect(stopped).toHaveLength(6 - extracts.length);
+      for (const field of stopped) {
+        expect(field.error).toContain("resolution stopped early: exceeded the 0.6s batch resolve budget");
+      }
+    });
+
+    it("renders the batch row and the folded call line from its report", async () => {
+      batchHandler({
+        fillFailure: (selector) => {
+          return selector === "#email" ? { message: "Element is not editable" } : undefined;
+        },
+      });
+      const tool = toolByName("browser_fill_form");
+      const result = await tool.execute(
+        "call-render",
+        { tabId: batchTabId, fields: fieldsOf("#name", "#email", "#phone") },
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+
+      const row = renderResultText(tool, result, { expanded: false, args: { tabId: batchTabId } });
+      expect(row).toContain("filled 1/3 field(s)");
+      const call = renderCallText(tool, { tabId: batchTabId, fields: fieldsOf("#name", "#email") }, false);
+      expect(call).toContain("2 field(s)");
+    });
+  });
+});
+
+/**
+ * Field validation runs before any runtime call, so it is testable on its own:
+ * refs, empty selectors and size are refused with a reason that names what was
+ * wrong instead of a bare "invalid".
+ */
+describe("fill-form field validation", () => {
+  function problemOf(result: FillFormValidation): string {
+    if (result.ok) throw new Error("expected the batch to be rejected");
+    return result.problem;
+  }
+
+  it("accepts plain strict selectors, including empty values and engine selectors", () => {
+    expect(
+      validateFillFormFields({
+        fields: [
+          { selector: "#a", value: "x" },
+          { selector: 'role=textbox[name="Email"]', value: "" },
+          { selector: "text=Sign in", value: "x" },
+          { selector: "internal:label=Phone", value: "x" },
+        ],
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("rejects every snapshot-ref form and names them, keeping plain selectors out of it", () => {
+    const problem = problemOf(
+      validateFillFormFields({
+        fields: [
+          { selector: "aria-ref=e3", value: "x" },
+          { selector: "  @e5", value: "x" },
+        ],
+      }),
+    );
+    expect(problem).toContain("snapshot refs are not supported");
+    expect(problem).toContain("aria-ref=e3");
+    expect(problem).toContain("@e5");
+    expect(problem).toContain("every fill invalidates the latest snapshot");
+  });
+
+  it("rejects an empty batch and one over the per-call size", () => {
+    expect(problemOf(validateFillFormFields({ fields: [] }))).toContain("at least one");
+    const oversize = Array.from({ length: MAX_FILL_FORM_FIELDS + 1 }, (_unused, index) => {
+      return { selector: `#field-${index}`, value: "x" };
+    });
+    expect(problemOf(validateFillFormFields({ fields: oversize }))).toContain(`limited to ${MAX_FILL_FORM_FIELDS}`);
+    expect(
+      validateFillFormFields({
+        fields: Array.from({ length: MAX_FILL_FORM_FIELDS }, (_unused, index) => {
+          return { selector: `#field-${index}`, value: "x" };
+        }),
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("rejects an empty selector by its 1-based position", () => {
+    const problem = problemOf(
+      validateFillFormFields({
+        fields: [
+          { selector: "#a", value: "x" },
+          { selector: "   ", value: "x" },
+          { selector: "#c", value: "x" },
+        ],
+      }),
+    );
+    expect(problem).toContain("field(s) 2 have an empty selector");
   });
 });
 

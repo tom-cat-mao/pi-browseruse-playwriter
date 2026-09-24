@@ -53,6 +53,7 @@ import type {
 } from "@tom-cat/pi-browser-runtime/browser-protocol";
 import * as runtime from "./bootstrap.ts";
 import { RuntimeRequestError, type BrowserRuntimeClient } from "./runtime-client.ts";
+import { fillForm, MAX_FILL_FORM_FIELDS } from "./fill-form.ts";
 import {
   byteLen,
   clampBytes,
@@ -1220,7 +1221,7 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Activate this session's browser tools (browser_profiles, browser_groups, browser_tabs, browser_navigate, " +
-      "browser_snapshot, browser_extract, browser_click, browser_fill, browser_evaluate, browser_screenshot, " +
+      "browser_snapshot, browser_extract, browser_click, browser_fill, browser_fill_form, browser_evaluate, browser_screenshot, " +
       "browser_network, browser_logs, browser_execute). They stay dormant to keep the prompt small — call this first " +
       "whenever the task involves the user's browser tabs or pages: reading, driving, filling forms, or extracting " +
       "web content. Idempotent.",
@@ -1251,6 +1252,11 @@ export default function (pi: ExtensionAPI) {
       // the session un-flagged, so a retry can still finish the activation
       // instead of the filter hiding the fleet for the rest of the session.
       activateSession(sessionId);
+      // Once per session, warm the shared runtime in the background so the first
+      // real browser tool call does not pay the cold start. Fire-and-forget:
+      // activation neither waits for it nor fails when the runtime is down — the
+      // next tool call awaits the same shared launch anyway.
+      void runtime.ensureRuntime().catch(() => {});
       return {
         content: [
           text(
@@ -1520,7 +1526,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Read a managed tab as a readable accessibility tree with element refs (aria-ref=eN). Default is the readable " +
       "tree, not interactive-only, so it can be large — narrow with search or a strict CSS selector matching one " +
-      "element. Output is bounded; full asks for the whole tree.",
+      "element, or interactiveOnly for just the actionable controls. Output is bounded; full asks for the whole tree.",
     promptSnippet: "Read a managed tab as an accessibility tree",
     promptGuidelines: [
       "browser_snapshot owns the refs: browser_click/browser_fill need an aria-ref=eN plus the snapshotId it came " +
@@ -1528,12 +1534,16 @@ export default function (pi: ExtensionAPI) {
       "the next ref action.",
       "Work observe → act → observe: browser_navigate/browser_snapshot to load and read, one acting tool, then a " +
       "fresh snapshot or evaluate to verify — pages change, so never chain blindly or re-click a dead control.",
+      "Skip browser_snapshot when browser_click/browser_fill have a nameable target (visible text, role, or label): " +
+      "call the acting tool directly with a strict selector; use snapshot→ref when the page is unknown, you must read " +
+      "content, or a strict selector errors, then snapshot to find the right target.",
     ],
     parameters: Type.Object({
       tabId: Type.String({ description: "Managed tab" }),
       search: Type.Optional(Type.String({ description: "node text filter" })),
       selector: Type.Optional(Type.String({ description: "CSS scope" })),
       full: Type.Optional(Type.Boolean({ description: "whole tree" })),
+      interactiveOnly: Type.Optional(Type.Boolean({ description: "only actionable controls" })),
     }),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       return run({
@@ -1546,11 +1556,12 @@ export default function (pi: ExtensionAPI) {
           ...(params.search ? { search: params.search } : {}),
           ...(params.selector ? { selector: params.selector } : {}),
           ...(params.full ? { full: params.full } : {}),
+          ...(params.interactiveOnly ? { interactiveOnly: params.interactiveOnly } : {}),
         },
       });
     },
     renderCall: makeRenderCall("browser snapshot", (a) =>
-      `[${shortId(a.tabId)}]${a.selector ? ` selector=${preview(a.selector, 40)}` : ""}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.full ? " full" : ""}`,
+      `[${shortId(a.tabId)}]${a.selector ? ` selector=${preview(a.selector, 40)}` : ""}${a.search ? ` search=${preview(a.search, 32)}` : ""}${a.full ? " full" : ""}${a.interactiveOnly ? " interactive-only" : ""}`,
     ),
     renderResult: makeRenderResult((view) => {
       const lines = view.text ? view.text.split("\n").length : 0;
@@ -1740,8 +1751,8 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Click",
     description:
       "Click an element in a managed tab. Pass either a snapshot ref (aria-ref=eN or @eN) with the snapshotId it came " +
-      "from, or a plain CSS/role selector. Selectors match strictly — zero or multiple matches is an error, never a " +
-      "guess.",
+      "from, or a plain Playwright selector — CSS, text=, or role= — which needs no snapshot. Selectors match " +
+      "strictly — zero or multiple matches is an error, never a guess.",
     promptSnippet: "Click an element by ref or CSS selector",
     parameters: Type.Object({
       tabId: Type.String({ description: "Managed tab" }),
@@ -1772,8 +1783,8 @@ export default function (pi: ExtensionAPI) {
     label: "Browser Fill",
     description:
       "Set text into an input/textarea/contenteditable; existing content is replaced. Target by " +
-      "snapshot ref (aria-ref=eN / @eN with its snapshotId) or a strict selector matching one element. To append, " +
-      "read the value with browser_evaluate, concatenate and fill that.",
+      "snapshot ref (aria-ref=eN / @eN with its snapshotId) or a plain Playwright selector — CSS, text=, or role= — " +
+      "matching one element with no snapshot. To append, read the value with browser_evaluate, concatenate and fill that.",
     promptSnippet: "Fill inputs and rich-text editors",
     parameters: Type.Object({
       tabId: Type.String({ description: "Managed tab" }),
@@ -1799,6 +1810,59 @@ export default function (pi: ExtensionAPI) {
       `[${shortId(a.tabId)}] ${preview(a.selector, 48)} ← "${preview(a.value, 40)}"`,
     ),
     renderResult: makeRenderResult((view) => `✓ filled${pageSuffix(view)}`),
+  });
+
+  // --- page: fill form (one deterministic batch) ----------------------------
+  // Composition lives in fill-form.ts: resolve every strict selector first, then
+  // one page.fill per field. Nothing here decides anything — it hands the batch
+  // the runtime client and the session identity.
+
+  pi.registerTool({
+    name: "browser_fill_form",
+    label: "Browser Fill Form",
+    description:
+      "Fill many fields of one form in one deterministic call. Every strict selector (CSS, or text=/role=/internal:label= " +
+      "as browser_fill takes on that tab) is resolved before anything is typed: if one matches zero or more than one element, " +
+      "nothing is filled and every failing selector is reported. Then one page.fill per field, in order (max 30). No snapshot " +
+      "refs (aria-ref=eN / @eN). Stops at the first failed fill; outcome=unknown may have partially applied.",
+    promptSnippet: "Fill many fields of one form in one deterministic batch",
+    parameters: Type.Object({
+      tabId: Type.String({ description: "Managed tab" }),
+      fields: Type.Array(
+        Type.Object({
+          selector: Type.String({ description: "strict CSS/text=/role=/internal:label=" }),
+          value: Type.String({ description: "replaces the field's content" }),
+        }),
+        { minItems: 1, maxItems: MAX_FILL_FORM_FIELDS, description: "one entry per field, filled in order" },
+      ),
+    }),
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      if (signal?.aborted) throw new Error("request cancelled before it started");
+      await runtime.ensureRuntime(signal);
+      if (signal?.aborted) throw new Error("request cancelled before it started");
+      return fillForm({
+        client: runtime.getClient(),
+        sessionId: runtime.sessionId(ctx),
+        cwd: ctx.cwd,
+        signal,
+        toolCallId,
+        tabId: params.tabId,
+        fields: params.fields,
+      });
+    },
+    renderCall: makeRenderCall("browser fill form", (a) => {
+      const count = Array.isArray(a.fields) ? a.fields.length : 0;
+      return `[${shortId(a.tabId)}] ${count} field(s)`;
+    }),
+    renderResult: makeRenderResult((view) => {
+      const filled = typeof view.details.filled === "number" ? view.details.filled : 0;
+      const total = Array.isArray(view.details.fields) ? view.details.fields.length : 0;
+      const status = str(view.details.status);
+      if (status === "filled") return `✓ filled ${filled}/${total} field(s)${pageSuffix(view)}`;
+      if (status === "partial") return `filled ${filled}/${total} field(s) — stopped mid-form${pageSuffix(view)}`;
+      if (status === "failed") return `nothing filled — the first fill failed${pageSuffix(view)}`;
+      return `nothing filled — ${str(view.details.issue) ? preview(view.details.issue, 64) : "unresolved selectors"}${pageSuffix(view)}`;
+    }),
   });
 
   // --- page: evaluate -------------------------------------------------------
